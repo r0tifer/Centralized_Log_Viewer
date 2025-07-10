@@ -271,7 +271,9 @@ class LogViewer(App):
         """Enable or disable mouse capture based on ``mouse_enabled``."""
         enabled = self.mouse_enabled
         try:
-            if hasattr(self, "set_mouse_capture"):
+            if hasattr(self.screen, "set_mouse_capture"):
+                self.screen.set_mouse_capture(enabled)
+            elif hasattr(self, "set_mouse_capture"):
                 self.set_mouse_capture(enabled)
             elif hasattr(self, "capture_mouse") and hasattr(self, "release_mouse"):
                 (self.capture_mouse if enabled else self.release_mouse)()
