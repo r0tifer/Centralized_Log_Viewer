@@ -39,7 +39,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.scroll_view import ScrollView
 from textual.reactive import reactive
-from textual.widgets    import Checkbox, Footer, Header, Input, RichLog, Static, Tree
+from textual.widgets    import Checkbox, Footer, Header, Input, RichLog, Static, Tree, Select
 
 # ───────────── Handle Loading Settings ─────────────
 from log_viewer.config import load_config
@@ -116,7 +116,7 @@ class LogViewer(App):
     current_log: reactive[Optional[Path]] = reactive(None)
     regex_filter: reactive[str] = reactive("")
     time_filter: reactive[str] = reactive("")
-    level_filter: reactive[str] = reactive("")
+    severity_filter: reactive[str] = reactive("")
     auto_scroll: reactive[bool] = reactive(True)
     show_lines: reactive[int] = reactive(DEFAULT_SHOW_LINES)
 
@@ -149,8 +149,24 @@ class LogViewer(App):
                         yield Static("Time:", classes="f_label")
                         yield Input(placeholder="e.g. 15m | 2025-05-21 08:00 to 09:00", id="time")
                     with Horizontal(classes="filter_row"):
-                        yield Static("Level:", classes="f_label")
-                        yield Input(placeholder="e.g. ERROR", id="level")
+                        yield Static("Log Severity:", classes="f_label")
+                        yield Select(
+                            options=[
+                                ("Low", "Low"),
+                                ("Medium", "Medium"),
+                                ("High", "High"),
+                                ("Critical", "Critical"),
+                                ("Other", "other"),
+                            ],
+                            id="severity_select",
+                        )
+                    with Horizontal(classes="filter_row"):
+                        yield Static("Custom:", classes="f_label")
+                        yield Input(
+                            placeholder="e.g. ERROR",
+                            id="severity_other",
+                            disabled=True,
+                        )
                     yield Checkbox(label="Auto-Scroll", value=True, id="auto_scroll")
                 with Horizontal(id="view"):
                     with Vertical(id="output_scroll"):
@@ -192,8 +208,8 @@ class LogViewer(App):
         meta: Static = self.query_one("#meta")
 
         regex_raw = self.regex_filter.strip()
-        level_raw = self.level_filter.strip()
-        filter_sig = (regex_raw, self.time_filter.strip(), level_raw, self.show_lines)
+        severity_raw = self.severity_filter.strip()
+        filter_sig = (regex_raw, self.time_filter.strip(), severity_raw, self.show_lines)
         full_redraw = filter_sig != self._last_filter_sig
 
         try:
@@ -201,7 +217,7 @@ class LogViewer(App):
         except re.error:
             pattern = None
         try:
-            level_pattern = re.compile(level_raw, re.IGNORECASE) if level_raw else None
+            level_pattern = re.compile(severity_raw, re.IGNORECASE) if severity_raw else None
         except re.error:
             level_pattern = None
 
@@ -441,12 +457,31 @@ class LogViewer(App):
         if isinstance(event.node.data, Path) and event.node.data.is_file():
             self._open_log(event.node.data)
 
-    def on_input_changed(self, _: Input.Changed):
-        """Handler for changes to filter inputs: updates reactive filters and re-renders."""
+    def _current_severity(self) -> str:
+        select = self.query_one("#severity_select", Select)
+        if select.value == "other":
+            return self.query_one("#severity_other", Input).value
+        return select.value or ""
+
+    def on_input_changed(self, event: Input.Changed):
+        """Handle changes to any input fields and refresh output."""
+        if event.input.id == "severity_other" and self.query_one("#severity_select", Select).value != "other":
+            return
         self.regex_filter = self.query_one("#regex").value
         self.time_filter = self.query_one("#time").value
-        self.level_filter = self.query_one("#level").value
-        self._render_output()
+        self.severity_filter = self._current_severity()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "severity_select":
+            other = self.query_one("#severity_other", Input)
+            if event.value == "other":
+                other.disabled = False
+                other.focus()
+            else:
+                other.disabled = True
+                other.value = ""
+            self.severity_filter = self._current_severity()
+            self._render_output()
 
     def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
         """Flip our auto_scroll flag whenever the box is toggled."""

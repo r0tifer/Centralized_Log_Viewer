@@ -11,7 +11,7 @@ An interactive terminal-based log viewer built with [Textual](https://textual.te
 - 🔍 **Regex-based filtering** of log lines in real time
 - 🕒 **Time range filters** (e.g., `15m`, `2h`, or `2024-05-01 10:00 to 2024-05-01 12:00`)
 - 🎨 **Color-coded log levels** for ERROR, WARNING, INFO, DEBUG
-- ⚙️ **Level filter** to focus on specific severities
+- ⚙️ **Log Severity filter** to focus on specific severities
 - 📜 **Live log tailing** with auto-scroll toggle
 - ↕️ **Adjustable tree and log pane sizes** with keyboard shortcuts
 
