@@ -14,7 +14,6 @@ An interactive terminal-based log viewer built with [Textual](https://textual.te
 - ⚙️ **Log Severity filter** to focus on specific severities
 - 📜 **Live log tailing** with auto-scroll toggle
 - ↕️ **Adjustable tree and log pane sizes** with keyboard shortcuts
-- 🖱️ **Toggle mouse capture** on demand
 
 ---
 
@@ -102,7 +101,6 @@ python main.py
 | `/`              | Regex filter               |
 | `T`              | Time range filter          |
 | `A`              | Toggle auto-scroll         |
-| `M`              | Toggle mouse capture       |
 | `Q`              | Quit application           |
 
 ---

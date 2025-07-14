@@ -111,7 +111,6 @@ class LogViewer(App):
         Binding("]", "expand_tree", "Widen tree"),
         Binding("+", "more_lines", "Taller pane"),
         Binding("-", "fewer_lines", "Shorter pane"),
-        Binding("m", "toggle_mouse", "Toggle mouse"),
     ]
 
     current_log: reactive[Optional[Path]] = reactive(None)
@@ -120,7 +119,6 @@ class LogViewer(App):
     severity_filter: reactive[str] = reactive("")
     auto_scroll: reactive[bool] = reactive(True)
     show_lines: reactive[int] = reactive(DEFAULT_SHOW_LINES)
-    mouse_enabled: reactive[bool] = reactive(True)
 
     _lines: List[str]
     _queue: SimpleQueue[str]
@@ -192,7 +190,6 @@ class LogViewer(App):
         self._observer = None
         await self._populate_tree()
         self._apply_tree_width()
-        self._apply_mouse_mode()
         self._drain_queue()
         self.set_focus(self.query_one("#tree"))
         self.set_interval(1 / REFRESH_HZ, self._drain_queue, name="flush")
@@ -305,23 +302,6 @@ class LogViewer(App):
         tree.styles.width = self._tree_width
         tree.refresh(layout=True)
 
-    def _apply_mouse_mode(self) -> None:
-        """Enable or disable mouse capture based on ``mouse_enabled``."""
-        enabled = self.mouse_enabled
-        try:
-            if hasattr(self.screen, "set_mouse_capture"):
-                self.screen.set_mouse_capture(enabled)
-            elif hasattr(self, "set_mouse_capture"):
-                self.set_mouse_capture(enabled)
-            elif hasattr(self, "capture_mouse") and hasattr(self, "release_mouse"):
-                (self.capture_mouse if enabled else self.release_mouse)()
-            elif hasattr(self, "mouse"):
-                self.mouse = enabled
-            elif hasattr(self, "ENABLE_MOUSE_SUPPORT"):
-                self.ENABLE_MOUSE_SUPPORT = enabled
-        except Exception:
-            pass
-
 
     def action_shrink_tree(self) -> None:
         """Handle — shrink the tree pane by 2 columns, minimum 15."""
@@ -354,11 +334,6 @@ class LogViewer(App):
         self.show_lines = max(MIN_SHOW_LINES, self.show_lines - SHOW_STEP)
         self._apply_view_height()
         self._render_output()
-
-    def action_toggle_mouse(self) -> None:
-        """Toggle mouse capture on/off at runtime."""
-        self.mouse_enabled = not self.mouse_enabled
-        self._apply_mouse_mode()
 
     # ───────────────────────── Tree Build ──────────────────────────
     @staticmethod
@@ -495,7 +470,6 @@ class LogViewer(App):
         self.regex_filter = self.query_one("#regex").value
         self.time_filter = self.query_one("#time").value
         self.severity_filter = self._current_severity()
-        self._render_output()
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "severity_select":
