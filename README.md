@@ -1,4 +1,4 @@
-# Centrailized Log Viewer
+# Centralized Log Viewer
 
 An interactive terminal-based log viewer built with [Textual](https://textual.textualize.io/). This application automatically discovers all `*.log` files inside a configurable directory (default: `logs/`) and provides a powerful UI for viewing, filtering, and tailing logs in real time.
 
