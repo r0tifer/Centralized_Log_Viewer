@@ -36,7 +36,7 @@ Header, Footer {
 /* ─── Right side: filters above log+meta ─────────────────── */
 #right {
   layout: grid;
-  grid-rows: 13 1fr;      /* filters fixed 13 rows, view takes rest */
+  grid-rows: 16 1fr;      /* filters fixed rows, view takes rest */
   width: 1fr;             /* fill remaining width beside tree */
   height: 100%;           /* full height under header/footer */
 }
@@ -65,7 +65,8 @@ Header, Footer {
 
 /* inputs fill the rest of the row */
 #regex,
-#time {
+#time,
+#level {
   width: 1fr;             /* fill remaining row width */
   height: 3;
   background: #22283b;

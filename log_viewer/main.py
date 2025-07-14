@@ -117,6 +117,7 @@ class LogViewer(App):
     current_log: reactive[Optional[Path]] = reactive(None)
     regex_filter: reactive[str] = reactive("")
     time_filter: reactive[str] = reactive("")
+    level_filter: reactive[str] = reactive("")
     auto_scroll: reactive[bool] = reactive(True)
     show_lines: reactive[int] = reactive(DEFAULT_SHOW_LINES)
     mouse_enabled: reactive[bool] = reactive(True)
@@ -126,7 +127,7 @@ class LogViewer(App):
     _observer: Optional[Observer] = None
     _tree_width: int = DEFAULT_TREE_WIDTH
     _last_rendered_idx: int = 0
-    _last_filter_sig: tuple[str, str, int] = ("", "", 0)
+    _last_filter_sig: tuple[str, str, str, int] = ("", "", "", 0)
 
     # ───────────────────────── UI Compose ──────────────────────────
     def compose(self) -> ComposeResult:
@@ -149,6 +150,9 @@ class LogViewer(App):
                     with Horizontal(classes="filter_row"):
                         yield Static("Time:", classes="f_label")
                         yield Input(placeholder="e.g. 15m | 2025-05-21 08:00 to 09:00", id="time")
+                    with Horizontal(classes="filter_row"):
+                        yield Static("Level:", classes="f_label")
+                        yield Input(placeholder="e.g. ERROR", id="level")
                     yield Checkbox(label="Auto-Scroll", value=True, id="auto_scroll")
                 with Horizontal(id="view"):
                     with Vertical(id="output_scroll"):
@@ -191,13 +195,18 @@ class LogViewer(App):
         meta: Static = self.query_one("#meta")
 
         regex_raw = self.regex_filter.strip()
-        filter_sig = (regex_raw, self.time_filter.strip(), self.show_lines)
+        level_raw = self.level_filter.strip()
+        filter_sig = (regex_raw, self.time_filter.strip(), level_raw, self.show_lines)
         full_redraw = filter_sig != self._last_filter_sig
 
         try:
             pattern = re.compile(regex_raw, re.IGNORECASE) if regex_raw else None
         except re.error:
             pattern = None
+        try:
+            level_pattern = re.compile(level_raw, re.IGNORECASE) if level_raw else None
+        except re.error:
+            level_pattern = None
 
         start_ts, end_ts = self._parse_time_filter(self.time_filter)
 
@@ -207,6 +216,8 @@ class LogViewer(App):
             shown: list[str] = []
             for ln in reversed(self._lines):
                 if pattern and not pattern.search(ln):
+                    continue
+                if level_pattern and not level_pattern.search(ln):
                     continue
                 if start_ts or end_ts:
                     try:
@@ -224,6 +235,17 @@ class LogViewer(App):
         else:
             new_lines = self._lines[self._last_rendered_idx:]
             for ln in new_lines:
+                if pattern and not pattern.search(ln):
+                    continue
+                if level_pattern and not level_pattern.search(ln):
+                    continue
+                if start_ts or end_ts:
+                    try:
+                        ts = datetime.fromisoformat(ln.split(" ", 1)[0])
+                        if (start_ts and ts < start_ts) or (end_ts and ts > end_ts):
+                            continue
+                    except Exception:
+                        pass
                 self._write_line_to_log(log_widget, ln)
 
         if self.auto_scroll:
@@ -448,6 +470,7 @@ class LogViewer(App):
         """Handler for changes to filter inputs: updates reactive filters and re-renders."""
         self.regex_filter = self.query_one("#regex").value
         self.time_filter = self.query_one("#time").value
+        self.level_filter = self.query_one("#level").value
         self._render_output()
 
     def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
@@ -485,7 +508,7 @@ class LogViewer(App):
         self.current_log = file_path
         self._last_rendered_idx = 0
         # pick a signature that won’t match any real filter, so full_redraw=True
-        self._last_filter_sig   = (None, None, None)  
+        self._last_filter_sig   = (None, None, None, None)
         
         # Render logs
         self._render_output()
