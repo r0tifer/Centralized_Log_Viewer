@@ -58,7 +58,7 @@ Header, Footer {
 
 /* the “Regex:” / “Time:” labels */
 .f_label {
-  width: 7;
+  width: 13;            /* allow longer labels like "Log Severity:" */
   text-align: right;
   padding-right: 1;
 }
