@@ -4,7 +4,7 @@ An interactive terminal-based log viewer built with [Textual](https://textual.te
 
 ---
 
-## ✨ Features
+## Features
 
 - 📁 **Recursive log discovery** from one or more configured directories
 - 🌲 **Tree-based navigation** of directory structure and `.log` files
@@ -26,7 +26,7 @@ An interactive terminal-based log viewer built with [Textual](https://textual.te
 - Python 3.9 or newer
 - [Poetry](https://python-poetry.org/) (recommended for dependency management)
 
-### 📦 Installation
+### Installation
 
 ```bash
 # Clone the repository
@@ -39,7 +39,7 @@ poetry install
 
 ---
 
-## 🛠 Configuration
+## Configuration
 
 The app uses a `settings.conf` file in the root directory:
 
@@ -79,7 +79,7 @@ show_step = 10
 
 ---
 
-## 🧭 Usage
+## Usage
 
 ```bash
 # Run via poetry
@@ -89,7 +89,7 @@ poetry run CentralizedLogViewer  # or: poetry run clv
 python -m log_viewer.main
 ```
 
-### 🎹 Keyboard Shortcuts
+### Keyboard Shortcuts
 
 | Key              | Action                     |
 |------------------|----------------------------|
@@ -107,23 +107,23 @@ python -m log_viewer.main
 
 > **Tip:** Shift-click inside the log pane while copy mode is active to capture only the log output.
 
-### 📁 Managing Log Sources at Runtime
+### Managing Log Sources at Runtime
 
 - Use the **Add Log Source** button in the top toolbar or press `A` to open the modal.
 - Enter an absolute path to a directory (all `*.log` files will be indexed) or to a specific log file.
 - If the viewer lacks permission to read the path, a warning explains what failed and reminds you to re-launch the app with elevated privileges.
 
-### 💾 Saving Your Session
+### Saving Your Session
 
 When you are satisfied with the extra sources you've added, press **Save Session** in the toolbar or hit `Ctrl+S`. The new paths are appended to `settings.conf` so they'll be loaded the next time the viewer starts. If you change your mind, simply skip saving—the temporary additions apply for the current session only.
 
-### 🖨️ Copy Mode
+### Copy Mode
 
 Press `Ctrl+L` to toggle copy mode. The tree, filters, and metadata panels collapse, giving you a clean log pane for clipboard captures. Exit copy mode with `Ctrl+L` again or by clicking outside the log pane.
 
 ---
 
-## 🧪 Development
+## Development
 
 To run in development mode:
 
@@ -132,9 +132,3 @@ poetry run textual run main.py --dev
 ```
 
 ---
-
-## 👤 Author
-
-**Michael Levesque**  
-📧 michael.levesque@yourdomain.com  
-🔗 [GitHub Profile](https://git.deeptree.tech/ADVTCH)
