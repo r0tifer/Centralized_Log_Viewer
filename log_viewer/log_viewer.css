@@ -14,6 +14,19 @@ Header, Footer {
   height: 1;
 }
 
+#menu_bar {
+  layout: horizontal;
+  padding: 0 1;
+  background: #1d1d35;
+  height: 3;
+  align-vertical: middle;
+}
+
+#menu_bar Button {
+  min-width: 20;
+  margin-right: 1;
+}
+
 /* ─── Main split: tree | right ────────────────────────────── */
 #main {
   layout: horizontal;
@@ -51,14 +64,15 @@ Header, Footer {
 /* each filter row (label + input) */
 .filter_row {
   layout: horizontal;
-  height: 3;
+  height: auto;
   min-height: 3;
   margin-bottom: 1;
+  align-vertical: middle;
 }
 
 /* the “Regex:” / “Time:” labels */
 .f_label {
-  width: 13;            /* allow longer labels like "Log Severity:" */
+  width: 10;
   text-align: right;
   padding-right: 1;
 }
@@ -69,11 +83,17 @@ Header, Footer {
 #severity_select,
 #severity_other {
   width: 1fr;             /* fill remaining row width */
-  height: 3;
+  min-height: 3;
+  height: auto;
   background: #22283b;
   color: white;
   border: round #00afff;
   padding: 0 1;
+}
+
+#filters .severity_row .f_label {
+  width: 10;
+  text-align: left;
 }
 
 /* auto-scroll checkbox sits under the inputs */
@@ -115,4 +135,24 @@ Header, Footer {
   border: round cyan;
   padding: 1;
   color: lightcyan;
+}
+
+/* ─── Copy mode ─────────────────────────────────────────────── */
+LogViewer.-copy-mode #left,
+LogViewer.-copy-mode #filters,
+LogViewer.-copy-mode #meta {
+  display: none;
+}
+
+LogViewer.-copy-mode #view {
+  padding: 0;
+}
+
+LogViewer.-copy-mode #output_scroll {
+  border: none;
+  width: 1fr;
+}
+
+LogViewer.-copy-mode #output {
+  padding: 0 1;
 }

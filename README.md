@@ -1,4 +1,4 @@
-# Centralized Log Viewer
+# Centralized Log Viewer (CLV)
 
 An interactive terminal-based log viewer built with [Textual](https://textual.textualize.io/). This application automatically discovers all `*.log` files inside a configurable directory (default: `logs/`) and provides a powerful UI for viewing, filtering, and tailing logs in real time.
 
@@ -8,12 +8,14 @@ An interactive terminal-based log viewer built with [Textual](https://textual.te
 
 - 📁 **Recursive log discovery** from one or more configured directories
 - 🌲 **Tree-based navigation** of directory structure and `.log` files
+- ➕ **Session-aware log sources** — add extra files or folders on the fly and persist them
 - 🔍 **Regex-based filtering** of log lines in real time
 - 🕒 **Time range filters** (e.g., `15m`, `2h`, or `2024-05-01 10:00 to 2024-05-01 12:00`)
 - 🎨 **Color-coded log levels** for ERROR, WARNING, INFO, DEBUG
 - ⚙️ **Log Severity filter** to focus on specific severities
 - 📜 **Live log tailing** with auto-scroll toggle
 - ↕️ **Adjustable tree and log pane sizes** with keyboard shortcuts
+- 🖨️ **Copy mode** that hides surrounding chrome for clean clipboard grabs
 
 ---
 
@@ -29,7 +31,7 @@ An interactive terminal-based log viewer built with [Textual](https://textual.te
 ```bash
 # Clone the repository
 git clone https://git.deeptree.tech/ADVTCH/Python/src/branch/main/log_viewer
-cd textual-log-viewer
+cd centralized-log-viewer
 
 # Install dependencies
 poetry install
@@ -81,13 +83,10 @@ show_step = 10
 
 ```bash
 # Run via poetry
-poetry run python -m main
-```
+poetry run CentralizedLogViewer  # or: poetry run clv
 
-Or, if you have the script installed:
-
-```bash
-python main.py
+# Or run the module directly
+python -m log_viewer.main
 ```
 
 ### 🎹 Keyboard Shortcuts
@@ -98,10 +97,29 @@ python main.py
 | `Enter`          | Open highlighted file      |
 | `[` / `]`        | Shrink/Expand tree         |
 | `+` / `-`        | Show more/fewer lines      |
+| `A`              | Add Log Source modal       |
+| `Ctrl+S`         | Save session to settings   |
+| `Ctrl+L`         | Toggle copy mode           |
 | `/`              | Regex filter               |
 | `T`              | Time range filter          |
-| `A`              | Toggle auto-scroll         |
+| `Space`          | Toggle auto-scroll checkbox|
 | `Q`              | Quit application           |
+
+> **Tip:** Shift-click inside the log pane while copy mode is active to capture only the log output.
+
+### 📁 Managing Log Sources at Runtime
+
+- Use the **Add Log Source** button in the top toolbar or press `A` to open the modal.
+- Enter an absolute path to a directory (all `*.log` files will be indexed) or to a specific log file.
+- If the viewer lacks permission to read the path, a warning explains what failed and reminds you to re-launch the app with elevated privileges.
+
+### 💾 Saving Your Session
+
+When you are satisfied with the extra sources you've added, press **Save Session** in the toolbar or hit `Ctrl+S`. The new paths are appended to `settings.conf` so they'll be loaded the next time the viewer starts. If you change your mind, simply skip saving—the temporary additions apply for the current session only.
+
+### 🖨️ Copy Mode
+
+Press `Ctrl+L` to toggle copy mode. The tree, filters, and metadata panels collapse, giving you a clean log pane for clipboard captures. Exit copy mode with `Ctrl+L` again or by clicking outside the log pane.
 
 ---
 
@@ -120,4 +138,3 @@ poetry run textual run main.py --dev
 **Michael Levesque**  
 📧 michael.levesque@yourdomain.com  
 🔗 [GitHub Profile](https://git.deeptree.tech/ADVTCH)
-
