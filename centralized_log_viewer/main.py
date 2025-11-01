@@ -44,7 +44,7 @@ from textual.widgets    import Button, Checkbox, Footer, Header, Input, RichLog,
 from .paths import get_resource_path
 
 # ───────────── Handle Loading Settings ─────────────
-from log_viewer.config import load_config
+from centralized_log_viewer.config import load_config
 _config = load_config()
 
 # ─────────────────────────── Globals ────────────────────────────
