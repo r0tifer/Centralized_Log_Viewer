@@ -46,7 +46,7 @@ jobs:
             --onedir \
             --console \
             --add-data "centralized_log_viewer/log_viewer.css:." \
-            -m centralized_log_viewer.main
+            centralized_log_viewer/main.py
 
       - name: Stage install tree
         run: |
