@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "centralized-log-viewer"
-version = "1.5.1"
+version = "1.5.2"
 description = "Centralized Log Viewing Application based on Textual. Log_viewer will auto discover the log(s) directory(ies) defined in the log_viewer.conf file."
 authors = ["Michael Levesque <michaell@advtch.me>"]
 readme = "README.md"
