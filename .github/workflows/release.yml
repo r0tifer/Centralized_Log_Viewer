@@ -9,114 +9,136 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  build-linux:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [x86_64, aarch64]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up QEMU (for aarch64)
-        uses: docker/setup-qemu-action@v3
-
-      - name: Build PyInstaller onefile
-        env:
-          TAG: ${{ github.ref_name }}
-          ARCH: ${{ matrix.arch }}
-        run: |
-          set -euo pipefail
-          IMAGE="quay.io/pypa/manylinux2014_${ARCH}"
-          docker run --rm \
-            -e TAG="$TAG" \
-            -e ARCH="$ARCH" \
-            -v "${GITHUB_WORKSPACE}:/src" \
-            "$IMAGE" \
-            bash -lc '
-              set -euo pipefail
-              cd /src
-              PYBIN=$(ls -d /opt/python/cp311*/bin | head -n1)
-              "$PYBIN/python" -m pip install --upgrade pip
-              "$PYBIN/python" -m pip install pyinstaller "textual==3.2.0" "watchdog==6.0.0"
-              PYTHON_PREFIX="$(dirname "$PYBIN")"
-              PYTHON_LIB_DIR="${PYTHON_PREFIX}/lib"
-              if [[ -d "$PYTHON_LIB_DIR" ]]; then
-                LIBPY=$(find "$PYTHON_LIB_DIR" -maxdepth 1 -name "libpython3*.so" -print -quit || true)
-                if [[ -n "$LIBPY" ]]; then
-                  export PYTHON_SHARED_LIBRARY="$LIBPY"
-                fi
-              fi
-              "$PYBIN/python" -m PyInstaller --onefile -n clv centralized_log_viewer/main.py
-              mkdir -p /src/dist_artifacts
-              cp -f centralized_log_viewer/log_viewer.css dist/ || true
-              tar -C dist -czf "/src/dist_artifacts/clv-${TAG}-linux-${ARCH}.tar.gz" clv log_viewer.css
-              # Checksums
-              cd /src/dist_artifacts
-              sha256sum "clv-${TAG}-linux-${ARCH}.tar.gz" > "clv-${TAG}-linux-${ARCH}.tar.gz.sha256"
-            '
-
-      - name: Upload artifact (CI)
-        uses: actions/upload-artifact@v4
-        with:
-          name: clv-${{ github.ref_name }}-${{ matrix.arch }}
-          path: |
-            dist_artifacts/*.tar.gz
-            dist_artifacts/*.sha256
-
-      - name: Attach to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          generate_release_notes: true
-          files: |
-            dist_artifacts/*.tar.gz
-            dist_artifacts/*.sha256
-          fail_on_unmatched_files: true
-
-  checksums:
-    name: Aggregate checksums and sign
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
     env:
-      CLV_GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-      CLV_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+      APP_NAME: centralized-log-viewer
+      BIN_NAME: clv
+      INSTALL_PREFIX: /opt/centralized-log-viewer
+      GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+      GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
     steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: downloads
+      - uses: actions/checkout@v4
 
-      - name: Generate aggregated SHA256SUMS
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tooling
         run: |
           set -euo pipefail
-          cd downloads
-          find . -type f -name "*.tar.gz" -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
-          install -D -m0644 SHA256SUMS ../SHA256SUMS
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev rpm build-essential
+          sudo gem install --no-document fpm
+          python -m pip install --upgrade pip
+          pip install poetry pyinstaller
+
+      - name: Install project deps
+        run: |
+          set -euo pipefail
+          poetry install --no-interaction --no-root
+
+      - name: Build PyInstaller (onedir)
+        run: |
+          set -euo pipefail
+          pyinstaller -y \
+            --name "${BIN_NAME}" \
+            --onedir \
+            --console \
+            --add-data "centralized_log_viewer/log_viewer.css:." \
+            -m centralized_log_viewer.main
+
+      - name: Stage install tree
+        run: |
+          set -euo pipefail
+          STAGE="stage"
+          INSTDIR="${STAGE}${INSTALL_PREFIX}"
+          USRBIN="${STAGE}/usr/local/bin"
+          mkdir -p "${INSTDIR}" "${USRBIN}"
+          cp -a "dist/${BIN_NAME}/." "${INSTDIR}/"
+          cat > "${USRBIN}/${BIN_NAME}" <<EOF
+#!/usr/bin/env bash
+exec ${INSTALL_PREFIX}/${BIN_NAME} "\$@"
+EOF
+          chmod +x "${USRBIN}/${BIN_NAME}"
+
+      - name: Build packages with fpm (DEB & RPM)
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          STAGE="stage"
+          VER="${VERSION#v}"
+          fpm -s dir -t deb -n "${APP_NAME}" -v "${VER}" \
+            --description "Centralized Log Viewer (Textual TUI)" \
+            --license "MIT" \
+            --url "https://github.com/${{ github.repository }}" \
+            -C "${STAGE}" .
+          fpm -s dir -t rpm -n "${APP_NAME}" -v "${VER}" \
+            --description "Centralized Log Viewer (Textual TUI)" \
+            --license "MIT" \
+            --url "https://github.com/${{ github.repository }}" \
+            -C "${STAGE}" .
+
+      - name: Make tarball (universal fallback)
+        run: |
+          set -euo pipefail
+          tar -C dist -czf "${APP_NAME}-linux-x86_64.tar.gz" "${BIN_NAME}"
+
+      - name: Compute checksums
+        run: |
+          set -euo pipefail
+          sha256sum ./*.deb ./*.rpm "${APP_NAME}-linux-x86_64.tar.gz" > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Import GPG key
-        if: ${{ env.CLV_GPG_PRIVATE_KEY != '' }}
+        if: ${{ env.GPG_PRIVATE_KEY != '' }}
         uses: crazy-max/ghaction-import-gpg@v6
         with:
-          gpg_private_key: ${{ env.CLV_GPG_PRIVATE_KEY }}
-          passphrase: ${{ env.CLV_GPG_PASSPHRASE }}
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
 
       - name: Sign SHA256SUMS
-        if: ${{ env.CLV_GPG_PRIVATE_KEY != '' }}
+        if: ${{ env.GPG_PRIVATE_KEY != '' }}
         run: |
           set -euo pipefail
           gpg --batch --yes --armor --output SHA256SUMS.asc --detach-sign SHA256SUMS
 
-      - name: Attach checksum files to release
+      - name: Create/Update GitHub Release & upload artifacts
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           files: |
+            *.deb
+            *.rpm
+            ${{ env.APP_NAME }}-linux-x86_64.tar.gz
             SHA256SUMS
             SHA256SUMS.asc
           fail_on_unmatched_files: false
+
+  build-pypi:
+    runs-on: ubuntu-latest
+    needs: build-linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build wheel and sdist
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install poetry
+          poetry install --no-interaction --no-root
+          poetry build
+
+      - name: Publish to PyPI
+        if: ${{ startsWith(github.ref, 'refs/tags/') && secrets.PYPI_TOKEN != '' }}
+        env:
+          POETRY_PYPI_TOKEN_PYPI: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          set -euo pipefail
+          poetry publish --username __token__ --password "${POETRY_PYPI_TOKEN_PYPI}"
