@@ -40,6 +40,13 @@ jobs:
               PYBIN=$(ls -d /opt/python/cp311*/bin | head -n1)
               "$PYBIN/python" -m pip install --upgrade pip
               "$PYBIN/python" -m pip install pyinstaller "textual==3.2.0" "watchdog==6.0.0"
+              PYTHON_LIB_DIR="$(dirname "$PYBIN")/../lib"
+              if [[ -d "$PYTHON_LIB_DIR" ]]; then
+                LIBPY=$(find "$PYTHON_LIB_DIR" -maxdepth 1 -name "libpython3*.so" -print -quit || true)
+                if [[ -n "$LIBPY" ]]; then
+                  export PYTHON_SHARED_LIBRARY="$LIBPY"
+                fi
+              fi
               "$PYBIN/python" -m PyInstaller --onefile -n clv centralized_log_viewer/main.py
               mkdir -p /src/dist_artifacts
               cp -f centralized_log_viewer/log_viewer.css dist/ || true
