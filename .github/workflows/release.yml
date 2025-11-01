@@ -1,0 +1,111 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (for aarch64)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build PyInstaller onefile
+        env:
+          TAG: ${{ github.ref_name }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          IMAGE="quay.io/pypa/manylinux2014_${ARCH}"
+          docker run --rm \
+            -e TAG="$TAG" \
+            -e ARCH="$ARCH" \
+            -v "${GITHUB_WORKSPACE}:/src" \
+            "$IMAGE" \
+            bash -lc '
+              set -euo pipefail
+              cd /src
+              PYBIN=$(ls -d /opt/python/cp311*/bin | head -n1)
+              "$PYBIN/pip" install --upgrade pip
+              "$PYBIN/pip" install pyinstaller "textual==3.2.0" "watchdog==6.0.0"
+              "$PYBIN/pyinstaller" --onefile -n clv log_viewer/main.py
+              mkdir -p /src/dist_artifacts
+              cp -f log_viewer/log_viewer.css dist/ || true
+              tar -C dist -czf "/src/dist_artifacts/clv-${TAG}-linux-${ARCH}.tar.gz" clv log_viewer.css
+              # Checksums
+              cd /src/dist_artifacts
+              sha256sum "clv-${TAG}-linux-${ARCH}.tar.gz" > "clv-${TAG}-linux-${ARCH}.tar.gz.sha256"
+            '
+
+      - name: Upload artifact (CI)
+        uses: actions/upload-artifact@v4
+        with:
+          name: clv-${{ github.ref_name }}-${{ matrix.arch }}
+          path: |
+            dist_artifacts/*.tar.gz
+            dist_artifacts/*.sha256
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist_artifacts/*.tar.gz
+            dist_artifacts/*.sha256
+          fail_on_unmatched_files: true
+
+  checksums:
+    name: Aggregate checksums and sign
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: downloads
+
+      - name: Generate aggregated SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd downloads
+          find . -type f -name "*.tar.gz" -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+          install -D -m0644 SHA256SUMS ../SHA256SUMS
+
+      - name: Import GPG key
+        if: ${{ secrets.GPG_PRIVATE_KEY != '' }}
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+
+      - name: Sign SHA256SUMS
+        if: ${{ secrets.GPG_PRIVATE_KEY != '' }}
+        run: |
+          set -euo pipefail
+          gpg --batch --yes --armor --output SHA256SUMS.asc --detach-sign SHA256SUMS
+
+      - name: Attach checksum files to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            SHA256SUMS
+            SHA256SUMS.asc
+          fail_on_unmatched_files: false
