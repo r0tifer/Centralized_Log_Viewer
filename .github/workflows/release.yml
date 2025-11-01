@@ -56,10 +56,7 @@ jobs:
           USRBIN="${STAGE}/usr/local/bin"
           mkdir -p "${INSTDIR}" "${USRBIN}"
           cp -a "dist/${BIN_NAME}/." "${INSTDIR}/"
-          cat > "${USRBIN}/${BIN_NAME}" <<EOF
-#!/usr/bin/env bash
-exec ${INSTALL_PREFIX}/${BIN_NAME} "\$@"
-EOF
+          printf '#!/usr/bin/env bash\nexec %s/%s "$@"\n' "${INSTALL_PREFIX}" "${BIN_NAME}" > "${USRBIN}/${BIN_NAME}"
           chmod +x "${USRBIN}/${BIN_NAME}"
 
       - name: Build packages with fpm (DEB & RPM)
