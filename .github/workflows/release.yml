@@ -40,9 +40,9 @@ jobs:
               PYBIN=$(ls -d /opt/python/cp311*/bin | head -n1)
               "$PYBIN/pip" install --upgrade pip
               "$PYBIN/pip" install pyinstaller "textual==3.2.0" "watchdog==6.0.0"
-              "$PYBIN/pyinstaller" --onefile -n clv log_viewer/main.py
+              "$PYBIN/pyinstaller" --onefile -n clv centralized_log_viewer/main.py
               mkdir -p /src/dist_artifacts
-              cp -f log_viewer/log_viewer.css dist/ || true
+              cp -f centralized_log_viewer/log_viewer.css dist/ || true
               tar -C dist -czf "/src/dist_artifacts/clv-${TAG}-linux-${ARCH}.tar.gz" clv log_viewer.css
               # Checksums
               cd /src/dist_artifacts
