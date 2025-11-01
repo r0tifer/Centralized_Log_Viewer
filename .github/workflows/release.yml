@@ -133,8 +133,9 @@ jobs:
           poetry build
 
       - name: Publish to PyPI
-        if: ${{ startsWith(github.ref, 'refs/tags/') && secrets.PYPI_TOKEN != '' }}
+        if: ${{ startsWith(github.ref, 'refs/tags/') && env.PYPI_TOKEN != '' }}
         env:
+          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
           POETRY_PYPI_TOKEN_PYPI: ${{ secrets.PYPI_TOKEN }}
         run: |
           set -euo pipefail
