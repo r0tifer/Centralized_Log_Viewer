@@ -40,7 +40,8 @@ jobs:
               PYBIN=$(ls -d /opt/python/cp311*/bin | head -n1)
               "$PYBIN/python" -m pip install --upgrade pip
               "$PYBIN/python" -m pip install pyinstaller "textual==3.2.0" "watchdog==6.0.0"
-              PYTHON_LIB_DIR="$(dirname "$PYBIN")/../lib"
+              PYTHON_PREFIX="$(dirname "$PYBIN")"
+              PYTHON_LIB_DIR="${PYTHON_PREFIX}/lib"
               if [[ -d "$PYTHON_LIB_DIR" ]]; then
                 LIBPY=$(find "$PYTHON_LIB_DIR" -maxdepth 1 -name "libpython3*.so" -print -quit || true)
                 if [[ -n "$LIBPY" ]]; then
