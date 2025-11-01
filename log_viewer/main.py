@@ -41,6 +41,7 @@ from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widgets    import Button, Checkbox, Footer, Header, Input, RichLog, Static, Tree, Select
+from .paths import get_resource_path
 
 # ───────────── Handle Loading Settings ─────────────
 from log_viewer.config import load_config
@@ -220,7 +221,9 @@ class LogViewer(App):
     """
 
     TITLE = "📜 Centralized Log Viewer "
-    CSS_PATH = "log_viewer.css" if (Path(__file__).parent / "log_viewer.css").exists() else None
+    TITLE = "Centralized Log Viewer"
+    _css_path = get_resource_path("log_viewer.css")
+    CSS_PATH = str(_css_path) if _css_path else None
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh_tree", "Reload tree"),

@@ -8,8 +8,11 @@ and UI layout defaults.
 """
 import configparser
 from pathlib import Path
+from typing import Optional
 
-CONFIG_PATH = Path(__file__).resolve().parents[1] / "settings.conf"
+from .paths import get_config_file
+
+CONFIG_PATH: Optional[Path] = get_config_file()
 
 def load_config():
     """
@@ -27,7 +30,9 @@ def load_config():
     """
 
     config = configparser.ConfigParser()
-    config.read(CONFIG_PATH)
+    # Determine config path dynamically with XDG and static fallbacks
+    path = CONFIG_PATH or (Path(__file__).resolve().parents[1] / "settings.conf")
+    config.read(path)
     viewer = config["log_viewer"]
 
     # parse and normalize all roots
