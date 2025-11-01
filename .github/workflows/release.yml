@@ -38,9 +38,9 @@ jobs:
               set -euo pipefail
               cd /src
               PYBIN=$(ls -d /opt/python/cp311*/bin | head -n1)
-              "$PYBIN/pip" install --upgrade pip
-              "$PYBIN/pip" install pyinstaller "textual==3.2.0" "watchdog==6.0.0"
-              "$PYBIN/pyinstaller" --onefile -n clv centralized_log_viewer/main.py
+              "$PYBIN/python" -m pip install --upgrade pip
+              "$PYBIN/python" -m pip install pyinstaller "textual==3.2.0" "watchdog==6.0.0"
+              "$PYBIN/python" -m PyInstaller --onefile -n clv centralized_log_viewer/main.py
               mkdir -p /src/dist_artifacts
               cp -f centralized_log_viewer/log_viewer.css dist/ || true
               tar -C dist -czf "/src/dist_artifacts/clv-${TAG}-linux-${ARCH}.tar.gz" clv log_viewer.css
