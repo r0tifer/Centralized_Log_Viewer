@@ -99,7 +99,8 @@ jobs:
         if: ${{ env.GPG_PRIVATE_KEY != '' }}
         run: |
           set -euo pipefail
-          gpg --batch --yes --armor --output SHA256SUMS.asc --detach-sign SHA256SUMS
+          gpg --batch --yes --pinentry-mode loopback --passphrase "${GPG_PASSPHRASE:-}" \
+            --armor --output SHA256SUMS.asc --detach-sign SHA256SUMS
 
       - name: Create/Update GitHub Release & upload artifacts
         if: startsWith(github.ref, 'refs/tags/')
