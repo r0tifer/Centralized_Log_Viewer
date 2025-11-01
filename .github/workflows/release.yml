@@ -74,6 +74,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      CLV_GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+      CLV_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -88,14 +91,14 @@ jobs:
           install -D -m0644 SHA256SUMS ../SHA256SUMS
 
       - name: Import GPG key
-        if: ${{ secrets.GPG_PRIVATE_KEY != '' }}
+        if: ${{ env.CLV_GPG_PRIVATE_KEY != '' }}
         uses: crazy-max/ghaction-import-gpg@v6
         with:
-          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
-          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+          gpg_private_key: ${{ env.CLV_GPG_PRIVATE_KEY }}
+          passphrase: ${{ env.CLV_GPG_PASSPHRASE }}
 
       - name: Sign SHA256SUMS
-        if: ${{ secrets.GPG_PRIVATE_KEY != '' }}
+        if: ${{ env.CLV_GPG_PRIVATE_KEY != '' }}
         run: |
           set -euo pipefail
           gpg --batch --yes --armor --output SHA256SUMS.asc --detach-sign SHA256SUMS
