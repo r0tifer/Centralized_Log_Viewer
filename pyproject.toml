@@ -8,7 +8,7 @@ packages = [{ include = "centralized_log_viewer" }]         # ← Ensures code i
 include = ["centralized_log_viewer/log_viewer.css"]         # ← Valid asset inclusion!
 
 [tool.poetry.dependencies]
-python = "^3.13"
+python = ">=3.11,<4.0"
 textual = "^3.2.0"
 watchdog = "^6.0.0"
 
