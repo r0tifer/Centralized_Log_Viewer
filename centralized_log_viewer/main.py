@@ -752,6 +752,8 @@ class LogViewer(App):
         self.regex_filter = self.query_one("#regex").value
         self.time_filter = self.query_one("#time").value
         self.severity_filter = self._current_severity()
+        if event.input.id in {"regex", "time", "severity_other"}:
+            self._render_output()
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "severity_select":
