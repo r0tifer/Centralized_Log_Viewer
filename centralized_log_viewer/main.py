@@ -26,9 +26,10 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from queue import SimpleQueue
-from typing import List, Optional
+from typing import List, Optional, Literal
 
 # ───────────── Import Third Party Librarys ─────────────
+from rich.style import Style
 from rich.text import Text
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -41,6 +42,7 @@ from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widgets    import Button, Checkbox, Footer, Header, Input, RichLog, Static, Tree, Select
+from textual.widgets._tree import TOGGLE_STYLE, TreeNode
 from .paths import get_resource_path
 
 # ───────────── Handle Loading Settings ─────────────
@@ -120,6 +122,65 @@ class CopySafeRichLog(RichLog):
             super().on_mouse_leave(event)
         if isinstance(self.app, LogViewer):
             self.app.exit_copy_mode()
+
+
+class LogTree(Tree[Path]):
+    """Tree widget that renders log sources with icons and themed guides."""
+
+    COMPONENT_CLASSES = Tree.COMPONENT_CLASSES | {
+        "tree--icon-root",
+        "tree--icon-branch",
+        "tree--icon-leaf",
+    }
+
+    ICON_ROOT = "🌲"
+    ICON_BRANCH = "📂"
+    ICON_LEAF = "📄"
+
+    def __init__(
+        self,
+        *args,
+        base_path: Path | None = None,
+        role: Literal["directory", "files", "placeholder"] = "directory",
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.base_path: Path | None = base_path
+        self.role: Literal["directory", "files", "placeholder"] = role
+        self.show_guides = True
+        self.guide_depth = 4
+
+    def render_label(
+        self,
+        node: TreeNode[Path],
+        base_style: Style,
+        style: Style,
+    ) -> Text:
+        """Render a label with toggle and icon styling."""
+
+        node_label = node._label.copy()
+        node_label.stylize(style)
+
+        if node._allow_expand:
+            toggle_symbol = self.ICON_NODE_EXPANDED if node.is_expanded else self.ICON_NODE
+            toggle = (f"{toggle_symbol} ", base_style + TOGGLE_STYLE)
+        else:
+            toggle = ("  ", base_style)
+
+        if node.is_root:
+            icon_name = "tree--icon-root"
+            icon_symbol = self.ICON_ROOT
+        elif node._allow_expand:
+            icon_name = "tree--icon-branch"
+            icon_symbol = self.ICON_BRANCH
+        else:
+            icon_name = "tree--icon-leaf"
+            icon_symbol = self.ICON_LEAF
+
+        icon_style = base_style + self.get_component_rich_style(icon_name, partial=True)
+        icon = (f"{icon_symbol} ", icon_style)
+
+        return Text.assemble(toggle, icon, node_label)
 
 
 class SessionMenu(Static):
@@ -285,7 +346,25 @@ class LogViewer(App):
         yield Header()
         with Horizontal(id="main"):
             with Vertical(id="left"):
-                yield Tree("Logs", id="tree")
+                with Vertical(id="tree_panel"):
+                    for base in self._session_dirs:
+                        yield LogTree(
+                            self._format_root_label(base),
+                            classes="log-tree",
+                            base_path=base,
+                        )
+                    if not self._session_dirs and not self._session_files:
+                        yield LogTree(
+                            "Log Sources",
+                            classes="log-tree",
+                            role="placeholder",
+                        )
+                    if self._session_files:
+                        yield LogTree(
+                            "Individual Logs",
+                            classes="log-tree",
+                            role="files",
+                        )
             with Vertical(id="right"):
                 with Vertical(id="filters"):
                     with Horizontal(classes="filter_row"):
@@ -335,9 +414,8 @@ class LogViewer(App):
         self._lines = []
         self._observer = None
         await self._populate_tree()
-        self._apply_tree_width()
         self._drain_queue()
-        self.set_focus(self.query_one("#tree"))
+        self._focus_initial_tree()
         self.set_interval(1 / REFRESH_HZ, self._drain_queue, name="flush")
 
     # ───────────────────────── Copy Mode ───────────────────────────
@@ -491,9 +569,18 @@ class LogViewer(App):
     # ─────────────────────── Width Helpers ─────────────────────────
     def _apply_tree_width(self) -> None:
         """Set the Tree widget's width; let the right-hand panel fill the rest."""
-        tree = self.query_one("#tree")
-        tree.styles.width = self._tree_width
-        tree.refresh(layout=True)
+        trees = [tree for tree in self.query("LogTree.log-tree", LogTree) if tree.display]
+        if not trees:
+            return
+        for tree in trees:
+            tree.styles.width = self._tree_width
+            tree.refresh(layout=True)
+        try:
+            left_panel = self.query_one("#left")
+            left_panel.styles.width = self._tree_width
+            left_panel.refresh(layout=True)
+        except Exception:
+            pass
 
 
     def action_shrink_tree(self) -> None:
@@ -542,40 +629,147 @@ class LogViewer(App):
                 except Exception:
                     pass
     
-    def _build_root_tree_nodes(self, tree: Tree) -> list[tuple[Path, Tree.Node]]:
-        """Prepare the root node and return (Path, Tree.Node) pairs for directory population."""
+    def _format_root_label(self, base: Path) -> str:
+        """Return the display label for a root directory tree."""
+
+        return str(base)
+
+    def _tree_panel(self) -> Vertical:
+        return self.query_one("#tree_panel", Vertical)
+
+    def _tree_widgets(self) -> list[LogTree]:
+        return list(self.query("LogTree.log-tree", LogTree))
+
+    def _visible_trees(self) -> list[LogTree]:
+        return [tree for tree in self._tree_widgets() if tree.display]
+
+    def _active_tree(self) -> Optional[LogTree]:
+        focused = self.focused
+        if isinstance(focused, LogTree) and focused.display:
+            return focused
+        visible = self._visible_trees()
+        return visible[0] if visible else None
+
+    def _focus_initial_tree(self) -> None:
+        tree = self._active_tree()
+        if tree:
+            self.set_focus(tree)
+
+    def _directory_trees(self) -> list[LogTree]:
+        return [tree for tree in self._tree_widgets() if tree.role == "directory"]
+
+    def _file_tree(self) -> Optional[LogTree]:
+        for tree in self._tree_widgets():
+            if tree.role == "files":
+                return tree
+        return None
+
+    def _placeholder_tree(self) -> Optional[LogTree]:
+        for tree in self._tree_widgets():
+            if tree.role == "placeholder":
+                return tree
+        return None
+
+    async def _ensure_directory_tree(self, base: Path) -> LogTree:
+        panel = self._tree_panel()
+        for tree in self._directory_trees():
+            if tree.base_path == base:
+                tree.display = True
+                return tree
+
+        label = self._format_root_label(base)
+        new_tree = LogTree(label, classes="log-tree", base_path=base, role="directory")
+
+        insert_before: LogTree | None = None
+        for child in panel.children:
+            if not isinstance(child, LogTree):
+                continue
+            if child.role != "directory":
+                insert_before = child
+                break
+            if child.base_path and str(child.base_path).lower() > str(base).lower():
+                insert_before = child
+                break
+
+        if insert_before is not None:
+            await panel.mount(new_tree, before=insert_before)
+        else:
+            await panel.mount(new_tree)
+
+        return new_tree
+
+    async def _ensure_file_tree(self) -> Optional[LogTree]:
+        panel = self._tree_panel()
+        tree = self._file_tree()
+        if self._session_files:
+            if tree is None:
+                tree = LogTree("Individual Logs", classes="log-tree", role="files")
+                await panel.mount(tree)
+            tree.display = True
+            return tree
+
+        if tree:
+            tree.display = False
+            self._clear_node(tree.root)
+            tree.root.label = "Individual Logs"
+        return None
+
+    async def _ensure_placeholder_tree(self) -> LogTree:
+        panel = self._tree_panel()
+        tree = self._placeholder_tree()
+        if tree is None:
+            tree = LogTree("Log Sources", classes="log-tree", role="placeholder")
+            await panel.mount(tree, before=self._file_tree())
+        tree.display = True
+        return tree
+
+    def _hide_placeholder_tree(self) -> None:
+        placeholder = self._placeholder_tree()
+        if placeholder:
+            placeholder.display = False
+
+    def _populate_file_tree(self, tree: LogTree) -> int:
         root = tree.root
+        self._clear_node(root)
+        if not self._session_files:
+            tree.display = False
+            root.label = "Individual Logs"
+            return 0
 
-        # Clear root children if any
-        if hasattr(root, "clear"):
-            root.clear()
-        else:
-            for child in list(root.children):
-                child.remove()
-
-        session_dirs = list(dict.fromkeys(self._session_dirs))
-        search_roots: list[tuple[Path, Tree.Node]] = []
-
-        if session_dirs:
-            root.label = "Log Sources"
-            for base in session_dirs:
-                node = root.add(str(base), data=base)
-                search_roots.append((base, node))
-        else:
-            root.label = "Log Sources" if self._session_files else "Log Viewer"
-
-        return search_roots
+        tree.display = True
+        root.label = "Individual Logs"
+        for file_path in sorted(self._session_files, key=lambda p: str(p).lower()):
+            root.add_leaf(str(file_path), data=file_path)
+        root.expand()
+        return len(self._session_files)
 
     async def _populate_tree(self):
-        """Build the tree, supporting one or many LOG_ROOTS dynamically."""
-        tree: Tree = self.query_one("#tree")
-        search_roots = self._build_root_tree_nodes(tree)
-        dir_nodes: dict[Path, Tree.Node] = {base: node for base, node in search_roots}
+        """Build the set of trees, supporting one or many log roots dynamically."""
+
+        session_dirs = list(dict.fromkeys(self._session_dirs))
+        directory_trees: dict[Path, LogTree] = {}
+        for base in session_dirs:
+            tree = await self._ensure_directory_tree(base)
+            directory_trees[base] = tree
+
+        for tree in self._directory_trees():
+            if tree.base_path not in directory_trees:
+                tree.display = False
+                self._clear_node(tree.root)
+
+        file_tree = await self._ensure_file_tree()
+
+        if not directory_trees and not self._session_files:
+            placeholder = await self._ensure_placeholder_tree()
+            self._clear_node(placeholder.root)
+            placeholder.root.label = "Log Sources"
+        else:
+            self._hide_placeholder_tree()
 
         def _scan_directories():
             successes: list[tuple[Path, list[Path]]] = []
             issues: list[tuple[Path, str]] = []
-            for base, _ in search_roots:
+            for base in session_dirs:
                 try:
                     files = sorted(
                         base.rglob("*.log"),
@@ -594,53 +788,69 @@ class LogViewer(App):
         for base, reason in scan_issues:
             self._inform(f"Skipping '{base}': {reason}", severity="warning")
 
-        total_dirs = set()
-        total_files = len(self._session_files)
+        total_dirs: set[Path] = set()
+        total_files = 0
 
         for base, files in all_file_lists:
+            tree = directory_trees.get(base)
+            if tree is None:
+                continue
+
+            root = tree.root
+            self._clear_node(root)
+            root.label = self._format_root_label(base)
+            dir_nodes: dict[Path, Tree.Node] = {base: root}
             total_dirs.add(base)
-            parent_node = dir_nodes[base]
+
             for file_path in files:
                 total_files += 1
                 rel = file_path.relative_to(base)
-                node = parent_node
+                node = root
                 for part in rel.parts[:-1]:
                     subpath = base / part
+                    total_dirs.add(subpath)
                     if subpath not in dir_nodes:
                         dir_nodes[subpath] = node.add(part, data=subpath)
                     node = dir_nodes[subpath]
-                    total_dirs.add(subpath)
                 node.add_leaf(rel.name, data=file_path)
 
-        tree.root.expand()
+            root.expand()
 
-        if self._session_files:
-            parent = tree.root
-            for file_path in sorted(self._session_files, key=lambda p: str(p).lower()):
-                parent.add_leaf(str(file_path), data=file_path)
+        standalone_count = 0
+        if file_tree:
+            standalone_count = self._populate_file_tree(file_tree)
+            total_files += standalone_count
 
         output = self.query_one("#output")
         output.clear()
-        output.write(
-            Text.from_markup(
-                f"[green]Discovered {len(total_dirs)} log folder(s)[/green]\n"
-                f"[cyan]Found      {total_files} log file(s)[/cyan]\n\n"
-                "[bold]Use the tree on the left to select which log to tail.[/bold]"
-            )
+        summary = (
+            f"[green]Discovered {len(directory_trees)} log root(s)[/green]\n"
+            f"[cyan]Found      {total_files} log file(s)[/cyan]"
         )
+        if standalone_count:
+            summary += f"\n[yellow]Standalone files: {standalone_count}[/yellow]"
+        summary += "\n\n[bold]Use the trees on the left to select which log to tail.[/bold]"
+        output.write(Text.from_markup(summary))
+
+        meta_lines = [
+            f"Roots:   {len(directory_trees)}",
+            f"Folders: {len(total_dirs)}",
+            f"Files:   {total_files}",
+        ]
+        if standalone_count:
+            meta_lines.append(f"Standalone: {standalone_count}")
 
         meta = self.query_one("#meta")
-        meta.update(
-            f"Root:    {tree.root.label}\n"
-            f"Folders: {len(total_dirs)}\n"
-            f"Files:   {total_files}"
-        )
+        meta.update("\n".join(meta_lines))
+
+        self._apply_tree_width()
 
 
     # ─────────────────────── User Actions ─────────────────────────
     async def action_refresh_tree(self):
         """Action handler to rebuild the log-file tree by calling `_populate_tree`."""
         await self._populate_tree()
+        self._focus_initial_tree()
 
     async def action_open_add_source(self) -> None:
         """Display modal dialog to add a new log directory or log file."""
@@ -697,6 +907,7 @@ class LogViewer(App):
         self._added_paths.add(path)
         self._all_sources.add(marker)
         await self._populate_tree()
+        self._focus_initial_tree()
         self._inform(f"Added {path} to the current session.")
 
     def action_save_session(self) -> None:
@@ -719,7 +930,9 @@ class LogViewer(App):
 
     def _cursor_node(self):
         """Return the currently highlighted Tree.Node, handling API differences."""
-        tree: Tree = self.query_one("#tree")
+        tree = self._active_tree()
+        if not tree:
+            return None
         node = getattr(tree, "cursor_node", None) or (
             tree.get_node(tree.cursor) if hasattr(tree, "cursor") else None
         )

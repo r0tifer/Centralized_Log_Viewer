@@ -35,15 +35,63 @@ Header, Footer {
 
 /* ─── Left sidebar (file tree) ───────────────────────────── */
 #left {
-  width: auto;            /* shrink‐wrap to #tree */
+  width: auto;            /* shrink‐wrap to tree panel */
   min-width: 10;          /* never narrower than 10 */
   max-width: 60;          /* never wider than 60 */
 }
 
 /* ─── File tree itself ────────────────────────────────────── */
-#tree {
+#tree_panel {
+  layout: vertical;
+  gap: 1;
+}
+
+.log-tree {
   width: 20;              /* default tree width */
   background: #2f2f2f;
+}
+
+/* custom tree colors and icons */
+LogTree {
+  color: #dce3f7;
+}
+
+LogTree > .tree--guides {
+  color: #587ca7;
+}
+
+LogTree > .tree--guides-hover {
+  color: #7aa3d1;
+}
+
+LogTree > .tree--guides-selected {
+  color: #95c8f5;
+}
+
+LogTree > .tree--highlight-line {
+  background: #2c384f;
+}
+
+LogTree > .tree--cursor {
+  background: #3d4f6a;
+  color: #ffffff;
+  text-style: bold;
+}
+
+LogTree > .tree--label {
+  color: #eef3ff;
+}
+
+LogTree > .tree--icon-root {
+  color: #81e09a;
+}
+
+LogTree > .tree--icon-branch {
+  color: #7fc4ff;
+}
+
+LogTree > .tree--icon-leaf {
+  color: #f6d38d;
 }
 
 /* ─── Right side: filters above log+meta ─────────────────── */
