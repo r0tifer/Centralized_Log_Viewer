@@ -12,6 +12,7 @@ An interactive terminal-based log viewer built with [Textual](https://textual.te
 - 🔍 **Regex-based filtering** of log lines in real time
 - 🕒 **Time range filters** (e.g., `15m`, `2h`, or `2024-05-01 10:00 to 2024-05-01 12:00`)
 - 🎨 **Color-coded log levels** for ERROR, WARNING, INFO, DEBUG
+- 📊 **Structured payload preview** for JSON/XML/CSV (CSV limits configurable via `settings.conf`)
 - ⚙️ **Log Severity filter** to focus on specific severities
 - 📜 **Live log tailing** with auto-scroll toggle
 - ↕️ **Adjustable tree and log pane sizes** with keyboard shortcuts
@@ -75,6 +76,12 @@ min_show_lines = 10
 # Number of lines to add or remove when increasing or decreasing the view size.
 # Used when pressing + or - to adjust visible log content.
 show_step = 10
+
+# Structured CSV rendering limits. Increase these if you want larger CSV payloads
+# (detected inside log messages) to be rendered in the UI; lower them to keep
+# the UI snappy when logs contain very large tables.
+csv_max_rows = 20
+csv_max_cols = 10
 ```
 
 ---

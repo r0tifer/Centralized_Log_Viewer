@@ -1,21 +1,22 @@
 [tool.poetry]
-name = "centralized-log-viewer"
-version = "1.5.2"
-description = "Centralized Log Viewing Application based on Textual. Log_viewer will auto discover the log(s) directory(ies) defined in the log_viewer.conf file."
-authors = ["Michael Levesque <michaell@advtch.me>"]
+name = "clv"
+version = "0.1.0"
+description = "Centralized Log Viewer Textual TUI"
 readme = "README.md"
-packages = [{ include = "centralized_log_viewer" }]
-include = ["centralized_log_viewer/log_viewer.css"]
+authors = ["Centralized Log Viewer Maintainers <maintainers@example.com>"]
+packages = [
+    { include = "clv" },
+]
 
 [tool.poetry.dependencies]
 python = ">=3.11,<4.0"
-textual = "^3.2.0"
-watchdog = "^6.0.0"
+textual = "^6.5.0"
+rich = ">=14.2.0"
 
 [tool.poetry.scripts]
-centralized-log-viewer = "centralized_log_viewer.main:main"
-clv = "centralized_log_viewer.main:main"
+clv = "clv.app:run"
+CentralizedLogViewer = "clv.app:run"
 
 [build-system]
-requires = ["poetry-core"]
+requires = ["poetry-core>=1.7.0"]
 build-backend = "poetry.core.masonry.api"
