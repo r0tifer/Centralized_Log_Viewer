@@ -157,6 +157,12 @@ jobs:
   build-pypi:
     runs-on: ubuntu-latest
     needs: build-linux
+    env:
+      # boolean flag available at IF-evaluation time
+      HAS_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN != '' }}
+      # expose the token to steps that need it
+      PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+      POETRY_PYPI_TOKEN_PYPI: ${{ secrets.PYPI_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -173,10 +179,8 @@ jobs:
           poetry build
 
       - name: Publish to PyPI
-        if: ${{ startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-dev') && secrets.PYPI_TOKEN != '' }}
-        env:
-          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
-          POETRY_PYPI_TOKEN_PYPI: ${{ secrets.PYPI_TOKEN }}
+        if: ${{ startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-dev') && env.HAS_PYPI_TOKEN == 'true' }}
         run: |
           set -euo pipefail
           poetry publish --username __token__ --password "${POETRY_PYPI_TOKEN_PYPI}"
+
