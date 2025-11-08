@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - 'v*'
+    branches: ['dev']
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -59,19 +61,34 @@ jobs:
           printf '#!/usr/bin/env bash\nexec %s/%s "$@"\n' "${INSTALL_PREFIX}" "${BIN_NAME}" > "${USRBIN}/${BIN_NAME}"
           chmod +x "${USRBIN}/${BIN_NAME}"
 
+      - name: Compute version (tags vs dev branch)
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            # Tag case: keep your current behavior (strip the leading v)
+            echo "PKG_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+            echo "IS_DEV=false" >> "$GITHUB_ENV"
+          else
+            # Branch case (e.g., dev): derive dev version
+            BASE="$(poetry version -s)"
+            DATE="$(date -u +%Y%m%d%H%M)"
+            SHA="$(git rev-parse --short HEAD)"
+            echo "PKG_VERSION=${BASE}~dev.${DATE}+g${SHA}" >> "$GITHUB_ENV"
+            echo "IS_DEV=true" >> "$GITHUB_ENV"
+          fi
+
       - name: Build packages with fpm (DEB & RPM)
         env:
           VERSION: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           STAGE="stage"
-          VER="${VERSION#v}"
-          fpm -s dir -t deb -n "${APP_NAME}" -v "${VER}" \
+          fpm -s dir -t deb -n "${APP_NAME}" -v "${PKG_VERSION}" \
             --description "Centralized Log Viewer (Textual TUI)" \
             --license "MIT" \
             --url "https://github.com/${{ github.repository }}" \
             -C "${STAGE}" .
-          fpm -s dir -t rpm -n "${APP_NAME}" -v "${VER}" \
+          fpm -s dir -t rpm -n "${APP_NAME}" -v "${PKG_VERSION}" \
             --description "Centralized Log Viewer (Textual TUI)" \
             --license "MIT" \
             --url "https://github.com/${{ github.repository }}" \
@@ -106,11 +123,29 @@ jobs:
             --local-user "${GPG_FINGERPRINT}" \
             --armor --output SHA256SUMS.asc --detach-sign SHA256SUMS
 
-      - name: Create/Update GitHub Release & upload artifacts
+      - name: Create Dev Pre-release (branch builds)
+        if: ${{ env.IS_DEV == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev-${{ github.run_number }}   # creates/updates a tag per run
+          name: "Dev build ${{ github.run_number }} (${{ github.sha }})"
+          prerelease: true
+          make_latest: false
+          generate_release_notes: true
+          files: |
+            *.deb
+            *.rpm
+            ${{ env.APP_NAME }}-linux-x86_64.tar.gz
+            SHA256SUMS
+            SHA256SUMS.asc
+
+      - name: Create Main Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
+          make_latest: true
+          generate_release_notes: true
           files: |
             *.deb
             *.rpm
@@ -138,7 +173,7 @@ jobs:
           poetry build
 
       - name: Publish to PyPI
-        if: ${{ startsWith(github.ref, 'refs/tags/') && env.PYPI_TOKEN != '' }}
+        if: ${{ startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-dev') && secrets.PYPI_TOKEN != '' }}
         env:
           PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
           POETRY_PYPI_TOKEN_PYPI: ${{ secrets.PYPI_TOKEN }}
