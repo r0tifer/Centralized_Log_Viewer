@@ -3,10 +3,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Iterable
+from contextlib import contextmanager
 
 from textual import events
 from textual.app import ComposeResult
 from textual.containers import Container
+from textual.css.query import NoMatches
 from textual.message import Message
 from textual.reactive import reactive
 from textual.widget import Widget
@@ -186,6 +188,10 @@ class QueryBar(Container):
         color: $text;
         text-style: bold;
     }
+    QueryBar RadioButton.-selected {
+        outline: wide $accent 30%;
+        background: $surface 24%;
+    }
 
     QueryBar RadioButton:hover,
     QueryBar RadioButton:focus {
@@ -227,7 +233,6 @@ class QueryBar(Container):
         margin-bottom: 0;
     }
     """
-
     regex_status = reactive(RegexStatus(True, ""))
 
     def __init__(self) -> None:
@@ -235,7 +240,14 @@ class QueryBar(Container):
         self._time_buttons: dict[str, RadioButton] = {}
         self._time_order: list[str] = []
         self._time_selection = "all"
+        self._time_focus_value: str | None = "all"
+
+        # Previous single boolean guard
         self._suppress_time_event = False
+        self._suppress_depth = 0
+        self._ignore_time_change_count = 0
+        self._ignore_next_radio_changed = 0
+
         self.time_set: RadioSet = self._build_time_controls()
         self.severity_segmented = SegmentedButtons(
             [
@@ -447,6 +459,69 @@ class QueryBar(Container):
         toggle = self.query_one("#pretty-structured-toggle", Switch)
         toggle.value = value
 
+    @contextmanager
+    def _suppress_time_events_ctx(self):
+        """Ignore RadioSet.Changed emitted by programmatic flips, released after a refresh."""
+        self._suppress_depth += 1
+        self._suppress_time_event = True
+        try:
+            yield
+        finally:
+            def _release_once():
+                self._suppress_depth = max(0, self._suppress_depth - 1)
+                if self._suppress_depth == 0:
+                    self._suppress_time_event = False
+            if self.app and self.app.is_running:
+                self.call_after_refresh(_release_once)
+            else:
+                _release_once()
+    
+    def _set_time_radio_exclusive(self, target: str) -> None:
+        """Ensure exactly one time radio is checked."""
+        button = self._time_buttons.get(target)
+        if button is None:
+            self._time_selection = target
+            return
+        with self._suppress_time_events_ctx():
+            with self.time_set.prevent(RadioButton.Changed):
+                for name, candidate in self._time_buttons.items():
+                    candidate.value = name == target
+                # Keep RadioSet bookkeeping aligned with the manual flip
+                self.time_set._pressed_button = button
+                nodes = getattr(self.time_set, "_nodes", [])
+                try:
+                    index = nodes.index(button)
+                except ValueError:
+                    index = None
+                self.time_set._selected = index
+                self._time_focus_value = target
+        self._time_selection = target
+    
+    def _reconcile_time_radios(self) -> None:
+        """Force radio visuals to match the canonical self._time_selection."""
+        target = self._time_selection
+        for name, button in self._time_buttons.items():
+            wanted = (name == target)
+            if button.value != wanted:
+                button.value = wanted
+
+    def _suppress_time_events(self) -> None:
+        # Prefer using the context manager. This is a safe, immediate suppress.
+        self._suppress_depth += 1
+        self._suppress_time_event = True
+
+    def _release_time_event_suppression(self) -> None:
+        self._suppress_depth = max(0, self._suppress_depth - 1)
+        if self._suppress_depth == 0:
+            self._suppress_time_event = False
+
+    def _time_nav_values(self) -> list[str]:
+        """Return ordered list of time button identifiers."""
+        values = [value for value in self._time_order if value in self._time_buttons]
+        if "range" in self._time_buttons:
+            values.append("range")
+        return values
+
     def cycle_time_preset(self) -> str:
         if not self._time_order:
             return self._time_selection
@@ -458,23 +533,28 @@ class QueryBar(Container):
         self.select_time(next_value, emit=True)
         return self._time_selection
 
-    def select_time(self, value: str, *, emit: bool = False) -> None:
+    def select_time(
+        self,
+        value: str,
+        *,
+        start: str | None = None,
+        end: str | None = None,
+        emit: bool = False,
+    ) -> None:
+        """Programmatically select a preset or 'range'."""
         if value in self._time_buttons:
-            if value != self._time_selection:
-                self._suppress_time_event = True
-                self._time_buttons[value].value = True
-                self._suppress_time_event = False
-            self._apply_time_selection(value, emit=emit)
+            self._set_time_radio_exclusive(value)
+            self._apply_time_selection(value, start=start, end=end, emit=emit)
             return
+        # Fallback to first preset if unknown
         if self._time_order:
             fallback = self._time_order[0]
             if fallback in self._time_buttons:
-                self._suppress_time_event = True
-                self._time_buttons[fallback].value = True
-                self._suppress_time_event = False
+                self._set_time_radio_exclusive(fallback)
                 self._apply_time_selection(fallback, emit=emit)
                 return
-        self._apply_time_selection(value, emit=emit)
+        self._apply_time_selection(value, start=start, end=end, emit=emit)
+
 
     def _apply_time_selection(
         self,
@@ -484,30 +564,31 @@ class QueryBar(Container):
         end: str | None = None,
         emit: bool = True,
     ) -> None:
+        """Set canonical selection + tooltip; emit message if requested."""
         self._time_selection = value
-        range_button = self._time_buttons.get("range")
-        if value == "range" and range_button is not None:
-            if start and end:
-                range_button.tooltip = f"{start} to {end}"
-            else:
-                range_button.tooltip = None
-        elif range_button is not None and value != "range":
-            # keep tooltip so users can see the last custom selection
-            pass
+
+        # Keep 'Custom' tooltip accurate (and persistent when leaving it).
+        rb = self._time_buttons.get("range")
+        if rb is not None and value == "range":
+            rb.tooltip = f"{start} to {end}" if (start and end) else None
+
+        # Double-reconcile to be extra safe against any late synthetic events.
+        self._set_time_radio_exclusive(self._time_selection)
+        if self.app and self.app.is_running:
+            def _after():
+                self._set_time_radio_exclusive(self._time_selection)
+            self.call_after_refresh(_after)
+
         if emit:
             self.post_message(self.TimeWindowChanged(value, start=start, end=end))
 
     def apply_custom_time_range(self, start: str, end: str, *, emit: bool = True) -> None:
-        range_button = self._time_buttons.get("range")
-        if range_button is None:
+        """Public entry from the App after Custom dialog returns (start, end)."""
+        if "range" not in self._time_buttons:
             return
-        self._suppress_time_event = True
-        try:
-            range_button.value = True
-        finally:
-            self._suppress_time_event = False
-        range_button.tooltip = f"{start} to {end}"
-        self._apply_time_selection("range", start=start, end=end, emit=emit)
+        # Swallow the synthetic RadioSet.Changed that may be emitted by set_time
+        self._ignore_next_radio_changed = 1
+        self.select_time("range", start=start, end=end, emit=emit)
 
     def set_severity(self, value: str) -> None:
         self.severity_segmented.set_value(value)
@@ -521,35 +602,38 @@ class QueryBar(Container):
         self.post_message(self.SeverityChanged(event.value))
 
     def on_radio_set_changed(self, event: RadioSet.Changed) -> None:  # type: ignore[override]
-        if self._suppress_time_event:
-            self._suppress_time_event = False
-            return
         if event.control is not self.time_set:
             return
+        if self._suppress_time_event:
+            return
+        if getattr(self, "_ignore_next_radio_changed", 0) > 0:
+            self._ignore_next_radio_changed -= 1
+            return
+
         button_id = event.pressed.id or ""
-        if button_id.startswith("time-"):
-            value = button_id.removeprefix("time-")
-        else:
-            value = self._time_selection
+        value = button_id.removeprefix("time-") if button_id.startswith("time-") else self._time_selection
+
+        self._handle_time_button_activation(value)
+
+    def _handle_time_button_activation(self, value: str) -> None:
         if value == "range":
-            previous = self._time_selection
-            if previous in self._time_buttons:
-                self._suppress_time_event = True
-                try:
-                    self._time_buttons[previous].value = True
-                finally:
-                    self._suppress_time_event = False
-            elif self._time_order:
-                fallback = self._time_order[0]
-                if fallback in self._time_buttons:
-                    self._suppress_time_event = True
-                    try:
-                        self._time_buttons[fallback].value = True
-                    finally:
-                        self._suppress_time_event = False
+            # If we're already on a custom range, keep its indicator lit so the user
+            # can adjust the values without clearing first.
+            if self._time_selection != "range":
+                prev = self._time_selection
+                if prev not in self._time_buttons and self._time_order:
+                    prev = self._time_order[0]
+                self._set_time_radio_exclusive(prev)
+            else:
+                self._set_time_radio_exclusive("range")
+
+            # Ask the App to open the custom dialog; do not emit TimeWindowChanged yet.
             self.post_message(self.CustomRangeRequested())
             return
-        self._apply_time_selection(value)
+
+        # Normal preset: apply immediately
+        self._set_time_radio_exclusive(value)
+        self._apply_time_selection(value, emit=True)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:  # type: ignore[override]
         if event.button.id in {"add-source", "run-query", "clear-query", "save-session"}:
@@ -590,6 +674,19 @@ class QueryBar(Container):
             super().__init__()
 
     async def on_key(self, event: events.Key) -> None:
+        if event.key in {"left", "right"}:
+            if (
+                self._navigate_time_buttons(event.key)
+                or self._navigate_severity_segments(event.key)
+                or self._navigate_action_buttons(event.key)
+            ):
+                event.stop()
+                return
+
+        if event.key in {"enter", "space"} and self._commit_time_focus():
+            event.stop()
+            return
+
         if event.key == "enter":
             self.post_message(self.ActionTriggered("run-query"))
         elif event.key == "escape":
@@ -597,3 +694,114 @@ class QueryBar(Container):
             query.value = ""
             self.validate_regex([])
             self.post_message(self.ActionTriggered("clear-query"))
+
+    def _navigate_time_buttons(self, direction_key: str) -> bool:
+        if not self.screen:
+            return False
+
+        focused = self.screen.focused
+        is_time_focus = False
+        current_value: str | None = None
+
+        if focused is self.time_set:
+            is_time_focus = True
+            current_value = self._time_focus_value or self._time_selection
+        elif isinstance(focused, RadioButton):
+            for value, button in self._time_buttons.items():
+                if button is focused:
+                    current_value = value
+                    is_time_focus = True
+                    break
+
+        if not is_time_focus:
+            return False
+
+        values = self._time_nav_values()
+        if not values:
+            return False
+        if current_value not in values:
+            current_value = values[0]
+
+        step = -1 if direction_key == "left" else 1
+        index = values.index(current_value)
+        next_index = index + step
+        if next_index < 0 or next_index >= len(values):
+            return False
+
+        next_value = values[next_index]
+        self.time_set.focus()
+        self._set_time_nav_focus(next_value)
+        return True
+
+    def _set_time_nav_focus(self, value: str | None) -> None:
+        self._time_focus_value = value
+        nodes = getattr(self.time_set, "_nodes", [])
+        index = None
+        if value is not None:
+            button = self._time_buttons.get(value)
+            if button in nodes:
+                index = nodes.index(button)
+        self.time_set._selected = index
+
+    def _commit_time_focus(self) -> bool:
+        if not self.screen:
+            return False
+        focused = self.screen.focused
+        if focused is not self.time_set and not isinstance(focused, RadioButton):
+            return False
+        target = self._time_focus_value
+        if not target or target == self._time_selection:
+            return False
+        self._handle_time_button_activation(target)
+        return True
+
+    def _navigate_severity_segments(self, direction_key: str) -> bool:
+        if not self.screen:
+            return False
+        focused = self.screen.focused
+        if focused is None:
+            return False
+        if focused is self.severity_segmented:
+            anchor = self.severity_segmented.value
+        elif self.severity_segmented.owns_widget(focused):
+            anchor = self.severity_segmented.focused_value
+        else:
+            return False
+        direction = -1 if direction_key == "left" else 1
+        return self.severity_segmented.nudge(direction, anchor=anchor)
+
+    def _navigate_action_buttons(self, direction_key: str) -> bool:
+        if not self.screen:
+            return False
+        focused = self.screen.focused
+        if not isinstance(focused, Button):
+            return False
+        button_id = focused.id
+        if button_id is None:
+            return False
+        nav_order = ["toggle-advanced", "add-source", "run-query", "clear-query", "save-session"]
+        if button_id not in nav_order:
+            return False
+        direction = -1 if direction_key == "left" else 1
+        index = nav_order.index(button_id)
+        next_index = index + direction
+        while 0 <= next_index < len(nav_order):
+            next_id = nav_order[next_index]
+            try:
+                target = self.query_one(f"#{next_id}", Button)
+            except NoMatches:
+                target = None
+            if target is not None:
+                target.focus()
+                return True
+            next_index += direction
+        return False
+
+    async def on_click(self, event: events.Click) -> None:
+        target = event.widget
+        if (
+            isinstance(target, RadioButton)
+            and target is self._time_buttons.get("range")
+            and self._time_selection == "range"
+        ):
+            self.post_message(self.CustomRangeRequested())

@@ -114,6 +114,15 @@ def test_show_message_uses_colored_toasts() -> None:
             mock_notify = MagicMock()
             app.notify = mock_notify
 
+            def panel_contains(substring: str) -> bool:
+                for strip in app.log_panel.lines:
+                    plain = getattr(strip, "plain", None)
+                    if plain is None:
+                        plain = str(strip)
+                    if substring in plain:
+                        return True
+                return False
+
             app.log_panel.clear()
             app._show_message("All good", "info")
             await pilot.pause()
@@ -121,14 +130,14 @@ def test_show_message_uses_colored_toasts() -> None:
             assert info_kwargs["severity"] == "information"
             assert info_kwargs["title"] == ""
             assert info_kwargs["markup"] is False
-            assert any("SUCCESS: All good" in line for line in app.log_panel.lines)
+            assert panel_contains("SUCCESS: All good")
 
             app.log_panel.clear()
             app._show_message("Heads up", "warning")
             await pilot.pause()
             warning_kwargs = mock_notify.call_args_list[-1].kwargs
             assert warning_kwargs["severity"] == "warning"
-            assert any("WARNING: Heads up" in line for line in app.log_panel.lines)
+            assert panel_contains("WARNING: Heads up")
 
     asyncio.run(scenario())
 

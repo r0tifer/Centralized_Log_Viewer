@@ -8,6 +8,7 @@ import itertools
 import json
 import os
 import re
+import shutil
 from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -26,10 +27,12 @@ from textual import messages
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.reactive import reactive
 from textual.timer import Timer
 from textual.widgets import Button, Footer, Label, RichLog, Static, Switch, Tree
 from textual.widgets import Input
+from textual.widget import MountError
 from textual.widgets._tree import TOGGLE_STYLE, TreeNode
 
 from .services import SourceManager, persist_log_sources
@@ -70,6 +73,23 @@ LOG_LINE_RE = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:[.,]\d+)?) - (?P<level>\w+) - (?P<message>.*)$"
 )
 
+SOURCES_PANEL_DEFAULT_WIDTH = 38
+SOURCES_PANEL_MIN_WIDTH = 24
+SOURCES_PANEL_MAX_WIDTH = 80
+SOURCES_PANEL_STEP = 2
+
+DEFAULT_SETTINGS_TEMPLATE = (
+    "[log_viewer]\n"
+    "log_dirs = /var/log\n"
+    "max_buffer_lines = 500\n"
+    "default_show_lines = 200\n"
+    "refresh_hz = 2\n"
+    "min_show_lines = 10\n"
+    "show_step = 10\n"
+    "csv_max_rows = 20\n"
+    "csv_max_cols = 10\n"
+)
+
 
 @dataclass
 class LogConfig:
@@ -100,8 +120,8 @@ def get_xdg_config_home() -> Path:
 
 
 def get_config_file() -> Optional[Path]:
-    xdg_conf = get_xdg_config_home() / "clv" / "settings.conf"
-    if xdg_conf.exists():
+    xdg_conf = _ensure_user_settings_file()
+    if xdg_conf:
         return xdg_conf
 
     dev_conf = Path(__file__).resolve().parents[1] / "settings.conf"
@@ -109,6 +129,35 @@ def get_config_file() -> Optional[Path]:
         return dev_conf
 
     return None
+
+
+def _ensure_user_settings_file() -> Optional[Path]:
+    """Ensure the per-user settings file exists; copy template defaults if needed."""
+
+    target = get_xdg_config_home() / "clv" / "settings.conf"
+    template = Path(__file__).resolve().parents[1] / "settings.conf"
+
+    if target.exists():
+        return target
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return template if template.exists() else None
+
+    if template.exists():
+        try:
+            shutil.copyfile(template, target)
+            return target
+        except OSError:
+            # Fall back to writing defaults below
+            pass
+
+    try:
+        target.write_text(DEFAULT_SETTINGS_TEMPLATE, encoding="utf-8")
+        return target
+    except OSError:
+        return template if template.exists() else None
 
 
 def load_config() -> LogConfig:
@@ -344,11 +393,13 @@ class LogTree(Tree[Path]):
         "tree--icon-root",
         "tree--icon-branch",
         "tree--icon-leaf",
+        "tree--focus-indicator",
     }
 
     ICON_ROOT = "🌲"
     ICON_BRANCH = "📂"
     ICON_LEAF = "📄"
+    FOCUS_ARROW = "›"
 
     def __init__(
         self,
@@ -374,6 +425,17 @@ class LogTree(Tree[Path]):
         node_label = node._label.copy()
         node_label.stylize(style)
 
+        is_cursor = node is self.cursor_node
+        indicator_style = base_style
+        if is_cursor:
+            indicator_style = base_style + self.get_component_rich_style(
+                "tree--focus-indicator",
+                partial=True,
+            )
+            indicator = (f"{self.FOCUS_ARROW} ", indicator_style)
+        else:
+            indicator = ("  ", base_style)
+
         if node._allow_expand:
             toggle_symbol = self.ICON_NODE_EXPANDED if node.is_expanded else self.ICON_NODE
             toggle = (f"{toggle_symbol} ", base_style + TOGGLE_STYLE)
@@ -393,7 +455,7 @@ class LogTree(Tree[Path]):
         icon_style = base_style + self.get_component_rich_style(icon_name, partial=True)
         icon = (f"{icon_symbol} ", icon_style)
 
-        return Text.assemble(toggle, icon, node_label)
+        return Text.assemble(indicator, toggle, icon, node_label)
 
 class LogViewerApp(App[None]):
     CSS = """
@@ -419,6 +481,11 @@ class LogViewerApp(App[None]):
         border-right: solid $surface 15%;
         padding: 0 2 0 1;
         background: $surface 2%;
+    }
+
+    #sources-panel:focus-within {
+        border-right: solid $accent 60%;
+        background: $surface 6%;
     }
 
     /* Let the tree area actually consume vertical space */
@@ -497,6 +564,12 @@ class LogViewerApp(App[None]):
         padding: 0 0 1 0;
     }
 
+    .log-tree:focus {
+        border: round $accent 50%;
+        background: $surface 10%;
+        outline: heavy $accent 60%;
+    }
+
     .empty-tree {
         color: $text-muted;
         padding: 1 0;
@@ -530,6 +603,11 @@ class LogViewerApp(App[None]):
 
     LogTree > .tree--label {
         color: #eef3ff;
+    }
+
+    LogTree > .tree--focus-indicator {
+        color: $accent;
+        text-style: bold;
     }
 
     LogTree > .tree--icon-root {
@@ -582,28 +660,58 @@ class LogViewerApp(App[None]):
         color: #fee2e2;
     }
 
+    LogViewerApp.-copy-mode #query-bar,
+    LogViewerApp.-copy-mode #chip-bar,
+    LogViewerApp.-copy-mode #advanced-drawer,
+    LogViewerApp.-copy-mode #sources-panel,
+    LogViewerApp.-copy-mode Footer,
+    LogViewerApp.-copy-mode Label.panel-title {
+        display: none;
+    }
+
+    LogViewerApp.-copy-mode #viewer-panel {
+        width: 1fr;
+        padding: 0;
+    }
+
+    LogViewerApp.-copy-mode #main-content RichLog {
+        border: none;
+    }
+
 
     """
     BINDINGS = [
         Binding("/", "focus_query", "Focus query", show=False),
+        Binding("ctrl+enter", "run_query", "Apply filters", show=False),
+        Binding("enter", "run_query", "Apply filters", show=False),
+        Binding("escape", "clear_field", "Clear query", show=False),
+        Binding("a", "open_add_source_dialog", "Add source", show=False),
+        Binding("[", "shrink_sources_panel", "Narrow sources", show=False),
+        Binding("]", "expand_sources_panel", "Widen sources", show=False),
+        Binding("+", "more_lines", "Show more lines", show=False),
+        Binding("-", "fewer_lines", "Show fewer lines", show=False),
+        Binding("ctrl+l", "toggle_copy_mode", "Copy mode", show=False),
+        Binding("ctrl+s", "save_session", "Persist session", show=False),
+        Binding("q", "quit_app", "Quit", show=False),
         Binding("t", "cycle_time", "Cycle time", show=False),
         Binding("s", "cycle_severity", "Cycle severity", show=False),
-        Binding("a", "toggle_autoscroll", "Auto scroll", show=False),
-        Binding("enter", "run_query", "Run", show=False),
-        Binding("escape", "clear_field", "Clear", show=False),
-        Binding("ctrl+s", "save_session", "Save", show=False),
     ]
 
     state = reactive(SessionState())
 
     def __init__(self) -> None:
         super().__init__()
+        self._persist_state = False
         self._store = StateStore()
         self._config = load_config()
         config_path = get_config_file()
         if config_path is None:
             config_path = get_xdg_config_home() / "clv" / "settings.conf"
         self._settings_path = config_path
+        self._sources_panel_width = SOURCES_PANEL_DEFAULT_WIDTH
+        self._show_step = max(1, self._config.show_step)
+        self._show_lines = self._clamp_show_lines(self._config.default_show_lines)
+        self._copy_mode_active = False
         self._sources: list[Path] = []
         self._source_manager = SourceManager([], [])
         self._selected_source: Optional[Path] = None
@@ -617,6 +725,8 @@ class LogViewerApp(App[None]):
         self.chip_bar = FilterChips(id="chip-bar")
         self.advanced_drawer = AdvancedFiltersDrawer()
         self.log_panel = RichLog(id="log-stream")
+        self.log_panel.auto_scroll = self.state.auto_scroll
+        self._is_shutting_down: bool = False
 
     def compose(self) -> ComposeResult:
         yield self.query_bar
@@ -660,6 +770,7 @@ class LogViewerApp(App[None]):
         tree_panel.styles.overflow_y = "auto"
         tree_panel.styles.overflow_x = "hidden"
         tree_panel.styles.scrollbar_gutter = "stable"
+        self._apply_sources_panel_width()
         self.log_panel.clear()
         self._write_discovery_summary(discovery_summary)
         selected = False
@@ -671,6 +782,8 @@ class LogViewerApp(App[None]):
             self.log_panel.clear()
             self._write_discovery_summary(discovery_summary)
         self._suppress_tree_selection = False
+        self._persist_state = True
+        self._store.save(self.state)
 
     def _apply_state(self) -> None:
         self.query_bar.set_query_value(self.state.query)
@@ -689,6 +802,7 @@ class LogViewerApp(App[None]):
             self.query_bar.select_time(self.state.time_window)
         switch = self.query_bar.query_one("#auto-scroll-toggle", Switch)
         switch.value = self.state.auto_scroll
+        self.log_panel.auto_scroll = self.state.auto_scroll
         self.query_bar.set_pretty_rendering(self.state.pretty_rendering)
         self._sync_regex_validation()
 
@@ -708,6 +822,48 @@ class LogViewerApp(App[None]):
 
     def _tree_panel(self) -> Vertical:
         return self.query_one("#tree-panel", Vertical)
+
+    def _ensure_tree_focus(self) -> None:
+        if not self.is_mounted:
+            return
+        try:
+            panel = self._tree_panel()
+        except NoMatches:
+            return
+        tree: LogTree | None = None
+        for candidate in panel.query(LogTree):
+            tree = candidate
+            break
+        if tree is None:
+            return
+        tree.focus()
+        cursor = tree.cursor_node
+        if cursor is None:
+            tree.select_node(tree.root)
+        tree.scroll_to_node(tree.cursor_node or tree.root)
+
+    def _apply_sources_panel_width(self) -> None:
+        if not self.is_mounted:
+            return
+        try:
+            panel = self.query_one("#sources-panel", Vertical)
+        except Exception:
+            return
+        panel.styles.width = self._sources_panel_width
+        panel.refresh(layout=True)
+
+    def _adjust_sources_panel_width(self, delta: int) -> None:
+        new_width = self._sources_panel_width + delta
+        self._sources_panel_width = max(
+            SOURCES_PANEL_MIN_WIDTH,
+            min(SOURCES_PANEL_MAX_WIDTH, new_width),
+        )
+        self._apply_sources_panel_width()
+
+    def _clamp_show_lines(self, value: int) -> int:
+        minimum = max(1, self._config.min_show_lines)
+        maximum = max(minimum, self._config.max_buffer_lines)
+        return max(minimum, min(value, maximum))
 
     @staticmethod
     def _clear_node(node: TreeNode[Path]) -> None:
@@ -817,6 +973,7 @@ class LogViewerApp(App[None]):
         if not panel.children:
             await panel.mount(Static("No log sources configured.", classes="empty-tree"))
 
+        self._ensure_tree_focus()
         self._sources = sorted(sources, key=lambda p: str(p).lower())
         configured_sources = len(session_dirs) + len(session_files)
         summary = DiscoverySummary(
@@ -984,7 +1141,9 @@ class LogViewerApp(App[None]):
             self._write_log_line("No log lines match the current filters.")
             return
 
-        for line in filtered:
+        visible = filtered[-self._show_lines :]
+
+        for line in visible:
             renderable = self._renderable_for_line(line)
             self._write_log_line(renderable)
         if self.state.auto_scroll:
@@ -1102,16 +1261,36 @@ class LogViewerApp(App[None]):
         return styled
 
     def _refresh_chips(self) -> None:
+        # Skip visual updates if the app is shutting down or the chip bar isn't attached
+        if getattr(self, "_is_shutting_down", False):
+            return
+        if not hasattr(self, "chip_bar") or not self.chip_bar or not self.chip_bar.is_attached:
+            return
+
         chips: list[FilterChip] = []
-        if self.state.query:
-            chips.append(FilterChip(f"Query: {self.state.query}", key="regex"))
-        if self.state.severity != "all":
-            chips.append(FilterChip(f"Severity: {self.state.severity.title()}", key="severity"))
-        if self.state.time_window and self.state.time_window not in {"", "all"}:
+
+        # Optional: keep the query chip compact
+        def _elide(text: str, limit: int = 64) -> str:
+            return text if len(text) <= limit else text[: limit - 1] + "…"
+
+        # Query chip
+        if getattr(self.state, "query", ""):
+            # If you previously used key="regex", consider switching to "query" for clarity
+            chips.append(FilterChip(f"Query: {_elide(self.state.query)}", key="query"))
+
+        # Severity chip
+        if getattr(self.state, "severity", "all") != "all":
+            chips.append(
+                FilterChip(f"Severity: {self.state.severity.title()}", key="severity")
+            )
+
+        # Time chips
+        tw = getattr(self.state, "time_window", "")
+        if tw and tw not in {"", "all"}:
             if (
-                self.state.time_window == "range"
-                and self.state.custom_start
-                and self.state.custom_end
+                tw == "range"
+                and getattr(self.state, "custom_start", "")
+                and getattr(self.state, "custom_end", "")
             ):
                 chips.append(
                     FilterChip(
@@ -1119,13 +1298,24 @@ class LogViewerApp(App[None]):
                         key="time",
                     )
                 )
-            elif self.state.time_window != "range":
-                chips.append(
-                    FilterChip(f"Time: {self.state.time_window}", key="time")
-                )
-        self.chip_bar.update_chips(chips)
+            elif tw != "range":
+                chips.append(FilterChip(f"Time: {tw}", key="time"))
+
+        # Mount chips only if the chip bar is still attached; ignore teardown races
+        try:
+            self.chip_bar.update_chips(chips)
+        except MountError:
+            return
 
     def watch_state(self, old_state: SessionState, new_state: SessionState) -> None:  # type: ignore[override]
+        if not getattr(self, "_persist_state", False):
+            return
+        tracked_changed = any(
+            getattr(old_state, field) != getattr(new_state, field)
+            for field in SessionState.PERSISTED_FIELDS
+        )
+        if not tracked_changed:
+            return
         self._store.save(new_state)
 
     def action_focus_query(self) -> None:
@@ -1140,11 +1330,6 @@ class LogViewerApp(App[None]):
         value = self.query_bar.cycle_severity()
         self._update_state(severity=value)
         self._render_log()
-
-    def action_toggle_autoscroll(self) -> None:
-        switch = self.query_bar.query_one("#auto-scroll-toggle", Switch)
-        switch.value = not switch.value
-        self._update_state(auto_scroll=switch.value)
 
     def action_run_query(self) -> None:
         self._render_log()
@@ -1170,6 +1355,59 @@ class LogViewerApp(App[None]):
         self._source_manager.clear_added()
         self._config.log_dirs = self._source_manager.all_sources()
         self._show_message(f"Saved {len(new_paths)} new log source(s) to settings.")
+
+    def action_open_add_source_dialog(self) -> None:
+        if not self.is_mounted:
+            return
+        self.run_worker(
+            self._prompt_add_source(),
+            name="add-source-dialog",
+            group="dialogs",
+            exit_on_error=False,
+        )
+
+    def action_shrink_sources_panel(self) -> None:
+        self._adjust_sources_panel_width(-SOURCES_PANEL_STEP)
+
+    def action_expand_sources_panel(self) -> None:
+        self._adjust_sources_panel_width(SOURCES_PANEL_STEP)
+
+    def action_more_lines(self) -> None:
+        updated = self._clamp_show_lines(self._show_lines + self._show_step)
+        if updated == self._show_lines:
+            self._announce_line_window()
+            return
+        self._show_lines = updated
+        self._render_log()
+        self._announce_line_window()
+
+    def action_fewer_lines(self) -> None:
+        updated = self._clamp_show_lines(self._show_lines - self._show_step)
+        if updated == self._show_lines:
+            self._announce_line_window()
+            return
+        self._show_lines = updated
+        self._render_log()
+        self._announce_line_window()
+
+    def action_toggle_copy_mode(self) -> None:
+        self._copy_mode_active = not self._copy_mode_active
+        self.set_class(self._copy_mode_active, "-copy-mode")
+        if self._copy_mode_active:
+            try:
+                self.set_focus(self.log_panel)
+            except Exception:
+                pass
+            message = "Copy mode enabled. UI chrome hidden for selection."
+        else:
+            message = "Copy mode disabled. Controls restored."
+        try:
+            self.notify(message, severity="information", title="", markup=False)
+        except Exception:
+            pass
+
+    def action_quit_app(self) -> None:
+        self.exit()
 
     async def _prompt_add_source(self) -> None:
         dialog = AddSourceDialog()
@@ -1213,8 +1451,22 @@ class LogViewerApp(App[None]):
             self._show_message("Log Source successfully added.")
 
     def _update_state(self, **changes) -> None:
+        # Always update the state first
         self.state = replace(self.state, **changes)
-        self._refresh_chips()
+
+        # Skip visual updates if we are shutting down or the UI isn't fully attached
+        if self._is_shutting_down:
+            return
+        if not self.is_mounted:
+            return
+        if not hasattr(self, "chip_bar") or not self.chip_bar.is_attached:
+            return
+
+        try:
+            self._refresh_chips()
+        except MountError:
+            # If teardown races detach the target, ignore the visual update
+            pass
 
     def _show_message(self, text: str, severity: Literal["info", "warning", "error"] = "info") -> None:
         normalized = severity if severity in {"info", "warning", "error"} else "info"
@@ -1240,6 +1492,19 @@ class LogViewerApp(App[None]):
         message = f"[{color}]{label}: {safe_text}[/{color}]"
         self._write_log_line(message)
 
+    def _announce_line_window(self) -> None:
+        if not self.is_mounted:
+            return
+        try:
+            self.notify(
+                f"Showing last {self._show_lines} line(s).",
+                severity="information",
+                title="",
+                markup=False,
+            )
+        except Exception:
+            pass
+
     def _write_log_line(self, payload: RenderableType | str) -> None:
         """Write to the log widget, preserving Rich renderables when provided."""
 
@@ -1262,16 +1527,12 @@ class LogViewerApp(App[None]):
     async def on_exit_app(self, message: messages.ExitApp) -> None:
         """Persist a cleared selection before the app exits."""
 
+        self._is_shutting_down = True
         self._clear_selected_source_state()
 
     async def on_query_bar_action_triggered(self, message: QueryBar.ActionTriggered) -> None:
         if message.action_id == "add-source":
-            self.run_worker(
-                self._prompt_add_source(),
-                name="add-source-dialog",
-                group="dialogs",
-                exit_on_error=False,
-            )
+            self.action_open_add_source_dialog()
         elif message.action_id == "run-query":
             self.action_run_query()
         elif message.action_id == "clear-query":
@@ -1293,12 +1554,25 @@ class LogViewerApp(App[None]):
         self._render_log()
 
     async def on_query_bar_custom_range_requested(self, message: QueryBar.CustomRangeRequested) -> None:
+        """Kick off the Custom Time dialog flow in a worker (don't await here)."""
+        self.run_worker(
+            self._prompt_custom_time_range(),
+            name="custom-time-range-dialog",
+            group="dialogs",
+            exit_on_error=False,
+        )
+    
+    async def _prompt_custom_time_range(self) -> None:
+        """Open the custom time dialog, await result, and apply the range."""
         dialog = CustomTimeRangeDialog(
             initial_start=self.state.custom_start,
             initial_end=self.state.custom_end,
         )
-        result = await self.push_screen(dialog)
+        # Must be awaited from a worker when wait_for_dismiss=True
+        result = await self.push_screen(dialog, wait_for_dismiss=True)
+
         if result is None:
+            # User canceled. If a custom range was already active, re-assert it visually.
             if (
                 self.state.time_window == "range"
                 and self.state.custom_start
@@ -1310,8 +1584,11 @@ class LogViewerApp(App[None]):
                     emit=False,
                 )
             return
+
         start, end = result
-        self.query_bar.apply_custom_time_range(start, end)
+        # Let QueryBar fire TimeWindowChanged so the normal handler runs.
+        self.query_bar.apply_custom_time_range(start, end, emit=True)
+
 
     async def on_query_bar_severity_changed(self, message: QueryBar.SeverityChanged) -> None:
         self._update_state(severity=message.value)
@@ -1348,6 +1625,7 @@ class LogViewerApp(App[None]):
         # Persist Auto-scroll when the user clicks the toggle
         if event.switch.id == "auto-scroll-toggle":
             self._update_state(auto_scroll=event.value)
+            self.log_panel.auto_scroll = event.value
         elif event.switch.id == "pretty-structured-toggle":
             self._update_state(pretty_rendering=event.value)
             self._render_log()

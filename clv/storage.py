@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, ClassVar, Dict
 
 
 @dataclass
 class SessionState:
     """Persisted options that should survive restarts."""
+
+    PERSISTED_FIELDS: ClassVar[tuple[str, ...]] = (
+        "auto_scroll",
+        "selected_source",
+        "pretty_rendering",
+    )
 
     query: str = ""
     severity: str = "all"
@@ -16,22 +22,13 @@ class SessionState:
     custom_start: str = ""
     custom_end: str = ""
     auto_scroll: bool = True
-    pretty_rendering: bool = False
     selected_source: str = ""
+    pretty_rendering: bool = False  # NEW: persist 'Structured output' toggle
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "SessionState":
         known: Dict[str, Any] = {}
-        for field in (
-            "query",
-            "severity",
-            "time_window",
-            "custom_start",
-            "custom_end",
-            "auto_scroll",
-            "pretty_rendering",
-            "selected_source",
-        ):
+        for field in cls.PERSISTED_FIELDS:
             if field in raw:
                 known[field] = raw[field]
         return cls(**known)
@@ -55,5 +52,6 @@ class StateStore:
         return SessionState.from_dict(data)
 
     def save(self, state: SessionState) -> None:
-        payload = json.dumps(asdict(state), indent=2)
-        self._state_file.write_text(payload)
+        payload = {field: getattr(state, field) for field in SessionState.PERSISTED_FIELDS}
+        serialized = json.dumps(payload, indent=2)
+        self._state_file.write_text(serialized)

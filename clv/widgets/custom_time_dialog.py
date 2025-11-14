@@ -124,44 +124,44 @@ class CustomTimeRangeDialog(ModalScreen[tuple[str, str]]):
             yield Label(
                 "Custom Time Range",
                 id="dialog-title",
-                classes=("dialog-section", "dialog-section-first"),
+                classes="dialog-section dialog-section-first",
             )
             with Container(id="range-columns", classes="dialog-section"):
                 with Container(id="start-column", classes="range-column"):
                     yield Label(
                         "Start Date",
-                        classes=("field-label", "field-label-first"),
+                        classes="field-label field-label-first",
                     )
                     yield Input(
                         value=start_date_value,
                         placeholder="2024-01-15",
                         id="start-date-input",
-                        classes=("field-input", "field-input-first"),
+                        classes="field-input field-input-first",
                     )
-                    yield Label("Start Time", classes=("field-label",))
+                    yield Label("Start Time", classes="field-label")
                     yield Input(
                         value=start_time_value,
                         placeholder="14:30 or 2:30 PM",
                         id="start-time-input",
-                        classes=("field-input",),
+                        classes="field-input",
                     )
                 with Container(id="end-column", classes="range-column"):
                     yield Label(
                         "End Date",
-                        classes=("field-label", "field-label-first"),
+                        classes="field-label field-label-first",
                     )
                     yield Input(
                         value=end_date_value,
                         placeholder="2024-01-15",
                         id="end-date-input",
-                        classes=("field-input", "field-input-first"),
+                        classes="field-input field-input-first",
                     )
-                    yield Label("End Time", classes=("field-label",))
+                    yield Label("End Time", classes="field-label")
                     yield Input(
                         value=end_time_value,
                         placeholder="18:30 or 6:30 PM",
                         id="end-time-input",
-                        classes=("field-input",),
+                        classes="field-input",
                     )
             yield Static("", id="dialog-error", classes="dialog-section")
             with Container(id="dialog-actions", classes="dialog-section"):
