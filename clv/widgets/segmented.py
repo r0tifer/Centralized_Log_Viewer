@@ -4,6 +4,7 @@ from rich.text import Text
 from textual import events
 from textual.app import ComposeResult
 from textual.message import Message
+from textual.widget import Widget
 from textual.widgets import Static
 
 
@@ -139,6 +140,44 @@ class SegmentedButtons(Static):
         self._refresh_state()
         self.post_message(self.ValueChanged(self, value))
 
+    def owns_widget(self, widget: Widget) -> bool:
+        """Return True if the widget is one of this group's segments."""
+        return any(segment is widget for segment in self._segments.values())
+
+    def nudge(self, direction: int, *, anchor: str | None = None, commit: bool = False) -> bool:
+        """Move focus left or right by one segment.
+
+        Args:
+            direction: -1 for left, +1 for right.
+            anchor: Optional current segment to anchor navigation from.
+            commit: When True, also activate the newly-focused segment.
+        """
+        if direction == 0:
+            return False
+        values = [opt for opt, _ in self._options]
+        if not values:
+            return False
+
+        current = anchor or self.focused_value or self._current
+        if current not in values:
+            current = values[0]
+
+        index = values.index(current)
+        next_index = index + direction
+        if next_index < 0 or next_index >= len(values):
+            return False
+
+        next_value = values[next_index]
+        segment = self._segments.get(next_value)
+        if segment is None:
+            return False
+        segment.focus()
+        if commit:
+            self._activate(next_value)
+        else:
+            self._set_focused(next_value)
+        return True
+
     def _set_hovered(self, value: str | None) -> None:
         if value == self._hovered:
             return
@@ -169,6 +208,10 @@ class SegmentedButtons(Static):
             if event.key in ("enter", "space"):
                 self._parent._activate(self._value)
                 event.stop()
+            elif event.key in ("left", "right"):
+                direction = -1 if event.key == "left" else 1
+                if self._parent.nudge(direction, anchor=self._value, commit=False):
+                    event.stop()
 
         def on_mouse_enter(self, event: events.MouseEnter) -> None:  # type: ignore[override]
             self._parent._set_hovered(self._value)

@@ -33,12 +33,29 @@ jobs:
           sudo apt-get install -y ruby ruby-dev rpm build-essential
           sudo gem install --no-document fpm
           python -m pip install --upgrade pip
-          pip install poetry pyinstaller
+          pip install build pyinstaller
 
       - name: Install project deps
         run: |
           set -euo pipefail
-          poetry install --no-interaction --no-root
+          pip install .
+
+      - name: Ensure settings.conf exists
+        run: |
+          set -euo pipefail
+          if [[ ! -f settings.conf ]]; then
+            printf '%s\n' \
+              "[log_viewer]" \
+              "log_dirs = /var/log" \
+              "max_buffer_lines = 500" \
+              "default_show_lines = 200" \
+              "refresh_hz = 2" \
+              "min_show_lines = 10" \
+              "show_step = 10" \
+              "csv_max_rows = 20" \
+              "csv_max_cols = 10" \
+              > settings.conf
+          fi
 
       - name: Build PyInstaller (onedir)
         run: |
@@ -47,8 +64,8 @@ jobs:
             --name "${BIN_NAME}" \
             --onedir \
             --console \
-            --add-data "centralized_log_viewer/log_viewer.css:." \
-            centralized_log_viewer/main.py
+            --add-data "settings.conf:." \
+            clv/__main__.py
 
       - name: Stage install tree
         run: |
@@ -70,7 +87,7 @@ jobs:
             echo "IS_DEV=false" >> "$GITHUB_ENV"
           else
             # Branch case (e.g., dev): derive dev version
-            BASE="$(poetry version -s)"
+            BASE="$(python -c "import pathlib, tomllib; data = tomllib.loads(pathlib.Path('pyproject.toml').read_text()); print(data['tool']['poetry']['version'])")"
             DATE="$(date -u +%Y%m%d%H%M)"
             SHA="$(git rev-parse --short HEAD)"
             echo "PKG_VERSION=${BASE}~dev.${DATE}+g${SHA}" >> "$GITHUB_ENV"
@@ -162,7 +179,6 @@ jobs:
       HAS_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN != '' }}
       # expose the token to steps that need it
       PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
-      POETRY_PYPI_TOKEN_PYPI: ${{ secrets.PYPI_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -170,17 +186,22 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Build wheel and sdist
+      - name: Install packaging tools
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install poetry
-          poetry install --no-interaction --no-root
-          poetry build
+          pip install build twine
+
+      - name: Build wheel and sdist
+        run: |
+          set -euo pipefail
+          python -m build
 
       - name: Publish to PyPI
         if: ${{ startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-dev') && env.HAS_PYPI_TOKEN == 'true' }}
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
         run: |
           set -euo pipefail
-          poetry publish --username __token__ --password "${POETRY_PYPI_TOKEN_PYPI}"
-
+          python -m twine upload --non-interactive dist/*
