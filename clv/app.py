@@ -681,20 +681,21 @@ class LogViewerApp(App[None]):
 
     """
     BINDINGS = [
-        Binding("/", "focus_query", "Focus query", show=False),
+        Binding("/", "focus_query", "Focus query", show=True),
         Binding("ctrl+enter", "run_query", "Apply filters", show=False),
-        Binding("enter", "run_query", "Apply filters", show=False),
-        Binding("escape", "clear_field", "Clear query", show=False),
-        Binding("a", "open_add_source_dialog", "Add source", show=False),
-        Binding("[", "shrink_sources_panel", "Narrow sources", show=False),
-        Binding("]", "expand_sources_panel", "Widen sources", show=False),
-        Binding("+", "more_lines", "Show more lines", show=False),
-        Binding("-", "fewer_lines", "Show fewer lines", show=False),
-        Binding("ctrl+l", "toggle_copy_mode", "Copy mode", show=False),
-        Binding("ctrl+s", "save_session", "Persist session", show=False),
-        Binding("q", "quit_app", "Quit", show=False),
-        Binding("t", "cycle_time", "Cycle time", show=False),
-        Binding("s", "cycle_severity", "Cycle severity", show=False),
+        Binding("enter", "run_query", "Apply filters", show=True),
+        Binding("escape", "clear_field", "Clear query", show=True),
+        Binding("a", "open_add_source_dialog", "Add source", show=True),
+        Binding("[", "shrink_sources_panel", "Narrow sources", show=True),
+        Binding("]", "expand_sources_panel", "Widen sources", show=True),
+        Binding("+", "more_lines", "Show more lines", show=True),
+        Binding("-", "fewer_lines", "Show fewer lines", show=True),
+        Binding("ctrl+l", "toggle_copy_mode", "Copy mode", show=True),
+        Binding("ctrl+s", "save_session", "Persist session", show=True),
+        Binding("ctrl+r", "reload_sources", "Reload sources", show=True),
+        Binding("q", "quit_app", "Quit", show=True),
+        Binding("t", "cycle_time", "Cycle time", show=True),
+        Binding("s", "cycle_severity", "Cycle severity", show=True),
     ]
 
     state = reactive(SessionState())
@@ -1065,6 +1066,8 @@ class LogViewerApp(App[None]):
         self._raw_lines.clear()
         for line in lines[-self._config.max_buffer_lines :]:
             self._raw_lines.append(line)
+        # Default to showing the full buffered log on initial selection.
+        self._show_lines = self._clamp_show_lines(self._config.max_buffer_lines)
         try:
             self._tail_offset = resolved.stat().st_size
         except OSError:
@@ -1072,7 +1075,7 @@ class LogViewerApp(App[None]):
         self._tail_remainder = ""
         self._update_state(selected_source=str(resolved))
         self._sync_regex_validation()
-        self._render_log()
+        self._render_log(force_scroll_end=True)
         self._restart_tail_timer()
         return True
 
@@ -1084,12 +1087,14 @@ class LogViewerApp(App[None]):
         if self._tail_timer is not None:
             self._tail_timer.stop()
             self._tail_timer = None
-        if not self._selected_source:
+        if not self._selected_source or not self.state.auto_scroll:
             return
         interval = max(0.25, 1 / max(self._config.refresh_hz, 1))
         self._tail_timer = self.set_interval(interval, self._poll_tail)
 
     def _poll_tail(self) -> None:
+        if not self.state.auto_scroll:
+            return
         if not self._selected_source:
             return
         path = self._selected_source
@@ -1122,7 +1127,7 @@ class LogViewerApp(App[None]):
         self._sync_regex_validation()
         self._render_log()
 
-    def _render_log(self) -> None:
+    def _render_log(self, *, force_scroll_end: bool = False) -> None:
         self.log_panel.clear()
         if not self._selected_source:
             if self._discovery_summary:
@@ -1146,7 +1151,7 @@ class LogViewerApp(App[None]):
         for line in visible:
             renderable = self._renderable_for_line(line)
             self._write_log_line(renderable)
-        if self.state.auto_scroll:
+        if force_scroll_end or self.state.auto_scroll:
             self.log_panel.scroll_end(animate=False)
 
     def _apply_filters(self, lines: list[str]) -> list[str]:
@@ -1355,6 +1360,37 @@ class LogViewerApp(App[None]):
         self._source_manager.clear_added()
         self._config.log_dirs = self._source_manager.all_sources()
         self._show_message(f"Saved {len(new_paths)} new log source(s) to settings.")
+
+    async def action_reload_sources(self) -> None:
+        """Reload configured sources and refresh the tree."""
+
+        selected_path = self._selected_source
+        added_paths = list(self._source_manager.added_paths)
+        if not self.is_mounted:
+            return
+
+        self._clear_selected_source_state()
+        self._config = load_config()
+        config_path = get_config_file()
+        if config_path:
+            self._settings_path = config_path
+        self._show_step = max(1, self._config.show_step)
+        self._show_lines = self._clamp_show_lines(self._show_lines)
+        self._raw_lines = deque(maxlen=self._config.max_buffer_lines)
+        self._initialize_sources()
+        for path in added_paths:
+            self._source_manager.add(str(path))
+        summary = await self._populate_tree()
+
+        reselected = False
+        if selected_path:
+            reselected = self._select_source(selected_path)
+
+        if not reselected:
+            self.log_panel.clear()
+            self._write_discovery_summary(summary)
+
+        self._show_message("Log sources reloaded.")
 
     def action_open_add_source_dialog(self) -> None:
         if not self.is_mounted:
@@ -1626,6 +1662,7 @@ class LogViewerApp(App[None]):
         if event.switch.id == "auto-scroll-toggle":
             self._update_state(auto_scroll=event.value)
             self.log_panel.auto_scroll = event.value
+            self._restart_tail_timer()
         elif event.switch.id == "pretty-structured-toggle":
             self._update_state(pretty_rendering=event.value)
             self._render_log()
