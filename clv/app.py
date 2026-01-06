@@ -728,6 +728,7 @@ class LogViewerApp(App[None]):
         self.log_panel = RichLog(id="log-stream")
         self.log_panel.auto_scroll = self.state.auto_scroll
         self._is_shutting_down: bool = False
+        self._suspend_source_highlight_scroll: bool = False
 
     def compose(self) -> ComposeResult:
         yield self.query_bar
@@ -772,6 +773,7 @@ class LogViewerApp(App[None]):
         tree_panel.styles.overflow_x = "hidden"
         tree_panel.styles.scrollbar_gutter = "stable"
         self._apply_sources_panel_width()
+        tree_panel.scroll_home(animate=False, immediate=True)
         self.log_panel.clear()
         self._write_discovery_summary(discovery_summary)
         selected = False
@@ -842,6 +844,54 @@ class LogViewerApp(App[None]):
         if cursor is None:
             tree.select_node(tree.root)
         tree.scroll_to_node(tree.cursor_node or tree.root)
+
+    def _scroll_sources_panel_to_node(self, tree: LogTree, node: TreeNode[Path]) -> None:
+        if self._suspend_source_highlight_scroll:
+            return
+        if node._line < 0:
+            return
+        try:
+            panel = self._tree_panel()
+        except NoMatches:
+            return
+        region = tree.region
+        if region is None:
+            return
+        panel_height = int(panel.size.height)
+        if panel_height <= 0:
+            return
+        panel_scroll = panel.scroll_offset.y
+        node_y = region.y + node._line
+        upper_threshold = panel_scroll + max(1, int(panel_height * 0.2))
+        lower_threshold = panel_scroll + max(1, int(panel_height * 0.6))
+
+        delta_scroll = 0
+        if node_y > lower_threshold:
+            delta_scroll = node_y - lower_threshold
+        elif node_y < upper_threshold:
+            delta_scroll = node_y - upper_threshold
+        else:
+            return
+
+        target_scroll = max(0, min(panel.max_scroll_y, panel_scroll + delta_scroll))
+        delta_scroll = target_scroll - panel_scroll
+        if delta_scroll == 0:
+            return
+
+        def _scroll_to_target() -> None:
+            panel.scroll_relative(
+                0,
+                delta_scroll,
+                animate=True,
+                force=True,
+                immediate=False,
+            )
+
+        panel.call_after_refresh(_scroll_to_target)
+
+    def _resume_source_highlight_scroll(self) -> None:
+        """Allow highlight events to adjust the sources panel again."""
+        self._suspend_source_highlight_scroll = False
 
     def _apply_sources_panel_width(self) -> None:
         if not self.is_mounted:
@@ -942,6 +992,7 @@ class LogViewerApp(App[None]):
         return count
 
     async def _populate_tree(self) -> DiscoverySummary:
+        self._suspend_source_highlight_scroll = True
         panel = self._tree_panel()
         for child in list(panel.children):
             await child.remove()
@@ -983,6 +1034,7 @@ class LogViewerApp(App[None]):
             log_count=total_files,
         )
         self._discovery_summary = summary
+        self.call_after_refresh(self._resume_source_highlight_scroll)
         return summary
 
     def _highlight_source(self, path: Path) -> None:
@@ -1559,6 +1611,11 @@ class LogViewerApp(App[None]):
             return
         if isinstance(event.node.data, Path) and event.node.data.is_file():
             self._select_source(event.node.data)
+
+    async def on_tree_node_highlighted(self, event: Tree.NodeHighlighted[Path]) -> None:
+        if not isinstance(event.control, LogTree):
+            return
+        self._scroll_sources_panel_to_node(event.control, event.node)
 
     async def on_exit_app(self, message: messages.ExitApp) -> None:
         """Persist a cleared selection before the app exits."""
