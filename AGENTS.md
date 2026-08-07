@@ -1,308 +1,182 @@
-
 # AGENTS.md — Centralized Log Viewer
 
 ## Mission & Product North Star
-Centralized Log Viewer (CLV) is the Linux counterpart to **Windows Event Viewer**. Our objective is a **fast, lightweight, minimal-dependency** TUI that provides a consistent, discoverable interface **both** in a desktop terminal emulator and on a **headless** server terminal.
+
+Centralized Log Viewer (CLV) is the Linux counterpart to **Windows Event
+Viewer**: a **fast, lightweight, minimal-dependency** TUI that behaves
+identically in a desktop terminal emulator and on a **headless** server
+terminal.
 
 **We prioritize:**
-- **Speed & Responsiveness** over features that add latency or RAM churn.
-- **Zero-surprise UX**: identical layouts and behaviors across environments.
+- **Speed & responsiveness** over features that add latency or RAM churn.
+- **Zero-surprise UX**: identical layout and behavior across environments.
 - **Low friction**: minimal dependencies, trivial install, predictable defaults.
 
 ---
 
-## Status & Migration Notes
-- The original monolithic entry point **`centralized_log_viewer/main.py` and supporting files** are **retired**.
-- They are replaced by the **modular CLV app** in `clv/app.py` (with supporting modules under `clv/`).
-- All new feature work, bug fixes, and maintenance must target the `clv` package.
-- If you touch anything in `centralized_log_viewer/`, it should be **for removal or thin compatibility shims only** (and those should be short‑lived).
+## Product Requirements (non-negotiable)
 
-### Rationale
-- Clear separation of concerns, testability, and composability.
-- Modern Textual component model, smaller surface of side effects, easier UX iteration.
+### 1) Point it anywhere
+An operator names **folders and/or individual files**. Folders are searched
+recursively. CLV is **not** restricted to `*.log` — any readable text file is a
+valid source. Filtering by name is the user's decision (`include_globs` /
+`exclude_globs`), not a hard-coded rule. Files are excluded for
+**readability** reasons (binary content, compressed archives), never for
+naming reasons.
 
-### Developer Actions
-1. **Stop** adding code to `centralized_log_viewer/`.
-2. **Port** any still‑useful logic to discrete, testable modules under `clv/`.
-3. **Delete** dead code aggressively; protect users by keeping the CLI entry points stable.
+### 2) Never silently lose a line
+Every physical line becomes a `LogEntry` with its raw text preserved. A line no
+format recognises is still **searchable**. Severity and time filters may hide a
+line that demonstrably lacks a level or timestamp — and when they do, the UI
+must **say so and count it**. An empty pane always explains itself.
 
----
+### 3) Bounded work, whatever the file size
+Opening a source seeks **backwards from the end**; nothing ever reads a whole
+file. Tailing reads only appended bytes and renders only new lines. Memory is
+capped by `max_buffer_lines` regardless of on-disk size. Discovery runs off the
+UI thread and is capped by `max_files`.
 
-## Architecture Overview
+### 4) Nothing off-screen, ever
+Layout must scale cleanly from 80 columns up. Every control stays on screen and
+keyboard-reachable at every supported width. Horizontal groups are built from
+`1fr` children so they **divide** available width rather than demanding a fixed
+amount. Fixed-width control clusters in a shared row are how the previous build
+pushed its action buttons off the edge — do not reintroduce them.
 
-### Top‑Level Modules (non‑exhaustive)
-- **Application shell**: `clv/app.py`
-  - orchestrates layout, routing of user actions, tailing and filtering, persistence, and rendering.
-- **State & persistence**: `clv/storage.py`
-  - small JSON‑backed session store with strong defaults.
-- **UI components**:
-  - `clv/widgets/query_bar.py` — query & filter controls (regex, time, severity, auto‑scroll) with validation & actions.
-  - `clv/widgets/advanced_drawer.py` — advanced, secondary controls (exclude paths, source filters, symlinks, etc.).
-  - `clv/widgets/segmented.py` — segmented button control (e.g., severity selection).
-  - `clv/widgets/filter_chip.py` — dismissible chips reflecting active filters.
+### 5) Single UX for desktop & headless
+No mouse-only affordances; every action has a keyboard path.
 
-### Key Data Flows
-1. **Source Discovery → Tail → Buffer**
-   - Discover `.log` files from configured paths, stream new content, and cap memory via ring buffers.
-2. **Filter Application**
-   - Regex & severity, plus time windows (`15m`, `1h`, `6h`, `24h`, custom range`).
-3. **Render**
-   - Colorize by severity, write to the log panel, auto‑scroll as needed.
-4. **Persist**
-   - Session state (selected source, filters, toggles) saved to JSON on change.
+### 6) Minimal dependencies
+Python 3.11+, Textual, and Rich (which ships with Textual). A new dependency
+must justify its size, maintenance burden, and availability on enterprise
+distros.
 
 ---
 
-## Extensibility & Ownership Model
+## Architecture
 
-CLV follows a **modular, multi-component architecture** designed for long-term extensibility. Each component owns its visuals, behavior, and communication interface.
+| Layer | Location | Owns | Must not |
+| --- | --- | --- | --- |
+| **App shell** | `clv/app.py` | Layout, routing, lifecycle, breakpoints | Parse, filter, read files, or define widget visuals |
+| **Services** | `clv/services/` | Parsing, filtering, discovery, reading, config, source management | Touch the UI or import Textual |
+| **Widgets** | `clv/widgets/` | Self-contained UI + own `DEFAULT_CSS` | Depend on other widgets' internals or import `clv.app` |
+| **Plugins** | `clv/plugins/` | Extension interfaces + loader | Break interface contracts |
+| **State** | `clv/storage.py` | JSON session persistence (atomic) | Depend on the UI |
 
-### Ownership by Module
+### Services
+- `parsing.py` — multi-format line parsing, canonical severity vocabulary,
+  continuation carry-forward.
+- `filtering.py` — `FilterSpec` → `FilterResult` with per-reason hidden counts.
+- `discovery.py` — walks roots into a `DiscoveryReport`; pure and synchronous
+  so callers can thread it.
+- `reader.py` — bounded backwards reads, incremental tailing, rotation and
+  truncation recovery.
+- `config.py` — settings resolution, validation, clamping.
+- `sources.py` — session source management and settings persistence.
 
-| Responsibility | Module | Description |
-|----------------|---------|--------------|
-| **App Shell & Layout** | `clv/app.py` | Root grid layout, orchestration, routing, global bindings, persistence hooks. |
-| **Persistence / State** | `clv/storage.py` | Manages session storage and configuration IO. |
-| **Query & Filters Bar** | `clv/widgets/query_bar.py` | Owns the query, time, severity, auto-scroll, and action controls. |
-| **Segmented Buttons** | `clv/widgets/segmented.py` | Reusable segmented control component. |
-| **Advanced Drawer** | `clv/widgets/advanced_drawer.py` | Secondary filters and configuration options. |
-| **Filter Chip** | `clv/widgets/filter_chip.py` | Dismissible tags representing active filters. |
-
-### Extensibility Goals
-
-- Support plug-in architecture under `clv/plugins/`:
-  - **Sources:** Extend discovery and log ingestion (`LogSourceProvider`).
-  - **Filters:** Extend filtering behavior (`FilterStage`).
-  - **Exporters:** Add export and integration pipelines (`Exporter`).
-- Encourage external developers to contribute modules without modifying core files.
-- Provide plugin discovery and validation for safe extensibility.
-
----
-
-## CSS & Styling Guidelines
-
-- Each widget owns its **`DEFAULT_CSS`** block.
-- App-level CSS focuses only on **layout, grid, and theming**.
-- Avoid cross-module styling collisions; namespace if necessary.
-- Remove programmatic sizing once stable CSS is applied.
-
----
-
-## Plugin Architecture (Planned)
-
-| Plugin Type | Interface | Purpose |
-|--------------|------------|----------|
-| **LogSourceProvider** | `discover()`, `open(path)` | Adds new log discovery or ingestion backends. |
-| **FilterStage** | `apply(line, context)` | Adds new filtering or transformation logic. |
-| **Exporter** | `export(session_state, lines)` | Enables export or integration workflows. |
-
-Plugins will be loadable via:
-- Local folder drop-ins under `clv/plugins/`
-- Python package entry points (`clv.plugins.*`)
+### Data flow
+```
+config.load_config ─→ SourceManager ─→ discovery.discover (thread)
+                                              ↓
+                                        DiscoveryReport ─→ tree
+                                              ↓
+   reader.SourceReader.prime/poll ─→ parsing.LogParser.feed ─→ deque[LogEntry]
+                                              ↓
+        plugins.apply_filters ─→ filtering.filter_entries ─→ RichLog
+```
 
 ---
 
-## Module Separation Principles
+## Styling rules
 
-| Layer | Owns | Must Not Do |
-|--------|------|--------------|
-| **App (`clv/app.py`)** | Layout, coordination, persistence hooks | Define widget visuals or logic directly |
-| **Widgets (`clv/widgets/…`)** | Self-contained UI behavior + CSS | Depend on other widgets’ internals |
-| **Storage/Services (`clv/storage.py`, `clv/services/…`)** | Data IO, config, and session management | Directly manipulate UI |
-| **Plugins (`clv/plugins/…`)** | External extensions | Break interface contracts |
-
----
-
-## North Star
-
-> CLV must remain **fast**, **clear**, and **modular** — a foundation that users can extend without breaking its simplicity or speed.
+- **CSS is the only place layout is decided.** No module assigns `.styles.*` at
+  runtime. The single exception is the user-adjustable source-tree width, which
+  is user state rather than a layout decision.
+- Each widget owns its `DEFAULT_CSS`. App CSS covers the shell only and must
+  not restate widget-internal rules.
+- **`DEFAULT_CSS` is scoped to its widget.** A selector rooted at
+  `LogViewerApp` will *not* match from inside a widget's own CSS. Responsive
+  rules therefore key off a breakpoint class the app **mirrors onto the
+  widget** (`QueryBar.-compact`, not `LogViewerApp.-compact QueryBar`).
+- Breakpoints: `-compact` (<90 cols), `-narrow` (<130), `-wide` (≥130).
 
 ---
 
-## Original Guidance (Preserved for Reference)
+## Message contracts
 
-# AGENTS.md — Centralized Log Viewer
+| Origin | Message | Purpose |
+| --- | --- | --- |
+| `QueryBar` | `ActionTriggered` | Run / Clear / Save / Add Source fired |
+| `QueryBar` | `TimeWindowChanged` | Time window changed (carries bounds for a custom range) |
+| `QueryBar` | `SeverityChanged` | Severity bucket changed |
+| `QueryBar` | `CustomRangeRequested` | Open the custom range dialog |
+| `SegmentedButtons` | `ValueChanged` / `Reselected` | Segment activated / re-activated |
+| `FilterChip` | `Dismissed` | Revert the named filter |
+| `AdvancedFiltersDrawer` | `SettingsChanged` | Full before/after snapshot; `needs_rescan` says whether discovery must re-run |
+| `AdvancedFiltersDrawer` | `RescanRequested` / `Closed` | Explicit rescan / dismissal |
 
-## Mission & Product North Star
-Centralized Log Viewer (CLV) is the Linux counterpart to **Windows Event Viewer**. Our objective is a **fast, lightweight, minimal-dependency** TUI that provides a consistent, discoverable interface **both** in a desktop terminal emulator and on a **headless** server terminal.
-
-**We prioritize:**
-- **Speed & Responsiveness** over features that add latency or RAM churn.
-- **Zero-surprise UX**: identical layouts and behaviors across environments.
-- **Low friction**: minimal dependencies, trivial install, predictable defaults.
-
----
-
-## Status & Migration Notes
-- The original monolithic entry point **`centralized_log_viewer/main.py` and supporting files** are **retired**.
-- They are replaced by the **modular CLV app** in `clv/app.py` (with supporting modules under `clv/`).
-- All new feature work, bug fixes, and maintenance must target the `clv` package.
-- If you touch anything in `centralized_log_viewer/`, it should be **for removal or thin compatibility shims only** (and those should be short‑lived).
-
-### Rationale
-- Clear separation of concerns, testability, and composability.
-- Modern Textual component model, smaller surface of side effects, easier UX iteration.
-
-### Developer Actions
-1. **Stop** adding code to `centralized_log_viewer/`.
-2. **Port** any still‑useful logic to discrete, testable modules under `clv/`.
-3. **Delete** dead code aggressively; protect users by keeping the CLI entry points stable.
+Cross-module communication goes through messages or public methods — never
+shared globals or reaching into another widget's tree.
 
 ---
 
-## Architecture Overview
+## Plugins
 
-### Top‑Level Modules (non‑exhaustive)
-- **Application shell**: `clv/app.py`
-  - orchestrates layout, routing of user actions, tailing and filtering, persistence, and rendering.
-- **State & persistence**: `clv/storage.py`
-  - small JSON‑backed session store with strong defaults.
-- **UI components**:
-  - `clv/widgets/query_bar.py` — query & filter controls (regex, time, severity, auto‑scroll) with validation & actions.
-  - `clv/widgets/advanced_drawer.py` — advanced, secondary controls (exclude paths, source filters, symlinks, etc.).
-  - `clv/widgets/segmented.py` — segmented button control (e.g., severity selection).
-  - `clv/widgets/filter_chip.py` — dismissible chips reflecting active filters.
+Three interfaces in `clv/plugins/__init__.py`:
 
-### Key Data Flows
-1. **Source Discovery → Tail → Buffer**
-   - Discover `.log` files from configured paths, stream new content, and cap memory via ring buffers.
-2. **Filter Application**
-   - Regex & severity, plus time windows (`15m`, `1h`, `6h`, `24h`, custom range`).
-3. **Render**
-   - Colorize by severity, write to the log panel, auto‑scroll as needed.
-4. **Persist**
-   - Session state (selected source, filters, toggles) saved to JSON on change.
+| Interface | Method | Purpose |
+| --- | --- | --- |
+| `LogSourceProvider` | `discover()`, `open(path)` | New ingestion backends |
+| `FilterStage` | `apply(entry, context) -> LogEntry \| None` | Transform or drop entries |
+| `Exporter` | `export(entries, context) -> ExportResult` | Send the current view somewhere |
+
+Loaded from `clv/plugins/{sources,filters,exporters}/` drop-ins (via a
+`register()` function or `__all__`) and from the `clv.plugins` entry point
+group. Optional `requires_clv` constraints are enforced.
+
+**Loading never raises.** Import failures, bad version constraints, and stages
+that throw at runtime are recorded in `PluginRegistry.errors`, surfaced in the
+Advanced drawer, and skipped. A third-party plugin must never stop CLV starting
+or break a render.
 
 ---
 
-## Product Requirements (non‑negotiable)
+## Testing
 
-### 1) Identity: “Linux Windows‑Event‑Viewer”
-- CLV **is** the Linux version of Windows Event Viewer: a focused, operator‑friendly viewer with live tailing, filterable panes, and ergonomic navigation.
+- Services are UI-free and unit-tested directly.
+- Widget and app behavior is tested headlessly via `App.run_test()`.
+- `tests/conftest.py` redirects `HOME` and `XDG_CONFIG_HOME` per test. **Never
+  remove this** — without it the suite reads and writes the developer's real
+  session and settings files.
+- Layout regressions are caught by asserting widget `region` bounds at a given
+  terminal size rather than by eyeballing screenshots.
 
-### 2) Lightweight & Fast
-- Target **instant launch** and **low CPU** when idle.
-- Avoid heavy dependency chains; prefer the standard library and Textual‑native approaches.
-- Keep the rendering loop lean; batch updates and avoid unnecessary reflows.
-
-### 3) Minimal Dependencies
-- Rely on Python 3.11+ and Textual only (plus Rich, which ships with Textual).
-- Any new dependency must justify:
-  - **Size/complexity cost vs. value**
-  - **Long‑term maintenance & security posture**
-  - **Availability on common enterprise distros**
-
-### 4) Single UX for Desktop & Headless
-- The UI must function the same on a **desktop terminal** and a **headless SSH** session.
-- No mouse‑only affordances; **every action must have a keyboard path**.
-
-### 5) Primary vs. Secondary Views
-- **Primary**: **Log Source** list + **Log Display** pane.
-- **Secondary**: filters, input boxes, drawers, selector buttons.
-- Secondary UI **must never** occlude or squeeze primary content off‑screen.
-
-### 6) Responsive Layout (No Squish, No Off‑Screen)
-- Layout must **scale cleanly** with terminal size:
-  - Minimums on critical panes; never render controls off‑screen.
-  - Use scroll, not overflow‐cut, for long lists.
-  - Guard rails on grid/flex sizing to prevent squish.
-
----
-
-## Interaction Model
-
-### Keyboard
-- Provide bindings for: **focus query**, **cycle time**, **cycle severity**, **toggle autoscroll**, **run**, **clear**, **save**.
-- Enter applies filters; Escape clears query.
-
-### Mouse
-- All interactive elements (buttons, chips, radio/segments, toggles, list selections) must respond to clicks.
-- No mouse‑only features. Keyboard always has parity.
-
-### Filter UX
-- Query is **regex**; validate continuously against a sample of recent lines and surface match counts.
-- Time presets cycling: `15m` → `1h` → `6h` → `24h` → `Range…` (with popover for ISO start/end inputs).
-- Severity segmented control: **All, Info, Warn, Error, Debug**.
-- **Chips** reflect active filters and can be dismissed to revert state.
-
-### Color & Readability
-- Severity‑based colorization; never rely solely on color for meaning. Include level text in each line.
-
----
-
-## Performance & Resource Budgets
-- **Tail poll interval** derived from a user‑configurable Hz (clamped for sanity).
-- **Ring buffer** caps in‑memory lines per source to prevent RAM bloat.
-- Regex validation runs on a **bounded recent sample** to keep the UI responsive.
-
----
-
-## Configuration & Defaults
-- Config lives at `~/.config/clv/settings.conf` (XDG) with a development fallback.
-- Important keys:
-  - `log_dirs`: comma‑separated absolute paths scanned recursively for `*.log`.
-  - `max_buffer_lines`: upper bound per file buffer.
-  - `default_show_lines`: initial visible lines in the log view.
-  - `refresh_hz`: polling frequency.
-  - `min_show_lines`, `show_step`: view sizing controls.
-
-**Principles**
-- Defaults must be safe (low CPU/RAM) and helpful out‑of‑the‑box.
-- Validate and sanitize config; on errors, fall back to sane defaults without crashing.
-
----
-
-## CLI & Packaging
-- Provide `clv` and `CentralizedLogViewer` console scripts that launch the same app.
-- Keep packaging simple; target Poetry build with minimal metadata.
-
----
-
-## Testing & Quality Bar
-- Unit tests for parsing, filtering, and state persistence.
-- Golden‑path UI tests for: query validation chip, time preset cycling, severity segmented control, and chip dismiss behaviors.
-- Manual smoke on small and **very large** logs; verify no UI squish at small terminal sizes.
-
----
-
-## Accessibility & Operability
-- Every interactive element must have a keyboard binding or be reachable via focus.
-- Tooltips and inline status (e.g., regex validity and approximate match counts) for quick feedback.
-- Avoid ASCII art that reduces usable width; prefer borders that collapse gracefully.
-
----
-
-## Contributing
-1. Open an issue that maps to one of the product pillars above.
-2. Propose changes as small, composable PRs.
-3. Include before/after terminal screenshots or a short asciinema when changing layout.
-4. Update this AGENTS.md if the change impacts architecture or principles.
+Run: `python -m pytest` (99 tests).
 
 ---
 
 ## Security & Privacy
-- Never read outside of configured `log_dirs` unless explicitly selected by the user.
-- Reads are **local only**; no exfiltration or telemetry.
-- Treat logs as sensitive; avoid writing them to caches or temp files.
+
+- Read only what the operator configured or explicitly selected.
+- Local only: no network, no telemetry, no exfiltration.
+- Treat log contents as sensitive; never copy them into caches or temp files.
+  Session state stores paths and filter settings, never log content.
 
 ---
 
-## Deletion & Sunsetting
-- Remove `centralized_log_viewer/` code once all usages are migrated.
-- Keep a single compatibility stub (if needed) that forwards to `clv.app:run`.
+## Non-Goals (for now)
+
+- Network collection, multi-node aggregation, remote tailing.
+- Heavy parsing DSLs or schema-aware pipelines.
+- Background daemons or privileged operations.
 
 ---
 
-## Appendix — Non‑Goals (for now)
-- Network collection, multi‑node aggregation, or remote tailing.
-- Heavy parsing DSLs or schema‑aware pipelines.
-- Plugin systems that introduce complex lifecycle/ABI concerns.
+## Quick Reference
 
----
-
-## Quick Reference (for new agents)
-- **Start here**: `clv/app.py` and `clv/widgets/`.
-- **Primary UI anchors**: Log Sources (left), Log Display (right).
-- **Keep it fast**: bounded buffers, cheap redraws, sample‑only regex validation.
-- **Keep it clear**: primary views always visible; secondary UI never occludes.
-- **Keep it consistent**: identical keyboard/mouse affordances; identical desktop/headless UX.
+- **Start here**: `clv/app.py`, then `clv/services/`.
+- **Primary UI**: source tree (left), log output (right); at `-compact` they
+  swap via `Ctrl+B`.
+- **Keep it fast**: bounded reads, incremental renders, threaded discovery.
+- **Keep it honest**: never drop a line silently; explain every empty pane.
+- **Keep it consistent**: identical keyboard and mouse paths everywhere.

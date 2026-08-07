@@ -1,41 +1,42 @@
 # Centralized Log Viewer (CLV)
 
-Centralized Log Viewer (CLV) is a fast, Textual-powered TUI that gives Linux users a Windows Event Viewer–inspired experience. CLV was born out of the need to have a lightweight, extensable (planned), and easy to deploy Log Viewer. Enter CLV. With CLV Linux User are provided an easy to configure settings file that accepts parent log folders and/or signle log folders. With Rich Text support, CLV can read and "Pretty" format a large number of file extensions. Not just `.log`! As an example: XML, CSV, TXT, and JSON. When CLV is opened or when a log source is add via the `Add Source` button, it discovers log sources, applies regex/time/severity filters, and renders colorized tails without surprises whether you are in a desktop terminal or on a headless box.
+CLV is a fast, Textual-powered TUI that gives Linux operators a Windows Event
+Viewer–inspired experience. Point it at any number of folders and/or individual
+files, and it discovers, tails, filters and colorizes them — the same way on a
+desktop terminal and on a headless 80-column SSH session.
 
 ---
 
 ## Feature Highlights
 
-- 🔍 **Zero-latency filtering:** Query bar validates regex as you type, pairs it with severity chips, and cycles through preset or custom time windows.
-- 🧱 **Advanced controls drawer:** Toggle auto-scroll, structured rendering, exclude paths, and other secondary filters without covering the main log pane.
-- 🪵 **Rich log rendering:** Severity-colored lines, structured payload preview (JSON/XML/CSV), copy-friendly mode, and bounded ring buffers to cap RAM.
-- 🧭 **Persistent state:** Session state (sources, filters, toggles) is saved automatically through `clv/storage.py`, so restarts pick up exactly where you left off.
-- 🧩 **Composable widgets:** Query bar, segmented buttons, filter chips, and drawers live under `clv/widgets/`, keeping the UI modular and easy to extend.
-- 🛠️ **Upcoming plugins:** `clv/plugins/` is being built out to host future log-source providers, filter stages, and exporters so new functionality can live outside the core.
+- 🔎 **Search that works on real logs.** The query is a regex matched against
+  the *whole line*, across every format CLV recognises — and lines it cannot
+  parse are still searchable rather than silently dropped. Smart case: a
+  lowercase query is case-insensitive, an uppercase character opts back in.
+- 🧬 **Multi-format parsing.** syslog (RFC 3164 and 5424), ISO-8601/bracketed
+  levels, Python `logging`, JSON lines, and Common Log Format access logs.
+  Anything else is kept as a raw line with its text intact.
+- 🧵 **Stack traces stay attached.** A line no format recognises inherits the
+  timestamp and severity of the entry above it, so a traceback survives a
+  "show me only errors" filter along with the ERROR that produced it.
+- 🪶 **Bounded memory, whatever the file size.** Opening a source seeks
+  backwards from the end of the file; a 160 MB log opens in ~2 ms using under a
+  megabyte. Tailing reads only what was appended.
+- 🧭 **Any file, not just `*.log`.** Name folders or files; every readable text
+  file counts. Binary files are detected by content and skipped, and
+  include/exclude globs are yours to set.
+- 📐 **Responsive layout.** Breakpoints at 90 and 130 columns reflow the
+  controls; every control stays on screen and keyboard-reachable down to 80
+  columns.
+- 🧩 **Plugins.** `LogSourceProvider`, `FilterStage` and `Exporter` interfaces,
+  loaded from `clv/plugins/` or from installed packages via the `clv.plugins`
+  entry point group. A broken plugin is reported, never fatal.
+- 💾 **Session state that persists.** Filters, toggles, drawer settings and the
+  selected source all come back on restart.
 
 ---
 
 ## Installation
-
-### Prebuilt packages (recommended)
-
-Download the latest release assets from the [GitHub Releases](https://github.com/r0tifer/clv_dev/releases) page and install the package for your distro:
-
-```bash
-# Debian/Ubuntu
-curl -LO https://github.com/r0tifer/clv_dev/releases/download/vX.Y.Z/centralized-log-viewer_X.Y.Z-1_amd64.deb
-sudo dpkg -i centralized-log-viewer_X.Y.Z-1_amd64.deb
-
-# RHEL/Fedora/openSUSE
-curl -LO https://github.com/r0tifer/clv_dev/releases/download/vX.Y.Z/centralized-log-viewer-X.Y.Z-1.x86_64.rpm
-sudo rpm -Uvh centralized-log-viewer-X.Y.Z-1.x86_64.rpm
-```
-
-These packages install the PyInstaller-built tree under `/opt/centralized-log-viewer` and install a `clv` launcher into `/usr/local/bin`.
-
-### Tarball
-
-Every release also ships `centralized-log-viewer-linux-x86_64.tar.gz`. Extract it anywhere and run `./clv/clv`.
 
 ### From source (developers)
 
@@ -43,78 +44,149 @@ Every release also ships `centralized-log-viewer-linux-x86_64.tar.gz`. Extract i
 git clone https://github.com/r0tifer/clv_dev.git
 cd clv_dev
 python -m pip install -e .
-python -m clv  # or: clv
+python -m clv   # or: clv
 ```
+
+### Prebuilt packages
+
+Download the latest release assets from
+[GitHub Releases](https://github.com/r0tifer/clv_dev/releases):
+
+```bash
+# Debian/Ubuntu
+sudo dpkg -i centralized-log-viewer_X.Y.Z-1_amd64.deb
+
+# RHEL/Fedora/openSUSE
+sudo rpm -Uvh centralized-log-viewer-X.Y.Z-1.x86_64.rpm
+```
+
+These install the PyInstaller tree under `/opt/centralized-log-viewer` with a
+`clv` launcher in `/usr/local/bin`. A `centralized-log-viewer-linux-x86_64.tar.gz`
+tarball ships with every release as a universal fallback.
+
+> **Note:** `install.sh` in this repo currently targets a different repository
+> and asset layout than the release workflow produces, and does not work. Use
+> one of the methods above until it is reconciled.
 
 ---
 
-## Configuration & Settings Priority
+## Configuration
 
-`settings.conf` is resolved in the following order:
+`settings.conf` is resolved in this order:
 
-1. `${XDG_CONFIG_HOME:-~/.config}/clv/settings.conf` – automatically created after the first run; this is the persistent user config.
-2. `settings.conf` in the repository root – used as a development fallback when the XDG file is missing.
-
-Key options:
+1. `${XDG_CONFIG_HOME:-~/.config}/clv/settings.conf` — created on first run.
+2. `settings.conf` in the repository root — development fallback.
 
 | Option | Purpose | Default |
 | --- | --- | --- |
-| `log_dirs` | Comma-separated absolute directories to scan recursively for `*.log`. | `./logs` (resolved relative to the working directory) |
-| `max_buffer_lines` | Lines kept per source before dropping old entries. | `500` |
-| `default_show_lines` / `min_show_lines` / `show_step` | Controls visible lines in the log panel. | `200 / 10 / 10` |
-| `refresh_hz` | Polling frequency for new log data. | `2` |
-| `csv_max_rows`, `csv_max_cols` | Structured payload preview limits. | `20 / 10` |
+| `log_dirs` | Folders **and/or files** to monitor, comma separated. Folders are searched recursively. | `/var/log` |
+| `include_globs` | Only list files matching these globs. Empty means every text file. | *(empty)* |
+| `exclude_globs` | Never list files matching these globs. | archives + binary journals |
+| `follow_symlinks` | Follow symlinked directories (cycles are detected). | `false` |
+| `skip_binary` | Skip files whose first block contains NUL bytes. | `true` |
+| `max_files` | Stop discovery after this many files. | `5000` |
+| `max_buffer_lines` | Lines held in memory per source. | `5000` |
+| `default_show_lines` / `min_show_lines` / `show_step` | Visible-line window and its `+`/`-` step. | `500 / 10 / 50` |
+| `refresh_hz` | Poll frequency for new content. | `2` |
+| `tree_width` | Starting width of the source tree, in columns. | `38` |
+| `csv_max_rows` / `csv_max_cols` | Structured payload preview limits. | `20 / 10` |
 
-Update the config, save, and restart CLV to apply the changes. Invalid or missing values fall back to safe defaults.
+Invalid values fall back to safe defaults; the app never fails to start because
+of a malformed settings file. Most discovery options are also editable at
+runtime in the **Advanced** drawer.
 
 ---
 
 ## Usage
 
-After installing:
-
 ```bash
-clv                # launches the Textual TUI
-clv --help         # list CLI flags
-python -m clv      # module entry point (mirrors clv script)
+clv              # launch the TUI
+python -m clv    # module entry point
 ```
 
 ### Keyboard shortcuts
 
 | Key | Action |
 | --- | --- |
-| `/` | Focus query input (regex) |
-| `Tab` / `Shift+Tab` | Move focus between controls |
-| `Ctrl+Enter` | Apply filters |
-| `Esc` | Clear query |
-| `A` | Add log source dialog |
-| `[` / `]` | Resize source tree |
-| `+` / `-` | Adjust visible log lines |
-| `Ctrl+L` | Toggle copy mode |
-| `Ctrl+S` | Persist session |
-| `Q` | Quit application |
+| `/` | Focus the query input |
+| `Enter` | Apply filters |
+| `Esc` | Clear the query |
+| `a` | Add a log source |
+| `t` / `s` | Cycle time window / severity |
+| `f` | Toggle the Advanced drawer |
+| `Ctrl+B` | Switch between tree and log pane (compact widths) |
+| `[` / `]` | Narrow / widen the source tree |
+| `+` / `-` | Show more / fewer lines |
+| `Ctrl+L` | Copy mode (hides all chrome) |
+| `Ctrl+S` | Save added sources to `settings.conf` |
+| `Ctrl+R` | Reload configuration and rescan |
+| `q` | Quit |
 
-Mouse interactions are fully supported, but every action has a keyboard path for headless use.
-
----
-
-## Development Notes
-
-- Core application lives in `clv/app.py`; avoid adding new code under `centralized_log_viewer/` (legacy shim only).
-- Widgets own their visuals/CSS in `clv/widgets/` and should not depend on one another’s internals.
-- Session/state logic is centralized in `clv/storage.py`; services like log discovery live under `clv/services/`.
-- Run `python -m pip install -e .` (or `poetry install` if you prefer) and then `python -m clv` to hack on the app. Textual’s `--dev` flag is supported: `python -m textual run clv/app.py --dev`.
+Every action has a keyboard path; mouse is fully supported but never required.
 
 ---
 
-## Plugin Roadmap (Coming Soon)
+## How filtering behaves
 
-Work is underway on a plugin interface (see `clv/plugins/`) featuring:
+Understanding two rules explains everything the pane does:
 
-- **LogSourceProvider** – discover and stream logs from new backends.
-- **FilterStage** – inject custom filtering or transformation logic.
-- **Exporter** – push the currently viewed session to downstream tools.
+1. **The query never drops what it cannot parse.** It matches raw line text, so
+   unstructured lines are searchable like any other.
+2. **Severity and time filters only hide lines that demonstrably lack what you
+   asked for** — and when they do, the empty pane says so, e.g. *"No matches —
+   12 have no detected severity (nothing in this source declares a level)."*
 
-Plugins will be loadable from a `clv/plugins/` directory or via Python entry points (`clv.plugins.*`), empowering teams to add organization-specific behavior without patching core CLV code.
+---
 
-Stay tuned to the AGENTS.md file and release notes as the plugin API stabilizes.
+## Architecture
+
+| Layer | Location | Responsibility |
+| --- | --- | --- |
+| App shell | `clv/app.py` | Layout, routing, lifecycle. No parsing or IO. |
+| Services | `clv/services/` | `parsing`, `filtering`, `discovery`, `reader`, `config`, `sources`. UI-free and independently testable. |
+| Widgets | `clv/widgets/` | Self-contained UI components owning their own CSS. |
+| Plugins | `clv/plugins/` | Extension interfaces and the loader. |
+| State | `clv/storage.py` | JSON session persistence (atomic writes). |
+
+Styling is CSS-only: no module assigns `.styles.*` at runtime except for the
+user-adjustable tree width. Responsive behavior comes from breakpoint classes
+(`-compact` / `-narrow` / `-wide`) that the app sets and widget CSS keys off.
+
+---
+
+## Writing a plugin
+
+Drop a module into `clv/plugins/filters/` (or `sources/` / `exporters/`), or
+publish one from an installed package under the `clv.plugins` entry point group.
+
+```python
+from dataclasses import replace
+from clv.plugins import FilterStage
+
+class Redact(FilterStage):
+    name = "redact-secrets"
+    requires_clv = ">=2.0,<3.0"     # optional
+
+    def apply(self, entry, context):
+        if "password" not in entry.raw:
+            return entry                # keep unchanged
+        return replace(entry, raw=entry.raw.replace("password", "******"))
+
+def register():
+    return Redact()
+```
+
+Return `None` from `apply` to drop a line. A plugin that fails to import, fails
+its version check, or raises at runtime is disabled and reported in the
+Advanced drawer — it cannot take the app down.
+
+---
+
+## Development
+
+```bash
+python -m pip install -e .
+python -m pip install pytest
+python -m pytest            # 94 tests
+python -m textual run clv/app.py --dev
+```

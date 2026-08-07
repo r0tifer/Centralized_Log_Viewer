@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "clv"
-version = "2.0.0"
+version = "2.1.0"
 description = "Centralized Log Viewer Textual TUI"
 readme = "README.md"
 authors = ["Centralized Log Viewer Maintainers <maintainers@example.com>"]
@@ -10,12 +10,23 @@ packages = [
 
 [tool.poetry.dependencies]
 python = ">=3.11,<4.0"
-textual = "^6.5.0"
+# Widened from ^6.5.0: the app is developed and tested against 8.x, and the
+# private-Textual-API coupling that made the old pin necessary is gone.
+textual = ">=6.5,<9.0"
 rich = ">=14.2.0"
+
+[tool.poetry.group.dev.dependencies]
+# Test-only. Previously declared as a runtime dependency, which shipped pytest
+# into the wheel and the PyInstaller bundle.
+pytest = "^9.0.2"
 
 [tool.poetry.scripts]
 clv = "clv.app:run"
 CentralizedLogViewer = "clv.app:run"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::DeprecationWarning"]
 
 [build-system]
 requires = ["poetry-core>=1.7.0"]
