@@ -38,19 +38,28 @@ desktop terminal and on a headless 80-column SSH session.
 
 ## Installation
 
-### From source (developers)
+### Install script (recommended)
 
 ```bash
-git clone https://github.com/r0tifer/clv_dev.git
-cd clv_dev
-python -m pip install -e .
-python -m clv   # or: clv
+curl -fsSL https://raw.githubusercontent.com/r0tifer/Centralized_Log_Viewer/main/install.sh | bash
+```
+
+Downloads the release build for your architecture (x86_64 or aarch64), verifies
+it against `SHA256SUMS` — and against the maintainer's GPG signature when one is
+published — then installs the program tree and a `clv` launcher on your PATH.
+Without root it installs under `~/.local`.
+
+```bash
+# Pin a version, choose locations, or require a specific signing key
+install.sh --version v2.1.0
+install.sh --prefix ~/bin --libdir ~/opt/clv
+install.sh --gpg-fpr <fingerprint>     # fail unless SHA256SUMS is signed by this key
 ```
 
 ### Prebuilt packages
 
-Download the latest release assets from
-[GitHub Releases](https://github.com/r0tifer/clv_dev/releases):
+Download release assets from
+[GitHub Releases](https://github.com/r0tifer/Centralized_Log_Viewer/releases):
 
 ```bash
 # Debian/Ubuntu
@@ -60,13 +69,22 @@ sudo dpkg -i centralized-log-viewer_X.Y.Z-1_amd64.deb
 sudo rpm -Uvh centralized-log-viewer-X.Y.Z-1.x86_64.rpm
 ```
 
-These install the PyInstaller tree under `/opt/centralized-log-viewer` with a
-`clv` launcher in `/usr/local/bin`. A `centralized-log-viewer-linux-x86_64.tar.gz`
-tarball ships with every release as a universal fallback.
+Both install the PyInstaller tree under `/opt/centralized-log-viewer` with a
+`clv` launcher in `/usr/local/bin`. A
+`centralized-log-viewer-linux-<arch>.tar.gz` tarball also ships with every
+release as a universal fallback.
 
-> **Note:** `install.sh` in this repo currently targets a different repository
-> and asset layout than the release workflow produces, and does not work. Use
-> one of the methods above until it is reconciled.
+### From source (developers)
+
+```bash
+git clone https://github.com/r0tifer/Centralized_Log_Viewer.git
+cd Centralized_Log_Viewer
+python -m pip install -e .
+python -m clv   # or: clv
+```
+
+CLV creates `~/.config/clv/settings.conf` on first run, whichever method you
+use.
 
 ---
 
