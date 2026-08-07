@@ -85,59 +85,72 @@ def test_added_source_appears_in_tree(tmp_path: Path) -> None:
 
     async def scenario() -> None:
         app = LogViewerApp()
-        async with app.run_test() as pilot:  # noqa: F841 - pilot kept for context management
+        async with app.run_test(size=(150, 40)) as pilot:  # noqa: F841
             app._source_manager = SourceManager([], [])
-            await app._populate_tree()
+            await app._rescan()
 
             addition = app._source_manager.add(str(sample_dir))
             assert addition.success is True
 
-            await app._populate_tree()
-            app._highlight_source(sample_dir)
+            await app._rescan()
+            await pilot.pause()
 
-            tree_panel = app.query_one("#tree-panel")
-            directory_tree = tree_panel.query_one(LogTree)
-            assert directory_tree.root.data == sample_dir.resolve()
-            focused = directory_tree.cursor_node
-            assert focused is not None
-            assert isinstance(focused.data, Path)
-            assert focused.data.resolve() == sample_dir.resolve()
+            tree = app.query_one("#source-tree", LogTree)
+            discovered = {
+                str(node.data)
+                for node in _walk(tree.root)
+                if isinstance(node.data, Path)
+            }
+            assert str((sample_dir / "service.log").resolve()) in discovered
+
+            # Highlighting the added file moves the cursor to it.
+            app._highlight_source(sample_dir / "service.log")
+            await pilot.pause()
+            cursor = tree.cursor_node
+            assert cursor is not None
+            assert isinstance(cursor.data, Path)
+            assert cursor.data.resolve() == (sample_dir / "service.log").resolve()
 
     asyncio.run(scenario())
 
 
-def test_show_message_uses_colored_toasts() -> None:
+def _walk(node):
+    yield node
+    for child in node.children:
+        yield from _walk(child)
+
+
+def test_messages_are_toasts_and_do_not_pollute_the_log_pane() -> None:
+    """App messages used to be written into the log, so copy mode copied them."""
 
     async def scenario() -> None:
         app = LogViewerApp()
-        async with app.run_test() as pilot:  # noqa: F841 - pilot kept for context management
+        async with app.run_test(size=(150, 40)) as pilot:  # noqa: F841
             mock_notify = MagicMock()
             app.notify = mock_notify
 
-            def panel_contains(substring: str) -> bool:
-                for strip in app.log_panel.lines:
-                    plain = getattr(strip, "plain", None)
-                    if plain is None:
-                        plain = str(strip)
-                    if substring in plain:
-                        return True
-                return False
-
             app.log_panel.clear()
-            app._show_message("All good", "info")
+            app._notify("All good", "info")
             await pilot.pause()
-            info_kwargs = mock_notify.call_args_list[-1].kwargs
-            assert info_kwargs["severity"] == "information"
-            assert info_kwargs["title"] == ""
-            assert info_kwargs["markup"] is False
-            assert panel_contains("SUCCESS: All good")
 
-            app.log_panel.clear()
-            app._show_message("Heads up", "warning")
+            kwargs = mock_notify.call_args_list[-1].kwargs
+            assert kwargs["severity"] == "information"
+            assert kwargs["markup"] is False
+
+            app._notify("Heads up", "warning")
             await pilot.pause()
-            warning_kwargs = mock_notify.call_args_list[-1].kwargs
-            assert warning_kwargs["severity"] == "warning"
-            assert panel_contains("WARNING: Heads up")
+            assert mock_notify.call_args_list[-1].kwargs["severity"] == "warning"
+
+            app._notify("Bad", "error")
+            await pilot.pause()
+            assert mock_notify.call_args_list[-1].kwargs["severity"] == "error"
+
+            # Nothing landed in the log pane.
+            rendered = "\n".join(
+                getattr(strip, "plain", str(strip)) for strip in app.log_panel.lines
+            )
+            for text in ("All good", "Heads up", "Bad"):
+                assert text not in rendered
 
     asyncio.run(scenario())
 

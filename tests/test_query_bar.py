@@ -1,145 +1,194 @@
+"""QueryBar interaction, exercised headlessly through a minimal host app."""
+
+from __future__ import annotations
+
 import asyncio
-import sys
-from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.widgets import Button
 
-sys.path.append(str(Path(__file__).resolve().parents[1]))
-
 from clv.widgets.query_bar import QueryBar
 
 
-class _QueryBarHarness(App[None]):
-    """Minimal Textual app so we can exercise QueryBar headlessly."""
+class _Harness(App[None]):
+    """Minimal Textual app so QueryBar can be driven without the full viewer."""
 
     def __init__(self) -> None:
         super().__init__()
         self.custom_requests = 0
+        self.time_changes: list[str] = []
+        self.severity_changes: list[str] = []
+        self.actions: list[str] = []
 
     def compose(self) -> ComposeResult:
         self.query_bar = QueryBar()
         yield self.query_bar
 
-    def on_query_bar_custom_range_requested(self, message: QueryBar.CustomRangeRequested) -> None:
+    def on_query_bar_custom_range_requested(self, _m: QueryBar.CustomRangeRequested) -> None:
         self.custom_requests += 1
 
+    def on_query_bar_time_window_changed(self, m: QueryBar.TimeWindowChanged) -> None:
+        self.time_changes.append(m.value)
 
-def test_custom_range_selection_deactivates_other_presets() -> None:
-    """Applying a custom range should only leave the Custom indicator lit."""
+    def on_query_bar_severity_changed(self, m: QueryBar.SeverityChanged) -> None:
+        self.severity_changes.append(m.value)
 
-    async def _exercise() -> None:
-        app = _QueryBarHarness()
-        async with app.run_test() as pilot:
-            qb = app.query_bar
+    def on_query_bar_action_triggered(self, m: QueryBar.ActionTriggered) -> None:
+        self.actions.append(m.action_id)
+
+
+def _run(scenario) -> None:
+    asyncio.run(scenario())
+
+
+def test_selecting_a_time_preset_emits_the_change() -> None:
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(150, 40)) as pilot:
             await pilot.pause()
-            await pilot.click("#time-range")
+            await pilot.click("#time-segments .segment")  # "All" is already active
             await pilot.pause()
+
+            app.query_bar.select_time("1h", emit=True)
+            await pilot.pause()
+
+            assert app.query_bar.time_selection == "1h"
+            assert "1h" in app.time_changes
+
+    _run(scenario)
+
+
+def test_custom_preset_asks_for_a_dialog_instead_of_committing() -> None:
+    """'Custom' has no window until the dialog supplies one."""
+
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(150, 40)) as pilot:
+            await pilot.pause()
+            app.query_bar.time_segmented._activate("range")
+            await pilot.pause()
+
             assert app.custom_requests == 1
-            qb.apply_custom_time_range("2024-01-01 00:00", "2024-01-01 12:00", emit=False)
-            await pilot.pause()
-            states = {name: button.value for name, button in qb._time_buttons.items()}
-            assert states["range"] is True
-            assert all(not active for name, active in states.items() if name != "range")
+            assert "range" not in app.time_changes
 
-            # Clicking Custom again should reopen the dialog while keeping the Custom
-            # indicator active (no need to clear or reselect presets first).
-            await pilot.click("#time-range")
-            await pilot.pause()
-            assert app.custom_requests == 2
-            states_after_reclick = {name: button.value for name, button in qb._time_buttons.items()}
-            assert states_after_reclick["range"] is True
-            assert all(
-                not active for name, active in states_after_reclick.items() if name != "range"
-            )
-
-    asyncio.run(_exercise())
-
-
-def test_severity_segments_arrow_navigation() -> None:
-    async def _exercise() -> None:
-        app = _QueryBarHarness()
-        async with app.run_test() as pilot:
-            qb = app.query_bar
-            await pilot.pause()
-            all_segment = qb.severity_segmented._segments["all"]
-            all_segment.focus()
+            # Applying a range does emit, and lights only Custom.
+            app.query_bar.apply_custom_time_range("2026-01-01 00:00", "2026-01-01 12:00")
             await pilot.pause()
 
-            await pilot.press("right")
+            assert app.query_bar.time_selection == "range"
+            assert app.query_bar.time_segmented.value == "range"
+            assert app.time_changes[-1] == "range"
+
+    _run(scenario)
+
+
+def test_reselecting_custom_reopens_the_dialog() -> None:
+    """Adjusting an active range must not require clearing it first."""
+
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(150, 40)) as pilot:
             await pilot.pause()
-            assert qb.severity_segmented.value == "all"
-            assert qb.screen.focused is qb.severity_segmented._segments["info"]
-
-            # Selection should update only when Enter/Space is pressed.
-            await pilot.press("enter")
+            app.query_bar.apply_custom_time_range("2026-01-01 00:00", "2026-01-01 12:00")
             await pilot.pause()
-            assert qb.severity_segmented.value == "info"
 
-            await pilot.press("left")
+            app.query_bar.time_segmented._activate("range")
             await pilot.pause()
-            assert qb.severity_segmented.value == "info"
-            assert qb.screen.focused is qb.severity_segmented._segments["all"]
 
-            await pilot.press("space")
+            assert app.custom_requests == 1
+            assert app.query_bar.time_segmented.value == "range"
+
+    _run(scenario)
+
+
+def test_cycling_time_presets_skips_custom() -> None:
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(150, 40)) as pilot:
             await pilot.pause()
-            assert qb.severity_segmented.value == "all"
-
-    asyncio.run(_exercise())
-
-
-def test_time_presets_require_confirmation() -> None:
-    async def _exercise() -> None:
-        app = _QueryBarHarness()
-        async with app.run_test() as pilot:
-            qb = app.query_bar
+            seen = [app.query_bar.cycle_time_preset() for _ in range(6)]
             await pilot.pause()
-            qb.time_set.focus()
+
+            assert "range" not in seen
+            assert seen[:5] == ["15m", "1h", "6h", "24h", "all"]
+
+    _run(scenario)
+
+
+def test_severity_arrow_navigation_needs_confirmation() -> None:
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(150, 40)) as pilot:
+            await pilot.pause()
+            segments = app.query_bar.severity_segmented
+            segments._segments["all"].focus()
             await pilot.pause()
 
             await pilot.press("right")
             await pilot.pause()
-            assert qb._time_selection == "all"
-            assert qb._time_focus_value == "15m"
+            # Focus moved but the selection has not committed yet.
+            assert segments.value == "all"
+            assert app.screen.focused is segments._segments["debug"]
 
             await pilot.press("enter")
             await pilot.pause()
-            assert qb._time_selection == "15m"
+            assert segments.value == "debug"
+            assert app.severity_changes[-1] == "debug"
 
-            await pilot.press("left")
+    _run(scenario)
+
+
+def test_regex_validation_reports_hits_and_errors() -> None:
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(150, 40)) as pilot:
             await pilot.pause()
-            assert qb._time_selection == "15m"
-            assert qb._time_focus_value == "all"
+            bar = app.query_bar
 
-            await pilot.press("space")
+            bar.set_query_value("error")
+            bar.validate_regex(["an error here", "clean line", "ERROR again"])
             await pilot.pause()
-            assert qb._time_selection == "all"
+            # Smart case: lowercase query matches both spellings.
+            assert bar.regex_status.valid is True
+            assert bar.regex_status.matches == 2
 
-    asyncio.run(_exercise())
-
-
-def test_action_buttons_arrow_navigation() -> None:
-    async def _exercise() -> None:
-        app = _QueryBarHarness()
-        async with app.run_test() as pilot:
-            qb = app.query_bar
+            bar.set_query_value("(unclosed")
+            bar.validate_regex(["anything"])
             await pilot.pause()
-            advanced_button = qb.query_one("#toggle-advanced", Button)
-            advanced_button.focus()
-            await pilot.pause()
+            assert bar.regex_status.valid is False
+            assert bar.query_one("#query-input").has_class("-regex-invalid")
 
-            expected_order = ["add-source", "run-query", "clear-query", "save-session"]
-            for expected_id in expected_order:
-                await pilot.press("right")
+    _run(scenario)
+
+
+def test_action_buttons_emit_their_ids() -> None:
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(150, 40)) as pilot:
+            await pilot.pause()
+            for button_id in ("add-source", "run-query", "clear-query", "save-session"):
+                app.query_bar.query_one(f"#{button_id}", Button).press()
                 await pilot.pause()
-                assert qb.screen.focused is not None
-                assert qb.screen.focused.id == expected_id
 
-            # Reverse direction back to Advanced Filters
-            for expected_id in ["clear-query", "run-query", "add-source", "toggle-advanced"]:
-                await pilot.press("left")
-                await pilot.pause()
-                assert qb.screen.focused is not None
-                assert qb.screen.focused.id == expected_id
+            assert app.actions == ["add-source", "run-query", "clear-query", "save-session"]
 
-    asyncio.run(_exercise())
+    _run(scenario)
+
+
+def test_every_control_stays_on_screen_at_eighty_columns() -> None:
+    """The regression that hid Run/Clear/Save on anything under ~200 columns."""
+
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app.query_bar.set_class(True, "-compact")
+            await pilot.pause()
+
+            for button_id in ("toggle-advanced", "add-source", "run-query", "clear-query", "save-session"):
+                button = app.query_bar.query_one(f"#{button_id}", Button)
+                region = button.region
+                assert region.width > 0, f"{button_id} has no width"
+                assert region.right <= 80, f"{button_id} extends past the right edge"
+
+    _run(scenario)

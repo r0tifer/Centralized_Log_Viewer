@@ -19,19 +19,22 @@ class SegmentedButtons(Static):
         border: round $surface 18%;
         padding: 0 1;
         height: 3;
+        width: 1fr;
         overflow: hidden;
     }
 
-    /* each segment should read as an interactive pill */
+    /* Segments share the group's width equally, so the control shrinks with
+       the terminal instead of overflowing it. min-width keeps short labels
+       legible; long labels truncate rather than pushing siblings off-screen. */
     SegmentedButtons > .segment {
         border: none;
         background: $surface 14%;
         color: $text;
         text-style: bold;           /* base: bold text */
-        padding: 0 2;
+        padding: 0 1;
         height: 3;                  /* fixed height so underline doesn't shift layout */
-        min-width: 6;
-        width: auto;
+        min-width: 4;
+        width: 1fr;
         margin-right: 1;
         outline: none;              /* avoid thick focus outlines that could clip text */
         /* Reserve space for the focus/hover/active underline so size never changes */
@@ -83,8 +86,14 @@ class SegmentedButtons(Static):
     }
     """
 
-    def __init__(self, options: list[tuple[str, str]], *, id: str | None = None) -> None:
-        super().__init__(id=id)
+    def __init__(
+        self,
+        options: list[tuple[str, str]],
+        *,
+        id: str | None = None,
+        classes: str | None = None,
+    ) -> None:
+        super().__init__(id=id, classes=classes)
         self._options = options
         self._current = options[0][0]
         self._segments: dict[str, SegmentedButtons._Segment] = {}
@@ -94,6 +103,17 @@ class SegmentedButtons(Static):
     @property
     def value(self) -> str:
         return self._current
+
+    @property
+    def values(self) -> list[str]:
+        """The option identifiers, in display order."""
+        return [value for value, _ in self._options]
+
+    def set_segment_tooltip(self, value: str, tooltip: str | None) -> None:
+        """Attach a tooltip to one segment (used for the custom range summary)."""
+        segment = self._segments.get(value)
+        if segment is not None:
+            segment.tooltip = tooltip
 
     @property
     def hovered_value(self) -> str | None:
@@ -106,7 +126,8 @@ class SegmentedButtons(Static):
         return self._focused
 
     def set_value(self, value: str) -> None:
-        if value == self._current:
+        """Select *value* without emitting ValueChanged (programmatic sync)."""
+        if value not in self.values:
             return
         self._current = value
         self._refresh_state()
@@ -135,6 +156,10 @@ class SegmentedButtons(Static):
 
     def _activate(self, value: str) -> None:
         if value == self._current:
+            # Re-activating the current segment is meaningful for options that
+            # open a dialog (the custom time range): the user wants to adjust
+            # it, not clear it first.
+            self.post_message(self.Reselected(self, value))
             return
         self._current = value
         self._refresh_state()
@@ -226,6 +251,18 @@ class SegmentedButtons(Static):
             self._parent._set_focused(None)
 
     class ValueChanged(Message):
+        def __init__(self, segmented: "SegmentedButtons", value: str) -> None:
+            super().__init__()
+            self.segmented = segmented
+            self.value = value
+
+        @property
+        def control(self) -> "SegmentedButtons":
+            return self.segmented
+
+    class Reselected(Message):
+        """Emitted when the already-active segment is activated again."""
+
         def __init__(self, segmented: "SegmentedButtons", value: str) -> None:
             super().__init__()
             self.segmented = segmented
