@@ -66,31 +66,60 @@ class MySource(LogSourceProvider):
 
 ### 2. FilterStage
 
-Processes or filters log lines before display.
+Transforms or drops entries before they reach the pane.
+
+`apply` receives a `LogEntry` (frozen dataclass: `raw`, `timestamp`, `level`,
+`message`, `format_name`, `continuation`) and a `FilterContext` (`spec`,
+`source`). Return an entry to keep it, or `None` to drop it. Use
+`dataclasses.replace` to modify — entries are immutable.
 
 ```python
+from dataclasses import replace
 from clv.plugins import FilterStage
 
 class RedactFilter(FilterStage):
     name = "RedactSensitiveData"
 
-    def apply(self, line, context):
-        return line.replace("password", "******")
+    def apply(self, entry, context):
+        if "password" not in entry.raw:
+            return entry
+        return replace(entry, raw=entry.raw.replace("password", "******"))
 ```
+
+Dropping is the same method:
+
+```python
+class DropDebug(FilterStage):
+    name = "DropDebug"
+
+    def apply(self, entry, context):
+        return None if entry.level == "DEBUG" else entry
+```
+
+Stages run *before* the user's query, severity and time filters.
 
 ### 3. Exporter
 
-Saves or transmits log data to an external destination.
+Saves or transmits the currently visible entries.
+
+`export` receives the sequence of `LogEntry` objects on screen plus the
+`FilterContext`, and returns an `ExportResult`.
 
 ```python
-from clv.plugins import Exporter
+import json
+from pathlib import Path
+from clv.plugins import Exporter, ExportResult
 
 class JsonExporter(Exporter):
     name = "JSON Exporter"
 
-    def export(self, session_state, lines):
-        with open("export.json", "w") as f:
-            f.write("\n".join(lines))
+    def export(self, entries, context):
+        destination = Path("export.json")
+        destination.write_text(
+            json.dumps([entry.raw for entry in entries], indent=2),
+            encoding="utf-8",
+        )
+        return ExportResult(ok=True, detail=f"{len(entries)} lines", destination=destination)
 ```
 
 ---
@@ -99,8 +128,11 @@ class JsonExporter(Exporter):
 
 The app dynamically discovers plugins using:
 
-1. **Local scan** — checks the `clv/plugins/` folder.  
-2. **Entry points** — scans installed packages that expose a `clv.plugins` namespace.
+1. **Local scan** — modules directly under `clv/plugins/` and in the
+   `sources/`, `filters/` and `exporters/` subpackages. Modules whose name
+   starts with `_` are skipped.
+2. **Entry points** — installed distributions advertising the `clv.plugins`
+   entry point group.
 
 Each plugin should register itself by defining an `__all__` list or `register()` function.
 
@@ -139,9 +171,22 @@ def register():
 
 ## Versioning & Compatibility
 
-- Follow **semantic versioning** for each plugin.  
-- Use `requires_clv = ">=1.0,<2.0"` in plugin metadata to indicate compatibility.  
-- The CLV app will warn users about incompatible versions.
+- Follow **semantic versioning** for each plugin.
+- Set `requires_clv` on the plugin class to declare compatibility, e.g.
+  `requires_clv = ">=2.0,<3.0"`. Comma-separated comparators (`>=`, `<=`, `>`,
+  `<`, `==`, `!=`) are supported and checked against `clv.__version__`.
+  Omitting it means "any version".
+- A plugin failing its constraint is skipped and reported in
+  `PluginRegistry.errors`, which the Advanced drawer surfaces.
+
+## Failure Handling
+
+Loading never raises. An import error, an unsatisfied `requires_clv`, a class
+that cannot be instantiated, an object that implements no interface, or a
+`FilterStage` that throws mid-render is recorded in `PluginRegistry.errors` and
+skipped — a stage that raises is disabled for that pass while the remaining
+stages keep running. A third-party plugin must never prevent CLV from starting
+or break a render.
 
 ---
 

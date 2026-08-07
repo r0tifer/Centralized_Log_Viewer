@@ -5,20 +5,91 @@ on:
     tags:
       - 'v*'
     branches: ['dev']
+  pull_request:
   workflow_dispatch: {}
 
 permissions:
   contents: write
 
+env:
+  APP_NAME: centralized-log-viewer
+  BIN_NAME: clv
+  INSTALL_PREFIX: /opt/centralized-log-viewer
+
 jobs:
-  build-linux:
+  # Nothing is published without the suite passing first. Previously the build
+  # job ran straight off a push and releases shipped untested code.
+  test:
     runs-on: ubuntu-latest
-    env:
-      APP_NAME: centralized-log-viewer
-      BIN_NAME: clv
-      INSTALL_PREFIX: /opt/centralized-log-viewer
-      GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-      GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install project and test dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install . pytest
+
+      - name: Run tests
+        run: python -m pytest -q
+
+  # Confirms the tag matches the version that will be built, so a mistyped tag
+  # cannot publish a package whose metadata disagrees with its filename.
+  check-version:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Tag must match pyproject version
+        run: |
+          set -euo pipefail
+          PROJECT_VERSION="$(python -c "import pathlib, tomllib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['tool']['poetry']['version'])")"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          echo "pyproject: ${PROJECT_VERSION}   tag: ${TAG_VERSION}"
+          if [[ "${PROJECT_VERSION}" != "${TAG_VERSION}" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match pyproject version ${PROJECT_VERSION}" >&2
+            exit 1
+          fi
+
+  build:
+    needs: [test, check-version]
+    # Only build artifacts for things we intend to publish, and never build a
+    # tag whose version disagrees with pyproject. check-version is skipped on
+    # branch pushes, and a skipped dependency would otherwise skip this job
+    # too, so treat "skipped" as acceptable but "failure" as blocking.
+    if: >-
+      always()
+      && github.event_name != 'pull_request'
+      && needs.test.result == 'success'
+      && (needs.check-version.result == 'success' || needs.check-version.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # aarch64 uses GitHub's free arm64 runners (public repositories).
+          # Remove this entry to go back to x86_64-only releases.
+          - runner: ubuntu-latest
+            arch: x86_64
+            deb_arch: amd64
+            rpm_arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            deb_arch: arm64
+            rpm_arch: aarch64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -33,28 +104,31 @@ jobs:
           sudo apt-get install -y ruby ruby-dev rpm build-essential
           sudo gem install --no-document fpm
           python -m pip install --upgrade pip
-          pip install build pyinstaller
+          pip install pyinstaller
 
-      - name: Install project deps
+      - name: Install project
+        run: pip install .
+
+      - name: Verify the settings template is present
         run: |
           set -euo pipefail
-          pip install .
+          # settings.conf is tracked; if it is missing something is wrong with
+          # the checkout. Writing a fallback here is how the shipped defaults
+          # previously drifted away from the real template.
+          test -f settings.conf || { echo "::error::settings.conf missing from checkout" >&2; exit 1; }
 
-      - name: Ensure settings.conf exists
+      - name: Compute version
         run: |
           set -euo pipefail
-          if [[ ! -f settings.conf ]]; then
-            printf '%s\n' \
-              "[log_viewer]" \
-              "log_dirs = /var/log" \
-              "max_buffer_lines = 500" \
-              "default_show_lines = 200" \
-              "refresh_hz = 2" \
-              "min_show_lines = 10" \
-              "show_step = 10" \
-              "csv_max_rows = 20" \
-              "csv_max_cols = 10" \
-              > settings.conf
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "PKG_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+            echo "IS_DEV=false" >> "$GITHUB_ENV"
+          else
+            BASE="$(python -c "import pathlib, tomllib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['tool']['poetry']['version'])")"
+            DATE="$(date -u +%Y%m%d%H%M)"
+            SHA="$(git rev-parse --short HEAD)"
+            echo "PKG_VERSION=${BASE}~dev.${DATE}+g${SHA}" >> "$GITHUB_ENV"
+            echo "IS_DEV=true" >> "$GITHUB_ENV"
           fi
 
       - name: Build PyInstaller (onedir)
@@ -67,6 +141,26 @@ jobs:
             --add-data "settings.conf:." \
             clv/__main__.py
 
+      - name: Smoke test the built binary
+        run: |
+          set -euo pipefail
+          # A bundle that cannot start is worse than no bundle. Run it against a
+          # throwaway HOME and confirm it provisions its config from the
+          # template bundled into _internal (see services/config.py).
+          export HOME="${RUNNER_TEMP}/smoke-home"
+          export XDG_CONFIG_HOME="${RUNNER_TEMP}/smoke-config"
+          mkdir -p "$HOME" "$XDG_CONFIG_HOME"
+          test -f "dist/${BIN_NAME}/_internal/settings.conf" \
+            || { echo "::error::settings.conf was not bundled into the onedir tree" >&2; exit 1; }
+          TERM=xterm-256color timeout 20 "dist/${BIN_NAME}/${BIN_NAME}" < /dev/null > /dev/null 2>&1 &
+          PID=$!
+          sleep 10
+          kill -TERM "$PID" 2>/dev/null || true
+          wait "$PID" 2>/dev/null || true
+          test -f "${XDG_CONFIG_HOME}/clv/settings.conf" \
+            || { echo "::error::binary did not provision its user settings file" >&2; exit 1; }
+          echo "Smoke test passed for ${{ matrix.arch }}"
+
       - name: Stage install tree
         run: |
           set -euo pipefail
@@ -78,48 +172,61 @@ jobs:
           printf '#!/usr/bin/env bash\nexec %s/%s "$@"\n' "${INSTALL_PREFIX}" "${BIN_NAME}" > "${USRBIN}/${BIN_NAME}"
           chmod +x "${USRBIN}/${BIN_NAME}"
 
-      - name: Compute version (tags vs dev branch)
-        run: |
-          set -euo pipefail
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            # Tag case: keep your current behavior (strip the leading v)
-            echo "PKG_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
-            echo "IS_DEV=false" >> "$GITHUB_ENV"
-          else
-            # Branch case (e.g., dev): derive dev version
-            BASE="$(python -c "import pathlib, tomllib; data = tomllib.loads(pathlib.Path('pyproject.toml').read_text()); print(data['tool']['poetry']['version'])")"
-            DATE="$(date -u +%Y%m%d%H%M)"
-            SHA="$(git rev-parse --short HEAD)"
-            echo "PKG_VERSION=${BASE}~dev.${DATE}+g${SHA}" >> "$GITHUB_ENV"
-            echo "IS_DEV=true" >> "$GITHUB_ENV"
-          fi
-
       - name: Build packages with fpm (DEB & RPM)
-        env:
-          VERSION: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          STAGE="stage"
           fpm -s dir -t deb -n "${APP_NAME}" -v "${PKG_VERSION}" \
+            -a "${{ matrix.deb_arch }}" \
             --description "Centralized Log Viewer (Textual TUI)" \
             --license "MIT" \
             --url "https://github.com/${{ github.repository }}" \
-            -C "${STAGE}" .
+            -C stage .
           fpm -s dir -t rpm -n "${APP_NAME}" -v "${PKG_VERSION}" \
+            -a "${{ matrix.rpm_arch }}" \
             --description "Centralized Log Viewer (Textual TUI)" \
             --license "MIT" \
             --url "https://github.com/${{ github.repository }}" \
-            -C "${STAGE}" .
+            -C stage .
 
-      - name: Make tarball (universal fallback)
+      - name: Make tarball
         run: |
           set -euo pipefail
-          tar -C dist -czf "${APP_NAME}-linux-x86_64.tar.gz" "${BIN_NAME}"
+          # Archives the onedir tree as a top-level "clv/" directory. install.sh
+          # relies on this name and this shape.
+          tar -C dist -czf "${APP_NAME}-linux-${{ matrix.arch }}.tar.gz" "${BIN_NAME}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            *.deb
+            *.rpm
+            ${{ env.APP_NAME }}-linux-${{ matrix.arch }}.tar.gz
+
+  # Checksums and the signature are produced once, over every architecture, so
+  # SHA256SUMS covers the whole release rather than one job's slice of it.
+  publish:
+    needs: [build]
+    if: always() && github.event_name != 'pull_request' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    env:
+      GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+      GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: release
 
       - name: Compute checksums
+        working-directory: release
         run: |
           set -euo pipefail
-          sha256sum ./*.deb ./*.rpm "${APP_NAME}-linux-x86_64.tar.gz" > SHA256SUMS
+          sha256sum ./*.deb ./*.rpm ./*.tar.gz | sed 's| \./| |' > SHA256SUMS
           cat SHA256SUMS
 
       - name: Import GPG key
@@ -132,6 +239,7 @@ jobs:
 
       - name: Sign SHA256SUMS
         if: ${{ env.GPG_PRIVATE_KEY != '' && steps.import_gpg.outputs.fingerprint != '' }}
+        working-directory: release
         env:
           GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
         run: |
@@ -141,20 +249,18 @@ jobs:
             --armor --output SHA256SUMS.asc --detach-sign SHA256SUMS
 
       - name: Create Dev Pre-release (branch builds)
-        if: ${{ env.IS_DEV == 'true' }}
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: dev-${{ github.run_number }}   # creates/updates a tag per run
-          name: "Dev build ${{ github.run_number }} (${{ github.sha }})"
+          # A single rolling "dev" tag, updated in place. The previous scheme
+          # minted dev-<run_number> on every push, accumulating a tag and a
+          # release per commit.
+          tag_name: dev
+          name: "Dev build (${{ github.sha }})"
           prerelease: true
           make_latest: false
           generate_release_notes: true
-          files: |
-            *.deb
-            *.rpm
-            ${{ env.APP_NAME }}-linux-x86_64.tar.gz
-            SHA256SUMS
-            SHA256SUMS.asc
+          files: release/*
 
       - name: Create Main Release
         if: startsWith(github.ref, 'refs/tags/')
@@ -163,22 +269,15 @@ jobs:
           tag_name: ${{ github.ref_name }}
           make_latest: true
           generate_release_notes: true
-          files: |
-            *.deb
-            *.rpm
-            ${{ env.APP_NAME }}-linux-x86_64.tar.gz
-            SHA256SUMS
-            SHA256SUMS.asc
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
+          files: release/*
 
   build-pypi:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [test, check-version]
     runs-on: ubuntu-latest
-    needs: build-linux
     env:
-      # boolean flag available at IF-evaluation time
       HAS_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN != '' }}
-      # expose the token to steps that need it
-      PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -193,15 +292,14 @@ jobs:
           pip install build twine
 
       - name: Build wheel and sdist
-        run: |
-          set -euo pipefail
-          python -m build
+        run: python -m build
+
+      - name: Check package metadata
+        run: python -m twine check dist/*
 
       - name: Publish to PyPI
-        if: ${{ startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-dev') && env.HAS_PYPI_TOKEN == 'true' }}
+        if: ${{ env.HAS_PYPI_TOKEN == 'true' }}
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
-        run: |
-          set -euo pipefail
-          python -m twine upload --non-interactive dist/*
+        run: python -m twine upload --non-interactive dist/*

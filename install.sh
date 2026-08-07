@@ -2,303 +2,261 @@
 set -euo pipefail
 
 # Centralized Log Viewer installer
-# - Detects arch, downloads latest release artifact, verifies checksum, and installs to /usr/local/bin (or ~/.local/bin)
-# - Places CSS next to the binary
-# - Ensures a user config at $XDG_CONFIG_HOME/clv/settings.conf (or ~/.config/clv/settings.conf)
+#
+# Downloads the release tarball for this machine's architecture, verifies it
+# against SHA256SUMS (and its GPG signature when available), and installs the
+# PyInstaller onedir tree plus a launcher on PATH.
+#
+# The release tarball is:
+#   centralized-log-viewer-linux-<arch>.tar.gz
+# and contains a single top-level directory:
+#   clv/
+#     clv           <- executable
+#     _internal/    <- runtime, including the bundled settings.conf template
+#
+# CLV creates its own ~/.config/clv/settings.conf on first run from that
+# bundled template, so this script deliberately does not write one. Duplicating
+# the template here is how the installed defaults previously drifted out of
+# sync with the application's.
 
-# Repository can be provided via --repo <owner/repo> or CLV_REPO env var.
 REPO="${CLV_REPO:-r0tifer/Centralized_Log_Viewer}"
-# Optional: expected GPG signer fingerprint to verify SHA256SUMS signature.
-GPG_FPR="${CLV_GPG_FPR:-}"
+APP_NAME="centralized-log-viewer"
 BIN_NAME="clv"
-ASSET_PREFIX="clv"
+# Optional: require SHA256SUMS to be signed by this GPG fingerprint.
+GPG_FPR="${CLV_GPG_FPR:-}"
+
+PREFIX=""
+LIBDIR=""
+VERSION=""
+FROM_LOCAL=""
 
 usage() {
   cat <<EOF
 Usage: curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash
 
 Options:
-  --repo <owner/repo> GitHub repo (default: ${REPO})
-  --gpg-fpr <fingerprint> Require SHA256SUMS to be signed by this GPG fingerprint
-  --prefix <dir>      Install directory (default: /usr/local/bin or ~/.local/bin)
-  --version <tag>     Install a specific version tag (e.g., v1.0.0). Defaults to latest
-  --from-local <dir> Install from local build directory (expects 'clv' and 'log_viewer.css')
+  --repo <owner/repo>   GitHub repo (default: ${REPO})
+  --version <tag>       Install a specific tag (e.g. v2.1.0). Defaults to latest
+  --prefix <dir>        Directory for the launcher (default: /usr/local/bin or ~/.local/bin)
+  --libdir <dir>        Directory for the program tree
+                        (default: /opt/${APP_NAME} or ~/.local/share/${APP_NAME})
+  --gpg-fpr <fpr>       Require SHA256SUMS to be signed by this GPG fingerprint
+  --from-local <dir>    Install from a local build (the 'dist/clv' directory
+                        produced by PyInstaller)
+  -h, --help            Show this help
 EOF
 }
-
-PREFIX=""
-VERSION=""
-FROM_LOCAL=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --repo) REPO="$2"; shift 2;;
-    --repo) REPO="$2"; shift 2;;
     --gpg-fpr) GPG_FPR="$2"; shift 2;;
     --prefix) PREFIX="$2"; shift 2;;
+    --libdir) LIBDIR="$2"; shift 2;;
     --version) VERSION="$2"; shift 2;;
     --from-local) FROM_LOCAL="$2"; shift 2;;
     -h|--help) usage; exit 0;;
-    *) echo "Unknown arg: $1"; usage; exit 1;;
+    *) echo "Unknown arg: $1" >&2; usage; exit 1;;
   esac
 done
 
+log()  { printf '%s\n' "$*"; }
+warn() { printf 'Warning: %s\n' "$*" >&2; }
+die()  { printf 'Error: %s\n' "$*" >&2; exit 1; }
+
 detect_arch() {
-  local uname_m
-  uname_m=$(uname -m)
-  case "$uname_m" in
+  local machine
+  machine="$(uname -m)"
+  case "$machine" in
     x86_64|amd64) echo "x86_64" ;;
     aarch64|arm64) echo "aarch64" ;;
-    *) echo "Unsupported arch: $uname_m" >&2; exit 1 ;;
+    *)
+      die "Unsupported architecture '${machine}'. Prebuilt packages exist for x86_64 and aarch64; install from source instead: pip install git+https://github.com/${REPO}.git"
+      ;;
   esac
 }
 
-ensure_prefix() {
+resolve_bindir() {
   if [[ -n "$PREFIX" ]]; then
+    mkdir -p "$PREFIX"
     echo "$PREFIX"
-    return
-  fi
-  if [[ -w /usr/local/bin ]]; then
+  elif [[ -w /usr/local/bin ]]; then
     echo "/usr/local/bin"
   else
-    echo "${HOME}/.local/bin"
     mkdir -p "${HOME}/.local/bin"
+    echo "${HOME}/.local/bin"
   fi
 }
 
-ensure_config() {
-  local cfg_home cfg_dir cfg_file
-  cfg_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
-  cfg_dir="${cfg_home}/clv"
-  cfg_file="${cfg_dir}/settings.conf"
-  mkdir -p "$cfg_dir"
-  if [[ ! -f "$cfg_file" ]]; then
-    if [[ -f settings.conf ]]; then
-      cp -f settings.conf "$cfg_file"
-    else
-      cat > "$cfg_file" <<CFG
-[log_viewer]
-# Comma-separated absolute paths to log directories or files
-log_dirs = /var/log
-max_buffer_lines = 500
-default_show_lines = 40
-refresh_hz = 4
-default_tree_width = 30
-min_show_lines = 10
-show_step = 10
-CFG
-    fi
-    echo "Created default config at $cfg_file"
+resolve_libdir() {
+  if [[ -n "$LIBDIR" ]]; then
+    echo "$LIBDIR"
+  elif [[ -w /opt ]]; then
+    echo "/opt/${APP_NAME}"
+  else
+    echo "${HOME}/.local/share/${APP_NAME}"
   fi
 }
 
-safe_extract_validate() {
-  local tarfile="$1"
-  local list
-  list=$(tar -tzf "$tarfile")
-  while IFS= read -r f; do
-    if [[ "$f" = /* || "$f" == *".."* ]]; then
-      echo "Refusing to extract unsafe path in archive: $f" >&2
-      exit 1
-    fi
-    case "$f" in
-      clv|log_viewer.css) ;;
-      *) echo "Unexpected file in archive: $f" >&2; exit 1 ;;
+# Reject archives that would write outside the extraction directory, or that
+# are not the expected single-top-level-directory shape.
+validate_archive() {
+  local tarfile="$1" entry
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    case "$entry" in
+      /*|*..*) die "Refusing to extract unsafe path from archive: ${entry}" ;;
+      "${BIN_NAME}"|"${BIN_NAME}"/*) ;;
+      *) die "Unexpected entry in archive (expected everything under '${BIN_NAME}/'): ${entry}" ;;
     esac
-  done <<< "$list"
+  done < <(tar -tzf "$tarfile")
 }
 
-verify_sha256sums_gpg() {
-  local owner sums sums_sig tmpgnupg
+verify_signature() {
+  local sums="$1" sig="$2" owner tmpgnupg
   owner="${REPO%%/*}"
-  sums="$1"
-  sums_sig="$2"
-  if ! command -v gpg >/dev/null 2>&1; then
-    return 1
+
+  command -v gpg >/dev/null 2>&1 || return 1
+
+  tmpgnupg="$(mktemp -d)"
+  # shellcheck disable=SC2064  # expand tmpgnupg now, not at trap time
+  trap "rm -rf '$tmpgnupg'" RETURN
+  GNUPGHOME="$tmpgnupg"
+  export GNUPGHOME
+
+  # Import the owner's public keys as published by GitHub.
+  local keys
+  if command -v python3 >/dev/null 2>&1; then
+    keys="$(curl -fsSL "https://api.github.com/users/${owner}/gpg_keys" \
+      | python3 -c 'import json,sys; print("\n".join(k.get("raw_key") or "" for k in json.load(sys.stdin)))' 2>/dev/null || true)"
+  else
+    # Fall back to a text scrape when python3 is unavailable.
+    keys="$(curl -fsSL "https://api.github.com/users/${owner}/gpg_keys" \
+      | grep -o '"raw_key": *"[^"]*"' | cut -d'"' -f4 | sed 's/\\n/\n/g' || true)"
   fi
-  tmpgnupg=$(mktemp -d)
-  trap 'rm -rf "$tmpgnupg"' RETURN
-  export GNUPGHOME="$tmpgnupg"
-  curl -fsSL "https://api.github.com/users/${owner}/gpg_keys" \
-    | grep -o '-----BEGIN PGP PUBLIC KEY BLOCK-----.*-----END PGP PUBLIC KEY BLOCK-----' \
-    | sed 's/\\n/\n/g' \
-    | gpg --batch --quiet --import 2>/dev/null || true
+  [[ -n "$keys" ]] || return 1
+  printf '%s\n' "$keys" | gpg --batch --quiet --import 2>/dev/null || return 1
+
   if [[ -n "$GPG_FPR" ]]; then
-    if ! gpg --batch --list-keys | grep -qi "$GPG_FPR"; then
-      echo "Expected GPG fingerprint not found in imported keys" >&2
-      return 1
-    fi
+    gpg --batch --list-keys --with-colons \
+      | grep -qi "$(printf '%s' "$GPG_FPR" | tr -d ' ')" \
+      || { warn "Required GPG fingerprint not found among ${owner}'s keys"; return 1; }
   fi
-  if gpg --batch --verify "$sums_sig" "$sums" >/dev/null 2>&1; then
+
+  gpg --batch --verify "$sig" "$sums" >/dev/null 2>&1
+}
+
+verify_checksum() {
+  local dir="$1" asset="$2" expected actual sha
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha="sha256sum"
+  elif command -v shasum >/dev/null 2>&1; then
+    sha="shasum -a 256"
+  else
+    warn "No sha256 tool available; skipping checksum verification"
     return 0
   fi
-  return 1
+
+  expected="$(awk -v f="$asset" '$2 == f {print $1}' "${dir}/SHA256SUMS" | head -n1)"
+  [[ -n "$expected" ]] || die "No checksum entry for ${asset} in SHA256SUMS"
+  actual="$(cd "$dir" && $sha "$asset" | awk '{print $1}')"
+  [[ "$expected" == "$actual" ]] || die "Checksum mismatch for ${asset}"
+  log "Checksum OK"
+}
+
+resolve_tag() {
+  local tag
+  if [[ -n "$VERSION" ]]; then
+    printf '%s' "$VERSION"
+    return
+  fi
+  tag="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+    | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' \
+    | cut -d'"' -f4 | head -n1)"
+  [[ -n "$tag" ]] || die "Could not determine the latest release tag for ${REPO}"
+  printf '%s' "$tag"
+}
+
+install_tree() {
+  local src="$1" libdir="$2" bindir="$3"
+
+  [[ -x "${src}/${BIN_NAME}" ]] || die "No '${BIN_NAME}' executable found in ${src}"
+
+  log "Installing program tree to ${libdir}"
+  if [[ -d "$libdir" ]]; then
+    rm -rf "${libdir:?}/"*
+  else
+    mkdir -p "$libdir"
+  fi
+  cp -a "${src}/." "${libdir}/"
+  chmod 0755 "${libdir}/${BIN_NAME}"
+
+  log "Installing launcher to ${bindir}/${BIN_NAME}"
+  cat > "${bindir}/${BIN_NAME}" <<LAUNCHER
+#!/usr/bin/env bash
+exec "${libdir}/${BIN_NAME}" "\$@"
+LAUNCHER
+  chmod 0755 "${bindir}/${BIN_NAME}"
 }
 
 download_and_install() {
-  local arch prefix tmpdir tag api_url rel_api rel_json rel_asset_url rel_sha_url asset_name sha_name
-  arch=$(detect_arch)
-  prefix=$(ensure_prefix)
-  tmpdir=$(mktemp -d)
+  local arch bindir libdir tag tmpdir asset base_url
+  arch="$(detect_arch)"
+  bindir="$(resolve_bindir)"
+  libdir="$(resolve_libdir)"
+  tag="$(resolve_tag)"
+  asset="${APP_NAME}-linux-${arch}.tar.gz"
+  base_url="https://github.com/${REPO}/releases/download/${tag}"
 
-  if [[ -z "$REPO" ]]; then
-    echo "Missing --repo <owner/repo>. You can also set CLV_REPO env var." >&2
-    exit 1
-  fi
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' EXIT
 
-  if [[ -n "$VERSION" ]]; then
-    tag="$VERSION"
-  else
-    # Resolve latest tag via GitHub API
-    api_url="https://api.github.com/repos/${REPO}/releases/latest"
-    tag=$(curl -fsSL "$api_url" | sed -n 's/.*"tag_name": "\([^"]\+\)".*/\1/p' | head -n1)
-    if [[ -z "$tag" ]]; then
-      echo "Failed to determine latest release tag" >&2
-      exit 1
-    fi
-  fi
+  log "Installing ${APP_NAME} ${tag} (${arch}) from ${REPO}"
 
-  echo "Resolving release assets for $REPO@$tag ..."
-  rel_api="https://api.github.com/repos/${REPO}/releases/tags/${tag}"
-  rel_json=$(curl -fsSL "$rel_api")
-  # Find first matching asset URL for linux-<arch>.tar.gz
-  rel_asset_url=$(echo "$rel_json" \
-    | tr '\n' ' ' \
-    | sed 's/\r//g' \
-    | grep -o '"browser_download_url":"[^"]*"' \
-    | cut -d '"' -f4 \
-    | grep -E "/download/${tag}/clv-.*-linux-${arch}\.tar\.gz$" \
-    | head -n1)
-  # Matching checksum file (same basename plus .sha256)
-  rel_sha_url=$(echo "$rel_json" \
-    | tr '\n' ' ' \
-    | sed 's/\r//g' \
-    | grep -o '"browser_download_url":"[^"]*"' \
-    | cut -d '"' -f4 \
-    | grep -E "/download/${tag}/clv-.*-linux-${arch}\.tar\.gz\.sha256$" \
-    | head -n1)
+  log "Downloading ${asset} ..."
+  curl -fL --retry 3 "${base_url}/${asset}" -o "${tmpdir}/${asset}" \
+    || die "Could not download ${asset} from release ${tag}. Does that release include an ${arch} build?"
 
-  if [[ -z "$rel_asset_url" ]]; then
-    # Fallback to conventional name if not found
-    asset_name="clv-${tag}-linux-${arch}.tar.gz"
-    rel_asset_url="https://github.com/${REPO}/releases/download/${tag}/${asset_name}"
-  else
-    asset_name=$(basename "$rel_asset_url")
-  fi
-
-  echo "Downloading ${asset_name} ..."
-  curl -fL "$rel_asset_url" -o "$tmpdir/$asset_name"
-
-  # Download checksum if available and verify
-  sha_name="${asset_name}.sha256"
-  if [[ -z "$rel_sha_url" ]]; then
-    # Try conventional name in release assets if not found via API
-    rel_sha_url="https://github.com/${REPO}/releases/download/${tag}/${sha_name}"
-  fi
-
-  # Prefer aggregated SHA256SUMS + signature
-  local sums_url sig_url
-  sums_url="https://github.com/${REPO}/releases/download/${tag}/SHA256SUMS"
-  sig_url="https://github.com/${REPO}/releases/download/${tag}/SHA256SUMS.asc"
-  echo "Fetching SHA256SUMS ..."
-  if curl -fL "$sums_url" -o "$tmpdir/SHA256SUMS" 2>/dev/null; then
-    if curl -fL "$sig_url" -o "$tmpdir/SHA256SUMS.asc" 2>/dev/null; then
-      if verify_sha256sums_gpg "$tmpdir/SHA256SUMS" "$tmpdir/SHA256SUMS.asc"; then
-        echo "SHA256SUMS signature verified"
+  log "Fetching SHA256SUMS ..."
+  if curl -fsSL "${base_url}/SHA256SUMS" -o "${tmpdir}/SHA256SUMS"; then
+    if curl -fsSL "${base_url}/SHA256SUMS.asc" -o "${tmpdir}/SHA256SUMS.asc" 2>/dev/null; then
+      if verify_signature "${tmpdir}/SHA256SUMS" "${tmpdir}/SHA256SUMS.asc"; then
+        log "SHA256SUMS signature verified"
+      elif [[ -n "$GPG_FPR" ]]; then
+        die "SHA256SUMS signature verification failed and --gpg-fpr was required"
       else
-        echo "Warning: failed to verify GPG signature; falling back to raw checksum check" >&2
+        warn "Could not verify the GPG signature; falling back to the raw checksum"
       fi
+    elif [[ -n "$GPG_FPR" ]]; then
+      die "No SHA256SUMS.asc in release ${tag} but --gpg-fpr was required"
     else
-      echo "No signature found; using raw checksum check" >&2
+      warn "No signature published for this release; using the raw checksum"
     fi
-    if command -v sha256sum >/dev/null 2>&1; then
-      expected=$(grep -E "[ ]${asset_name}$" "$tmpdir/SHA256SUMS" | awk '{print $1}' | head -n1)
-      if [[ -z "$expected" ]]; then
-        echo "Checksum entry for ${asset_name} not found in SHA256SUMS" >&2
-        exit 1
-      fi
-      actual=$(sha256sum "$tmpdir/$asset_name" | awk '{print $1}')
-      if [[ "$expected" != "$actual" ]]; then
-        echo "Checksum mismatch for ${asset_name}" >&2
-        exit 1
-      fi
-      echo "Checksum OK"
-    elif command -v shasum >/dev/null 2>&1; then
-      expected=$(grep -E "[ ]${asset_name}$" "$tmpdir/SHA256SUMS" | awk '{print $1}' | head -n1)
-      if [[ -z "$expected" ]]; then
-        echo "Checksum entry for ${asset_name} not found in SHA256SUMS" >&2
-        exit 1
-      fi
-      actual=$(shasum -a 256 "$tmpdir/$asset_name" | awk '{print $1}')
-      if [[ "$expected" != "$actual" ]]; then
-        echo "Checksum mismatch for ${asset_name}" >&2
-        exit 1
-      fi
-      echo "Checksum OK"
-    else
-      echo "Warning: no sha256 tool found; skipping verification" >&2
-    fi
+    verify_checksum "$tmpdir" "$asset"
+  elif [[ -n "$GPG_FPR" ]]; then
+    die "No SHA256SUMS in release ${tag} but --gpg-fpr was required"
   else
-    echo "SHA256SUMS not found; trying per-asset checksum"
-    sha_name="${asset_name}.sha256"
-    if [[ -z "$rel_sha_url" ]]; then
-      rel_sha_url="https://github.com/${REPO}/releases/download/${tag}/${sha_name}"
-    fi
-    if curl -fL "$rel_sha_url" -o "$tmpdir/$sha_name" 2>/dev/null; then
-      if command -v sha256sum >/dev/null 2>&1; then
-        (cd "$tmpdir" && sha256sum -c "$sha_name")
-        echo "Checksum OK"
-      elif command -v shasum >/dev/null 2>&1; then
-        expected=$(cut -d ' ' -f1 "$tmpdir/$sha_name")
-        actual=$(shasum -a 256 "$tmpdir/$asset_name" | awk '{print $1}')
-        if [[ "$expected" != "$actual" ]]; then
-          echo "Checksum mismatch" >&2
-          exit 1
-        fi
-        echo "Checksum OK"
-      else
-        echo "Warning: no sha256 tool found; skipping verification" >&2
-      fi
-    else
-      echo "Warning: checksum file not found; skipping verification" >&2
-    fi
+    warn "No SHA256SUMS published for this release; skipping verification"
   fi
 
-  echo "Validating and extracting ..."
-  safe_extract_validate "$tmpdir/$asset_name"
-  tar --no-same-owner -C "$tmpdir" -xzf "$tmpdir/$asset_name"
+  log "Validating and extracting ..."
+  validate_archive "${tmpdir}/${asset}"
+  tar --no-same-owner -C "$tmpdir" -xzf "${tmpdir}/${asset}"
 
-  # Expecting extracted files: clv, log_viewer.css
-  install -m 0755 "$tmpdir/${BIN_NAME}" "$prefix/${BIN_NAME}"
-  if [[ -f "$tmpdir/log_viewer.css" ]]; then
-    install -m 0644 "$tmpdir/log_viewer.css" "$prefix/log_viewer.css"
-  fi
-
-  echo "Installed ${BIN_NAME} to $prefix"
+  install_tree "${tmpdir}/${BIN_NAME}" "$libdir" "$bindir"
 }
 
 install_from_local() {
-  local arch prefix src
-  arch=$(detect_arch) # not used, but kept for parity
-  prefix=$(ensure_prefix)
-  src="$FROM_LOCAL"
-  if [[ ! -x "$src/clv" ]]; then
-    echo "Local source missing 'clv' executable: $src" >&2
-    exit 1
-  fi
-  install -m 0755 "$src/clv" "$prefix/clv"
-  if [[ -f "$src/log_viewer.css" ]]; then
-    install -m 0644 "$src/log_viewer.css" "$prefix/log_viewer.css"
-  fi
-  echo "Installed clv from local: $src -> $prefix"
+  local bindir libdir
+  bindir="$(resolve_bindir)"
+  libdir="$(resolve_libdir)"
+  [[ -d "$FROM_LOCAL" ]] || die "Local source directory not found: ${FROM_LOCAL}"
+  install_tree "$FROM_LOCAL" "$libdir" "$bindir"
 }
 
 main() {
-  if ! command -v curl >/dev/null 2>&1; then
-    echo "curl is required" >&2; exit 1
-  fi
-
-  ensure_config
+  command -v curl >/dev/null 2>&1 || die "curl is required"
+  command -v tar  >/dev/null 2>&1 || die "tar is required"
 
   if [[ -n "$FROM_LOCAL" ]]; then
     install_from_local
@@ -306,12 +264,16 @@ main() {
     download_and_install
   fi
 
-  # PATH hint
-  if ! command -v clv >/dev/null 2>&1; then
-    echo "Note: add \"$HOME/.local/bin\" to your PATH if not already present." >&2
+  local bindir
+  bindir="$(resolve_bindir)"
+  if ! command -v "$BIN_NAME" >/dev/null 2>&1; then
+    warn "${bindir} is not on your PATH. Add it with:"
+    # shellcheck disable=SC2016  # $PATH is literal here: it is a line to copy
+    printf '  export PATH="%s:$PATH"\n' "$bindir" >&2
   fi
 
-  echo "Done. Run: clv"
+  log "Done. Run: ${BIN_NAME}"
+  log "CLV will create ~/.config/clv/settings.conf on first run."
 }
 
 main "$@"
