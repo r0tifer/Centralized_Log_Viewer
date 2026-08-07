@@ -10,6 +10,7 @@ from __future__ import annotations
 import configparser
 import os
 import shutil
+import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
@@ -108,9 +109,26 @@ def user_config_path() -> Path:
     return get_xdg_config_home() / "clv" / "settings.conf"
 
 
-def repo_config_path() -> Path:
-    """Development fallback: settings.conf beside the package."""
+def bundled_config_path() -> Path:
+    """Locate the shipped settings.conf template.
+
+    Under PyInstaller the source tree does not exist on disk; the data file
+    added with ``--add-data settings.conf:.`` lands in the extraction root that
+    PyInstaller exposes as ``sys._MEIPASS``. Relying on ``__file__`` and
+    counting parent directories happens to land in the same place for a onedir
+    build, but it is an accident of the layout and breaks under onefile.
+    """
+
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return Path(meipass) / "settings.conf"
+    # Development checkout: settings.conf sits beside the clv package.
     return Path(__file__).resolve().parents[2] / "settings.conf"
+
+
+#: Backwards-compatible alias; the template is only a "repo" path when running
+#: from a source checkout.
+repo_config_path = bundled_config_path
 
 
 def ensure_user_settings_file() -> Optional[Path]:
