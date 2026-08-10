@@ -17,6 +17,7 @@ class _Harness(App[None]):
     def __init__(self) -> None:
         super().__init__()
         self.changes: list[AdvancedFiltersDrawer.SettingsChanged] = []
+        self.view_changes: list[AdvancedFiltersDrawer.ViewToggleChanged] = []
         self.rescans = 0
 
     def compose(self) -> ComposeResult:
@@ -26,6 +27,9 @@ class _Harness(App[None]):
 
     def on_advanced_filters_drawer_settings_changed(self, m) -> None:
         self.changes.append(m)
+
+    def on_advanced_filters_drawer_view_toggle_changed(self, m) -> None:
+        self.view_changes.append(m)
 
     def on_advanced_filters_drawer_rescan_requested(self, _m) -> None:
         self.rescans += 1
@@ -159,5 +163,196 @@ def test_search_options_reach_the_filter_spec() -> None:
             assert spec.invert is True
             assert spec.case_sensitive is True
             assert spec.regex is False
+
+    asyncio.run(scenario())
+
+
+# --- view toggles mirrored into the drawer ---------------------------------
+
+
+def test_exactly_one_copy_of_the_view_toggles_is_visible() -> None:
+    """They live in the query bar when it is wide, in the drawer when it is not."""
+
+    async def scenario() -> None:
+        from clv.app import BREAKPOINT_MERGE
+
+        for width in (80, 120, BREAKPOINT_MERGE - 1, BREAKPOINT_MERGE, 190):
+            app = LogViewerApp()
+            async with app.run_test(size=(width, 34)) as pilot:
+                await pilot.pause()
+                await pilot.pause()
+                app.advanced_drawer.show()
+                await pilot.pause()
+
+                in_bar = app.query_bar.query_one("#toggles").display
+                in_drawer = app.advanced_drawer.query_one("#view-toggles").display
+
+                assert in_bar != in_drawer, (
+                    f"at {width} cols the toggles are "
+                    f"{'in both places' if in_bar else 'nowhere'}"
+                )
+                assert in_bar is (width >= BREAKPOINT_MERGE)
+
+    asyncio.run(scenario())
+
+
+def test_drawer_toggles_drive_real_behaviour(tmp_path: Path) -> None:
+    """Not just widget state: the log panel and the render must follow."""
+
+    source = tmp_path / "a.log"
+    source.write_text("2026-08-07 09:00:00 - INFO - one\n", encoding="utf-8")
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(80, 34)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app._select_source(source)
+            app.advanced_drawer.show()
+            await pilot.pause()
+
+            assert app.state.auto_scroll is True
+            assert app.log_panel.auto_scroll is True
+
+            app.advanced_drawer.query_one("#drawer-auto-scroll", Switch).value = False
+            await pilot.pause()
+            assert app.state.auto_scroll is False
+            assert app.log_panel.auto_scroll is False
+            # Auto-scroll governs the viewport, never ingestion.
+            assert app._tail_timer is not None
+
+            app.advanced_drawer.query_one("#drawer-structured", Switch).value = True
+            await pilot.pause()
+            assert app.state.pretty_rendering is True
+
+    asyncio.run(scenario())
+
+
+def test_the_two_copies_stay_in_step() -> None:
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(190, 34)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+
+            # Flip from the query bar (visible at this width).
+            app.query_bar.query_one("#auto-scroll-toggle", Switch).value = False
+            await pilot.pause()
+            assert app.state.auto_scroll is False
+            assert app.advanced_drawer.query_one("#drawer-auto-scroll", Switch).value is False
+
+            # Flip from the drawer's mirror and it propagates back.
+            app.advanced_drawer.query_one("#drawer-auto-scroll", Switch).value = True
+            await pilot.pause()
+            assert app.state.auto_scroll is True
+            assert app.query_bar.query_one("#auto-scroll-toggle", Switch).value is True
+
+    asyncio.run(scenario())
+
+
+def test_view_state_survives_crossing_the_breakpoint() -> None:
+    """Resizing swaps which control is shown; it must not change the setting."""
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(80, 34)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.advanced_drawer.show()
+            await pilot.pause()
+
+            app.advanced_drawer.query_one("#drawer-auto-scroll", Switch).value = False
+            await pilot.pause()
+            assert app.state.auto_scroll is False
+
+            await pilot.resize_terminal(190, 34)
+            await pilot.pause()
+            await pilot.pause()
+            assert app.state.auto_scroll is False
+            assert app.query_bar.query_one("#auto-scroll-toggle", Switch).value is False
+
+            await pilot.resize_terminal(80, 34)
+            await pilot.pause()
+            await pilot.pause()
+            assert app.state.auto_scroll is False
+            assert app.advanced_drawer.query_one("#drawer-auto-scroll", Switch).value is False
+
+    asyncio.run(scenario())
+
+
+def test_syncing_the_mirror_does_not_emit() -> None:
+    """Echoing the app's value back must not read as a user action."""
+
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(120, 34)) as pilot:
+            await pilot.pause()
+            settings_before = len(app.changes)
+
+            app.drawer.sync_view_toggles(auto_scroll=False, structured=True)
+            await pilot.pause()
+
+            assert app.drawer.query_one("#drawer-auto-scroll", Switch).value is False
+            assert app.drawer.query_one("#drawer-structured", Switch).value is True
+            # A sync is the app telling the drawer, not the user telling the app.
+            assert app.view_changes == []
+            assert len(app.changes) == settings_before
+
+            # A real flip does report, so the suppression is not simply stuck on.
+            app.drawer.query_one("#drawer-structured", Switch).value = False
+            await pilot.pause()
+            assert [(m.field, m.value) for m in app.view_changes] == [("structured", False)]
+
+    asyncio.run(scenario())
+
+
+def test_drawer_mirror_is_seeded_from_the_restored_session(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        from clv.storage import SessionState, StateStore
+
+        store = StateStore(root=tmp_path)
+        store.save(SessionState(auto_scroll=False, pretty_rendering=True))
+
+        app = LogViewerApp(store=StateStore(root=tmp_path))
+        async with app.run_test(size=(80, 34)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.advanced_drawer.show()
+            await pilot.pause()
+
+            assert app.advanced_drawer.query_one("#drawer-auto-scroll", Switch).value is False
+            assert app.advanced_drawer.query_one("#drawer-structured", Switch).value is True
+
+    asyncio.run(scenario())
+
+
+def test_section_headings_are_actually_painted() -> None:
+    """`height: 1` with `padding-bottom: 1` leaves zero rows for the text.
+
+    The headings still laid out at the right coordinates, so geometry
+    assertions passed while every one of them painted nothing.
+    """
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(120, 44)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.advanced_drawer.show()
+            await pilot.pause()
+            await pilot.pause()
+
+            strips = app.screen._compositor.render_strips()
+            painted = "\n".join(
+                "".join(segment.text for segment in strip) for strip in strips
+            )
+
+            for heading in ("View", "Source discovery"):
+                assert heading in painted, f"{heading!r} lays out but paints nothing"
+
+            for label in app.advanced_drawer.query(".drawer-heading"):
+                assert label.region.height >= 2, (
+                    "a heading with bottom padding needs height for the text too"
+                )
 
     asyncio.run(scenario())
