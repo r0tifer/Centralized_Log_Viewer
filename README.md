@@ -132,6 +132,8 @@ python -m clv    # module entry point
 | `a` | Add a log source |
 | `t` / `s` | Cycle time window / severity |
 | `f` | Toggle the Advanced drawer |
+| `w` | Follow new lines (auto-scroll) on/off |
+| `o` | Structured output on/off |
 | `Ctrl+B` | Switch between tree and log pane (compact widths) |
 | `[` / `]` | Narrow / widen the source tree |
 | `+` / `-` | Show more / fewer lines |

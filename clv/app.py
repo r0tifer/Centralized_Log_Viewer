@@ -76,6 +76,10 @@ STRUCTURED_PAYLOAD_MAX_CHARS = 8_192
 #: Terminal widths at which the layout changes shape.
 BREAKPOINT_COMPACT = 90
 BREAKPOINT_NARROW = 130
+#: Width at which the time presets, toggles and action buttons fit on a single
+#: line together. Measured against their natural widths (48 + 21 + 55 columns
+#: plus padding), not guessed, and asserted in tests/test_query_bar.py.
+BREAKPOINT_MERGE = 136
 
 SOURCES_PANEL_MIN_WIDTH = 20
 SOURCES_PANEL_MAX_WIDTH = 120
@@ -230,6 +234,11 @@ class LogViewerApp(App[None]):
         Binding("t", "cycle_time", "Time", show=True),
         Binding("s", "cycle_severity", "Severity", show=True),
         Binding("f", "toggle_advanced", "Advanced", show=True),
+        # The auto-scroll and structured switches are only shown when the query
+        # bar merges its rows, so they need a keyboard path that does not
+        # depend on terminal width.
+        Binding("w", "toggle_auto_scroll", "Follow", show=True),
+        Binding("o", "toggle_structured", "Structured", show=False),
         Binding("ctrl+b", "toggle_pane", "Switch pane", show=True),
         Binding("[", "shrink_sources_panel", "Narrower", show=False),
         Binding("]", "expand_sources_panel", "Wider", show=False),
@@ -263,6 +272,7 @@ class LogViewerApp(App[None]):
         self._sources_panel_width = self._config.tree_width
         self._copy_mode = False
         self._breakpoint = ""
+        self._merged = False
         self._plugins: PluginRegistry = PluginRegistry()
 
         self.query_bar = QueryBar()
@@ -371,7 +381,12 @@ class LogViewerApp(App[None]):
             breakpoint_name = "-narrow"
         else:
             breakpoint_name = "-wide"
-        if breakpoint_name == self._breakpoint:
+
+        # Merging the time presets, toggles and actions onto one line needs
+        # more room than "-wide" guarantees, so it gets its own threshold
+        # rather than riding along with the size class.
+        merged = width >= BREAKPOINT_MERGE
+        if breakpoint_name == self._breakpoint and merged == self._merged:
             return
 
         targets = [self, self.query_bar, self.advanced_drawer]
@@ -379,7 +394,10 @@ class LogViewerApp(App[None]):
             active = name == breakpoint_name
             for target in targets:
                 target.set_class(active, name)
+        self.query_bar.set_class(merged, "-merged")
+
         self._breakpoint = breakpoint_name
+        self._merged = merged
         self._apply_panel_width()
         self._sync_compact_pane()
 
@@ -845,6 +863,20 @@ class LogViewerApp(App[None]):
 
     def action_cycle_severity(self) -> None:
         self.query_bar.cycle_severity()
+
+    def action_toggle_auto_scroll(self) -> None:
+        """Flip auto-scroll. Driving the Switch keeps state and UI in step."""
+        switch = self.query_bar.query_one("#auto-scroll-toggle", Switch)
+        switch.value = not switch.value
+        self._notify("Following new lines." if switch.value else "Auto-scroll paused.")
+
+    def action_toggle_structured(self) -> None:
+        """Flip structured rendering of JSON/XML/CSV payloads."""
+        switch = self.query_bar.query_one("#pretty-structured-toggle", Switch)
+        switch.value = not switch.value
+        self._notify(
+            "Structured output on." if switch.value else "Structured output off."
+        )
 
     def action_toggle_advanced(self) -> None:
         self.advanced_drawer.toggle()
