@@ -31,8 +31,10 @@ desktop terminal and on a headless 80-column SSH session.
 - 🧩 **Plugins.** `LogSourceProvider`, `FilterStage` and `Exporter` interfaces,
   loaded from `clv/plugins/` or from installed packages via the `clv.plugins`
   entry point group. A broken plugin is reported, never fatal.
-- 💾 **Session state that persists.** Filters, toggles, drawer settings and the
-  selected source all come back on restart.
+- 💾 **Session state that persists.** Filters, toggles and drawer settings come
+  back on restart. The source you had open does not: CLV opens on its discovery
+  summary so every launch starts from a known state rather than silently
+  resuming a tail.
 
 ---
 

@@ -338,3 +338,68 @@ def test_rescan_returns_to_a_collapsed_tree(tmp_path: Path) -> None:
             assert app.query_one("#source-tree", LogTree).last_line + 1 == 1
 
     asyncio.run(scenario())
+
+
+# --- what a launch opens ----------------------------------------------------
+
+
+def test_launch_shows_the_summary_not_the_last_source(tmp_path: Path) -> None:
+    """A relaunch must not silently resume tailing whatever was open before."""
+
+    root = _nested_tree(tmp_path)
+    target = root / "alpha" / "a.log"
+
+    async def scenario() -> None:
+        from clv.services import SourceManager
+        from clv.storage import StateStore
+
+        store = StateStore(root=tmp_path / "state")
+
+        # Session one: open a source and set a filter.
+        first = LogViewerApp(store=store)
+        async with first.run_test(size=(120, 30)) as pilot:
+            first._source_manager = SourceManager([root], [])
+            await first._rescan()
+            first._select_source(target)
+            first._update_state(query="hello", severity="warn")
+            await pilot.pause()
+            assert first._selected_source == target.resolve()
+            first._store.save(first.state)
+
+        # Session two: relaunch against the same store.
+        second = LogViewerApp(store=StateStore(root=tmp_path / "state"))
+        async with second.run_test(size=(120, 30)) as pilot:
+            second._source_manager = SourceManager([root], [])
+            await second._rescan()
+            await pilot.pause()
+
+            assert second._selected_source is None, "a source was reopened on launch"
+            assert second._tail_timer is None, "a tail was started on launch"
+
+            rendered = "\n".join(
+                getattr(line, "plain", str(line)) for line in second.log_panel.lines
+            )
+            assert "Log files found" in rendered
+            assert "Select a log from the tree to begin." in rendered
+
+            # Filters still come back; only the open source does not.
+            assert second.state.query == "hello"
+            assert second.state.severity == "warn"
+
+    asyncio.run(scenario())
+
+
+def test_the_open_source_path_is_never_written_to_disk(tmp_path: Path) -> None:
+    """Storing it would record where someone had been reading, unused."""
+
+    import json
+
+    from clv.storage import SessionState, StateStore
+
+    store = StateStore(root=tmp_path)
+    store.save(SessionState(query="x"))
+
+    payload = json.loads(store.path.read_text(encoding="utf-8"))
+
+    assert "selected_source" not in payload
+    assert not hasattr(SessionState(), "selected_source")

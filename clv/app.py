@@ -310,10 +310,10 @@ class LogViewerApp(App[None]):
 
         self._source_manager = SourceManager(*self._split_roots(self._config.log_dirs))
         self._apply_state_to_widgets()
+        # Deliberately no source is opened here: the viewer starts on the
+        # discovery summary so a launch always begins from a known state
+        # rather than silently resuming and tailing whatever was open last.
         await self._rescan()
-
-        if self.state.selected_source:
-            self._select_source(Path(self.state.selected_source), announce=False)
 
         self._refresh_chips()
         self._update_status()
@@ -518,7 +518,6 @@ class LogViewerApp(App[None]):
         if not resolved.is_file():
             if announce:
                 self._notify(f"{resolved} is not a readable file.", "error")
-            self._update_state(selected_source="")
             return False
 
         self._stop_tail()
@@ -537,7 +536,6 @@ class LogViewerApp(App[None]):
         self._entries.extend(self._parser.feed(initial.lines))
         self._show_lines = min(self._config.default_show_lines, self._config.max_buffer_lines)
 
-        self._update_state(selected_source=str(resolved))
         self._sync_regex_validation()
         self._render_log(scroll_end=True)
         self._start_tail()
