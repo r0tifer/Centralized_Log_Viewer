@@ -76,6 +76,10 @@ STRUCTURED_PAYLOAD_MAX_CHARS = 8_192
 #: Terminal widths at which the layout changes shape.
 BREAKPOINT_COMPACT = 90
 BREAKPOINT_NARROW = 130
+#: Width at which the time presets, toggles and action buttons fit on a single
+#: line together. Measured against their natural widths (48 + 21 + 55 columns
+#: plus padding), not guessed, and asserted in tests/test_query_bar.py.
+BREAKPOINT_MERGE = 136
 
 SOURCES_PANEL_MIN_WIDTH = 20
 SOURCES_PANEL_MAX_WIDTH = 120
@@ -230,6 +234,11 @@ class LogViewerApp(App[None]):
         Binding("t", "cycle_time", "Time", show=True),
         Binding("s", "cycle_severity", "Severity", show=True),
         Binding("f", "toggle_advanced", "Advanced", show=True),
+        # The auto-scroll and structured switches are only shown when the query
+        # bar merges its rows, so they need a keyboard path that does not
+        # depend on terminal width.
+        Binding("w", "toggle_auto_scroll", "Follow", show=True),
+        Binding("o", "toggle_structured", "Structured", show=False),
         Binding("ctrl+b", "toggle_pane", "Switch pane", show=True),
         Binding("[", "shrink_sources_panel", "Narrower", show=False),
         Binding("]", "expand_sources_panel", "Wider", show=False),
@@ -263,6 +272,7 @@ class LogViewerApp(App[None]):
         self._sources_panel_width = self._config.tree_width
         self._copy_mode = False
         self._breakpoint = ""
+        self._merged = False
         self._plugins: PluginRegistry = PluginRegistry()
 
         self.query_bar = QueryBar()
@@ -351,6 +361,12 @@ class LogViewerApp(App[None]):
             use_regex=self.state.use_regex,
             invert_match=self.state.invert_match,
         )
+        # Seed the drawer's mirrored view switches from the restored session,
+        # so they are correct the first time the drawer is opened.
+        self.advanced_drawer.sync_view_toggles(
+            auto_scroll=self.state.auto_scroll,
+            structured=self.state.pretty_rendering,
+        )
 
     # --- responsiveness -----------------------------------------------------
 
@@ -371,7 +387,12 @@ class LogViewerApp(App[None]):
             breakpoint_name = "-narrow"
         else:
             breakpoint_name = "-wide"
-        if breakpoint_name == self._breakpoint:
+
+        # Merging the time presets, toggles and actions onto one line needs
+        # more room than "-wide" guarantees, so it gets its own threshold
+        # rather than riding along with the size class.
+        merged = width >= BREAKPOINT_MERGE
+        if breakpoint_name == self._breakpoint and merged == self._merged:
             return
 
         targets = [self, self.query_bar, self.advanced_drawer]
@@ -379,7 +400,13 @@ class LogViewerApp(App[None]):
             active = name == breakpoint_name
             for target in targets:
                 target.set_class(active, name)
+        # The drawer needs it too: it shows the mirrored view toggles only when
+        # the query bar is not showing its own.
+        self.query_bar.set_class(merged, "-merged")
+        self.advanced_drawer.set_class(merged, "-merged")
+
         self._breakpoint = breakpoint_name
+        self._merged = merged
         self._apply_panel_width()
         self._sync_compact_pane()
 
@@ -846,6 +873,22 @@ class LogViewerApp(App[None]):
     def action_cycle_severity(self) -> None:
         self.query_bar.cycle_severity()
 
+    def action_toggle_auto_scroll(self) -> None:
+        """Flip auto-scroll from the keyboard."""
+        self._set_auto_scroll(not self.state.auto_scroll)
+        self._notify(
+            "Following new lines." if self.state.auto_scroll else "Auto-scroll paused."
+        )
+
+    def action_toggle_structured(self) -> None:
+        """Flip structured rendering of JSON/XML/CSV payloads."""
+        self._set_structured(not self.state.pretty_rendering)
+        self._notify(
+            "Structured output on."
+            if self.state.pretty_rendering
+            else "Structured output off."
+        )
+
     def action_toggle_advanced(self) -> None:
         self.advanced_drawer.toggle()
         self._refresh_plugin_status()
@@ -1061,15 +1104,59 @@ class LogViewerApp(App[None]):
         self._render_log()
 
     def on_switch_changed(self, event: Switch.Changed) -> None:
+        # Only the query bar's switches reach here; the drawer stops its own
+        # and reports them as ViewToggleChanged.
         if event.switch.id == "auto-scroll-toggle":
-            self._update_state(auto_scroll=event.value)
-            self.log_panel.auto_scroll = event.value
-            if event.value:
-                self.log_panel.scroll_end(animate=False)
-            self._update_status()
+            self._set_auto_scroll(event.value)
         elif event.switch.id == "pretty-structured-toggle":
-            self._update_state(pretty_rendering=event.value)
-            self._render_log()
+            self._set_structured(event.value)
+
+    def on_advanced_filters_drawer_view_toggle_changed(
+        self, message: AdvancedFiltersDrawer.ViewToggleChanged
+    ) -> None:
+        if message.field == "auto_scroll":
+            self._set_auto_scroll(message.value)
+        else:
+            self._set_structured(message.value)
+
+    # --- view state -----------------------------------------------------------
+    #
+    # Auto-scroll and structured output each have two controls: one in the query
+    # bar and a mirror in the Advanced drawer, exactly one of which is visible
+    # at a time. Both funnel through here so the state has a single owner and
+    # the two copies cannot drift apart.
+
+    def _set_auto_scroll(self, value: bool) -> None:
+        self._update_state(auto_scroll=value)
+        self.log_panel.auto_scroll = value
+        if value:
+            self.log_panel.scroll_end(animate=False)
+        self._sync_view_toggles()
+        self._update_status()
+
+    def _set_structured(self, value: bool) -> None:
+        self._update_state(pretty_rendering=value)
+        self._sync_view_toggles()
+        self._render_log()
+
+    def _sync_view_toggles(self) -> None:
+        """Push the canonical view state onto both sets of controls."""
+
+        if self._is_shutting_down or not self.is_mounted:
+            return
+        try:
+            # prevent(), not a flag: Switch.Changed is posted asynchronously,
+            # so a flag would already be cleared when the handler ran and the
+            # echo would come back as a fresh user action.
+            with self.prevent(Switch.Changed):
+                self.query_bar.set_auto_scroll(self.state.auto_scroll)
+                self.query_bar.set_pretty_rendering(self.state.pretty_rendering)
+        except NoMatches:
+            pass
+        self.advanced_drawer.sync_view_toggles(
+            auto_scroll=self.state.auto_scroll,
+            structured=self.state.pretty_rendering,
+        )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:  # type: ignore[override]
         if (event.button.id or "") == "toggle-advanced":

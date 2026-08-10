@@ -234,6 +234,93 @@ def test_hit_counter_aligns_with_the_input_text() -> None:
     _run(scenario)
 
 
+def test_time_toggles_and_actions_merge_onto_one_row_when_wide() -> None:
+    """Presets left, toggles centred, actions right — all on a single line."""
+
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(190, 30)) as pilot:
+            await pilot.pause()
+            bar = app.query_bar
+            bar.set_class(True, "-merged")
+            await pilot.pause()
+
+            # Compare the three containers, not their inner controls: a
+            # LabeledField's own region starts at its label row, one line above
+            # the control inside it.
+            presets = bar.query_one("#time-field").region
+            toggles = bar.query_one("#toggles").region
+            actions = bar.query_one("#actions").region
+
+            # One row: same vertical band.
+            assert presets.y == toggles.y == actions.y
+
+            # Left / middle / right ordering with real gaps between them.
+            assert presets.right < toggles.x
+            assert toggles.right < actions.x
+
+            # The toggles sit between the two, not hard against either side.
+            left_gap = toggles.x - presets.right
+            right_gap = actions.x - toggles.right
+            assert left_gap > 4 and right_gap > 4
+
+    _run(scenario)
+
+
+def test_merged_row_aligns_presets_switches_and_buttons() -> None:
+    """The action buttons have no label row, so they need the offset."""
+
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(190, 30)) as pilot:
+            await pilot.pause()
+            bar = app.query_bar
+            bar.set_class(True, "-merged")
+            await pilot.pause()
+
+            preset = bar.time_segmented._segments["all"].region
+            switch = bar.query_one("#auto-scroll-toggle").region
+            button = bar.query_one("#run-query", Button).region
+
+            assert preset.y == switch.y == button.y
+
+    _run(scenario)
+
+
+def test_unmerged_layout_stacks_and_hides_the_toggles() -> None:
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            bar = app.query_bar
+            bar.set_class(False, "-merged")
+            await pilot.pause()
+
+            presets = bar.time_segmented.region
+            actions = bar.query_one("#actions").region
+
+            assert not bar.query_one("#toggles").display
+            assert actions.y > presets.y, "actions should stack below the presets"
+
+    _run(scenario)
+
+
+def test_merging_saves_vertical_space() -> None:
+    async def scenario() -> None:
+        heights = {}
+        for merged in (False, True):
+            app = _Harness()
+            async with app.run_test(size=(190, 30)) as pilot:
+                await pilot.pause()
+                app.query_bar.set_class(merged, "-merged")
+                await pilot.pause()
+                heights[merged] = app.query_bar.region.height
+
+        assert heights[True] < heights[False]
+
+    _run(scenario)
+
+
 def test_every_control_stays_on_screen_at_eighty_columns() -> None:
     """The regression that hid Run/Clear/Save on anything under ~200 columns."""
 
@@ -249,5 +336,88 @@ def test_every_control_stays_on_screen_at_eighty_columns() -> None:
                 region = button.region
                 assert region.width > 0, f"{button_id} has no width"
                 assert region.right <= 80, f"{button_id} extends past the right edge"
+
+    _run(scenario)
+
+
+# --- app-level: the merge breakpoint and the keyboard fallbacks -------------
+
+
+def test_merge_breakpoint_matches_what_the_row_actually_needs() -> None:
+    """BREAKPOINT_MERGE is a measured minimum, not a guess.
+
+    One column below it the merged row would overflow, so the layout must
+    still be stacked; at the breakpoint everything fits on one line.
+    """
+
+    async def scenario() -> None:
+        from clv.app import BREAKPOINT_MERGE, LogViewerApp
+
+        for width, expect_merged in ((BREAKPOINT_MERGE - 1, False), (BREAKPOINT_MERGE, True)):
+            app = LogViewerApp()
+            async with app.run_test(size=(width, 32)) as pilot:
+                await pilot.pause()
+                await pilot.pause()
+                bar = app.query_bar
+                assert bar.has_class("-merged") is expect_merged, width
+
+                presets = bar.query_one("#time-field").region
+                actions = bar.query_one("#actions").region
+                on_one_row = presets.y == actions.y
+                assert on_one_row is expect_merged, width
+
+                # Whatever the layout, nothing may leave the screen.
+                for button_id in (
+                    "toggle-advanced",
+                    "add-source",
+                    "run-query",
+                    "clear-query",
+                    "save-session",
+                ):
+                    region = bar.query_one(f"#{button_id}", Button).region
+                    assert region.width > 0 and region.right <= width, (button_id, width)
+
+    _run(scenario)
+
+
+def test_hidden_switches_remain_reachable_from_the_keyboard() -> None:
+    """The switches are only rendered in the merged layout.
+
+    Before these bindings existed they were unreachable below the merge width:
+    absent from the Advanced drawer and bound to no key, so auto-scroll and
+    structured output simply could not be changed on a narrow terminal.
+
+    Focus is moved off the query input first: single-letter bindings are
+    swallowed by a focused Input, which is true of the existing a/t/s/f
+    bindings too.
+    """
+
+    async def scenario() -> None:
+        from clv.app import LogViewerApp
+
+        app = LogViewerApp()
+        async with app.run_test(size=(80, 32)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            assert not app.query_bar.query_one("#toggles").display
+
+            app.set_focus(app.log_panel)
+            await pilot.pause()
+
+            auto_before = app.state.auto_scroll
+            pretty_before = app.state.pretty_rendering
+
+            await pilot.press("w")
+            await pilot.pause()
+            assert app.state.auto_scroll is not auto_before
+
+            await pilot.press("o")
+            await pilot.pause()
+            assert app.state.pretty_rendering is not pretty_before
+
+            # And back again.
+            await pilot.press("w")
+            await pilot.pause()
+            assert app.state.auto_scroll is auto_before
 
     _run(scenario)

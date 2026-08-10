@@ -71,10 +71,13 @@ class AdvancedFiltersDrawer(Static):
 
     AdvancedFiltersDrawer.-hidden { display: none; }
 
+    /* height must cover the padding as well as the text: `height: 1` with
+       `padding-bottom: 1` left zero rows for content, so every section
+       heading in this drawer laid out correctly but painted nothing. */
     AdvancedFiltersDrawer .drawer-heading {
         text-style: bold;
         color: $text-muted;
-        height: 1;
+        height: auto;
         padding-bottom: 1;
     }
 
@@ -134,6 +137,16 @@ class AdvancedFiltersDrawer(Static):
         padding: 0 1;
     }
 
+    AdvancedFiltersDrawer #view-toggles {
+        height: auto;
+        width: 1fr;
+    }
+
+    /* When the query bar is wide enough to show its own auto-scroll and
+       structured switches, this mirror is redundant and would be a second
+       place to change the same setting. */
+    AdvancedFiltersDrawer.-merged #view-toggles { display: none; }
+
     /* Stack the rows when there isn't width to share. The breakpoint class is
        mirrored onto this widget by the app, because DEFAULT_CSS is scoped and
        cannot reach the app node. */
@@ -151,11 +164,29 @@ class AdvancedFiltersDrawer(Static):
         super().__init__(id="advanced-drawer")
         self._settings = settings or AdvancedSettings()
         self._visible = False
+        # View state is owned by the app (it lives in SessionState); the drawer
+        # only mirrors it. Held here so compose() can seed the switches.
+        self._auto_scroll = True
+        self._structured = False
         self.add_class("-hidden")
 
     # --- composition --------------------------------------------------------
 
     def compose(self) -> ComposeResult:
+        # Mirrors the query bar's auto-scroll / structured switches, which are
+        # only rendered when that bar is wide enough to merge its rows. This
+        # section is hidden in that case, so exactly one copy is ever visible.
+        with Container(id="view-toggles"):
+            yield Label("View", classes="drawer-heading")
+            with Horizontal(classes="drawer-row"):
+                with Vertical(classes="drawer-toggle"):
+                    yield Label("Auto-scroll")
+                    yield Switch(value=self._auto_scroll, id="drawer-auto-scroll")
+                with Vertical(classes="drawer-toggle"):
+                    yield Label("Structured")
+                    yield Switch(value=self._structured, id="drawer-structured")
+                yield Static("", classes="drawer-field")
+
         yield Label("Source discovery", classes="drawer-heading")
         with Horizontal(classes="drawer-row"):
             with Vertical(classes="drawer-field"):
@@ -222,18 +253,49 @@ class AdvancedFiltersDrawer(Static):
     def _emit(self, previous: AdvancedSettings) -> None:
         self.post_message(self.SettingsChanged(self._settings, previous))
 
+    def sync_view_toggles(self, *, auto_scroll: bool, structured: bool) -> None:
+        """Mirror the app's view state onto this drawer's switches.
+
+        Does not emit: the app is the owner, and echoing back would bounce
+        between the two copies of these controls. Suppression uses ``prevent``
+        rather than a flag because Switch.Changed is posted asynchronously --
+        a flag cleared at the end of this method is already back to False by
+        the time the handler runs.
+        """
+
+        self._auto_scroll = auto_scroll
+        self._structured = structured
+        try:
+            with self.prevent(Switch.Changed):
+                self.query_one("#drawer-auto-scroll", Switch).value = auto_scroll
+                self.query_one("#drawer-structured", Switch).value = structured
+        except NoMatches:  # not composed yet
+            pass
+
     def on_switch_changed(self, event: Switch.Changed) -> None:
+        switch_id = event.switch.id or ""
+
+        # Switches inside the drawer are ours; stop the event either way so the
+        # app's global handler does not also try to interpret it.
+        view_field = {
+            "drawer-auto-scroll": "auto_scroll",
+            "drawer-structured": "structured",
+        }.get(switch_id)
+        if view_field is not None:
+            event.stop()
+            setattr(self, f"_{view_field}", event.value)
+            self.post_message(self.ViewToggleChanged(view_field, event.value))
+            return
+
         field = {
             "follow-symlinks": "follow_symlinks",
             "skip-binary": "skip_binary",
             "case-sensitive": "case_sensitive",
             "use-regex": "use_regex",
             "invert-match": "invert_match",
-        }.get(event.switch.id or "")
+        }.get(switch_id)
         if field is None:
             return
-        # Switches inside the drawer are ours; stop the event so the app's
-        # global handler doesn't also try to interpret it.
         event.stop()
         previous = self._settings
         self._settings = replace(self._settings, **{field: event.value})
@@ -300,6 +362,18 @@ class AdvancedFiltersDrawer(Static):
         @property
         def needs_rescan(self) -> bool:
             return self.settings.affects_discovery(self.previous)
+
+    class ViewToggleChanged(Message):
+        """Auto-scroll or structured output was flipped from inside the drawer.
+
+        Separate from SettingsChanged because these are view state owned by the
+        app, not discovery or search settings, and they never trigger a rescan.
+        """
+
+        def __init__(self, field: str, value: bool) -> None:
+            super().__init__()
+            self.field = field
+            self.value = value
 
     class RescanRequested(Message):
         """The user asked to re-run discovery now."""

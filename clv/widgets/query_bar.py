@@ -151,31 +151,46 @@ class QueryBar(Container):
 
     QueryBar #match-count.-invalid { color: $error; }
 
-    /* --- time + toggles row --- */
+    /* --- time / toggles / actions ---
+       Stacked by default and merged onto one line only when the terminal is
+       wide enough (the `-merged` class). Progressive enhancement rather than
+       the reverse, so the fallback is the layout that always fits. */
 
-    /* Absorbs the slack on its row so the toggles stay pinned right, while the
-       presets inside it hug their labels. */
+    QueryBar #time-row {
+        layout: vertical;
+        height: auto;
+    }
+
     QueryBar #time-field { width: 1fr; }
     QueryBar #time-field .field-control { width: auto; }
 
+    /* Only meaningful on one line; as a vertical child it would claim a row. */
+    QueryBar .qb-spacer { display: none; }
+
+    /* Shown only in the merged layout. Stacked, they would claim a whole row
+       for two switches; they stay reachable from the keyboard either way
+       (see the toggle_auto_scroll / toggle_structured bindings). */
     QueryBar #toggles {
         layout: horizontal;
         width: auto;
         height: auto;
-        align: right top;
+        align: center top;
+        display: none;
     }
+
+    QueryBar.-merged #toggles { display: block; }
 
     QueryBar #toggles > LabeledField {
         width: auto;
         min-width: 10;
+        margin-right: 3;
     }
+
+    QueryBar #toggles > LabeledField:last-child { margin-right: 0; }
 
     QueryBar #toggles .field-control { width: auto; }
 
     QueryBar Switch { height: 3; }
-
-    /* --- actions row: on its own line, so nothing competes with the presets
-       for horizontal space. This is what keeps the buttons on screen. --- */
 
     QueryBar #actions {
         layout: horizontal;
@@ -200,10 +215,25 @@ class QueryBar(Container):
        DEFAULT_CSS is scoped to this widget, so these key off a class the app
        mirrors onto the QueryBar itself rather than off the app node. --- */
 
-    /* Narrow: toggles move into the Advanced drawer, freeing a whole row. */
-    QueryBar.-narrow #toggles,
-    QueryBar.-compact #toggles {
-        display: none;
+    /* Merged: presets hug left, actions hug right, and the two flexible
+       spacers push the toggles into the middle. Applied only above the merge
+       width, because all three together need more room than -wide guarantees. */
+    QueryBar.-merged #time-row { layout: horizontal; }
+
+    QueryBar.-merged .qb-spacer {
+        display: block;
+        width: 1fr;
+        min-width: 0;
+        height: 1;
+    }
+
+    QueryBar.-merged #time-field { width: auto; }
+
+    /* Sharing the row with LabeledFields, whose label occupies the first line,
+       so the buttons need that line too or they ride one row high. */
+    QueryBar.-merged #actions {
+        width: auto;
+        padding-top: 1;
     }
 
     /* Compact: query and severity stack so neither is squeezed to nothing,
@@ -253,8 +283,14 @@ class QueryBar(Container):
             yield Static("", id="match-count")
             yield LabeledField("Severity", self.severity_segmented, id="severity-field")
 
+        # Time presets, toggles and actions share one row when there is width
+        # for it: presets left, toggles centred between the flexible spacers,
+        # actions right. Below the merge breakpoint the row switches to a
+        # vertical layout and they stack, which is how they used to be laid
+        # out permanently.
         with Horizontal(id="time-row", classes="qb-row"):
             yield LabeledField("Time", self.time_segmented, id="time-field")
+            yield Static("", classes="qb-spacer")
             with Container(id="toggles"):
                 yield LabeledField(
                     "Auto-scroll",
@@ -266,13 +302,13 @@ class QueryBar(Container):
                     Switch(value=False, id="pretty-structured-toggle"),
                     id="pretty-field",
                 )
-
-        with Horizontal(id="actions"):
-            yield Button("Advanced", id="toggle-advanced", variant="warning")
-            yield Button("Add Source", id="add-source", variant="success")
-            yield Button("Run", id="run-query", variant="primary")
-            yield Button("Clear", id="clear-query", variant="error")
-            yield Button("Save", id="save-session", variant="success")
+            yield Static("", classes="qb-spacer")
+            with Container(id="actions"):
+                yield Button("Advanced", id="toggle-advanced", variant="warning")
+                yield Button("Add Source", id="add-source", variant="success")
+                yield Button("Run", id="run-query", variant="primary")
+                yield Button("Clear", id="clear-query", variant="error")
+                yield Button("Save", id="save-session", variant="success")
 
     # --- query --------------------------------------------------------------
 

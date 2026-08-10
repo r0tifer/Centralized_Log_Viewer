@@ -113,7 +113,21 @@ config.load_config ─→ SourceManager ─→ discovery.discover (thread)
 | `SegmentedButtons` | `ValueChanged` / `Reselected` | Segment activated / re-activated |
 | `FilterChip` | `Dismissed` | Revert the named filter |
 | `AdvancedFiltersDrawer` | `SettingsChanged` | Full before/after snapshot; `needs_rescan` says whether discovery must re-run |
+| `AdvancedFiltersDrawer` | `ViewToggleChanged` | Auto-scroll / structured flipped from the drawer's mirrored controls |
 | `AdvancedFiltersDrawer` | `RescanRequested` / `Closed` | Explicit rescan / dismissal |
+
+### Controls with two homes
+
+Auto-scroll and structured output appear in the query bar when it is wide
+enough to merge its rows, and in the Advanced drawer's **View** section when it
+is not — exactly one copy is ever visible. The app owns the state; both
+controls funnel through `_set_auto_scroll` / `_set_structured`, and
+`_sync_view_toggles` pushes the result back to both.
+
+Mirroring uses `prevent(Switch.Changed)`, **not** a boolean guard. Textual posts
+`Switch.Changed` asynchronously, so a flag cleared at the end of the sync method
+is already back to `False` by the time the handler runs, and the echo arrives
+looking like a fresh user action.
 
 Cross-module communication goes through messages or public methods — never
 shared globals or reaching into another widget's tree.
