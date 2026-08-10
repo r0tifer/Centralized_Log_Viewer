@@ -208,3 +208,133 @@ def test_prompt_add_source_failure_without_messages_shows_fallback(monkeypatch) 
             assert severity == "error"
 
     asyncio.run(scenario())
+
+
+# --- tree expansion state --------------------------------------------------
+
+
+def _nested_tree(tmp_path: Path) -> Path:
+    """A root with nested folders, each holding a log."""
+    root = tmp_path / "logs"
+    for relative in ("", "alpha", "alpha/deep", "alpha/deep/deeper", "beta"):
+        directory = root / relative if relative else root
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "a.log").write_text("2026-08-07 09:00:00 - INFO - x\n", encoding="utf-8")
+    return root
+
+
+def test_tree_starts_fully_collapsed(tmp_path: Path) -> None:
+    """Expanding everything up front buries the roots under the hierarchy."""
+
+    root = _nested_tree(tmp_path)
+
+    async def scenario() -> None:
+        from clv.services import SourceManager
+
+        app = LogViewerApp()
+        async with app.run_test(size=(120, 30)) as pilot:
+            app._source_manager = SourceManager([root], [])
+            await app._rescan()
+            await pilot.pause()
+
+            tree = app.query_one("#source-tree", LogTree)
+            folders = [n for n in _walk(tree.root) if n is not tree.root and n.allow_expand]
+
+            assert folders, "expected folder nodes in the fixture"
+            assert not any(node.is_expanded for node in folders)
+            # Only the configured root is on screen.
+            assert tree.last_line + 1 == 1
+
+    asyncio.run(scenario())
+
+
+def test_folders_still_expand_on_demand(tmp_path: Path) -> None:
+    root = _nested_tree(tmp_path)
+
+    async def scenario() -> None:
+        from clv.services import SourceManager
+
+        app = LogViewerApp()
+        async with app.run_test(size=(120, 30)) as pilot:
+            app._source_manager = SourceManager([root], [])
+            await app._rescan()
+            await pilot.pause()
+
+            tree = app.query_one("#source-tree", LogTree)
+            tree.focus()
+            tree.cursor_line = 0
+
+            await pilot.press("enter")
+            await pilot.pause()
+            expanded_rows = tree.last_line + 1
+            assert expanded_rows > 1
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert tree.last_line + 1 == 1
+
+    asyncio.run(scenario())
+
+
+def test_revealing_a_source_expands_only_its_own_path(tmp_path: Path) -> None:
+    """Regression: expand() invalidates the tree's line list.
+
+    Selecting in the same frame read a stale line for the target and parked the
+    cursor on the root instead. It only became visible once folders stopped
+    being expanded when the tree was built.
+    """
+
+    root = _nested_tree(tmp_path)
+    deep = root / "alpha" / "deep" / "deeper" / "a.log"
+
+    async def scenario() -> None:
+        from clv.services import SourceManager
+
+        app = LogViewerApp()
+        async with app.run_test(size=(120, 30)) as pilot:
+            app._source_manager = SourceManager([root], [])
+            await app._rescan()
+            await pilot.pause()
+
+            app._highlight_source(deep)
+            await pilot.pause()
+            await pilot.pause()
+
+            tree = app.query_one("#source-tree", LogTree)
+            cursor = tree.cursor_node
+            assert cursor is not None and isinstance(cursor.data, Path)
+            assert cursor.data.resolve() == deep.resolve(), "cursor did not land on the target"
+
+            # Siblings outside the revealed path stay shut.
+            beta = next(
+                node
+                for node in _walk(tree.root)
+                if isinstance(node.data, Path) and node.data.name == "beta"
+            )
+            assert not beta.is_expanded
+
+    asyncio.run(scenario())
+
+
+def test_rescan_returns_to_a_collapsed_tree(tmp_path: Path) -> None:
+    root = _nested_tree(tmp_path)
+
+    async def scenario() -> None:
+        from clv.services import SourceManager
+
+        app = LogViewerApp()
+        async with app.run_test(size=(120, 30)) as pilot:
+            app._source_manager = SourceManager([root], [])
+            await app._rescan()
+            await pilot.pause()
+
+            app._highlight_source(root / "alpha" / "a.log")
+            await pilot.pause()
+            await pilot.pause()
+            assert app.query_one("#source-tree", LogTree).last_line + 1 > 1
+
+            await app._rescan()
+            await pilot.pause()
+            assert app.query_one("#source-tree", LogTree).last_line + 1 == 1
+
+    asyncio.run(scenario())

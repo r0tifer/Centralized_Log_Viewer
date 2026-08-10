@@ -461,7 +461,11 @@ class LogViewerApp(App[None]):
                 tree.root.add_leaf(f"{ICON_FILE} {root}", data=root)
                 continue
 
-            root_node = tree.root.add(f"{ICON_FOLDER} {root}", data=root, expand=True)
+            # Every folder starts collapsed. Expanding the whole hierarchy up
+            # front buries the configured roots under hundreds of rows on a
+            # tree of any size; the operator opens the branch they want.
+            # _highlight_source still expands ancestors on demand.
+            root_node = tree.root.add(f"{ICON_FOLDER} {root}", data=root, expand=False)
             folders: dict[Path, TreeNode[Path]] = {root: root_node}
             for item in items:
                 parent = root_node
@@ -470,7 +474,7 @@ class LogViewerApp(App[None]):
                     current = current / part
                     if current not in folders:
                         folders[current] = parent.add(
-                            f"{ICON_FOLDER} {part}", data=current, expand=True
+                            f"{ICON_FOLDER} {part}", data=current, expand=False
                         )
                     parent = folders[current]
                 parent.add_leaf(f"{ICON_FILE} {item.path.name}", data=item.path)
@@ -486,12 +490,26 @@ class LogViewerApp(App[None]):
         node = _find_node(tree.root, target)
         if node is None:
             return
+
+        # Expand outermost-first: expanding an inner node while its own parent
+        # is still collapsed leaves it off the rendered line list.
+        ancestors: list[TreeNode[Path]] = []
         parent = node.parent
         while parent is not None:
-            parent.expand()
+            ancestors.append(parent)
             parent = parent.parent
-        tree.select_node(node)
-        tree.scroll_to_node(node)
+        for ancestor in reversed(ancestors):
+            ancestor.expand()
+
+        # Selecting has to wait for the tree to rebuild its line list, which
+        # expand() has just invalidated. Selecting immediately reads a stale
+        # line for the target and silently parks the cursor on the root -- only
+        # visible once folders stopped being expanded up front.
+        def _select() -> None:
+            tree.select_node(node)
+            tree.scroll_to_node(node)
+
+        self.call_after_refresh(_select)
 
     # --- source selection and tailing --------------------------------------
 
