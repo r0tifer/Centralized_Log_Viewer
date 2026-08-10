@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 
 from textual.app import App, ComposeResult
-from textual.widgets import Button
+from textual.widgets import Button, Input
 
 from clv.widgets.query_bar import QueryBar
 
@@ -171,6 +171,65 @@ def test_action_buttons_emit_their_ids() -> None:
                 await pilot.pause()
 
             assert app.actions == ["add-source", "run-query", "clear-query", "save-session"]
+
+    _run(scenario)
+
+
+def test_query_input_absorbs_the_free_space() -> None:
+    """The sized controls take what they need; the input gets the remainder."""
+
+    async def scenario() -> None:
+        widths = {}
+        severities = {}
+        for terminal in (100, 140, 200):
+            app = _Harness()
+            async with app.run_test(size=(terminal, 24)) as pilot:
+                await pilot.pause()
+                widths[terminal] = app.query_bar.query_one("#query-input", Input).region.width
+                severities[terminal] = app.query_bar.query_one("#severity-field").region.width
+
+        # The input grows roughly one-for-one with the terminal...
+        assert widths[140] - widths[100] == 40
+        assert widths[200] - widths[140] == 60
+        # ...while severity keeps hugging its segments.
+        assert len(set(severities.values())) == 1
+
+    _run(scenario)
+
+
+def test_breathing_room_between_the_input_and_the_severity_pills() -> None:
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(140, 24)) as pilot:
+            await pilot.pause()
+            query_input = app.query_bar.query_one("#query-input", Input).region
+            first_pill = app.query_bar.severity_segmented._segments["all"].region
+
+            gap = first_pill.x - query_input.right
+            assert gap >= 2, "pills are butted against the input"
+            # The counter lives in that space, so it is not simply padding.
+            counter = app.query_bar.query_one("#match-count").region
+            assert query_input.right <= counter.x < first_pill.x
+
+    _run(scenario)
+
+
+def test_hit_counter_aligns_with_the_input_text() -> None:
+    """The counter is a bare Static in the row, so it needs its own offset."""
+
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(140, 24)) as pilot:
+            await pilot.pause()
+            app.query_bar.set_query_value("error")
+            app.query_bar.validate_regex(["an error", "ERROR too", "clean"])
+            await pilot.pause()
+
+            assert app.query_bar.regex_status.matches == 2  # smart case
+            counter = app.query_bar.query_one("#match-count")
+            query_input = app.query_bar.query_one("#query-input", Input)
+            # Same text row as the input's content, not its top border.
+            assert counter.content_region.y == query_input.content_region.y
 
     _run(scenario)
 
