@@ -12,77 +12,83 @@ class SegmentedButtons(Static):
     """Simple segmented button group built from toggle buttons."""
 
     DEFAULT_CSS = """
-    /* Horizontal pill group that clearly reads as clickable */
+    /* Horizontal pill group.
+       No border or background of its own: a `border: round` on a height-3 group
+       leaves a single interior row, which clipped each segment's fill down to
+       its middle line. Dropping it lets the segments render as full-height
+       blocks (matching the action buttons) and returns two columns of width. */
     SegmentedButtons {
         layout: horizontal;
-        background: $surface 6%;
-        border: round $surface 18%;
-        padding: 0 1;
+        background: transparent;
+        border: none;
+        padding: 0;
         height: 3;
-        width: 1fr;
+        width: auto;
         overflow: hidden;
     }
 
-    /* Segments share the group's width equally, so the control shrinks with
-       the terminal instead of overflowing it. min-width keeps short labels
-       legible; long labels truncate rather than pushing siblings off-screen. */
+    /* Segments size to their label so the fill marks the clickable area only,
+       rather than stretching across the whole row.
+
+       The fill is $panel-lighten-1 rather than a $surface tint: $surface is
+       #1E1E1E against a #121212 background, so `$surface 14%` blended to
+       #131313 -- one step off invisible. This is a cool slate that reads
+       clearly and complements the warm accent used for the active segment. */
     SegmentedButtons > .segment {
         border: none;
-        background: $surface 14%;
+        background: $panel-lighten-1;
         color: $text;
         text-style: bold;           /* base: bold text */
-        padding: 0 1;
+        content-align: center middle;
+        padding: 0 2;
         height: 3;                  /* fixed height so underline doesn't shift layout */
-        min-width: 4;
-        width: 1fr;
+        min-width: 5;
+        width: auto;
         margin-right: 1;
         outline: none;              /* avoid thick focus outlines that could clip text */
-        /* Reserve space for the focus/hover/active underline so size never changes */
-        border-bottom: tall transparent;
     }
 
     SegmentedButtons > .segment:last-child {
         margin-right: 0;
     }
 
-    /* Hover: subtle emphasis; still no layout shift */
+    /* Hover: one step brighter than the resting fill; no layout shift */
     SegmentedButtons > .segment.-hover {
-        background: $surface 18%;
+        background: $panel-lighten-2;
         color: $text;
         text-style: bold underline;
     }
 
-    /* Keyboard focus: high-visibility yellow bar + underline (no resize) */
+    /* Keyboard focus: same lift as hover, marked by an underline.
+       States are carried by fill and text-style rather than by a border,
+       because a border on a fixed height-3 widget consumes an interior row
+       and pushes the label off centre. */
     SegmentedButtons > .segment:focus {
-        background: $surface 20%;
+        background: $panel-lighten-2;
         color: $text;
         text-style: bold underline;
-        border-bottom: tall $warning 70%;  /* bright yellow focus indicator */
     }
 
-    /* active segment stays legible and suppresses extra outlines */
+    /* Active: solid warm accent against the cool resting fill, so the
+       selection is distinguishable by hue as well as by brightness. */
     SegmentedButtons > .segment.-active {
-        background: $accent 35%;
+        background: $accent 55%;
         color: $text;
-        text-style: bold underline;   /* consistent underline */
-        border-bottom: tall $accent 40%;  /* keep active underline in accent */
+        text-style: bold;
     }
 
-    /* Active + hover: same background, no extra shift */
     SegmentedButtons > .segment.-active.-hover {
-        background: $accent 35%;
+        background: $accent 70%;
         color: $text;
-        text-style: bold underline;
-        border-bottom: tall $accent 40%;
+        text-style: bold;
     }
 
-    /* Active + keyboard focus: keep accent base, show a stronger yellow tip */
+    /* Active + keyboard focus: keep the accent fill and add the underline, so
+       "selected" and "focused" stay separately readable. */
     SegmentedButtons > .segment.-active:focus {
-        background: $accent 35%;
+        background: $accent 70%;
         color: $text;
         text-style: bold underline;
-        /* Slightly stronger yellow over accent to clearly signal keyboard focus */
-        border-bottom: tall $warning 80%;
     }
     """
 
