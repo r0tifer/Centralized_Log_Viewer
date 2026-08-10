@@ -116,8 +116,13 @@ class QueryBar(Container):
 
     /* --- query row --- */
 
-    QueryBar #query-field { width: 2fr; }
-    QueryBar #severity-field { width: 3fr; }
+    /* The query input takes whatever the sized controls don't need. Severity
+       hugs its segments (which size to their labels), so a fixed fr share
+       would strand dead space to the right of the pills. margin-left keeps
+       the pills off the input rather than butted against it. */
+    QueryBar #query-field { width: 1fr; min-width: 20; }
+    QueryBar #severity-field { width: auto; margin-left: 2; }
+    QueryBar #severity-field .field-control { width: auto; }
 
     QueryBar Input {
         border: tall $surface 25%;
@@ -131,11 +136,15 @@ class QueryBar(Container):
         background: $error 10%;
     }
 
+    /* Sits directly in the row rather than inside a LabeledField, so it starts
+       one row higher than its neighbours; the extra top padding drops it onto
+       the input's text row. min-width reserves the counter's space so the row
+       does not jump when a hit count appears. */
     QueryBar #match-count {
         width: auto;
         min-width: 10;
-        height: 3;
-        padding: 1 1 0 1;
+        height: 4;
+        padding: 2 1 0 1;
         color: $text-muted;
         text-align: right;
     }
@@ -144,7 +153,10 @@ class QueryBar(Container):
 
     /* --- time + toggles row --- */
 
-    QueryBar #time-field { width: 3fr; }
+    /* Absorbs the slack on its row so the toggles stay pinned right, while the
+       presets inside it hug their labels. */
+    QueryBar #time-field { width: 1fr; }
+    QueryBar #time-field .field-control { width: auto; }
 
     QueryBar #toggles {
         layout: horizontal;
@@ -201,10 +213,13 @@ class QueryBar(Container):
         height: auto;
     }
 
+    /* Stacked, so neither needs to reserve width for the other and the
+       severity indent would only push the pills off-centre. */
     QueryBar.-compact #query-field,
     QueryBar.-compact #severity-field {
         width: 1fr;
         margin-right: 0;
+        margin-left: 0;
     }
 
     QueryBar.-compact #match-count { display: none; }

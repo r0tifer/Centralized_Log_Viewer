@@ -64,6 +64,24 @@ log()  { printf '%s\n' "$*"; }
 warn() { printf 'Warning: %s\n' "$*" >&2; }
 die()  { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
+# Scratch directory, cleaned up on exit.
+#
+# This is deliberately script-scope rather than a function local: the EXIT trap
+# runs after the function that created it has returned, so a local would be out
+# of scope by then and `set -u` would abort the trap. That left the temp tree
+# behind and made a successful install exit non-zero.
+SCRATCH_DIR=""
+
+cleanup() {
+  [[ -n "${SCRATCH_DIR:-}" && -d "${SCRATCH_DIR}" ]] && rm -rf "${SCRATCH_DIR}"
+  return 0
+}
+trap cleanup EXIT
+
+make_scratch() {
+  SCRATCH_DIR="$(mktemp -d)"
+}
+
 detect_arch() {
   local machine
   machine="$(uname -m)"
@@ -113,19 +131,22 @@ validate_archive() {
 }
 
 verify_signature() {
-  local sums="$1" sig="$2" owner tmpgnupg
+  local sums="$1" sig="$2" owner keyring keys
   owner="${REPO%%/*}"
 
   command -v gpg >/dev/null 2>&1 || return 1
 
-  tmpgnupg="$(mktemp -d)"
-  # shellcheck disable=SC2064  # expand tmpgnupg now, not at trap time
-  trap "rm -rf '$tmpgnupg'" RETURN
-  GNUPGHOME="$tmpgnupg"
-  export GNUPGHOME
+  # A keyring under the scratch dir, so it is removed with everything else and
+  # the caller's GNUPGHOME is never touched. Passing --homedir per invocation
+  # avoids exporting an environment variable that would outlive the directory
+  # it points at.
+  [[ -n "${SCRATCH_DIR:-}" ]] || return 1
+  keyring="${SCRATCH_DIR}/gnupg"
+  rm -rf "$keyring"
+  mkdir -p "$keyring"
+  chmod 0700 "$keyring"
 
   # Import the owner's public keys as published by GitHub.
-  local keys
   if command -v python3 >/dev/null 2>&1; then
     keys="$(curl -fsSL "https://api.github.com/users/${owner}/gpg_keys" \
       | python3 -c 'import json,sys; print("\n".join(k.get("raw_key") or "" for k in json.load(sys.stdin)))' 2>/dev/null || true)"
@@ -135,15 +156,15 @@ verify_signature() {
       | grep -o '"raw_key": *"[^"]*"' | cut -d'"' -f4 | sed 's/\\n/\n/g' || true)"
   fi
   [[ -n "$keys" ]] || return 1
-  printf '%s\n' "$keys" | gpg --batch --quiet --import 2>/dev/null || return 1
+  printf '%s\n' "$keys" | gpg --homedir "$keyring" --batch --quiet --import 2>/dev/null || return 1
 
   if [[ -n "$GPG_FPR" ]]; then
-    gpg --batch --list-keys --with-colons \
+    gpg --homedir "$keyring" --batch --list-keys --with-colons \
       | grep -qi "$(printf '%s' "$GPG_FPR" | tr -d ' ')" \
       || { warn "Required GPG fingerprint not found among ${owner}'s keys"; return 1; }
   fi
 
-  gpg --batch --verify "$sig" "$sums" >/dev/null 2>&1
+  gpg --homedir "$keyring" --batch --verify "$sig" "$sums" >/dev/null 2>&1
 }
 
 verify_checksum() {
@@ -208,8 +229,8 @@ download_and_install() {
   asset="${APP_NAME}-linux-${arch}.tar.gz"
   base_url="https://github.com/${REPO}/releases/download/${tag}"
 
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
+  make_scratch
+  tmpdir="$SCRATCH_DIR"
 
   log "Installing ${APP_NAME} ${tag} (${arch}) from ${REPO}"
 
