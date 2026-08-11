@@ -39,10 +39,18 @@ from textual.timer import Timer
 from textual.widgets import Button, Footer, Input, Label, RichLog, Static, Switch, Tree
 from textual.widgets._tree import TreeNode
 
-from .plugins import FilterContext, PluginRegistry, load_plugins
+from .plugins import Exporter, FilterContext, PluginError, PluginRegistry, load_plugins
 from .services import SourceManager, persist_log_sources
+from .services.clipboard import prepare_payload
 from .services.config import LogConfig, get_config_file, load_config, user_config_path
 from .services.discovery import DiscoveryReport, discover
+from .services.export import (
+    BUILTIN_FORMATS,
+    builtin_format,
+    default_stem,
+    describe_formats,
+    write_atomically,
+)
 from .services.filtering import (
     FilterSpec,
     QueryError,
@@ -58,6 +66,7 @@ from .storage import SessionState, StateStore
 from .widgets.add_source_dialog import AddSourceDialog
 from .widgets.advanced_drawer import AdvancedFiltersDrawer, AdvancedSettings
 from .widgets.custom_time_dialog import CustomTimeRangeDialog
+from .widgets.export_dialog import ExportChoice, ExportDialog, ExportRequest
 from .widgets.filter_chip import FilterChip, FilterChips
 from .widgets.help_overlay import HelpOverlay, HelpSection
 from .widgets.query_bar import QueryBar
@@ -124,6 +133,8 @@ BINDING_CATEGORIES: dict[str, str] = {
     "toggle_advanced": "Search",
     "toggle_auto_scroll": "View",
     "toggle_structured": "View",
+    "export_view": "View",
+    "copy_view": "View",
     "toggle_pane": "View",
     "shrink_sources_panel": "View",
     "expand_sources_panel": "View",
@@ -327,6 +338,13 @@ class LogViewerApp(App[None]):
         Binding("+", "more_lines", "More lines", show=False),
         Binding("-", "fewer_lines", "Fewer lines", show=False),
         Binding("ctrl+l", "toggle_copy_mode", "Copy mode", show=True),
+        # Hidden, like every binding added after the footer filled up at 80
+        # columns; `?` is how they are found. Note that Textual's Input binds
+        # ctrl+e to end-of-line, so this fires everywhere except inside the
+        # query input — deliberately not `priority`, since stealing a
+        # text-editing key from the input is the worse trade.
+        Binding("ctrl+e", "export_view", "Export view", show=False),
+        Binding("y", "copy_view", "Copy to clipboard", show=False),
         Binding("ctrl+s", "save_session", "Save sources", show=True),
         Binding("ctrl+r", "reload_sources", "Reload", show=True),
         Binding("q", "quit_app", "Quit", show=True),
@@ -400,6 +418,9 @@ class LogViewerApp(App[None]):
 
         self._refresh_chips()
         self._sync_star_button()
+        # Filled at mount rather than only when the drawer opens, so the plugin
+        # and exporter lines are correct the first time it is seen.
+        self._refresh_plugin_status()
         self._update_status()
         self._persist_state = True
 
@@ -450,6 +471,7 @@ class LogViewerApp(App[None]):
         self.advanced_drawer.sync_view_toggles(
             auto_scroll=self.state.auto_scroll,
             structured=self.state.pretty_rendering,
+            clipboard=self.state.clipboard_osc52,
         )
 
     # --- responsiveness -----------------------------------------------------
@@ -1185,6 +1207,57 @@ class LogViewerApp(App[None]):
         self._render_log()
         self._notify(f"Showing up to {self._show_lines} lines.")
 
+    def action_copy_view(self) -> None:
+        """Put the visible lines on the local clipboard via OSC 52.
+
+        The counterpart to `Ctrl+L`, not a replacement for it: copy mode needs a
+        local terminal selection, which is exactly what is unavailable over tmux
+        or SSH, and this path needs a terminal that honours OSC 52. Whichever
+        one an operator's setup supports, one of them works.
+        """
+
+        if self._selected_source is None:
+            self._notify("Open a log before copying.", "warning")
+            return
+        if not self.state.clipboard_osc52:
+            self._notify(
+                "Clipboard copy is off — enable it in the Advanced drawer, "
+                "or use Ctrl+L copy mode.",
+                "warning",
+            )
+            return
+
+        try:
+            result = self._visible_entries(self._entries)
+        except QueryError as exc:
+            self._notify(f"Cannot copy while the query is invalid: {exc}", "error")
+            return
+
+        # The lines on screen, filter and window included — the same slice
+        # _render_log writes. Ctrl+E is the path for the whole filtered set.
+        visible = result.entries[-self._show_lines :]
+        payload = prepare_payload(
+            [entry.raw for entry in visible],
+            max_bytes=self._config.clipboard_max_bytes,
+        )
+        if payload.empty:
+            self._notify(
+                payload.summary
+                if not payload.truncated
+                else "That line is larger than clipboard_max_bytes; nothing copied.",
+                "warning",
+            )
+            return
+
+        try:
+            self.copy_to_clipboard(payload.text)
+        except Exception as exc:  # noqa: BLE001 - terminal-dependent
+            # Guarded so a terminal that rejects the sequence cannot leave a
+            # half-written escape on screen or take the app down with it.
+            self._notify(f"Clipboard copy failed: {exc}", "error")
+            return
+        self._notify(payload.summary, "warning" if payload.truncated else "info")
+
     def action_toggle_copy_mode(self) -> None:
         self._copy_mode = not self._copy_mode
         self.set_class(self._copy_mode, "-copy-mode")
@@ -1196,6 +1269,10 @@ class LogViewerApp(App[None]):
 
     def action_add_source(self) -> None:
         self.run_worker(self._prompt_add_source(), group="dialogs", exit_on_error=False)
+
+    def action_export_view(self) -> None:
+        """Write the entries the filters kept to a file."""
+        self.run_worker(self._prompt_export(), group="dialogs", exit_on_error=False)
 
     def action_save_session(self) -> None:
         new_paths = self._source_manager.added_paths
@@ -1253,6 +1330,109 @@ class LogViewerApp(App[None]):
                 self._highlight_source(addition.path)
         elif addition.path and self._source_manager.contains(addition.path):
             self._highlight_source(addition.path)
+
+    def _exporter_choices(self) -> list[ExportChoice]:
+        """Built-ins first, then whatever the plugin registry supplied.
+
+        Plugin exporters are marked ``needs_path=False``: ``Exporter.export``
+        receives the entries and a :class:`FilterContext` and nothing else, so
+        the destination is theirs to choose and the dialog's path input does not
+        apply to them.
+        """
+
+        choices = [
+            ExportChoice(f"builtin:{fmt.key}", fmt.label, fmt.extension)
+            for fmt in BUILTIN_FORMATS
+        ]
+        choices += [
+            ExportChoice(
+                f"plugin:{index}", f"{_plugin_name(exporter)} (plugin)", needs_path=False
+            )
+            for index, exporter in enumerate(self._plugins.exporters)
+        ]
+        return choices
+
+    async def _prompt_export(self) -> None:
+        if self._selected_source is None:
+            self._notify("Open a log before exporting.", "warning")
+            return
+
+        try:
+            # The whole filtered set, deliberately not the `_show_lines` window:
+            # an export is the answer to "save what I filtered", not "save what
+            # happens to fit on screen".
+            result = self._visible_entries(self._entries)
+        except QueryError as exc:
+            self._notify(f"Cannot export while the query is invalid: {exc}", "error")
+            return
+
+        entries = list(result.entries)
+        if not entries:
+            self._notify("Nothing to export — no entries match the filters.", "warning")
+            return
+
+        dialog = ExportDialog(
+            self._exporter_choices(),
+            entry_count=len(entries),
+            default_name=default_stem(self._selected_source),
+        )
+        request = await self.push_screen(dialog, wait_for_dismiss=True)
+        if request is None:
+            self._notify("Export canceled.")
+            return
+        self._run_export(request, entries)
+
+    def _run_export(self, request: ExportRequest, entries: list[LogEntry]) -> None:
+        if request.key.startswith("builtin:"):
+            self._export_builtin(request, entries)
+        else:
+            self._export_via_plugin(request, entries)
+
+    def _export_builtin(self, request: ExportRequest, entries: list[LogEntry]) -> None:
+        fmt = builtin_format(request.key.split(":", 1)[1])
+        if fmt is None or request.path is None:  # pragma: no cover - defensive
+            self._notify("Unknown export format.", "error")
+            return
+        try:
+            written = write_atomically(request.path, entries, fmt.writer)
+        except OSError as exc:
+            # Permissions, a missing directory, a full disk: reported, never a
+            # traceback, and the destination is left as it was.
+            self._notify(f"Export failed: {exc}", "error")
+            return
+        self._notify(f"Exported {_plural(written, 'entry', 'entries')} to {request.path}.")
+
+    def _export_via_plugin(self, request: ExportRequest, entries: list[LogEntry]) -> None:
+        exporter = self._exporter_at(request.key)
+        if exporter is None:  # pragma: no cover - defensive
+            self._notify("That exporter is no longer available.", "error")
+            return
+        name = _plugin_name(exporter)
+        try:
+            outcome = exporter.export(entries, self._plugin_context())
+        except Exception as exc:  # noqa: BLE001 - third-party code
+            # Same contract as a FilterStage that raises: recorded, surfaced,
+            # and survivable. An export must never take down the app.
+            self._plugins.errors.append(PluginError(name, f"raised: {exc}"))
+            self._refresh_plugin_status()
+            self._notify(f"Exporter {name} failed: {exc}", "error")
+            return
+
+        if outcome is None or not getattr(outcome, "ok", False):
+            detail = getattr(outcome, "detail", "") or "reported a failure"
+            self._notify(f"Exporter {name}: {detail}", "warning")
+            return
+        detail = outcome.detail or f"exported {_plural(len(entries), 'entry', 'entries')}"
+        destination = f" → {outcome.destination}" if outcome.destination else ""
+        self._notify(f"Exporter {name}: {detail}{destination}")
+
+    def _exporter_at(self, key: str) -> Optional[Exporter]:
+        try:
+            index = int(key.split(":", 1)[1])
+        except (IndexError, ValueError):
+            return None
+        exporters = self._plugins.exporters
+        return exporters[index] if 0 <= index < len(exporters) else None
 
     async def _prompt_custom_range(self) -> None:
         dialog = CustomTimeRangeDialog(
@@ -1360,6 +1540,8 @@ class LogViewerApp(App[None]):
     ) -> None:
         if message.field == "auto_scroll":
             self._set_auto_scroll(message.value)
+        elif message.field == "clipboard":
+            self._set_clipboard_enabled(message.value)
         else:
             self._set_structured(message.value)
 
@@ -1383,6 +1565,15 @@ class LogViewerApp(App[None]):
         self._sync_view_toggles()
         self._render_log()
 
+    def _set_clipboard_enabled(self, value: bool) -> None:
+        """Terminal capability, not a filter: nothing needs re-rendering."""
+        self._update_state(clipboard_osc52=value)
+        self._notify(
+            "Clipboard copy (y) enabled."
+            if value
+            else "Clipboard copy off — Ctrl+L copy mode still works."
+        )
+
     def _sync_view_toggles(self) -> None:
         """Push the canonical view state onto both sets of controls."""
 
@@ -1400,6 +1591,7 @@ class LogViewerApp(App[None]):
         self.advanced_drawer.sync_view_toggles(
             auto_scroll=self.state.auto_scroll,
             structured=self.state.pretty_rendering,
+            clipboard=self.state.clipboard_osc52,
         )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:  # type: ignore[override]
@@ -1448,6 +1640,14 @@ class LogViewerApp(App[None]):
                 str(error) for error in self._plugins.errors[:3]
             ))
         self.advanced_drawer.set_plugin_status(" · ".join(parts))
+        # Read-only, so an operator can see what Ctrl+E offers without opening
+        # the dialog.
+        self.advanced_drawer.set_export_status(
+            describe_formats(
+                [fmt.label for fmt in BUILTIN_FORMATS]
+                + [_plugin_name(exporter) for exporter in self._plugins.exporters]
+            )
+        )
 
     async def on_unmount(self) -> None:
         self._is_shutting_down = True
@@ -1456,6 +1656,16 @@ class LogViewerApp(App[None]):
             # Persist as-is: the selected source is deliberately kept so the
             # next launch reopens it.
             self._store.save(self.state)
+
+
+def _plugin_name(plugin: object) -> str:
+    """A plugin's own name, without trusting it to have set one."""
+    name = getattr(plugin, "name", "") or ""
+    return name if isinstance(name, str) and name else type(plugin).__name__
+
+
+def _plural(count: int, singular: str, plural: str) -> str:
+    return f"{count} {singular if count == 1 else plural}"
 
 
 def _compact_path(path: Path) -> str:

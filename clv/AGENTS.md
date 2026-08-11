@@ -64,7 +64,10 @@ Each plugin should subclass an abstract interface defined in `clv/plugins/__init
 - `FilterStage`
 - `Exporter`
 
-The app will later load them dynamically via a registry.
+`plugins.load_plugins()` loads them at startup into a `PluginRegistry`.
+`FilterStage`s run on every render and `Exporter`s are invoked from the `Ctrl+E`
+dialog; `LogSourceProvider` is loaded and reported but not yet consulted by
+discovery.
 
 ---
 

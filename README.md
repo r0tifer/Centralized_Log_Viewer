@@ -30,6 +30,10 @@ desktop terminal and on a headless 80-column SSH session.
 - 📐 **Responsive layout.** Breakpoints at 90 and 130 columns reflow the
   controls; every control stays on screen and keyboard-reachable down to 80
   columns.
+- 📤 **Get the view out.** `Ctrl+E` writes the filtered entries as JSON Lines,
+  CSV or raw text — the whole filtered set, not just the lines on screen. `y`
+  copies what is on screen to your local clipboard through the terminal, so it
+  works over SSH and tmux where a mouse selection does not.
 - 🧩 **Plugins.** `LogSourceProvider`, `FilterStage` and `Exporter` interfaces,
   loaded from `clv/plugins/` or from installed packages via the `clv.plugins`
   entry point group. A broken plugin is reported, never fatal.
@@ -116,6 +120,7 @@ use.
 | `refresh_hz` | Poll frequency for new content. | `2` |
 | `tree_width` | Starting width of the source tree, in columns. | `38` |
 | `csv_max_rows` / `csv_max_cols` | Structured payload preview limits. | `20 / 10` |
+| `clipboard_max_bytes` | Most log text one `y` clipboard copy may carry. Oversized copies are truncated at a line boundary and say so. | `65536` |
 
 Invalid values fall back to safe defaults; the app never fails to start because
 of a malformed settings file. Most discovery options are also editable at
@@ -141,6 +146,51 @@ One wrinkle worth knowing: while the cursor is in the query input, `?` types a
 literal question mark, because it is a valid regex character. Press `Esc` first
 if the input has focus. Tailing continues while the overlay is open.
 
+### Exporting
+
+`Ctrl+E` writes the entries the filters kept to a file. Three formats ship:
+
+| Format | What it contains |
+| --- | --- |
+| JSON Lines | One object per entry — raw line, timestamp, level, message, detected format, continuation flag and every parsed field. The only lossless option. |
+| CSV | A fixed, rectangular table of the same columns, with the parsed fields as one JSON column. |
+| Plain text | The raw lines, byte-identical to what is on screen. |
+
+Two things worth knowing:
+
+- It exports the **whole filtered set**, not just the lines that fit on screen.
+  The dialog states the count before it writes, so `+`/`-` never changes what an
+  export contains.
+- Writing is atomic (a sibling temp file, then a rename), and overwriting an
+  existing file takes a second press of Export. A permission error is reported
+  as a notification, not a traceback.
+
+Any `Exporter` plugin you have installed is listed in the same dialog, below the
+built-ins. The Advanced drawer shows the full list read-only, so you can see
+what is available without opening the dialog.
+
+One wrinkle: while the cursor is in the query input, `Ctrl+E` moves it to the end
+of the line — that binding belongs to the input. Press `Tab` or click the log
+pane first.
+
+### Copying to the clipboard
+
+`y` copies the lines currently on screen — filters and the visible-line window
+included — to your **local** clipboard using an OSC 52 escape sequence.
+
+`y` and `Ctrl+L` solve the same problem from opposite ends and both are kept:
+
+| | Needs | Works over SSH / tmux |
+| --- | --- | --- |
+| `y` | A terminal that honours OSC 52 | Yes |
+| `Ctrl+L` copy mode | A local mouse selection | No |
+
+A copy larger than `clipboard_max_bytes` is truncated at a line boundary,
+keeping the newest lines, and the notification says how many were dropped —
+there is no silent partial copy. If your terminal renders the sequence as
+garbage, turn it off with the **Clipboard (OSC 52)** switch in the Advanced
+drawer; the setting is remembered, and `Ctrl+L` remains.
+
 ### Keyboard shortcuts
 
 | Key | Action |
@@ -158,6 +208,8 @@ if the input has focus. Tailing continues while the overlay is open.
 | `Ctrl+B` | Switch between tree and log pane (compact widths) |
 | `[` / `]` | Narrow / widen the source tree |
 | `+` / `-` | Show more / fewer lines |
+| `Ctrl+E` | Export the filtered entries to a file |
+| `y` | Copy the visible lines to the clipboard (OSC 52) |
 | `Ctrl+L` | Copy mode (hides all chrome) |
 | `Ctrl+S` | Save added sources to `settings.conf` |
 | `Ctrl+R` | Reload configuration and rescan |
@@ -184,7 +236,7 @@ Understanding two rules explains everything the pane does:
 | Layer | Location | Responsibility |
 | --- | --- | --- |
 | App shell | `clv/app.py` | Layout, routing, lifecycle. No parsing or IO. |
-| Services | `clv/services/` | `parsing`, `filtering`, `discovery`, `reader`, `config`, `sources`. UI-free and independently testable. |
+| Services | `clv/services/` | `parsing`, `filtering`, `discovery`, `reader`, `config`, `sources`, `export`, `clipboard`. UI-free and independently testable. |
 | Widgets | `clv/widgets/` | Self-contained UI components owning their own CSS. |
 | Plugins | `clv/plugins/` | Extension interfaces and the loader. |
 | State | `clv/storage.py` | JSON session persistence (atomic writes). |
@@ -221,6 +273,12 @@ Return `None` from `apply` to drop a line. A plugin that fails to import, fails
 its version check, or raises at runtime is disabled and reported in the
 Advanced drawer — it cannot take the app down.
 
+`Exporter` plugins are reachable from the UI: `Ctrl+E` lists them alongside the
+three built-in formats and hands the selected one the whole filtered set. An
+exporter chooses its own destination (`export` receives the entries and a
+`FilterContext`, not a path), and one that raises is reported and skipped like
+any other plugin failure.
+
 ---
 
 ## Development
@@ -228,6 +286,6 @@ Advanced drawer — it cannot take the app down.
 ```bash
 python -m pip install -e .
 python -m pip install pytest
-python -m pytest            # 197 tests
+python -m pytest            # 290 tests
 python -m textual run clv/app.py --dev
 ```

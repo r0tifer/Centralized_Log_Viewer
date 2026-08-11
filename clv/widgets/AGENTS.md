@@ -38,6 +38,8 @@ Widgets are the building blocks of Centralized Log Viewer (CLV). Each one is **s
 | **SegmentedButtons** | Multi-button selection group | `ValueChanged` | Used by QueryBar for Severity; reusable elsewhere. |
 | **AdvancedFiltersDrawer** | Secondary filter options | `Closed`, (future) `Changed` | Optional drawer for plugin or advanced UI elements. |
 | **FilterChip** | Displays active filters | `Dismissed` | Allows quick removal of active filters. |
+| **HelpOverlay** | Lists every keybinding | *(dismiss only)* | Modal; sections are built by the app from `BINDINGS`, so it cannot go stale. |
+| **ExportDialog** | Format + destination for `Ctrl+E` | *(dismisses with `ExportRequest`)* | Modal; states the entry count, and overwriting takes a second press of Export. |
 
 ---
 

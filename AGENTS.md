@@ -106,6 +106,15 @@ distros.
 - `documents.py` — stdlib-only text extraction for container formats.
 - `config.py` — settings resolution, validation, clamping.
 - `sources.py` — session source management and settings persistence.
+- `export.py` — the three built-in output formats (JSON Lines, CSV, plain text)
+  and the atomic write behind `Ctrl+E`. Core rather than drop-in plugins so a
+  built-in cannot fail to load and the drawer's plugin count keeps meaning
+  "installed plugins"; `clv/plugins/exporters/` is still a live extension point.
+  Does **not** import `clv.plugins` — that dependency already runs the other way.
+- `clipboard.py` — assembles and size-caps the payload `y` hands to
+  `App.copy_to_clipboard`. OSC 52 has no continuation form, so an oversized
+  payload is truncated at a line boundary and reported, never chunked and never
+  silently dropped.
 
 ### Data flow
 ```
@@ -146,7 +155,8 @@ config.load_config ─→ SourceManager ─→ discovery.discover (thread)
 | `SegmentedButtons` | `ValueChanged` / `Reselected` | Segment activated / re-activated |
 | `FilterChip` | `Dismissed` | Revert the named filter |
 | `AdvancedFiltersDrawer` | `SettingsChanged` | Full before/after snapshot; `needs_rescan` says whether discovery must re-run |
-| `AdvancedFiltersDrawer` | `ViewToggleChanged` | Auto-scroll / structured flipped from the drawer's mirrored controls |
+| `AdvancedFiltersDrawer` | `ViewToggleChanged` | Auto-scroll / structured / clipboard flipped from a drawer switch |
+| `ExportDialog` | dismiss value | `ExportRequest(key, path)`, or `None` when canceled |
 | `AdvancedFiltersDrawer` | `RescanRequested` / `Closed` | Explicit rescan / dismissal |
 
 ### Controls with two homes
@@ -161,6 +171,12 @@ Mirroring uses `prevent(Switch.Changed)`, **not** a boolean guard. Textual posts
 `Switch.Changed` asynchronously, so a flag cleared at the end of the sync method
 is already back to `False` by the time the handler runs, and the echo arrives
 looking like a fresh user action.
+
+The **Clipboard (OSC 52)** switch is the counter-example: it has one home, so it
+lives in the drawer's own `#output-options` container rather than in
+`#view-toggles`, which is hidden once the query bar is wide enough to show its
+copies. A single-home control placed in that container disappears above 148
+columns.
 
 Cross-module communication goes through messages or public methods — never
 shared globals or reaching into another widget's tree.
@@ -198,7 +214,7 @@ or break a render.
 - Layout regressions are caught by asserting widget `region` bounds at a given
   terminal size rather than by eyeballing screenshots.
 
-Run: `python -m pytest` (247 tests).
+Run: `python -m pytest` (290 tests).
 
 ---
 

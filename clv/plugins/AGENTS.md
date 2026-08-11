@@ -126,10 +126,27 @@ Stages run *before* the user's query, severity and time filters.
 
 ### 3. Exporter
 
-Saves or transmits the currently visible entries.
+Saves or transmits the entries the filters kept.
 
-`export` receives the sequence of `LogEntry` objects on screen plus the
-`FilterContext`, and returns an `ExportResult`.
+**Reachable from the UI:** `Ctrl+E` opens the export dialog, which lists every
+loaded `Exporter` below CLV's three built-in formats (JSON Lines, CSV and plain
+text — those live in `clv.services.export`, not here, so that a built-in cannot
+fail to load).
+
+`export` receives the sequence of `LogEntry` objects that passed the plugin
+stages and the user's filters, plus the `FilterContext`, and returns an
+`ExportResult`. Three points follow from that:
+
+- The sequence is the **whole filtered set**, not the `_show_lines` window the
+  pane happens to be showing. Do not assume it is small.
+- There is no destination argument. An exporter picks its own path and reports it
+  back as `ExportResult.destination`; the dialog disables its path input for
+  plugin exporters and says so. Confine writes to somewhere the operator would
+  expect, and never to a temp or cache directory — log content is sensitive.
+- Raising is survivable but visible: the exception is recorded in
+  `PluginRegistry.errors`, surfaced as a notification and shown in the Advanced
+  drawer. Returning `ExportResult(ok=False, detail=...)` is the way to report a
+  failure you expected.
 
 ```python
 import json

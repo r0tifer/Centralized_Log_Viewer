@@ -31,6 +31,10 @@ _LIMITS: dict[str, tuple[int, int, int]] = {
     "csv_max_cols": (10, 1, 200),
     "max_files": (DEFAULT_MAX_FILES, 1, 200_000),
     "tree_width": (38, 20, 120),
+    # Bytes of log text one OSC 52 copy may carry. The default is under tmux's
+    # ~74 kB passthrough limit with room for base64 expansion, so a copy that
+    # fits the cap is a copy the terminal will actually accept.
+    "clipboard_max_bytes": (65_536, 1_024, 1_000_000),
 }
 
 DEFAULT_SETTINGS_TEMPLATE = f"""[{CONFIG_SECTION}]
@@ -75,6 +79,10 @@ tree_width = 38
 # Structured payload preview limits.
 csv_max_rows = 20
 csv_max_cols = 10
+
+# Most log text one 'y' (OSC 52 clipboard copy) may carry. Oversized copies are
+# truncated at a line boundary and the notification says how much was dropped.
+clipboard_max_bytes = 65536
 """
 
 
@@ -92,6 +100,7 @@ class LogConfig:
     csv_max_rows: int = _LIMITS["csv_max_rows"][0]
     csv_max_cols: int = _LIMITS["csv_max_cols"][0]
     tree_width: int = _LIMITS["tree_width"][0]
+    clipboard_max_bytes: int = _LIMITS["clipboard_max_bytes"][0]
 
     def with_discovery(self, **changes) -> "LogConfig":
         """Return a copy with individual discovery settings replaced."""
@@ -294,6 +303,7 @@ def load_config(path: Optional[Path] = None) -> LogConfig:
         csv_max_rows=_read_int(section, "csv_max_rows"),
         csv_max_cols=_read_int(section, "csv_max_cols"),
         tree_width=_read_int(section, "tree_width"),
+        clipboard_max_bytes=_read_int(section, "clipboard_max_bytes"),
     )
 
     # default_show_lines must not exceed what the buffer can hold.
