@@ -53,7 +53,7 @@ from .services.filtering import (
     parse_relative_window,
 )
 from .services.parsing import LogEntry, LogParser
-from .services.reader import SourceReader
+from .services.reader import AnyReader, open_reader
 from .storage import SessionState, StateStore
 from .widgets.add_source_dialog import AddSourceDialog
 from .widgets.advanced_drawer import AdvancedFiltersDrawer, AdvancedSettings
@@ -274,7 +274,7 @@ class LogViewerApp(App[None]):
         self._source_manager = SourceManager([], [])
         self._report: DiscoveryReport | None = None
         self._selected_source: Optional[Path] = None
-        self._reader: SourceReader | None = None
+        self._reader: AnyReader | None = None
         self._parser = LogParser()
         self._entries: deque[LogEntry] = deque(maxlen=self._config.max_buffer_lines)
         self._tail_timer: Timer | None = None
@@ -569,7 +569,7 @@ class LogViewerApp(App[None]):
         self._parser.reset()
         self._entries = deque(maxlen=self._config.max_buffer_lines)
 
-        reader = SourceReader(resolved, max_lines=self._config.max_buffer_lines)
+        reader = open_reader(resolved, max_lines=self._config.max_buffer_lines)
         try:
             initial = reader.prime()
         except OSError as exc:
@@ -621,7 +621,8 @@ class LogViewerApp(App[None]):
             self._entries.clear()
             self._entries.extend(self._parser.feed(result.lines))
             self._render_log(scroll_end=self.state.auto_scroll)
-            self._notify(f"{self._reader.path.name} was rotated; reloaded.", "warning")
+            notice = self._reader.RELOAD_NOTICE.format(name=self._reader.path.name)
+            self._notify(notice, "warning")
             return
 
         if not result.lines:

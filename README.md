@@ -23,8 +23,10 @@ desktop terminal and on a headless 80-column SSH session.
   backwards from the end of the file; a 160 MB log opens in ~2 ms using under a
   megabyte. Tailing reads only what was appended.
 - 🧭 **Any file, not just `*.log`.** Name folders or files; every readable text
-  file counts. Binary files are detected by content and skipped, and
-  include/exclude globs are yours to set.
+  file counts — including UTF-16 exports from Windows and PowerShell, and
+  `.ods` spreadsheets, which are unpacked into tab-separated rows. Binary
+  files are detected by content and skipped, and include/exclude globs are
+  yours to set.
 - 📐 **Responsive layout.** Breakpoints at 90 and 130 columns reflow the
   controls; every control stays on screen and keyboard-reachable down to 80
   columns.
@@ -105,9 +107,9 @@ use.
 | --- | --- | --- |
 | `log_dirs` | Folders **and/or files** to monitor, comma separated. Folders are searched recursively. | `/var/log` |
 | `include_globs` | Only list files matching these globs. Empty means every text file. | *(empty)* |
-| `exclude_globs` | Never list files matching these globs. | archives + binary journals |
+| `exclude_globs` | Never list files matching these globs. | archives, binary journals, PDFs |
 | `follow_symlinks` | Follow symlinked directories (cycles are detected). | `false` |
-| `skip_binary` | Skip files whose first block contains NUL bytes. | `true` |
+| `skip_binary` | Skip files whose first block decodes to NUL characters. UTF-16 text and extractable documents (`.ods`) are exempt. | `true` |
 | `max_files` | Stop discovery after this many files. | `5000` |
 | `max_buffer_lines` | Lines held in memory per source. | `5000` |
 | `default_show_lines` / `min_show_lines` / `show_step` | Visible-line window and its `+`/`-` step. | `500 / 10 / 50` |
@@ -214,6 +216,6 @@ Advanced drawer — it cannot take the app down.
 ```bash
 python -m pip install -e .
 python -m pip install pytest
-python -m pytest            # 94 tests
+python -m pytest            # 197 tests
 python -m textual run clv/app.py --dev
 ```

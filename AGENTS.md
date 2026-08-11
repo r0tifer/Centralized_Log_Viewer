@@ -24,6 +24,19 @@ valid source. Filtering by name is the user's decision (`include_globs` /
 **readability** reasons (binary content, compressed archives), never for
 naming reasons.
 
+"Readable text" is judged on **characters, not bytes**. UTF-16 encodes ASCII
+with a NUL beside every character, so a byte-level NUL test rejects the
+Windows and PowerShell exports operators most often point CLV at. Encoding is
+sniffed from the byte-order mark (`reader.detect_encoding`) and BOM-less files
+are read as UTF-8, as before — statistical charset guessing is **not** done,
+because guessing wrong puts a core dump on screen.
+
+A small number of **container documents** are readable text that no byte test
+can recognise, because the text is inside an archive. These are declared by
+suffix in `documents.FORMATS` (currently `.ods`) and bypass the binary check.
+Anything needing a third-party parser does not qualify — that is why PDFs are
+in `DEFAULT_EXCLUDE_GLOBS` rather than supported.
+
 ### 2) Never silently lose a line
 Every physical line becomes a `LogEntry` with its raw text preserved. A line no
 format recognises is still **searchable**. Severity and time filters may hide a
@@ -35,6 +48,13 @@ Opening a source seeks **backwards from the end**; nothing ever reads a whole
 file. Tailing reads only appended bytes and renders only new lines. Memory is
 capped by `max_buffer_lines` regardless of on-disk size. Discovery runs off the
 UI thread and is capped by `max_files`.
+
+**Container documents are the one exception**, and they invert two of these
+rules on purpose. A deflated archive has no cheap tail, so `DocumentReader`
+extracts the document whole, bounded by a **line** budget rather than a byte
+one, and re-extracts on change instead of tailing. It also keeps the **first**
+lines rather than the last: a spreadsheet's header row names its columns, and
+a document has no "newest" end the way a log does.
 
 ### 4) Nothing off-screen, ever
 Layout must scale cleanly from 80 columns up. Every control stays on screen and
@@ -68,9 +88,18 @@ distros.
   continuation carry-forward.
 - `filtering.py` — `FilterSpec` → `FilterResult` with per-reason hidden counts.
 - `discovery.py` — walks roots into a `DiscoveryReport`; pure and synchronous
-  so callers can thread it.
-- `reader.py` — bounded backwards reads, incremental tailing, rotation and
-  truncation recovery.
+  so callers can thread it. Every skip is attributed to exactly one of
+  **`unsupported file type`** (CLV cannot display it), **`filtered out`** (the
+  operator's own globs hid it), or **`unreadable`** (the read failed). Keep
+  these apart: only the first is CLV's verdict on the file, and merging them
+  back into one "excluded" count is what made the number unactionable. A
+  *named* source that is skipped is also listed by path — a file the operator
+  typed out must never disappear into a tally.
+- `reader.py` — BOM-based encoding detection, bounded backwards reads,
+  incremental tailing, rotation and truncation recovery. `open_reader()` picks
+  between `SourceReader` (streams) and `DocumentReader` (container documents);
+  both expose `path` / `prime()` / `poll()` and a `RELOAD_NOTICE` template.
+- `documents.py` — stdlib-only text extraction for container formats.
 - `config.py` — settings resolution, validation, clamping.
 - `sources.py` — session source management and settings persistence.
 
@@ -165,7 +194,7 @@ or break a render.
 - Layout regressions are caught by asserting widget `region` bounds at a given
   terminal size rather than by eyeballing screenshots.
 
-Run: `python -m pytest` (99 tests).
+Run: `python -m pytest` (197 tests).
 
 ---
 
