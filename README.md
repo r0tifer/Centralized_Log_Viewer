@@ -130,10 +130,22 @@ clv              # launch the TUI
 python -m clv    # module entry point
 ```
 
+### Getting help
+
+Press `?` for an overlay listing every keybinding, grouped by what it does. The
+footer only has room for the first handful at narrow widths, so the overlay is
+the complete list — it is generated from the bindings themselves and cannot
+fall out of date. Dismiss it with `?`, `Esc` or `q`.
+
+One wrinkle worth knowing: while the cursor is in the query input, `?` types a
+literal question mark, because it is a valid regex character. Press `Esc` first
+if the input has focus. Tailing continues while the overlay is open.
+
 ### Keyboard shortcuts
 
 | Key | Action |
 | --- | --- |
+| `?` | Show every keybinding |
 | `/` | Focus the query input |
 | `Enter` | Apply filters |
 | `Esc` | Clear the query |

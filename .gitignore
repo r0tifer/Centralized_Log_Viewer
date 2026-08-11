@@ -3,3 +3,4 @@ __pycache__/
 .cache/
 centralized_log_viewer
 AGENTS.md
+TODO.md

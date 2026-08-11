@@ -69,9 +69,35 @@ class MySource(LogSourceProvider):
 Transforms or drops entries before they reach the pane.
 
 `apply` receives a `LogEntry` (frozen dataclass: `raw`, `timestamp`, `level`,
-`message`, `format_name`, `continuation`) and a `FilterContext` (`spec`,
-`source`). Return an entry to keep it, or `None` to drop it. Use
+`message`, `format_name`, `continuation`, `fields`) and a `FilterContext`
+(`spec`, `source`). Return an entry to keep it, or `None` to drop it. Use
 `dataclasses.replace` to modify — entries are immutable.
+
+`fields` is the structure the parser recovered from the line: a **read-only
+mapping of string to string**, empty for a line no format matched. Key names
+are normalised across formats, so `entry.fields.get("host")` means the same
+thing whether the line came from syslog or from an access log; the full
+vocabulary is documented in the `clv.services.parsing` module docstring. Values
+are never coerced — an HTTP status is `"500"`, not `500`.
+
+Three things to know before using it:
+
+- A continuation line (a stack trace frame, say) inherits its parent's
+  timestamp and level but **not** its fields, so `fields` is empty there.
+- It is a `mappingproxy`. `copy.deepcopy` and therefore `dataclasses.asdict`
+  cannot handle one; call `dict(entry.fields)` if you need a plain dict.
+- To add fields, pass a new mapping to `replace`. Do not try to mutate the one
+  you were given — it is read-only by design.
+
+```python
+class TagUnknownHosts(FilterStage):
+    name = "TagUnknownHosts"
+
+    def apply(self, entry, context):
+        if "host" in entry.fields:
+            return entry
+        return replace(entry, fields={**entry.fields, "host": "unknown"})
+```
 
 ```python
 from dataclasses import replace

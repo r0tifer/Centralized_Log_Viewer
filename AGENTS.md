@@ -85,7 +85,11 @@ distros.
 
 ### Services
 - `parsing.py` — multi-format line parsing, canonical severity vocabulary,
-  continuation carry-forward.
+  continuation carry-forward. Whatever structure a matcher captured beyond the
+  timestamp and level is carried on `LogEntry.fields`, under key names
+  normalised across formats — `host` means the same thing whether it came from
+  syslog or from an access log. Values are strings and are never coerced; a
+  continuation inherits timestamp and level but never fields.
 - `filtering.py` — `FilterSpec` → `FilterResult` with per-reason hidden counts.
 - `discovery.py` — walks roots into a `DiscoveryReport`; pure and synchronous
   so callers can thread it. Every skip is attributed to exactly one of
@@ -194,7 +198,7 @@ or break a render.
 - Layout regressions are caught by asserting widget `region` bounds at a given
   terminal size rather than by eyeballing screenshots.
 
-Run: `python -m pytest` (197 tests).
+Run: `python -m pytest` (247 tests).
 
 ---
 

@@ -59,6 +59,7 @@ from .widgets.add_source_dialog import AddSourceDialog
 from .widgets.advanced_drawer import AdvancedFiltersDrawer, AdvancedSettings
 from .widgets.custom_time_dialog import CustomTimeRangeDialog
 from .widgets.filter_chip import FilterChip, FilterChips
+from .widgets.help_overlay import HelpOverlay, HelpSection
 from .widgets.query_bar import QueryBar
 
 SEVERITY_COLORS: dict[str, str] = {
@@ -94,6 +95,72 @@ ICON_FILE = "📄"
 #: starring never changes a row's width.
 ICON_STAR = "⭐"
 STARRED_GROUP = f"{ICON_STAR} Starred"
+
+#: Help categories, in the order the overlay lists them. A category with no
+#: bindings is skipped, so a group can be declared before the item that fills
+#: it: Navigation is empty until a line cursor exists to navigate with.
+HELP_CATEGORY_ORDER: tuple[str, ...] = (
+    "Help",
+    "Search",
+    "Navigation",
+    "View",
+    "Sources",
+    "Session",
+    "Other",
+)
+
+#: Which category each binding belongs to, keyed by action name. Kept parallel
+#: to ``BINDINGS`` rather than as a ``Binding`` argument so binding
+#: construction stays exactly what Textual documents. An action missing here
+#: still appears in the overlay under "Other" — help is generated, so it can
+#: never go stale — and ``test_help_overlay`` fails on the omission so the
+#: fallback stays a safety net rather than a destination.
+BINDING_CATEGORIES: dict[str, str] = {
+    "show_help": "Help",
+    "focus_query": "Search",
+    "clear_query": "Search",
+    "cycle_time": "Search",
+    "cycle_severity": "Search",
+    "toggle_advanced": "Search",
+    "toggle_auto_scroll": "View",
+    "toggle_structured": "View",
+    "toggle_pane": "View",
+    "shrink_sources_panel": "View",
+    "expand_sources_panel": "View",
+    "more_lines": "View",
+    "fewer_lines": "View",
+    "toggle_copy_mode": "View",
+    "add_source": "Sources",
+    "toggle_star": "Sources",
+    "reload_sources": "Sources",
+    "save_session": "Session",
+    "quit_app": "Session",
+}
+
+
+def build_help_sections(
+    bindings: Iterable[Binding],
+    categories: dict[str, str] | None = None,
+) -> list[HelpSection]:
+    """Group *bindings* into the overlay's sections, in declaration order.
+
+    Pure and app-free so the grouping can be tested without running the app,
+    and so the overlay widget never has to reach back into ``clv.app``.
+    """
+
+    lookup = BINDING_CATEGORIES if categories is None else categories
+    grouped: dict[str, list[tuple[str, str]]] = {}
+    for binding in bindings:
+        category = lookup.get(binding.action, "Other")
+        grouped.setdefault(category, []).append(
+            (binding.key, binding.description or binding.action)
+        )
+
+    ordered = [name for name in HELP_CATEGORY_ORDER if name in grouped]
+    # A category invented by a caller's map is still listed, after the known
+    # ones, rather than silently dropping the bindings it holds.
+    ordered += [name for name in grouped if name not in HELP_CATEGORY_ORDER]
+    return [HelpSection(name, tuple(grouped[name])) for name in ordered]
 
 
 class LogTree(Tree[Path]):
@@ -235,6 +302,10 @@ class LogViewerApp(App[None]):
     """
 
     BINDINGS = [
+        # First in the list on purpose. The footer fills from the left and
+        # drops from the right, so the binding that documents all the others
+        # is the one that must never be the entry that falls off.
+        Binding("question_mark", "show_help", "Help", show=True),
         Binding("/", "focus_query", "Query", show=True),
         Binding("escape", "clear_query", "Clear", show=True),
         Binding("a", "add_source", "Add source", show=True),
@@ -1038,6 +1109,15 @@ class LogViewerApp(App[None]):
 
         if len(present) == 1:
             self._select_source(present[0], announce=False)
+
+    def action_show_help(self) -> None:
+        """Open the binding list. Tailing continues behind it."""
+
+        # `?` reaches this action from the overlay too, where it closes rather
+        # than reopening; guard anyway so it can never stack two overlays.
+        if isinstance(self.screen, HelpOverlay):
+            return
+        self.push_screen(HelpOverlay(build_help_sections(self.BINDINGS)))
 
     def action_toggle_advanced(self) -> None:
         self.advanced_drawer.toggle()
