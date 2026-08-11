@@ -87,6 +87,10 @@ SOURCES_PANEL_STEP = 4
 
 ICON_FOLDER = "📂"
 ICON_FILE = "📄"
+#: Replaces the file icon on a starred log rather than sitting beside it, so
+#: starring never changes a row's width.
+ICON_STAR = "⭐"
+STARRED_GROUP = f"{ICON_STAR} Starred"
 
 
 class LogTree(Tree[Path]):
@@ -234,6 +238,7 @@ class LogViewerApp(App[None]):
         Binding("t", "cycle_time", "Time", show=True),
         Binding("s", "cycle_severity", "Severity", show=True),
         Binding("f", "toggle_advanced", "Advanced", show=True),
+        Binding("asterisk", "toggle_star", "Star", show=True),
         # The auto-scroll and structured switches are only shown when the query
         # bar merges its rows, so they need a keyboard path that does not
         # depend on terminal width.
@@ -310,10 +315,11 @@ class LogViewerApp(App[None]):
 
         self._source_manager = SourceManager(*self._split_roots(self._config.log_dirs))
         self._apply_state_to_widgets()
-        # Deliberately no source is opened here: the viewer starts on the
-        # discovery summary so a launch always begins from a known state
-        # rather than silently resuming and tailing whatever was open last.
+        # Nothing is opened implicitly: the viewer starts on the discovery
+        # summary rather than resuming whatever happened to be open last.
+        # A starred log is different — it was chosen for this.
         await self._rescan()
+        self._open_starred_on_launch()
 
         self._refresh_chips()
         self._update_status()
@@ -449,6 +455,19 @@ class LogViewerApp(App[None]):
         tree: LogTree = LogTree("Sources", id="source-tree")
         await panel.mount(tree)
 
+        # Starred logs are repeated in a group at the top. With the tree
+        # collapsed by default, a favourite would otherwise cost a walk down
+        # the hierarchy on every launch.
+        starred = self._starred_paths()
+        present = sorted(
+            (item.path for item in report.files if _resolve(item.path) in starred),
+            key=lambda p: str(p).lower(),
+        )
+        if present:
+            group = tree.root.add(STARRED_GROUP, data=None, expand=True)
+            for path in present:
+                group.add_leaf(f"{ICON_STAR} {_compact_path(path)}", data=path)
+
         # One branch per configured root, then a folder hierarchy beneath it.
         by_root: dict[Path, list] = {}
         for item in report.files:
@@ -458,7 +477,7 @@ class LogViewerApp(App[None]):
             items = by_root[root]
             if len(items) == 1 and items[0].path == root:
                 # The operator named this single file directly.
-                tree.root.add_leaf(f"{ICON_FILE} {root}", data=root)
+                tree.root.add_leaf(self._leaf_label(root, str(root)), data=root)
                 continue
 
             # Every folder starts collapsed. Expanding the whole hierarchy up
@@ -477,11 +496,27 @@ class LogViewerApp(App[None]):
                             f"{ICON_FOLDER} {part}", data=current, expand=False
                         )
                     parent = folders[current]
-                parent.add_leaf(f"{ICON_FILE} {item.path.name}", data=item.path)
+                parent.add_leaf(
+                    self._leaf_label(item.path, item.path.name), data=item.path
+                )
 
         tree.focus()
 
-    def _highlight_source(self, path: Path) -> None:
+    def _starred_paths(self) -> set[Path]:
+        return {_resolve(Path(entry)) for entry in self.state.starred}
+
+    def _leaf_label(self, path: Path, text: str) -> str:
+        icon = ICON_STAR if _resolve(path) in self._starred_paths() else ICON_FILE
+        return f"{icon} {text}"
+
+    def _highlight_source(self, path: Path, *, select: bool = True) -> None:
+        """Reveal *path* in the tree.
+
+        ``select=False`` moves the cursor without selecting, because
+        ``select_node`` posts NodeSelected and would open the log. Starring a
+        file should bookmark it, not open it.
+        """
+
         try:
             tree = self.query_one("#source-tree", LogTree)
         except NoMatches:
@@ -505,11 +540,14 @@ class LogViewerApp(App[None]):
         # expand() has just invalidated. Selecting immediately reads a stale
         # line for the target and silently parks the cursor on the root -- only
         # visible once folders stopped being expanded up front.
-        def _select() -> None:
-            tree.select_node(node)
+        def _reveal() -> None:
+            if select:
+                tree.select_node(node)
+            else:
+                tree.move_cursor(node)
             tree.scroll_to_node(node)
 
-        self.call_after_refresh(_select)
+        self.call_after_refresh(_reveal)
 
     # --- source selection and tailing --------------------------------------
 
@@ -905,6 +943,60 @@ class LogViewerApp(App[None]):
             else "Structured output off."
         )
 
+    async def action_toggle_star(self) -> None:
+        """Star or unstar the log under the tree cursor."""
+
+        try:
+            tree = self.query_one("#source-tree", LogTree)
+        except NoMatches:
+            return
+        node = tree.cursor_node
+        data = node.data if node is not None else None
+        if not isinstance(data, Path) or not data.is_file():
+            self._notify("Move the cursor to a log file to star it.", "warning")
+            return
+
+        key = str(_resolve(data))
+        starred = set(self.state.starred)
+        if key in starred:
+            starred.discard(key)
+            message = f"Unstarred {data.name}."
+        else:
+            starred.add(key)
+            message = f"Starred {data.name}."
+        self._update_state(starred=tuple(sorted(starred)))
+
+        # Rebuild from the report already in hand rather than re-walking the
+        # filesystem, then put the cursor back where the operator left it.
+        if self._report is not None:
+            await self._build_tree(self._report)
+            self._highlight_source(data, select=False)
+        self._notify(message)
+
+    def _open_starred_on_launch(self) -> None:
+        """Open a starred log when exactly one of them is available.
+
+        Several stars are a set of favourites rather than an instruction about
+        what to open, so the summary stays put and the group is there to jump
+        from. A star pointing at something no longer discoverable is reported
+        and kept: rotated logs come back.
+        """
+
+        report = self._report
+        if report is None or not self.state.starred:
+            return
+
+        discovered = {_resolve(item.path) for item in report.files}
+        starred = [Path(entry) for entry in self.state.starred]
+        present = [path for path in starred if _resolve(path) in discovered]
+
+        for path in starred:
+            if _resolve(path) not in discovered:
+                self._notify(f"Starred log is not available: {path}", "warning")
+
+        if len(present) == 1:
+            self._select_source(present[0], announce=False)
+
     def action_toggle_advanced(self) -> None:
         self.advanced_drawer.toggle()
         self._refresh_plugin_status()
@@ -1228,6 +1320,12 @@ class LogViewerApp(App[None]):
             # Persist as-is: the selected source is deliberately kept so the
             # next launch reopens it.
             self._store.save(self.state)
+
+
+def _compact_path(path: Path) -> str:
+    """``deeper/a.log`` — enough to tell identically named logs apart."""
+    parent = path.parent.name
+    return f"{parent}/{path.name}" if parent else path.name
 
 
 def _resolve(path: Path) -> Path:

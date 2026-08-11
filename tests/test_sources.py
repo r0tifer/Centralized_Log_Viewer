@@ -403,3 +403,188 @@ def test_the_open_source_path_is_never_written_to_disk(tmp_path: Path) -> None:
 
     assert "selected_source" not in payload
     assert not hasattr(SessionState(), "selected_source")
+
+
+# --- starred logs -----------------------------------------------------------
+
+
+def _starred_group(tree):
+    from clv.app import STARRED_GROUP
+
+    return next((n for n in _walk(tree.root) if str(n.label).startswith(STARRED_GROUP)), None)
+
+
+def test_starring_marks_the_log_without_opening_it(tmp_path: Path) -> None:
+    """A star is a bookmark. select_node would post NodeSelected and open it."""
+
+    root = _nested_tree(tmp_path)
+    target = root / "alpha" / "deep" / "deeper" / "a.log"
+
+    async def scenario() -> None:
+        from clv.services import SourceManager
+
+        app = LogViewerApp()
+        async with app.run_test(size=(120, 30)) as pilot:
+            app._source_manager = SourceManager([root], [])
+            await app._rescan()
+            app._highlight_source(target, select=False)
+            await pilot.pause()
+            await pilot.pause()
+
+            await pilot.press("*")
+            await pilot.pause()
+            await pilot.pause()
+
+            assert app.state.starred == (str(target.resolve()),)
+            assert app._selected_source is None, "starring opened the log"
+            rendered = "\n".join(
+                getattr(line, "plain", str(line)) for line in app.log_panel.lines
+            )
+            assert "Log files found" in rendered
+
+    asyncio.run(scenario())
+
+
+def test_starred_logs_get_a_group_at_the_top_of_the_tree(tmp_path: Path) -> None:
+    root = _nested_tree(tmp_path)
+    target = root / "alpha" / "deep" / "deeper" / "a.log"
+
+    async def scenario() -> None:
+        from clv.services import SourceManager
+
+        app = LogViewerApp()
+        async with app.run_test(size=(120, 30)) as pilot:
+            app._source_manager = SourceManager([root], [])
+            app._update_state(starred=(str(target.resolve()),))
+            await app._rescan()
+            await pilot.pause()
+
+            tree = app.query_one("#source-tree", LogTree)
+            group = _starred_group(tree)
+            assert group is not None, "no Starred group"
+            assert group.is_expanded
+            assert [n.data for n in group.children] == [target]
+            # It is the first thing in the tree, above the configured roots.
+            assert tree.root.children[0] is group
+
+    asyncio.run(scenario())
+
+
+def test_starring_toggles_off_again(tmp_path: Path) -> None:
+    root = _nested_tree(tmp_path)
+    target = root / "alpha" / "a.log"
+
+    async def scenario() -> None:
+        from clv.services import SourceManager
+
+        app = LogViewerApp()
+        async with app.run_test(size=(120, 30)) as pilot:
+            app._source_manager = SourceManager([root], [])
+            await app._rescan()
+            app._highlight_source(target, select=False)
+            await pilot.pause()
+            await pilot.pause()
+
+            await pilot.press("*")
+            await pilot.pause()
+            await pilot.pause()
+            assert app.state.starred == (str(target.resolve()),)
+
+            await pilot.press("*")
+            await pilot.pause()
+            await pilot.pause()
+            assert app.state.starred == ()
+            assert _starred_group(app.query_one("#source-tree", LogTree)) is None
+
+    asyncio.run(scenario())
+
+
+def test_one_star_opens_on_launch_several_do_not(tmp_path: Path) -> None:
+    root = _nested_tree(tmp_path)
+    first = root / "alpha" / "a.log"
+    second = root / "beta" / "a.log"
+
+    async def launch(starred: tuple[str, ...]):
+        from clv.services import SourceManager
+        from clv.storage import SessionState, StateStore
+
+        store = StateStore(root=tmp_path / "state")
+        store.save(SessionState(starred=starred))
+
+        app = LogViewerApp(store=StateStore(root=tmp_path / "state"))
+        async with app.run_test(size=(120, 30)) as pilot:
+            app._source_manager = SourceManager([root], [])
+            await app._rescan()
+            app._open_starred_on_launch()
+            await pilot.pause()
+            return app._selected_source
+
+    async def scenario() -> None:
+        opened = await launch((str(first.resolve()),))
+        assert opened == first.resolve(), "a single star should open on launch"
+
+        opened = await launch((str(first.resolve()), str(second.resolve())))
+        assert opened is None, "several stars are favourites, not an instruction"
+
+    asyncio.run(scenario())
+
+
+def test_a_star_pointing_at_a_missing_log_warns_and_is_kept(tmp_path: Path) -> None:
+    root = _nested_tree(tmp_path)
+    gone = root / "alpha" / "a.log"
+    survivor = root / "beta" / "a.log"
+    starred = (str(gone.resolve()), str(survivor.resolve()))
+    gone.unlink()
+
+    async def scenario() -> None:
+        from clv.services import SourceManager
+        from clv.storage import SessionState, StateStore
+
+        store = StateStore(root=tmp_path / "state")
+        store.save(SessionState(starred=starred))
+
+        app = LogViewerApp(store=StateStore(root=tmp_path / "state"))
+        async with app.run_test(size=(120, 30)) as pilot:
+            app._source_manager = SourceManager([root], [])
+            await app._rescan()
+
+            notices: list[tuple[str, str]] = []
+            app.notify = lambda message, **kw: notices.append(
+                (message, kw.get("severity", ""))
+            )
+            app._open_starred_on_launch()
+            await pilot.pause()
+
+            warnings = [m for m, s in notices if "not available" in m]
+            assert warnings and str(gone) in warnings[0]
+            # Kept, because a rotated log comes back.
+            assert app.state.starred == starred
+            # The one that survived is the only one available, so it opens.
+            assert app._selected_source == survivor.resolve()
+
+    asyncio.run(scenario())
+
+
+def test_stars_survive_a_restart(tmp_path: Path) -> None:
+    from clv.storage import SessionState, StateStore
+
+    store = StateStore(root=tmp_path)
+    store.save(SessionState(starred=("/var/log/a.log", "/var/log/b.log")))
+
+    restored = StateStore(root=tmp_path).load()
+
+    assert restored.starred == ("/var/log/a.log", "/var/log/b.log")
+
+
+def test_a_corrupt_starred_list_degrades_to_the_usable_entries(tmp_path: Path) -> None:
+    import json
+
+    from clv.storage import StateStore
+
+    store = StateStore(root=tmp_path)
+    store.path.write_text(
+        json.dumps({"starred": ["/var/log/a.log", 42, None, "/var/log/b.log"]}),
+        encoding="utf-8",
+    )
+
+    assert store.load().starred == ("/var/log/a.log", "/var/log/b.log")
