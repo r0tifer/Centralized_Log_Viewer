@@ -24,7 +24,6 @@ class SessionState:
     custom_start: str = ""
     custom_end: str = ""
     auto_scroll: bool = True
-    selected_source: str = ""
     pretty_rendering: bool = False
     # Advanced drawer state
     include_globs: str = ""
@@ -35,9 +34,18 @@ class SessionState:
     use_regex: bool = True
     invert_match: bool = False
     tree_width: int = 38
+    #: Absolute paths the operator starred, as a sorted tuple. Unlike the
+    #: source that merely happened to be open, these are chosen explicitly, so
+    #: recording them is something the operator asked for.
+    starred: tuple[str, ...] = ()
 
-    #: Fields written to disk. All of them — the previous build persisted only
-    #: three and dropped every filter on exit.
+    #: Fields written to disk. Every field on this class — the previous build
+    #: persisted only three and dropped every filter on exit.
+    #:
+    #: The selected source is deliberately not among them. The viewer opens on
+    #: the discovery summary rather than resuming and tailing whatever was last
+    #: open, so storing the path would record where someone had been reading
+    #: without ever being used.
     PERSISTED_FIELDS: ClassVar[tuple[str, ...]] = (
         "query",
         "severity",
@@ -45,7 +53,6 @@ class SessionState:
         "custom_start",
         "custom_end",
         "auto_scroll",
-        "selected_source",
         "pretty_rendering",
         "include_globs",
         "exclude_globs",
@@ -55,6 +62,7 @@ class SessionState:
         "use_regex",
         "invert_match",
         "tree_width",
+        "starred",
     )
 
     @classmethod
@@ -75,6 +83,12 @@ class SessionState:
                 continue
             if expected == "str" and not isinstance(value, str):
                 continue
+            if expected == "tuple[str, ...]":
+                # JSON has no tuples; keep only the string entries so one bad
+                # element cannot discard the whole list.
+                if not isinstance(value, (list, tuple)):
+                    continue
+                value = tuple(item for item in value if isinstance(item, str))
             known[name] = value
         return cls(**known)
 

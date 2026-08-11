@@ -31,8 +31,14 @@ desktop terminal and on a headless 80-column SSH session.
 - 🧩 **Plugins.** `LogSourceProvider`, `FilterStage` and `Exporter` interfaces,
   loaded from `clv/plugins/` or from installed packages via the `clv.plugins`
   entry point group. A broken plugin is reported, never fatal.
-- 💾 **Session state that persists.** Filters, toggles, drawer settings and the
-  selected source all come back on restart.
+- ⭐ **Starred logs.** Press `*` on any log to star it. Starred logs are
+  repeated in a group at the top of the tree, so a favourite buried several
+  folders deep is one keystroke away. Star exactly one and CLV opens it on
+  launch.
+- 💾 **Session state that persists.** Filters, toggles, drawer settings and
+  stars come back on restart. The source you merely had open does not: without
+  a star, CLV opens on its discovery summary, so every launch starts from a
+  known state rather than silently resuming a tail.
 
 ---
 
@@ -132,6 +138,7 @@ python -m clv    # module entry point
 | `a` | Add a log source |
 | `t` / `s` | Cycle time window / severity |
 | `f` | Toggle the Advanced drawer |
+| `*` | Star / unstar the log under the cursor |
 | `w` | Follow new lines (auto-scroll) on/off |
 | `o` | Structured output on/off |
 | `Ctrl+B` | Switch between tree and log pane (compact widths) |
