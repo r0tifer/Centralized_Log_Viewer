@@ -77,9 +77,12 @@ STRUCTURED_PAYLOAD_MAX_CHARS = 8_192
 BREAKPOINT_COMPACT = 90
 BREAKPOINT_NARROW = 130
 #: Width at which the time presets, toggles and action buttons fit on a single
-#: line together. Measured against their natural widths (48 + 21 + 55 columns
-#: plus padding), not guessed, and asserted in tests/test_query_bar.py.
-BREAKPOINT_MERGE = 136
+#: line together. Measured, not guessed: the row needs 147 columns, so this
+#: leaves one to spare. It moved from 136 when the Star button was added to the
+#: action row, and tests/test_query_bar.py checks that nothing sits off-screen
+#: at exactly this width — so widening that row again fails the build until the
+#: number is re-measured.
+BREAKPOINT_MERGE = 148
 
 SOURCES_PANEL_MIN_WIDTH = 20
 SOURCES_PANEL_MAX_WIDTH = 120
@@ -235,10 +238,13 @@ class LogViewerApp(App[None]):
         Binding("/", "focus_query", "Query", show=True),
         Binding("escape", "clear_query", "Clear", show=True),
         Binding("a", "add_source", "Add source", show=True),
+        # Ordered before the filter bindings deliberately. The footer drops
+        # entries from the right as it runs out of room, and at 80 columns
+        # Star was being truncated to a bare "*".
+        Binding("asterisk", "toggle_star", "Star", show=True),
         Binding("t", "cycle_time", "Time", show=True),
         Binding("s", "cycle_severity", "Severity", show=True),
         Binding("f", "toggle_advanced", "Advanced", show=True),
-        Binding("asterisk", "toggle_star", "Star", show=True),
         # The auto-scroll and structured switches are only shown when the query
         # bar merges its rows, so they need a keyboard path that does not
         # depend on terminal width.
@@ -322,6 +328,7 @@ class LogViewerApp(App[None]):
         self._open_starred_on_launch()
 
         self._refresh_chips()
+        self._sync_star_button()
         self._update_status()
         self._persist_state = True
 
@@ -579,6 +586,7 @@ class LogViewerApp(App[None]):
         self._start_tail()
         self._update_status()
         self._sync_compact_pane()
+        self._sync_star_button()
         return True
 
     def _start_tail(self) -> None:
@@ -943,17 +951,49 @@ class LogViewerApp(App[None]):
             else "Structured output off."
         )
 
-    async def action_toggle_star(self) -> None:
-        """Star or unstar the log under the tree cursor."""
+    def _star_target(self) -> Optional[Path]:
+        """The log that starring would act on.
+
+        The tree cursor wins while the tree has focus — that is what the
+        operator is pointing at. Otherwise it is the log on screen, so the
+        toolbar button stars what you are reading rather than something the
+        cursor happens to be resting on.
+        """
 
         try:
             tree = self.query_one("#source-tree", LogTree)
         except NoMatches:
+            tree = None
+
+        def cursor_file() -> Optional[Path]:
+            if tree is None or tree.cursor_node is None:
+                return None
+            data = tree.cursor_node.data
+            return data if isinstance(data, Path) and data.is_file() else None
+
+        if tree is not None and tree.has_focus:
+            target = cursor_file()
+            if target is not None:
+                return target
+        if self._selected_source is not None:
+            return self._selected_source
+        return cursor_file()
+
+    def _sync_star_button(self) -> None:
+        """Show whether the star target is starred, or disable when there is none."""
+
+        if self._is_shutting_down or not self.is_mounted:
             return
-        node = tree.cursor_node
-        data = node.data if node is not None else None
-        if not isinstance(data, Path) or not data.is_file():
-            self._notify("Move the cursor to a log file to star it.", "warning")
+        target = self._star_target()
+        starred = None if target is None else str(_resolve(target)) in self.state.starred
+        self.query_bar.set_star_state(starred)
+
+    async def action_toggle_star(self) -> None:
+        """Star or unstar the log the star target resolves to."""
+
+        data = self._star_target()
+        if data is None:
+            self._notify("Open a log, or move the tree cursor to one, to star it.", "warning")
             return
 
         key = str(_resolve(data))
@@ -971,6 +1011,7 @@ class LogViewerApp(App[None]):
         if self._report is not None:
             await self._build_tree(self._report)
             self._highlight_source(data, select=False)
+        self._sync_star_button()
         self._notify(message)
 
     def _open_starred_on_launch(self) -> None:
@@ -1151,7 +1192,21 @@ class LogViewerApp(App[None]):
         if isinstance(data, Path) and data.is_file():
             self._select_source(data)
 
+    def on_tree_node_highlighted(self, _event: Tree.NodeHighlighted[Path]) -> None:
+        # The star target follows the cursor while the tree has focus, so the
+        # button has to follow it too.
+        self._sync_star_button()
+
+    def on_descendant_focus(self, _event) -> None:
+        # Focus moving between the tree and the rest of the UI changes which
+        # log the star button would act on.
+        self._sync_star_button()
+
     def on_query_bar_action_triggered(self, message: QueryBar.ActionTriggered) -> None:
+        if message.action_id == "toggle-star":
+            # Async action, so it runs as a worker rather than blocking here.
+            self.run_worker(self.action_toggle_star(), group="star", exit_on_error=False)
+            return
         handlers = {
             "add-source": self.action_add_source,
             "run-query": self._render_log,

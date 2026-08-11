@@ -39,6 +39,11 @@ TIME_PRESETS: list[tuple[str, str]] = [
     ("range", "Custom"),
 ]
 
+#: Star button labels. Same width in both states, so toggling a star never
+#: reflows the action row; the glyph carries the state.
+STAR_OFF = "☆ Star"
+STAR_ON = "⭐ Star"
+
 #: Severity buckets exposed in the UI, matching services.parsing.SEVERITY_BUCKETS.
 SEVERITY_OPTIONS: list[tuple[str, str]] = [
     ("all", "All"),
@@ -211,6 +216,13 @@ class QueryBar(Container):
 
     QueryBar #actions Button:first-child { margin-left: 0; }
 
+    /* Starred reads as filled-and-warm; unstarred stays neutral so the two
+       are distinguishable by more than the glyph outline. */
+    QueryBar #toggle-star.-starred {
+        background: $warning 45%;
+        text-style: bold;
+    }
+
     /* --- breakpoints ----------------------------------------------------
        DEFAULT_CSS is scoped to this widget, so these key off a class the app
        mirrors onto the QueryBar itself rather than off the app node. --- */
@@ -306,6 +318,7 @@ class QueryBar(Container):
             with Container(id="actions"):
                 yield Button("Advanced", id="toggle-advanced", variant="warning")
                 yield Button("Add Source", id="add-source", variant="success")
+                yield Button(STAR_OFF, id="toggle-star")
                 yield Button("Run", id="run-query", variant="primary")
                 yield Button("Clear", id="clear-query", variant="error")
                 yield Button("Save", id="save-session", variant="success")
@@ -421,6 +434,26 @@ class QueryBar(Container):
 
     # --- toggles ------------------------------------------------------------
 
+    def set_star_state(self, starred: Optional[bool]) -> None:
+        """Reflect whether the star target is starred.
+
+        ``None`` means there is nothing to star, which disables the button
+        rather than leaving it looking usable.
+        """
+
+        try:
+            button = self.query_one("#toggle-star", Button)
+        except NoMatches:
+            return
+        button.disabled = starred is None
+        button.label = STAR_ON if starred else STAR_OFF
+        button.set_class(bool(starred), "-starred")
+        button.tooltip = (
+            "Select a log to star" if starred is None
+            else "Unstar this log (*)" if starred
+            else "Star this log (*)"
+        )
+
     def set_pretty_rendering(self, value: bool) -> None:
         self.query_one("#pretty-structured-toggle", Switch).value = value
 
@@ -448,7 +481,13 @@ class QueryBar(Container):
             self.post_message(self.CustomRangeRequested())
 
     def on_button_pressed(self, event: Button.Pressed) -> None:  # type: ignore[override]
-        if event.button.id in {"add-source", "run-query", "clear-query", "save-session"}:
+        if event.button.id in {
+            "add-source",
+            "toggle-star",
+            "run-query",
+            "clear-query",
+            "save-session",
+        }:
             self.post_message(self.ActionTriggered(event.button.id))
 
     async def on_key(self, event: events.Key) -> None:
