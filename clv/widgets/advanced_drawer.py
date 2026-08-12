@@ -155,9 +155,11 @@ class AdvancedFiltersDrawer(Static):
        place to change the same setting. */
     AdvancedFiltersDrawer.-merged #view-toggles { display: none; }
 
-    /* Deliberately *not* inside #view-toggles: the clipboard switch has only
-       one home, so hiding it at -merged (where the query bar shows its own
-       copies of the other two) would make it vanish above 148 columns. */
+    /* Deliberately *not* inside #view-toggles: the clipboard and detail-pane
+       switches each have only one home, so hiding them at -merged (where the
+       query bar shows its own copies of the other two) would make them vanish
+       above 148 columns. Giving the detail pane a query-bar copy instead would
+       push that row past BREAKPOINT_MERGE, which was measured for two. */
     AdvancedFiltersDrawer #output-options {
         height: auto;
         width: 1fr;
@@ -185,6 +187,7 @@ class AdvancedFiltersDrawer(Static):
         self._auto_scroll = True
         self._structured = False
         self._clipboard = True
+        self._detail_pane = False
         self.add_class("-hidden")
 
     # --- composition --------------------------------------------------------
@@ -204,15 +207,24 @@ class AdvancedFiltersDrawer(Static):
                     yield Switch(value=self._structured, id="drawer-structured")
                 yield Static("", classes="drawer-field")
 
-        # Its own container rather than a fourth toggle in the View row above:
-        # that row disappears when the query bar shows its own copies, and this
-        # switch has nowhere else to live.
+        # Its own container rather than more toggles in the View row above:
+        # that row disappears when the query bar shows its own copies, and
+        # these two switches have nowhere else to live. What they have in
+        # common is being *single-home* — the keyboard is their only other
+        # path — which is why they share a section rather than a subject.
+        #
+        # They also share a row, which is not cosmetic: the drawer is capped at
+        # max-height 16 and scrolls, so a section per switch pushed "Source
+        # discovery" below the fold where it laid out and painted nothing.
         with Container(id="output-options"):
-            yield Label("Output", classes="drawer-heading")
+            yield Label("Output & panes", classes="drawer-heading")
             with Horizontal(classes="drawer-row"):
                 with Vertical(classes="drawer-toggle"):
                     yield Label("Clipboard (OSC 52)")
                     yield Switch(value=self._clipboard, id="drawer-clipboard")
+                with Vertical(classes="drawer-toggle"):
+                    yield Label("Detail pane")
+                    yield Switch(value=self._detail_pane, id="drawer-detail-pane")
                 yield Static("", classes="drawer-field")
 
         yield Label("Source discovery", classes="drawer-heading")
@@ -295,6 +307,7 @@ class AdvancedFiltersDrawer(Static):
         auto_scroll: bool,
         structured: bool,
         clipboard: bool | None = None,
+        detail_pane: bool | None = None,
     ) -> None:
         """Mirror the app's view state onto this drawer's switches.
 
@@ -304,20 +317,25 @@ class AdvancedFiltersDrawer(Static):
         a flag cleared at the end of this method is already back to False by
         the time the handler runs.
 
-        ``clipboard`` is optional because that switch has no second copy in the
-        query bar: it only needs seeding, not continuous mirroring.
+        ``clipboard`` and ``detail_pane`` are optional because neither switch
+        has a second copy in the query bar: they only need seeding, not
+        continuous mirroring.
         """
 
         self._auto_scroll = auto_scroll
         self._structured = structured
         if clipboard is not None:
             self._clipboard = clipboard
+        if detail_pane is not None:
+            self._detail_pane = detail_pane
         try:
             with self.prevent(Switch.Changed):
                 self.query_one("#drawer-auto-scroll", Switch).value = auto_scroll
                 self.query_one("#drawer-structured", Switch).value = structured
                 if clipboard is not None:
                     self.query_one("#drawer-clipboard", Switch).value = clipboard
+                if detail_pane is not None:
+                    self.query_one("#drawer-detail-pane", Switch).value = detail_pane
         except NoMatches:  # not composed yet
             pass
 
@@ -330,6 +348,7 @@ class AdvancedFiltersDrawer(Static):
             "drawer-auto-scroll": "auto_scroll",
             "drawer-structured": "structured",
             "drawer-clipboard": "clipboard",
+            "drawer-detail-pane": "detail_pane",
         }.get(switch_id)
         if view_field is not None:
             event.stop()

@@ -32,11 +32,11 @@ from rich.table import Table
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Container, Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.reactive import reactive
 from textual.timer import Timer
-from textual.widgets import Button, Footer, Input, Label, RichLog, Static, Switch, Tree
+from textual.widgets import Button, Footer, Input, Label, Static, Switch, Tree
 from textual.widgets._tree import TreeNode
 
 from .plugins import Exporter, FilterContext, PluginError, PluginRegistry, load_plugins
@@ -66,9 +66,11 @@ from .storage import SessionState, StateStore
 from .widgets.add_source_dialog import AddSourceDialog
 from .widgets.advanced_drawer import AdvancedFiltersDrawer, AdvancedSettings
 from .widgets.custom_time_dialog import CustomTimeRangeDialog
+from .widgets.detail_pane import DetailPane
 from .widgets.export_dialog import ExportChoice, ExportDialog, ExportRequest
 from .widgets.filter_chip import FilterChip, FilterChips
 from .widgets.help_overlay import HelpOverlay, HelpSection
+from .widgets.log_view import LogView
 from .widgets.query_bar import QueryBar
 
 SEVERITY_COLORS: dict[str, str] = {
@@ -131,6 +133,18 @@ BINDING_CATEGORIES: dict[str, str] = {
     "cycle_time": "Search",
     "cycle_severity": "Search",
     "toggle_advanced": "Search",
+    # LogView owns the cursor keys. They are bound on the widget rather than
+    # the app so they cannot fight the source tree or a text input, and they
+    # are folded into the overlay by build_help_sections rather than written
+    # out by hand — help stays generated.
+    "cursor_up": "Navigation",
+    "cursor_down": "Navigation",
+    "cursor_page_up": "Navigation",
+    "cursor_page_down": "Navigation",
+    "cursor_home": "Navigation",
+    "cursor_end": "Navigation",
+    "select_cursor": "Navigation",
+    "toggle_detail": "Navigation",
     "toggle_auto_scroll": "View",
     "toggle_structured": "View",
     "export_view": "View",
@@ -257,7 +271,19 @@ class LogViewerApp(App[None]):
         padding: 0 1;
     }
 
+    /* Holds the log pane and the detail pane. The split direction is the only
+       thing decided here — how much room the detail pane takes is its own CSS,
+       keyed off the breakpoint class mirrored onto it. */
+    #log-area {
+        layout: vertical;
+        width: 1fr;
+        height: 1fr;
+    }
+
+    LogViewerApp.-wide #log-area { layout: horizontal; }
+
     #log-stream {
+        width: 1fr;
         height: 1fr;
         border: solid $surface 20%;
         scrollbar-gutter: stable;
@@ -292,12 +318,19 @@ class LogViewerApp(App[None]):
     LogViewerApp.-compact.-viewer-focused #sources-panel { display: none; }
     LogViewerApp.-compact.-viewer-focused #viewer-panel { display: block; width: 100%; }
 
-    /* Copy mode strips the chrome so a mouse selection grabs log text only. */
+    /* 80 columns cannot hold both panes at a readable width, so the detail
+       pane takes the viewer and the log goes behind it. Esc-free by design:
+       `d` closes it and the log is back. */
+    LogViewerApp.-compact #log-area.-detail #log-stream { display: none; }
+
+    /* Copy mode strips the chrome so a mouse selection grabs log text only —
+       which includes the detail pane, whose property table is not log text. */
     LogViewerApp.-copy-mode #query-bar,
     LogViewerApp.-copy-mode #chip-bar,
     LogViewerApp.-copy-mode #advanced-drawer,
     LogViewerApp.-copy-mode #sources-panel,
     LogViewerApp.-copy-mode #status-bar,
+    LogViewerApp.-copy-mode DetailPane,
     LogViewerApp.-copy-mode Footer,
     LogViewerApp.-copy-mode .panel-title {
         display: none;
@@ -332,6 +365,7 @@ class LogViewerApp(App[None]):
         # depend on terminal width.
         Binding("w", "toggle_auto_scroll", "Follow", show=True),
         Binding("o", "toggle_structured", "Structured", show=False),
+        Binding("d", "toggle_detail", "Detail pane", show=False),
         Binding("ctrl+b", "toggle_pane", "Switch pane", show=True),
         Binding("[", "shrink_sources_panel", "Narrower", show=False),
         Binding("]", "expand_sources_panel", "Wider", show=False),
@@ -375,15 +409,20 @@ class LogViewerApp(App[None]):
         self._merged = False
         self._plugins: PluginRegistry = PluginRegistry()
 
+        #: Set when the cursor moved off the last line and suspended follow, so
+        #: the status line can say *why* it is paused rather than just that it
+        #: is. Cleared by anything that resumes following.
+        self._follow_suspended_by_cursor = False
+
         self.query_bar = QueryBar()
         self.chip_bar = FilterChips(id="chip-bar")
         self.advanced_drawer = AdvancedFiltersDrawer()
-        self.log_panel = RichLog(
+        self.log_panel = LogView(
             id="log-stream",
             wrap=True,
-            markup=False,
-            max_lines=self._config.max_buffer_lines,
+            max_rows=self._config.max_buffer_lines,
         )
+        self.detail_pane = DetailPane(id="detail-pane")
 
     # --- composition --------------------------------------------------------
 
@@ -397,7 +436,9 @@ class LogViewerApp(App[None]):
                 yield Vertical(id="tree-panel")
             with Vertical(id="viewer-panel"):
                 yield Label("Log Output", classes="panel-title")
-                yield self.log_panel
+                with Container(id="log-area"):
+                    yield self.log_panel
+                    yield self.detail_pane
         yield Static("", id="status-bar")
         yield Footer()
 
@@ -418,6 +459,7 @@ class LogViewerApp(App[None]):
 
         self._refresh_chips()
         self._sync_star_button()
+        self._sync_detail_pane()
         # Filled at mount rather than only when the drawer opens, so the plugin
         # and exporter lines are correct the first time it is seen.
         self._refresh_plugin_status()
@@ -472,6 +514,7 @@ class LogViewerApp(App[None]):
             auto_scroll=self.state.auto_scroll,
             structured=self.state.pretty_rendering,
             clipboard=self.state.clipboard_osc52,
+            detail_pane=self.state.detail_pane,
         )
 
     # --- responsiveness -----------------------------------------------------
@@ -501,7 +544,7 @@ class LogViewerApp(App[None]):
         if breakpoint_name == self._breakpoint and merged == self._merged:
             return
 
-        targets = [self, self.query_bar, self.advanced_drawer]
+        targets = [self, self.query_bar, self.advanced_drawer, self.detail_pane]
         for name in ("-compact", "-narrow", "-wide"):
             active = name == breakpoint_name
             for target in targets:
@@ -769,34 +812,58 @@ class LogViewerApp(App[None]):
     def _render_log(self, *, scroll_end: bool = False) -> None:
         if self._is_shutting_down:
             return
+        # Which line the cursor was on, so a filter change does not send it
+        # back to the top. Captured before the pane is cleared.
+        previous_entry = self.log_panel.cursor_entry
+        previous_index = self.log_panel.cursor
         self.log_panel.clear()
 
         if self._selected_source is None:
             if self._report is not None:
                 self._show_discovery_summary(self._report)
+            self._sync_detail_pane()
             return
 
         if not self._entries:
             self.log_panel.write(Text("No log entries in the selected source.", style="dim"))
+            self._sync_detail_pane()
             return
 
         try:
             result = self._visible_entries(self._entries)
         except QueryError as exc:
             self.log_panel.write(Text(f"Invalid query: {exc}", style="bold #f87171"))
+            self._sync_detail_pane()
             return
 
         if not result.entries:
             message = describe_empty_result(result.stats, self._filter_spec())
             self.log_panel.write(Text(message, style="dim"))
+            self._sync_detail_pane()
             return
 
         for entry in result.entries[-self._show_lines :]:
-            self.log_panel.write(self._renderable_for(entry))
+            self.log_panel.write_entry(self._renderable_for(entry), entry)
 
+        self._restore_cursor(previous_entry, previous_index)
         if scroll_end or self.state.auto_scroll:
             self.log_panel.scroll_end(animate=False)
         self._update_status()
+
+    def _restore_cursor(self, entry: LogEntry | None, index: int) -> None:
+        """Put the cursor back where it was, or as near as the new view allows.
+
+        Resetting to the top on every keystroke in the query box would make the
+        cursor useless while filtering, which is exactly when it is wanted. The
+        selected line wins when it survived; when it did not, the nearest
+        surviving line does — never the top.
+        """
+
+        if entry is None or index < 0:
+            return
+        if self.log_panel.move_cursor_to_entry(entry, near=index):
+            return
+        self.log_panel.clamp_cursor(index)
 
     def _append_entries(self, entries: list[LogEntry]) -> None:
         """Incremental render for tailed lines.
@@ -812,7 +879,7 @@ class LogViewerApp(App[None]):
         except QueryError:
             return
         for entry in result.entries:
-            self.log_panel.write(self._renderable_for(entry))
+            self.log_panel.write_entry(self._renderable_for(entry), entry)
 
     def _renderable_for(self, entry: LogEntry) -> RenderableType:
         if self.state.pretty_rendering:
@@ -949,7 +1016,15 @@ class LogViewerApp(App[None]):
         except QueryError:
             detail = "invalid query"
 
-        follow = "following" if self.state.auto_scroll else "paused"
+        if self.state.auto_scroll:
+            follow = "following"
+        elif self._follow_suspended_by_cursor:
+            # Say *why* it stopped. Incoming lines fighting a cursor the
+            # operator just moved is the failure mode this avoids, and a bare
+            # "paused" would look like the app had decided on its own.
+            follow = "paused — cursor moved, End resumes"
+        else:
+            follow = "paused"
         status.update(f"{self._selected_source} · {detail} · {follow}")
 
     def _refresh_chips(self) -> None:
@@ -1034,6 +1109,13 @@ class LogViewerApp(App[None]):
         self._set_auto_scroll(not self.state.auto_scroll)
         self._notify(
             "Following new lines." if self.state.auto_scroll else "Auto-scroll paused."
+        )
+
+    def action_toggle_detail(self) -> None:
+        """Show or hide the event detail pane."""
+        self._set_detail_pane(not self.state.detail_pane)
+        self._notify(
+            "Detail pane open." if self.state.detail_pane else "Detail pane closed."
         )
 
     def action_toggle_structured(self) -> None:
@@ -1139,7 +1221,12 @@ class LogViewerApp(App[None]):
         # than reopening; guard anyway so it can never stack two overlays.
         if isinstance(self.screen, HelpOverlay):
             return
-        self.push_screen(HelpOverlay(build_help_sections(self.BINDINGS)))
+        # LogView's cursor keys are bound on the widget, not the app, so they
+        # have to be handed in explicitly — still generated from Binding
+        # objects, so a key added there can no more go missing from the overlay
+        # than one added here.
+        bindings = list(self.BINDINGS) + list(LogView.BINDINGS)
+        self.push_screen(HelpOverlay(build_help_sections(bindings)))
 
     def action_toggle_advanced(self) -> None:
         self.advanced_drawer.toggle()
@@ -1542,8 +1629,35 @@ class LogViewerApp(App[None]):
             self._set_auto_scroll(message.value)
         elif message.field == "clipboard":
             self._set_clipboard_enabled(message.value)
+        elif message.field == "detail_pane":
+            self._set_detail_pane(message.value)
         else:
             self._set_structured(message.value)
+
+    def on_log_view_cursor_moved(self, message: LogView.CursorMoved) -> None:
+        """Follow mode and the detail pane both track the cursor.
+
+        Moving the cursor off the last line suspends following, because the
+        alternative is incoming lines dragging the view out from under whoever
+        just pointed at something. `End` (or `w`) puts it back.
+        """
+
+        if self.state.auto_scroll and not message.at_end:
+            self._set_auto_scroll(False, cursor_suspended=True)
+            self._notify("Auto-scroll paused — End resumes following.")
+        elif message.at_end and self._follow_suspended_by_cursor:
+            self._set_auto_scroll(True)
+            self._notify("Following new lines.")
+        if self.state.detail_pane:
+            self.detail_pane.show(message.entry)
+        self._update_status()
+
+    def on_log_view_entry_selected(self, message: LogView.EntrySelected) -> None:
+        """Enter on a line opens the detail pane on it."""
+
+        if not self.state.detail_pane:
+            self._set_detail_pane(True)
+        self.detail_pane.show(message.entry)
 
     # --- view state -----------------------------------------------------------
     #
@@ -1552,13 +1666,20 @@ class LogViewerApp(App[None]):
     # at a time. Both funnel through here so the state has a single owner and
     # the two copies cannot drift apart.
 
-    def _set_auto_scroll(self, value: bool) -> None:
+    def _set_auto_scroll(self, value: bool, *, cursor_suspended: bool = False) -> None:
         self._update_state(auto_scroll=value)
         self.log_panel.auto_scroll = value
+        # Resuming clears the reason, whichever control resumed it.
+        self._follow_suspended_by_cursor = cursor_suspended and not value
         if value:
             self.log_panel.scroll_end(animate=False)
         self._sync_view_toggles()
         self._update_status()
+
+    def _set_detail_pane(self, value: bool) -> None:
+        self._update_state(detail_pane=value)
+        self._sync_view_toggles()
+        self._sync_detail_pane()
 
     def _set_structured(self, value: bool) -> None:
         self._update_state(pretty_rendering=value)
@@ -1592,7 +1713,29 @@ class LogViewerApp(App[None]):
             auto_scroll=self.state.auto_scroll,
             structured=self.state.pretty_rendering,
             clipboard=self.state.clipboard_osc52,
+            detail_pane=self.state.detail_pane,
         )
+
+    def _sync_detail_pane(self) -> None:
+        """Show or hide the detail pane and refresh what it is showing.
+
+        The `-detail` class on the container is what the compact breakpoint
+        keys off to hide the log behind the pane; the pane's own visibility is
+        its `-visible` class.
+        """
+
+        # is_running, not is_mounted: rendering is unit-tested without a screen,
+        # and query_one needs one. Same guard _update_status uses.
+        if self._is_shutting_down or not self.is_running:
+            return
+        visible = self.state.detail_pane
+        self.detail_pane.set_class(visible, "-visible")
+        try:
+            self.query_one("#log-area", Container).set_class(visible, "-detail")
+        except NoMatches:
+            pass
+        if visible:
+            self.detail_pane.show(self.log_panel.cursor_entry)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:  # type: ignore[override]
         if (event.button.id or "") == "toggle-advanced":

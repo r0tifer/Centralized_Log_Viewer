@@ -124,7 +124,9 @@ config.load_config ─→ SourceManager ─→ discovery.discover (thread)
                                               ↓
    reader.SourceReader.prime/poll ─→ parsing.LogParser.feed ─→ deque[LogEntry]
                                               ↓
-        plugins.apply_filters ─→ filtering.filter_entries ─→ RichLog
+        plugins.apply_filters ─→ filtering.filter_entries ─→ LogView
+                                                               ↓
+                                                cursor ─→ DetailPane
 ```
 
 ---
@@ -152,6 +154,8 @@ config.load_config ─→ SourceManager ─→ discovery.discover (thread)
 | `QueryBar` | `TimeWindowChanged` | Time window changed (carries bounds for a custom range) |
 | `QueryBar` | `SeverityChanged` | Severity bucket changed |
 | `QueryBar` | `CustomRangeRequested` | Open the custom range dialog |
+| `LogView` | `CursorMoved` | The line cursor moved; carries whether it is on the last entry |
+| `LogView` | `EntrySelected` | `Enter` on a line — open the detail pane on it |
 | `SegmentedButtons` | `ValueChanged` / `Reselected` | Segment activated / re-activated |
 | `FilterChip` | `Dismissed` | Revert the named filter |
 | `AdvancedFiltersDrawer` | `SettingsChanged` | Full before/after snapshot; `needs_rescan` says whether discovery must re-run |
@@ -214,7 +218,7 @@ or break a render.
 - Layout regressions are caught by asserting widget `region` bounds at a given
   terminal size rather than by eyeballing screenshots.
 
-Run: `python -m pytest` (290 tests).
+Run: `python -m pytest` (316 tests).
 
 ---
 
@@ -239,7 +243,8 @@ Run: `python -m pytest` (290 tests).
 
 - **Start here**: `clv/app.py`, then `clv/services/`.
 - **Primary UI**: source tree (left), log output (right); at `-compact` they
-  swap via `Ctrl+B`.
+  swap via `Ctrl+B`. The log pane (`LogView`) carries a line cursor, and the
+  `DetailPane` beside/below it renders whatever that cursor is on.
 - **Keep it fast**: bounded reads, incremental renders, threaded discovery.
 - **Keep it honest**: never drop a line silently; explain every empty pane.
 - **Keep it consistent**: identical keyboard and mouse paths everywhere.

@@ -19,6 +19,11 @@ desktop terminal and on a headless 80-column SSH session.
 - 🧵 **Stack traces stay attached.** A line no format recognises inherits the
   timestamp and severity of the entry above it, so a traceback survives a
   "show me only errors" filter along with the ERROR that produced it.
+- 🔬 **Select a line, see the whole event.** Arrow keys move a cursor through
+  the log; `Enter` opens a detail pane showing the raw line beside its parsed
+  timestamp, canonical severity, detected format and every field the parser
+  recovered — host, tag, PID, HTTP status, or the flattened keys of a JSON
+  payload.
 - 🪶 **Bounded memory, whatever the file size.** Opening a source seeks
   backwards from the end of the file; a 160 MB log opens in ~2 ms using under a
   megabyte. Tailing reads only what was appended.
@@ -146,6 +151,40 @@ One wrinkle worth knowing: while the cursor is in the query input, `?` types a
 literal question mark, because it is a valid regex character. Press `Esc` first
 if the input has focus. Tailing continues while the overlay is open.
 
+### Inspecting an event
+
+The log pane has a cursor. Arrow keys move it a line at a time, `PgUp`/`PgDn` a
+screen at a time, `Home`/`End` to either end, and a mouse click selects the line
+you click on.
+
+`Enter` on the selected line opens the **detail pane**, which lists:
+
+| Property | |
+| --- | --- |
+| The raw line | Exactly as it appears in the file |
+| `Timestamp` | Normalised, or `—` when the line carries none |
+| `Level` | The canonical severity, or `—` |
+| `Format` | Which format matched — down to *unrecognised* |
+| `Continuation` | Whether the timestamp and level were inherited from the line above |
+| …then every field | `host`, `tag`, `pid`, `status`, or a JSON payload's keys flattened to dotted paths |
+
+`d` opens and closes the pane without moving the cursor, and there is a **Detail
+pane** switch in the Advanced drawer. Whether it is open is remembered between
+runs; which line you had selected is not.
+
+Not every line has fields — four of the formats CLV recognises carry none, and
+an unrecognised line carries nothing but its text. The pane says which case it
+is rather than showing you an empty list.
+
+Where the pane goes depends on the width: beside the log from 130 columns,
+below it between 90 and 130, and in place of the log at 80, where the two
+cannot share the screen. Press `d` to get the log back.
+
+**Moving the cursor pauses follow mode.** Otherwise incoming lines would drag
+the view out from under the line you just pointed at. The status bar says so —
+*"paused — cursor moved, End resumes"* — and `End` or `w` starts following
+again.
+
 ### Exporting
 
 `Ctrl+E` writes the entries the filters kept to a file. Three formats ship:
@@ -197,12 +236,16 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | --- | --- |
 | `?` | Show every keybinding |
 | `/` | Focus the query input |
-| `Enter` | Apply filters |
+| `Enter` | Apply filters (in the query input) · open the detail pane (in the log pane) |
 | `Esc` | Clear the query |
 | `a` | Add a log source |
 | `t` / `s` | Cycle time window / severity |
 | `f` | Toggle the Advanced drawer |
 | `*` | Star / unstar the log under the cursor |
+| `↑` / `↓` | Move the line cursor |
+| `PgUp` / `PgDn` | Move the line cursor a screen at a time |
+| `Home` / `End` | First / last line (`End` also resumes following) |
+| `d` | Show / hide the event detail pane |
 | `w` | Follow new lines (auto-scroll) on/off |
 | `o` | Structured output on/off |
 | `Ctrl+B` | Switch between tree and log pane (compact widths) |

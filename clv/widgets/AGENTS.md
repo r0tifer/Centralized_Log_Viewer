@@ -40,6 +40,8 @@ Widgets are the building blocks of Centralized Log Viewer (CLV). Each one is **s
 | **FilterChip** | Displays active filters | `Dismissed` | Allows quick removal of active filters. |
 | **HelpOverlay** | Lists every keybinding | *(dismiss only)* | Modal; sections are built by the app from `BINDINGS`, so it cannot go stale. |
 | **ExportDialog** | Format + destination for `Ctrl+E` | *(dismisses with `ExportRequest`)* | Modal; states the entry count, and overwriting takes a second press of Export. |
+| **LogView** | The log pane, with a line cursor | `CursorMoved`, `EntrySelected` | `ScrollView` + Line API. Rows are entry-indexed, not line-indexed, because one entry can wrap or render as a whole panel. Append is O(new); the row cap trims in batches so the rebuild is amortised. Owns the cursor keys as widget-scoped `BINDINGS`. |
+| **DetailPane** | Properties of the selected entry | *(none — driven by `show()`)* | Never renders a blank property list: four formats carry no fields, so each no-field case explains itself. |
 
 ---
 

@@ -146,9 +146,7 @@ def test_messages_are_toasts_and_do_not_pollute_the_log_pane() -> None:
             assert mock_notify.call_args_list[-1].kwargs["severity"] == "error"
 
             # Nothing landed in the log pane.
-            rendered = "\n".join(
-                getattr(strip, "plain", str(strip)) for strip in app.log_panel.lines
-            )
+            rendered = "\n".join(app.log_panel.text_lines)
             for text in ("All good", "Heads up", "Bad"):
                 assert text not in rendered
 
@@ -376,9 +374,7 @@ def test_launch_shows_the_summary_not_the_last_source(tmp_path: Path) -> None:
             assert second._selected_source is None, "a source was reopened on launch"
             assert second._tail_timer is None, "a tail was started on launch"
 
-            rendered = "\n".join(
-                getattr(line, "plain", str(line)) for line in second.log_panel.lines
-            )
+            rendered = "\n".join(second.log_panel.text_lines)
             assert "Log files found" in rendered
             assert "Select a log from the tree to begin." in rendered
 
@@ -437,9 +433,7 @@ def test_starring_marks_the_log_without_opening_it(tmp_path: Path) -> None:
 
             assert app.state.starred == (str(target.resolve()),)
             assert app._selected_source is None, "starring opened the log"
-            rendered = "\n".join(
-                getattr(line, "plain", str(line)) for line in app.log_panel.lines
-            )
+            rendered = "\n".join(app.log_panel.text_lines)
             assert "Log files found" in rendered
 
     asyncio.run(scenario())

@@ -12,6 +12,7 @@ from textual.widgets import Footer, Input, Static
 
 from clv.app import BINDING_CATEGORIES, LogViewerApp, build_help_sections
 from clv.widgets.help_overlay import HelpOverlay, HelpSection, format_key
+from clv.widgets.log_view import LogView
 
 
 def _rows(sections: list[HelpSection]) -> list[tuple[str, str]]:
@@ -22,11 +23,15 @@ def _rows(sections: list[HelpSection]) -> list[tuple[str, str]]:
 
 
 def test_every_binding_has_a_category() -> None:
-    """The fallback bucket is a safety net, not somewhere bindings live."""
+    """The fallback bucket is a safety net, not somewhere bindings live.
+
+    Covers LogView too: its cursor keys are bound on the widget rather than the
+    app, and a key an operator cannot find is a key that does not exist.
+    """
 
     uncategorised = {
         binding.action
-        for binding in LogViewerApp.BINDINGS
+        for binding in [*LogViewerApp.BINDINGS, *LogView.BINDINGS]
         if binding.action not in BINDING_CATEGORIES
     }
     assert uncategorised == set()
@@ -40,9 +45,7 @@ def test_sections_follow_the_declared_category_order() -> None:
         titles,
         key=["Help", "Search", "Navigation", "View", "Sources", "Session"].index,
     )
-    # Navigation has no bindings until a line cursor exists; an empty category
-    # is skipped rather than rendered as a bare heading.
-    assert "Navigation" not in titles
+    assert "Navigation" in titles
 
 
 def test_an_uncategorised_binding_still_appears() -> None:
