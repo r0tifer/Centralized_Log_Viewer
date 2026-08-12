@@ -100,14 +100,13 @@ jobs:
       - name: Install build tooling
         run: |
           set -euo pipefail
+          # Packaging only. PyInstaller and the project itself are installed
+          # inside the manylinux container that does the build, so the runner
+          # needs neither -- installing them here would just be a second,
+          # unused copy whose version nobody checks.
           sudo apt-get update
           sudo apt-get install -y ruby ruby-dev rpm build-essential
           sudo gem install --no-document fpm
-          python -m pip install --upgrade pip
-          pip install pyinstaller
-
-      - name: Install project
-        run: pip install .
 
       - name: Verify the settings template is present
         run: |
@@ -131,15 +130,58 @@ jobs:
             echo "IS_DEV=true" >> "$GITHUB_ENV"
           fi
 
-      - name: Build PyInstaller (onedir)
+      - name: Build PyInstaller (onedir) inside manylinux
         run: |
           set -euo pipefail
-          pyinstaller -y \
-            --name "${BIN_NAME}" \
-            --onedir \
-            --console \
-            --add-data "settings.conf:." \
-            clv/__main__.py
+          # Built in manylinux_2_28 (AlmaLinux 8) rather than on the runner,
+          # because a binary is only as portable as the oldest glibc it was
+          # linked against. Building on ubuntu-latest produced a bundle that
+          # demanded GLIBC_2.38 -- fine on Ubuntu 24.04 and nowhere else that
+          # matters: not RHEL 9 (2.34), Debian 12 (2.36), or Ubuntu 22.04
+          # (2.35). This floors it at 2.28 instead.
+          #
+          # Only PyInstaller runs in here. fpm, signing and the smoke test stay
+          # on the runner, which has the tooling and can happily execute a
+          # binary built against an older glibc.
+          #
+          # Note this makes the *bundled* libraries older still, which is
+          # harmless for the app and would be fatal for any system binary that
+          # inherited LD_LIBRARY_PATH from it -- see journald.child_environment,
+          # which is what keeps that from happening.
+          docker run --rm \
+            -v "${PWD}:/work" -w /work \
+            -e BIN_NAME="${BIN_NAME}" \
+            "quay.io/pypa/manylinux_2_28_${{ matrix.arch }}" \
+            bash -euo pipefail -c '
+              export PATH="/opt/python/cp311-cp311/bin:${PATH}"
+              python -m pip install --quiet --upgrade pip
+              python -m pip install --quiet pyinstaller .
+              pyinstaller -y \
+                --name "${BIN_NAME}" \
+                --onedir \
+                --console \
+                --add-data "settings.conf:." \
+                clv/__main__.py
+            '
+          # The container writes as root; the rest of the job is the runner user.
+          sudo chown -R "$(id -u):$(id -g)" build dist
+
+      - name: The bundle must run on more than the machine that built it
+        run: |
+          set -euo pipefail
+          # The guard for the regression this step exists to prevent: drop the
+          # container and the floor silently climbs to whatever the runner
+          # ships, which is how a release stops installing on RHEL.
+          MAX_GLIBC="$(find "dist/${BIN_NAME}" -type f \( -name '*.so*' -o -name "${BIN_NAME}" \) -print0 \
+            | xargs -0 -r objdump -T 2>/dev/null \
+            | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+          echo "highest glibc requirement in the bundle: ${MAX_GLIBC:-none}"
+          ALLOWED="GLIBC_2.28"
+          HIGHEST="$(printf '%s\n%s\n' "${MAX_GLIBC#GLIBC_}" "${ALLOWED#GLIBC_}" | sort -V | tail -1)"
+          if [[ "${HIGHEST}" != "${ALLOWED#GLIBC_}" ]]; then
+            echo "::error::bundle needs ${MAX_GLIBC}, above the ${ALLOWED} floor — was it built outside manylinux?" >&2
+            exit 1
+          fi
 
       - name: Smoke test the built binary
         run: |
