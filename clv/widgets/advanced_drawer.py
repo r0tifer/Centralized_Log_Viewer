@@ -149,6 +149,7 @@ class AdvancedFiltersDrawer(Static):
        without opening the dialog. No top padding: it sits directly under the
        plugin line as a second detail of the same block. */
     AdvancedFiltersDrawer #export-status,
+    AdvancedFiltersDrawer #journald-status,
     AdvancedFiltersDrawer #watch-status {
         color: $text-muted;
         height: auto;
@@ -212,6 +213,7 @@ class AdvancedFiltersDrawer(Static):
         self._clipboard = True
         self._detail_pane = False
         self._watch_rules = True
+        self._journald = False
         self.add_class("-hidden")
 
     # --- composition --------------------------------------------------------
@@ -289,6 +291,13 @@ class AdvancedFiltersDrawer(Static):
             with Vertical(classes="drawer-toggle"):
                 yield Label("Group rotated")
                 yield Switch(value=self._settings.group_rotated, id="group-rotated")
+            # Discovery, not output: the journal is a source, and this is where
+            # an operator looks for "what counts as a source". Disabled with a
+            # caption where journalctl is unavailable, so the answer to "why is
+            # there no journal here" is on screen rather than in the docs.
+            with Vertical(classes="drawer-toggle"):
+                yield Label("Journal (systemd)")
+                yield Switch(value=self._journald, id="drawer-journald")
             with Vertical(classes="drawer-field"):
                 yield Label("Buffered lines per source")
                 yield Input(
@@ -318,6 +327,7 @@ class AdvancedFiltersDrawer(Static):
         yield Static("", id="plugin-status")
         yield Static("", id="export-status")
         yield Static("", id="watch-status")
+        yield Static("", id="journald-status")
 
         with Container(id="drawer-actions"):
             yield Button("Rescan sources", id="rescan-sources", variant="primary")
@@ -347,6 +357,26 @@ class AdvancedFiltersDrawer(Static):
         try:
             self.query_one("#watch-status", Static).update(text)
         except NoMatches:
+            pass
+
+    def set_journald(self, enabled: bool, *, available: bool = True, reason: str = "") -> None:
+        """Show whether the journal is on, and disable the switch when it cannot be.
+
+        A switch that silently does nothing is worse than no switch: where
+        `journalctl` is missing this one is disabled and the status line says
+        why, so "there is no journal here" is answered on screen.
+        """
+
+        self._journald = enabled
+        try:
+            switch = self.query_one("#drawer-journald", Switch)
+            with self.prevent(Switch.Changed):
+                switch.value = enabled
+            switch.disabled = not available
+            self.query_one("#journald-status", Static).update(
+                f"Journal: {reason}" if reason else ""
+            )
+        except NoMatches:  # not composed yet
             pass
 
     def _emit(self, previous: AdvancedSettings) -> None:
@@ -430,6 +460,11 @@ class AdvancedFiltersDrawer(Static):
             "drawer-clipboard": "clipboard",
             "drawer-detail-pane": "detail_pane",
             "drawer-watch-rules": "watch_rules",
+            # A view toggle in mechanism only: the app owns it, acts on it, and
+            # syncs it back. What it actually does is grant consent to run a
+            # subprocess, which is why it is the app's decision and not this
+            # widget's — see LogViewerApp._set_journald.
+            "drawer-journald": "journald",
         }.get(switch_id)
         if view_field is not None:
             event.stop()

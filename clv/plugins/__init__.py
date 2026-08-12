@@ -56,16 +56,66 @@ class Plugin(ABC):
         return self.name
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderSource:
+    """One source a provider offers, and who offered it.
+
+    A provider's sources are **not** filesystem paths, even though they are
+    identified by one: nothing on disk answers to ``journal:unit/sshd.service``.
+    That is deliberate and is what keeps them out of every operation that
+    assumes a real file — starring (which persists a path), include/exclude
+    globs (which describe a directory walk), and the rotated-set grouping — all
+    of which test ``isinstance(data, Path)`` and so cannot see one of these.
+    Those operations were generalised nowhere: a provider source is a different
+    kind of thing, and pretending otherwise is how it would end up in someone's
+    ``session.json`` as a path that does not exist.
+    """
+
+    path: Path
+    label: str
+    #: The provider's own name, for the tree group and for error attribution.
+    provider: str = ""
+
+    @property
+    def name(self) -> str:
+        return self.label or self.path.name
+
+
 class LogSourceProvider(Plugin):
     """Supplies log sources that the filesystem walker would not find."""
 
     @abstractmethod
-    def discover(self) -> Iterable[Path]:
-        """Return the paths (or path-like identifiers) this provider offers."""
+    def discover(self) -> Iterable[Path | ProviderSource]:
+        """Return the sources this provider offers.
+
+        Either bare identifiers or :class:`ProviderSource` records, when the
+        provider has a better label than the identifier's last component.
+        """
 
     @abstractmethod
     def open(self, path: Path) -> Iterator[str]:
-        """Yield the lines of *path*."""
+        """Yield the lines of *path*.
+
+        The simple contract, and still the whole of it for a provider that
+        produces a finite list of lines. A provider that tails something should
+        implement :meth:`open_reader` instead; this is then never called.
+        """
+
+    def open_reader(self, path: Path, *, max_lines: int) -> Optional[Any]:
+        """Return a ``prime``/``poll`` reader for *path*, or None.
+
+        Optional. Returning None — the default — means "use :meth:`open`", and
+        core wraps that iterator in a reader itself, so a provider written
+        against the original interface keeps working untouched.
+
+        Implement this when the source is a live stream rather than a list of
+        lines: an iterator cannot express tailing, cannot be asked to stop, and
+        has nowhere to put the cleanup a subprocess needs. The returned object
+        must expose ``path``, ``prime()``, ``poll()`` and ``RELOAD_NOTICE``,
+        and should expose ``close()`` when it holds anything.
+        """
+
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +158,64 @@ class Exporter(Plugin):
     @abstractmethod
     def export(self, entries: Sequence[LogEntry], context: FilterContext) -> ExportResult:
         """Write or transmit *entries*."""
+
+
+# --- adapting the simple contract -------------------------------------------
+
+
+class IteratorReader:
+    """Turns a provider's ``open()`` iterator into a reader.
+
+    So that the older, simpler half of :class:`LogSourceProvider` keeps working
+    now that core expects ``prime``/``poll``. The iterator is drained up to the
+    line budget on prime and then drained further on each poll, which is enough
+    for a provider that yields a finite list and honest for one that does not:
+    a generator that blocks would block the poll, which is why a provider that
+    tails should implement ``open_reader`` instead.
+    """
+
+    RELOAD_NOTICE = "{name} was reloaded."
+
+    def __init__(self, path: Path, lines: Iterator[str], *, max_lines: int) -> None:
+        self.path = path
+        self._lines = lines
+        self._max_lines = max_lines
+        self._offset = 0
+        self._exhausted = False
+
+    @property
+    def offset(self) -> int:
+        return self._offset
+
+    def _drain(self, limit: int) -> list[str]:
+        collected: list[str] = []
+        if self._exhausted:
+            return collected
+        for line in self._lines:
+            collected.append(str(line).rstrip("\n"))
+            if len(collected) >= limit:
+                return collected
+        self._exhausted = True
+        return collected
+
+    def prime(self):
+        from ..services.reader import TailRead
+
+        lines = self._drain(self._max_lines)
+        self._offset = len(lines)
+        return TailRead(lines=lines, offset=self._offset)
+
+    def poll(self):
+        from ..services.reader import TailRead
+
+        lines = self._drain(self._max_lines)
+        self._offset += len(lines)
+        return TailRead(lines=lines, offset=self._offset)
+
+    def close(self) -> None:
+        closer = getattr(self._lines, "close", None)
+        if closer is not None:
+            closer()
 
 
 # --- version constraints ----------------------------------------------------
@@ -174,6 +282,9 @@ class PluginRegistry:
     filters: list[FilterStage] = field(default_factory=list)
     exporters: list[Exporter] = field(default_factory=list)
     errors: list[PluginError] = field(default_factory=list)
+    #: Which provider offered which source, filled by `discover_sources`. A
+    #: source identifier means nothing without the provider that coined it.
+    _owners: dict[Path, LogSourceProvider] = field(default_factory=dict, repr=False)
 
     @property
     def total(self) -> int:
@@ -212,6 +323,61 @@ class PluginRegistry:
         else:
             self.exporters.append(plugin)
         return True
+
+    def discover_sources(self) -> list[ProviderSource]:
+        """Ask every provider what it offers, skipping the ones that raise.
+
+        Same contract as a ``FilterStage`` that throws: recorded, surfaced in
+        the drawer, and survivable. A broken provider must not be able to stop
+        discovery, which is the one thing standing between the operator and
+        every source they have.
+        """
+
+        found: list[ProviderSource] = []
+        self._owners = {}
+        for provider in self.sources:
+            name = getattr(provider, "name", "") or type(provider).__name__
+            try:
+                offered = list(provider.discover())
+            except Exception as exc:  # noqa: BLE001 - third-party code
+                self.errors.append(PluginError(name, f"discover() raised: {exc}"))
+                continue
+            for item in offered:
+                source = (
+                    item
+                    if isinstance(item, ProviderSource)
+                    else ProviderSource(Path(item), Path(item).name, name)
+                )
+                if not source.provider:
+                    source = ProviderSource(source.path, source.label, name)
+                self._owners[source.path] = provider
+                found.append(source)
+        return found
+
+    def open_source(self, source: ProviderSource, *, max_lines: int) -> Optional[Any]:
+        """Build a reader for a provider source, or None if it failed.
+
+        Prefers the provider's own ``open_reader``; falls back to wrapping
+        ``open()``, so both halves of the interface reach the same pane.
+        """
+
+        provider = self._owners.get(source.path)
+        if provider is None:
+            self.errors.append(
+                PluginError(source.provider or "provider", "no longer offers this source")
+            )
+            return None
+        name = getattr(provider, "name", "") or type(provider).__name__
+        try:
+            reader = provider.open_reader(source.path, max_lines=max_lines)
+            if reader is not None:
+                return reader
+            return IteratorReader(
+                source.path, iter(provider.open(source.path)), max_lines=max_lines
+            )
+        except Exception as exc:  # noqa: BLE001 - third-party code
+            self.errors.append(PluginError(name, f"open() raised: {exc}"))
+            return None
 
     def apply_filters(self, entries: Sequence[LogEntry], context: FilterContext) -> list[LogEntry]:
         """Run every filter stage over *entries*, skipping stages that raise."""
@@ -346,7 +512,9 @@ __all__ = [
     "ExportResult",
     "FilterContext",
     "FilterStage",
+    "IteratorReader",
     "LogSourceProvider",
+    "ProviderSource",
     "Plugin",
     "PluginError",
     "PluginRegistry",

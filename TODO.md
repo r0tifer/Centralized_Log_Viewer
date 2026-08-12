@@ -903,6 +903,55 @@ opt-in, per-unit and per-boot sources, and the non-systemd fallback; new
 `settings.conf` row for `enable_journald`; update the plugin section to note
 that `LogSourceProvider` is now wired.
 
+**As shipped.** One claim in this item was simply wrong, and it is the one the
+rest of the plan rested on:
+
+- **The parser does *not* read `journalctl -o json` today.** This item states
+  "The parser needs **no** changes — `priority` is already in
+  `_JSON_LEVEL_KEYS`". It is, but nothing else lines up: the journal emits
+  `MESSAGE`, `PRIORITY` and `__REALTIME_TIMESTAMP` — uppercase keys the JSON
+  matcher never looks for, a priority that is a numeric string rather than a
+  level name, and a timestamp in microseconds since the epoch. Fed in as-is,
+  every record parses as a JSON line with **no timestamp, no level, and the
+  whole record as its message**. The fix is in the plugin, not in
+  `parsing.py`: the plugin chose `-o json`, so it owns what that produces, and
+  teaching core about one source's field names would put a niche vocabulary in
+  the file every format shares. `translate()` emits a JSON line with
+  normalised keys and keeps every original journal field beside them, so both
+  `unit:sshd.service` and `_SYSTEMD_UNIT:sshd.service` work.
+  `test_untranslated_journal_output_would_not_have_parsed` is kept as the
+  record of why the translation exists.
+- **Severity push-down only helps for three buckets.** `error`, `warn` and
+  `info` map to `--priority=3/4/6`; `debug` and `trace` map to 7, which is
+  everything. Pushing those down would filter nothing while looking like it
+  did, so nothing is pushed and the item's "when a severity bucket is active"
+  is narrowed to "when it would actually filter". A pushed-down priority is
+  always a *superset* of what the bucket keeps — the client-side filter still
+  decides exactly, and this only avoids carrying what it would discard.
+- **The interface gained `open_reader()` rather than changing `open()`.** An
+  iterator cannot express tailing, cannot be asked to stop, and has nowhere to
+  put a subprocess's cleanup. `open()` still works and core wraps it in
+  `IteratorReader`, so nothing written against the old interface breaks.
+- **Provider sources are a type, not a path.** `ProviderSource` is what the
+  tree carries, and starring, glob filtering and rotated-set grouping all test
+  `isinstance(data, Path)`, so they skip it without a single new branch. The
+  item asked for the choice between excluding and generalising to be
+  documented; excluding won, because a journal unit has no directory to walk
+  and no file to persist.
+- **The drawer's plugin count now includes a shipped plugin.** Item 3
+  deliberately kept built-in exporters out of `clv/plugins/` so the count would
+  keep meaning "plugins someone installed". This item asks for journald *in*
+  `clv/plugins/sources/`, and for a good reason — a subprocess behind a default
+  is exactly what shipping it in core would mean — so the count now reads 1
+  where a clean install used to read 0. Recorded rather than quietly fixed:
+  the two items want different things and this one wins, because consent
+  matters more than a tally.
+
+The subprocess lifetime is handled at two levels: `JournalReader.close()`
+terminates and then kills, and `SourceSession` calls it on every source switch
+and from `on_unmount`. An exited `journalctl` is *not* respawned by the next
+poll — that would be a fork bomb with a nice name — and there is a test for it.
+
 ---
 
 ## 13. Merged multi-source view

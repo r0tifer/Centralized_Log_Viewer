@@ -139,6 +139,7 @@ use.
 | `clipboard_max_bytes` | Most log text one `y` clipboard copy may carry. Oversized copies are truncated at a line boundary and say so. | `65536` |
 | `watch_rate_limit` | Seconds a watch rule waits before notifying again; matches inside the window are counted and reported together. | `60` |
 | `watch_bell` | Ring the terminal bell when a watch rule notifies. | `false` |
+| `enable_journald` | Offer the systemd journal as a source. Off by default: reading it runs `journalctl`, and CLV spawns no subprocess unasked. The drawer's switch writes this line for you. | `false` |
 
 Invalid values fall back to safe defaults; the app never fails to start because
 of a malformed settings file. Most discovery options are also editable at
@@ -212,6 +213,43 @@ precise about what is and is not bounded:
   file, and CLV says how many members it actually read.
 - **Only the live member tails.** Nothing appends to `syslog.2.gz`, so it is
   read once and never polled again.
+
+### The systemd journal
+
+On Linux the OS event log *is* the journal — binary, so no amount of file
+discovery will ever find it. CLV reads it through a plugin that shells out to
+`journalctl -o json --follow`, and offers:
+
+| Source | |
+| --- | --- |
+| **System journal** | everything, as one stream |
+| **This boot** / **Previous boot** | `--boot 0`, `--boot -1` |
+| One node per `.service` unit | the closest thing to Event Viewer's *Windows Logs → Application / Security / System* |
+
+Journal sources appear in a **Providers** group in the tree and behave like any
+other source from there on: the same filters, cursor, marks, detail pane and
+export. Because the plugin normalises the journal's own fields, field queries
+work immediately — `unit:sshd.service`, `host:web01`, `pid:991`, and the raw
+`_SYSTEMD_UNIT` spelling too.
+
+**It is off by default, and turning it on is a decision you make explicitly.**
+Reading the journal means running a subprocess, and CLV does not spawn one
+unless asked — which is also why the journal ships as a plugin rather than as
+part of core. With `enable_journald` false, nothing is spawned and nothing is
+enumerated. Enable it either by setting `enable_journald = true` in
+`settings.conf`, or with the **Journal (systemd)** switch in the Advanced
+drawer, which turns it on and writes that line back to your settings file so the
+choice is made once rather than every launch.
+
+On a machine without systemd — or without `journalctl` on `PATH` — CLV runs
+normally, the switch is disabled, and the drawer says why.
+
+Two details worth knowing. A severity bucket is pushed down to
+`journalctl --priority` where that actually filters something (`error`, `warn`,
+`info`), so debug records are not carried across a pipe just to be discarded;
+`debug` and `trace` map to priority 7, which is everything, so nothing is pushed
+down and CLV does not pretend otherwise. And the initial read is bounded by
+`--lines`, the journal's equivalent of the backwards seek CLV does on a file.
 
 ### Inspecting an event
 
@@ -530,6 +568,20 @@ three built-in formats and hands the selected one the whole filtered set. An
 exporter chooses its own destination (`export` receives the entries and a
 `FilterContext`, not a path), and one that raises is reported and skipped like
 any other plugin failure.
+
+`LogSourceProvider` plugins are wired too: whatever `discover()` returns appears
+in a **Providers** group in the tree, and selecting one opens it like any other
+source. Implement `discover()` and `open()` and CLV wraps your iterator; for a
+source that tails, implement the optional `open_reader(path, *, max_lines)`
+instead and return an object with `prime()`, `poll()`, `path`, `RELOAD_NOTICE`
+and — if it holds anything — `close()`, which CLV calls on every source switch
+and at shutdown. The shipped [`journald`](clv/plugins/sources/journald.py)
+provider is the worked example.
+
+Provider sources are **not** filesystem paths, and CLV does not pretend they
+are: starring, include/exclude globs and rotated-set grouping all test for a
+real `Path` and so skip them. That is deliberate — a provider identifier in
+your `session.json` would be a path that does not exist.
 
 ---
 

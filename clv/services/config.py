@@ -99,6 +99,12 @@ watch_rate_limit = 60
 
 # Ring the terminal bell when a watch rule notifies. Off by default.
 watch_bell = false
+
+# Read the systemd journal (per unit and per boot) as a source. Off by default:
+# reading it means running journalctl, and CLV does not spawn a subprocess
+# without being asked. The Advanced drawer's "Journal (systemd)" switch turns
+# this on and writes it back here.
+enable_journald = false
 """
 
 
@@ -121,6 +127,10 @@ class LogConfig:
     #: Ring the terminal bell when a watch rule notifies. Off by default: a
     #: bell is a thing an operator opts into, never a thing a log does to them.
     watch_bell: bool = False
+    #: Read the systemd journal. Off by default because reading it means
+    #: running `journalctl`, and a plugin may not spawn a subprocess without
+    #: consent — which is the argument for the journal being a plugin at all.
+    enable_journald: bool = False
 
     def with_discovery(self, **changes) -> "LogConfig":
         """Return a copy with individual discovery settings replaced."""
@@ -327,6 +337,7 @@ def load_config(path: Optional[Path] = None) -> LogConfig:
         clipboard_max_bytes=_read_int(section, "clipboard_max_bytes"),
         watch_rate_limit=_read_int(section, "watch_rate_limit"),
         watch_bell=_read_bool(section, "watch_bell", False),
+        enable_journald=_read_bool(section, "enable_journald", False),
     )
 
     # default_show_lines must not exceed what the buffer can hold.

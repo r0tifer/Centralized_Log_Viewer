@@ -249,7 +249,7 @@ Three interfaces in `clv/plugins/__init__.py`:
 
 | Interface | Method | Purpose |
 | --- | --- | --- |
-| `LogSourceProvider` | `discover()`, `open(path)` | New ingestion backends |
+| `LogSourceProvider` | `discover()`, `open(path)`, optional `open_reader(path)` | New ingestion backends |
 | `FilterStage` | `apply(entry, context) -> LogEntry \| None` | Transform or drop entries |
 | `Exporter` | `export(entries, context) -> ExportResult` | Send the current view somewhere |
 
@@ -260,7 +260,32 @@ group. Optional `requires_clv` constraints are enforced.
 **Loading never raises.** Import failures, bad version constraints, and stages
 that throw at runtime are recorded in `PluginRegistry.errors`, surfaced in the
 Advanced drawer, and skipped. A third-party plugin must never stop CLV starting
-or break a render.
+or break a render. The same contract covers providers: one that raises in
+`discover()` or `open()` costs only its own sources, never the operator's real
+ones.
+
+`open()` returns an iterator, which cannot express tailing, cannot be asked to
+stop, and has nowhere to put cleanup. A provider that follows a live stream
+implements `open_reader()` instead and returns the same `path`/`prime()`/
+`poll()`/`RELOAD_NOTICE` surface every core reader has, plus `close()` when it
+holds something. A provider that only implements `open()` still works — core
+wraps it in `IteratorReader` — which is what let this be added without breaking
+anything already written against the interface.
+
+**A provider source is not a path.** `ProviderSource` is its own type, and
+starring, glob filtering and rotated-set grouping all test `isinstance(data,
+Path)` and therefore cannot see one. None of those were generalised to
+accommodate them, deliberately: a journal unit has no directory to walk and no
+file to persist, and putting one in `session.json` would record a path that
+does not exist.
+
+**The journal is a plugin because of consent, not because of layering.**
+Reading it runs `journalctl`, and a plugin may not spawn a subprocess without
+the operator asking; core shipping that would put a subprocess behind a default.
+`enable_journald` is read fresh on every scan, so the drawer switch takes effect
+without a reload. The one cost is that the drawer's plugin count now includes a
+shipped provider, which Item 3 wanted to keep meaning "plugins someone
+installed" — the trade Item 12 asked for.
 
 ---
 

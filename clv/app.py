@@ -40,8 +40,15 @@ from textual.timer import Timer
 from textual.widgets import Button, Footer, Input, Label, Static, Switch, Tree
 from textual.widgets._tree import TreeNode
 
-from .plugins import Exporter, FilterContext, PluginError, PluginRegistry, load_plugins
-from .services import SourceManager, persist_log_sources
+from .plugins import (
+    Exporter,
+    FilterContext,
+    PluginError,
+    PluginRegistry,
+    ProviderSource,
+    load_plugins,
+)
+from .services import SourceManager, persist_log_sources, persist_setting
 from .services.clipboard import prepare_payload
 from .services.config import LogConfig, get_config_file, load_config, user_config_path
 from .services.discovery import DiscoveredFile, DiscoveryReport, discover
@@ -151,6 +158,10 @@ VIEWS_GROUP = f"{ICON_VIEW} Views"
 #: A rotated set: several files, one log. Distinct from the folder icon
 #: because expanding it lists members rather than a directory's contents.
 ICON_ROTATED = "🗂"
+#: A source a plugin supplies rather than one found on disk. Its own group and
+#: its own icon, because none of the things that assume a file apply to it.
+ICON_PROVIDER = "🔌"
+PROVIDERS_GROUP = f"{ICON_PROVIDER} Providers"
 
 #: Help categories, in the order the overlay lists them. A category with no
 #: bindings is skipped, so a group can be declared before the item that fills
@@ -463,6 +474,10 @@ class LogViewerApp(App[None]):
 
         self._source_manager = SourceManager([], [])
         self._report: DiscoveryReport | None = None
+        #: What the loaded providers offered on the last scan. Kept apart from
+        #: the report because these are not files and must not end up anywhere
+        #: that assumes they are.
+        self._provider_sources: list[ProviderSource] = []
         #: Readers and buffers, owned by a UI-free service. A single open log is
         #: a session of one, so nothing below has a single-source path of its
         #: own to keep in step — see clv/services/session.py.
@@ -588,6 +603,7 @@ class LogViewerApp(App[None]):
         # Filled at mount rather than only when the drawer opens, so the plugin
         # and exporter lines are correct the first time it is seen.
         self._refresh_plugin_status()
+        self._sync_journald_status()
         self._update_status()
         self._persist_state = True
 
@@ -716,6 +732,12 @@ class LogViewerApp(App[None]):
         if report is None:
             report = DiscoveryReport()
         self._report = report
+        # Providers are asked on the same pass, but never in the same thread:
+        # a provider may shell out, and a plugin's idea of "quick" is not
+        # something discovery should have to trust. It is guarded instead —
+        # one that raises is recorded and skipped, like a filter stage.
+        self._provider_sources = self._plugins.discover_sources()
+        self._refresh_plugin_status()
         await self._build_tree(report)
         if self._selected_source is None:
             self._show_discovery_summary(report)
@@ -728,7 +750,7 @@ class LogViewerApp(App[None]):
         # first one left registered.
         await panel.remove_children()
 
-        if not report.files and not self.state.views:
+        if not report.files and not self.state.views and not self._provider_sources:
             await panel.mount(Static("No log sources found.", classes="empty-tree"))
             return
 
@@ -742,6 +764,14 @@ class LogViewerApp(App[None]):
             group = tree.root.add(VIEWS_GROUP, data=None, expand=True)
             for view in self.state.views:
                 group.add_leaf(f"{ICON_VIEW} {view.name}", data=view)
+
+        # Provider sources next: few, named rather than pathed, and nothing
+        # below this point in the tree can hold one — a folder hierarchy is
+        # exactly what they do not have.
+        if self._provider_sources:
+            group = tree.root.add(PROVIDERS_GROUP, data=None, expand=True)
+            for source in self._provider_sources:
+                group.add_leaf(f"{ICON_PROVIDER} {source.name}", data=source)
 
         # Starred logs are repeated in a group at the top. With the tree
         # collapsed by default, a favourite would otherwise cost a walk down
@@ -920,6 +950,39 @@ class LogViewerApp(App[None]):
         self._after_source_change()
         reader = buffer.reader
         self._notify(describe_set(rotated_set, getattr(reader, "members_read", 0)))
+        return True
+
+    def _select_provider_source(self, source: ProviderSource) -> bool:
+        """Open a source a plugin supplied.
+
+        Everything past the reader is identical to a file: the same buffer, the
+        same filters, the same cursor. What is different is that the failure
+        modes belong to third-party code, so opening is guarded the way a
+        filter stage is and a provider that throws costs only its own source.
+        """
+
+        self._stop_tail()
+        reader = self._plugins.open_source(
+            source, max_lines=self._config.max_buffer_lines
+        )
+        if reader is None:
+            self._refresh_plugin_status()
+            self._notify(f"{source.name} could not be opened — see the drawer.", "error")
+            return False
+
+        try:
+            self._session.adopt(source.path, reader)
+            # The severity bucket may be answerable at the source rather than
+            # after the fact; a journal follow can filter before the pipe.
+            self._session.push_severity(self.state.severity)
+        except Exception as exc:  # noqa: BLE001 - third-party reader
+            self._plugins.errors.append(PluginError(source.provider, f"raised: {exc}"))
+            self._refresh_plugin_status()
+            self._notify(f"Failed to read {source.name}: {exc}", "error")
+            return False
+
+        self._show_lines = min(self._config.default_show_lines, self._config.max_buffer_lines)
+        self._after_source_change()
         return True
 
     def _after_source_change(self) -> None:
@@ -2391,6 +2454,8 @@ class LogViewerApp(App[None]):
             self._select_source(data)
         elif isinstance(data, RotatedSet):
             self._select_rotated_set(data)
+        elif isinstance(data, ProviderSource):
+            self._select_provider_source(data)
         elif isinstance(data, SavedView):
             self._apply_view(data)
             self._notify(f"Applied view '{data.name}'.")
@@ -2422,6 +2487,13 @@ class LogViewerApp(App[None]):
 
     def on_query_bar_severity_changed(self, message: QueryBar.SeverityChanged) -> None:
         self._update_state(severity=message.value)
+        # Offered to the source first: a reader that can filter before the data
+        # reaches us re-primes, and what it handed over earlier answered a
+        # different question. Every other reader ignores this entirely.
+        if self._session.push_severity(message.value):
+            self._sync_field_names()
+            self._watch_index.reset()
+            self._sync_watch_rules()
         self._render_log()
 
     def on_query_bar_time_window_changed(self, message: QueryBar.TimeWindowChanged) -> None:
@@ -2489,6 +2561,8 @@ class LogViewerApp(App[None]):
             self._set_detail_pane(message.value)
         elif message.field == "watch_rules":
             self._set_watch_enabled(message.value)
+        elif message.field == "journald":
+            self._set_journald(message.value)
         else:
             self._set_structured(message.value)
 
@@ -2552,6 +2626,44 @@ class LogViewerApp(App[None]):
             "Clipboard copy (y) enabled."
             if value
             else "Clipboard copy off — Ctrl+L copy mode still works."
+        )
+
+    def _set_journald(self, value: bool) -> None:
+        """Turn the journal on or off, and record the choice in settings.conf.
+
+        Flipping this switch *is* the consent the plugin rule requires, so it
+        takes effect now — but consent given once should not have to be given
+        again every launch, and the settings file is where CLV already writes
+        an operator's decision (`Ctrl+S` does exactly this with `log_dirs`).
+        The plugin re-reads the file on every scan, so no reload is needed.
+        """
+
+        try:
+            persist_setting(self._settings_path, "enable_journald", str(value).lower())
+        except OSError as exc:
+            self._notify(f"Could not save the journal setting: {exc}", "error")
+            self._sync_journald_status()
+            return
+
+        self._config = replace(self._config, enable_journald=value)
+        self._notify(
+            f"systemd journal enabled — written to {self._settings_path}."
+            if value
+            else "systemd journal disabled."
+        )
+        self.run_worker(self._rescan(), group="discovery", exit_on_error=False)
+
+    def _sync_journald_status(self) -> None:
+        """Show journal state in the drawer, including why it may be off."""
+
+        from .plugins.sources.journald import availability
+
+        available, reason = availability()
+        self.advanced_drawer.set_journald(
+            self._config.enable_journald and available,
+            available=available,
+            reason=reason
+            or ("reading /var/log/journal via journalctl" if self._config.enable_journald else ""),
         )
 
     def _sync_view_toggles(self) -> None:

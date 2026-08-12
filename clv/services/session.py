@@ -279,6 +279,41 @@ class SourceSession:
         self._buffers = [buffer]
         return buffer
 
+    def adopt(self, path: Path, reader) -> SourceBuffer:
+        """Replace the set with one buffer over a reader built elsewhere.
+
+        For sources core cannot open by itself: a plugin knows how to read a
+        journal unit, and this is where what it built joins everything else.
+        """
+
+        buffer = SourceBuffer(path, max_lines=self._max_lines, reader=reader)
+        buffer.prime()
+        self.close()
+        self._buffers = [buffer]
+        return buffer
+
+    def push_severity(self, severity: str) -> bool:
+        """Offer the severity bucket to readers that can filter at the source.
+
+        Most cannot and are left alone. One that can — a journal follow, which
+        would otherwise carry every debug line across a pipe for the client to
+        throw away — restarts, and says so by returning True, because the lines
+        it already handed over are from the old query.
+        """
+
+        restarted = False
+        for buffer in self._buffers:
+            setter = getattr(buffer.reader, "set_severity", None)
+            if setter is None:
+                continue
+            try:
+                if setter(severity):
+                    buffer.prime()
+                    restarted = True
+            except OSError:
+                continue
+        return restarted
+
     def close(self) -> None:
         """Drop every buffer, releasing whatever their readers hold."""
 
