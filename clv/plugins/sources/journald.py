@@ -30,6 +30,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -71,6 +72,50 @@ PRIORITY_PUSHDOWN: dict[str, str] = {
 
 def journalctl_path() -> Optional[str]:
     return shutil.which("journalctl")
+
+
+def child_environment() -> dict[str, str]:
+    """The environment a *system* binary should be run with.
+
+    A frozen build is the reason this exists. PyInstaller points
+    ``LD_LIBRARY_PATH`` at its own ``_internal`` directory so the bundled
+    interpreter finds the libraries shipped beside it — and child processes
+    inherit it, so ``/usr/bin/journalctl`` loads the *bundle's* copies of
+    libcrypto, libssl and the rest instead of the system's.
+
+    That is fatal exactly when the bundle was built on a different distribution
+    from the one running it, which for a released binary is the normal case::
+
+        journalctl: .../_internal/libcrypto.so.3: version `OPENSSL_3.4.0' not
+        found (required by /usr/lib64/systemd/libsystemd-shared-258.10.so)
+
+    journalctl exits 1, the unit list comes back empty, and the tree shows only
+    the two sources that need no subprocess. So children get the environment
+    they would have had: whatever PyInstaller saved in ``*_ORIG``, or the path
+    with the bundle's own directory removed. Anything the operator set
+    themselves is left alone — it is theirs, and only the injected entry is
+    ours to take back out.
+    """
+
+    env = dict(os.environ)
+    bundle = getattr(sys, "_MEIPASS", None)
+    for variable in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"):
+        original = env.pop(f"{variable}_ORIG", None)
+        if original is not None:
+            env[variable] = original
+            continue
+        if not bundle or variable not in env:
+            continue
+        kept = [
+            entry
+            for entry in env[variable].split(os.pathsep)
+            if entry and os.path.normpath(entry) != os.path.normpath(bundle)
+        ]
+        if kept:
+            env[variable] = os.pathsep.join(kept)
+        else:
+            env.pop(variable, None)
+    return env
 
 
 def availability() -> tuple[bool, str]:
@@ -251,6 +296,9 @@ class JournalReader:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 text=False,
+                # Without this the follow dies the same way the enumeration
+                # did, and with stderr discarded it would die silently.
+                env=child_environment(),
             )
         except OSError as exc:
             raise OSError(f"could not run journalctl: {exc}") from exc
@@ -486,6 +534,7 @@ def _run(argv: list[str]) -> tuple[str, str]:
             text=True,
             timeout=QUERY_TIMEOUT,
             check=False,
+            env=child_environment(),
         )
     except subprocess.TimeoutExpired:
         return "", f"journalctl timed out after {QUERY_TIMEOUT}s"

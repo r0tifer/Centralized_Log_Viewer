@@ -686,3 +686,69 @@ def test_providers_are_asked_off_the_event_loop(tmp_path: Path) -> None:
             assert len(app._provider_sources) == 1
 
     asyncio.run(scenario())
+
+
+# --- running a system binary from inside a bundle ---------------------------
+
+
+def test_the_bundles_library_path_is_kept_away_from_child_processes(monkeypatch) -> None:
+    """PyInstaller's LD_LIBRARY_PATH makes journalctl load the wrong libcrypto.
+
+    The frozen app needs `_internal` on the path; a system binary must not
+    have it, or it loads the bundle's libraries instead of the system's and
+    dies when the two distributions disagree:
+
+        journalctl: .../libcrypto.so.3: version `OPENSSL_3.4.0' not found
+        (required by /usr/lib64/systemd/libsystemd-shared-258.10-1.fc43.so)
+
+    Exit 1, no unit list, and a tree holding only the two sources that need no
+    subprocess at all.
+    """
+
+    monkeypatch.setattr(journald.sys, "_MEIPASS", "/opt/app/_internal", raising=False)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/app/_internal")
+
+    env = journald.child_environment()
+
+    assert "LD_LIBRARY_PATH" not in env
+
+
+def test_a_path_the_operator_set_themselves_survives(monkeypatch) -> None:
+    """Only the injected entry is ours to remove."""
+
+    monkeypatch.setattr(journald.sys, "_MEIPASS", "/opt/app/_internal", raising=False)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/app/_internal:/usr/local/lib")
+
+    assert journald.child_environment()["LD_LIBRARY_PATH"] == "/usr/local/lib"
+
+
+def test_the_original_path_is_restored_when_pyinstaller_saved_one(monkeypatch) -> None:
+    monkeypatch.setattr(journald.sys, "_MEIPASS", "/opt/app/_internal", raising=False)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/app/_internal")
+    monkeypatch.setenv("LD_LIBRARY_PATH_ORIG", "/usr/lib/mine")
+
+    env = journald.child_environment()
+
+    assert env["LD_LIBRARY_PATH"] == "/usr/lib/mine"
+    assert "LD_LIBRARY_PATH_ORIG" not in env
+
+
+def test_an_unfrozen_run_is_left_exactly_as_it_is(monkeypatch) -> None:
+    monkeypatch.delattr(journald.sys, "_MEIPASS", raising=False)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/usr/local/lib")
+
+    assert journald.child_environment()["LD_LIBRARY_PATH"] == "/usr/local/lib"
+
+
+def test_the_follow_subprocess_gets_the_cleaned_environment() -> None:
+    """stderr is discarded on the follow, so this would fail silently."""
+
+    captured = {}
+
+    def spawn(argv, **kwargs):
+        captured.update(kwargs)
+        return FakeProcess()
+
+    journald.JournalReader(Path("journal:all"), max_lines=10, spawn=spawn).prime()
+
+    assert "env" in captured, "the follow inherited the bundle's library path"

@@ -104,6 +104,15 @@ state rather than an error. That combination cost the shipped binary its
 journal support entirely; see
 `test_drop_ins_are_found_without_the_folder_existing_on_disk`.
 
+**A subprocess must not inherit a frozen build's environment.** PyInstaller
+puts its own `_internal` directory on `LD_LIBRARY_PATH` so the bundled
+interpreter finds the libraries shipped beside it. Children inherit that, so a
+*system* binary loads the bundle's libcrypto/libssl instead of the system's and
+dies whenever the build machine's distribution differs from the user's — which
+for a released binary is the normal case. Run system tools with
+`journald.child_environment()`, which restores `*_ORIG` or strips the bundle's
+own entry and leaves anything the operator set alone.
+
 **Subprocesses need consent.** A plugin must not run one because it was
 installed. The shipped `journald` provider is the pattern: a `settings.conf`
 opt-in, read fresh on every `discover()`, returning no sources at all until it
