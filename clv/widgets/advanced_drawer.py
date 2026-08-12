@@ -123,6 +123,14 @@ class AdvancedFiltersDrawer(Static):
         padding-top: 1;
     }
 
+    /* Read-only list of what Ctrl+E can write, so the exporters are visible
+       without opening the dialog. No top padding: it sits directly under the
+       plugin line as a second detail of the same block. */
+    AdvancedFiltersDrawer #export-status {
+        color: $text-muted;
+        height: auto;
+    }
+
     AdvancedFiltersDrawer #drawer-actions {
         layout: horizontal;
         align: right middle;
@@ -147,6 +155,16 @@ class AdvancedFiltersDrawer(Static):
        place to change the same setting. */
     AdvancedFiltersDrawer.-merged #view-toggles { display: none; }
 
+    /* Deliberately *not* inside #view-toggles: the clipboard and detail-pane
+       switches each have only one home, so hiding them at -merged (where the
+       query bar shows its own copies of the other two) would make them vanish
+       above 148 columns. Giving the detail pane a query-bar copy instead would
+       push that row past BREAKPOINT_MERGE, which was measured for two. */
+    AdvancedFiltersDrawer #output-options {
+        height: auto;
+        width: 1fr;
+    }
+
     /* Stack the rows when there isn't width to share. The breakpoint class is
        mirrored onto this widget by the app, because DEFAULT_CSS is scoped and
        cannot reach the app node. */
@@ -168,6 +186,8 @@ class AdvancedFiltersDrawer(Static):
         # only mirrors it. Held here so compose() can seed the switches.
         self._auto_scroll = True
         self._structured = False
+        self._clipboard = True
+        self._detail_pane = False
         self.add_class("-hidden")
 
     # --- composition --------------------------------------------------------
@@ -185,6 +205,26 @@ class AdvancedFiltersDrawer(Static):
                 with Vertical(classes="drawer-toggle"):
                     yield Label("Structured")
                     yield Switch(value=self._structured, id="drawer-structured")
+                yield Static("", classes="drawer-field")
+
+        # Its own container rather than more toggles in the View row above:
+        # that row disappears when the query bar shows its own copies, and
+        # these two switches have nowhere else to live. What they have in
+        # common is being *single-home* — the keyboard is their only other
+        # path — which is why they share a section rather than a subject.
+        #
+        # They also share a row, which is not cosmetic: the drawer is capped at
+        # max-height 16 and scrolls, so a section per switch pushed "Source
+        # discovery" below the fold where it laid out and painted nothing.
+        with Container(id="output-options"):
+            yield Label("Output & panes", classes="drawer-heading")
+            with Horizontal(classes="drawer-row"):
+                with Vertical(classes="drawer-toggle"):
+                    yield Label("Clipboard (OSC 52)")
+                    yield Switch(value=self._clipboard, id="drawer-clipboard")
+                with Vertical(classes="drawer-toggle"):
+                    yield Label("Detail pane")
+                    yield Switch(value=self._detail_pane, id="drawer-detail-pane")
                 yield Static("", classes="drawer-field")
 
         yield Label("Source discovery", classes="drawer-heading")
@@ -233,6 +273,7 @@ class AdvancedFiltersDrawer(Static):
             yield Static("", classes="drawer-field")
 
         yield Static("", id="plugin-status")
+        yield Static("", id="export-status")
 
         with Container(id="drawer-actions"):
             yield Button("Rescan sources", id="rescan-sources", variant="primary")
@@ -250,10 +291,24 @@ class AdvancedFiltersDrawer(Static):
         except NoMatches:
             pass
 
+    def set_export_status(self, text: str) -> None:
+        """Show what the export dialog offers. Read-only: `Ctrl+E` runs it."""
+        try:
+            self.query_one("#export-status", Static).update(text)
+        except NoMatches:
+            pass
+
     def _emit(self, previous: AdvancedSettings) -> None:
         self.post_message(self.SettingsChanged(self._settings, previous))
 
-    def sync_view_toggles(self, *, auto_scroll: bool, structured: bool) -> None:
+    def sync_view_toggles(
+        self,
+        *,
+        auto_scroll: bool,
+        structured: bool,
+        clipboard: bool | None = None,
+        detail_pane: bool | None = None,
+    ) -> None:
         """Mirror the app's view state onto this drawer's switches.
 
         Does not emit: the app is the owner, and echoing back would bounce
@@ -261,14 +316,26 @@ class AdvancedFiltersDrawer(Static):
         rather than a flag because Switch.Changed is posted asynchronously --
         a flag cleared at the end of this method is already back to False by
         the time the handler runs.
+
+        ``clipboard`` and ``detail_pane`` are optional because neither switch
+        has a second copy in the query bar: they only need seeding, not
+        continuous mirroring.
         """
 
         self._auto_scroll = auto_scroll
         self._structured = structured
+        if clipboard is not None:
+            self._clipboard = clipboard
+        if detail_pane is not None:
+            self._detail_pane = detail_pane
         try:
             with self.prevent(Switch.Changed):
                 self.query_one("#drawer-auto-scroll", Switch).value = auto_scroll
                 self.query_one("#drawer-structured", Switch).value = structured
+                if clipboard is not None:
+                    self.query_one("#drawer-clipboard", Switch).value = clipboard
+                if detail_pane is not None:
+                    self.query_one("#drawer-detail-pane", Switch).value = detail_pane
         except NoMatches:  # not composed yet
             pass
 
@@ -280,6 +347,8 @@ class AdvancedFiltersDrawer(Static):
         view_field = {
             "drawer-auto-scroll": "auto_scroll",
             "drawer-structured": "structured",
+            "drawer-clipboard": "clipboard",
+            "drawer-detail-pane": "detail_pane",
         }.get(switch_id)
         if view_field is not None:
             event.stop()
@@ -364,8 +433,9 @@ class AdvancedFiltersDrawer(Static):
             return self.settings.affects_discovery(self.previous)
 
     class ViewToggleChanged(Message):
-        """Auto-scroll or structured output was flipped from inside the drawer.
+        """A view switch was flipped from inside the drawer.
 
+        ``field`` is one of ``auto_scroll``, ``structured`` or ``clipboard``.
         Separate from SettingsChanged because these are view state owned by the
         app, not discovery or search settings, and they never trigger a rescan.
         """

@@ -19,15 +19,30 @@ desktop terminal and on a headless 80-column SSH session.
 - 🧵 **Stack traces stay attached.** A line no format recognises inherits the
   timestamp and severity of the entry above it, so a traceback survives a
   "show me only errors" filter along with the ERROR that produced it.
+- 🔬 **Select a line, see the whole event.** Arrow keys move a cursor through
+  the log; `Enter` opens a detail pane showing the raw line beside its parsed
+  timestamp, canonical severity, detected format and every field the parser
+  recovered — host, tag, PID, HTTP status, or the flattened keys of a JSON
+  payload.
 - 🪶 **Bounded memory, whatever the file size.** Opening a source seeks
   backwards from the end of the file; a 160 MB log opens in ~2 ms using under a
   megabyte. Tailing reads only what was appended.
 - 🧭 **Any file, not just `*.log`.** Name folders or files; every readable text
-  file counts. Binary files are detected by content and skipped, and
-  include/exclude globs are yours to set.
+  file counts — including UTF-16 exports from Windows and PowerShell, and
+  `.ods` spreadsheets, which are unpacked into tab-separated rows. Binary
+  files are detected by content and skipped, and include/exclude globs are
+  yours to set.
 - 📐 **Responsive layout.** Breakpoints at 90 and 130 columns reflow the
   controls; every control stays on screen and keyboard-reachable down to 80
   columns.
+- 🔖 **Mark the lines that matter.** `m` bookmarks the line under the cursor,
+  `M` steps between the marks, and `Ctrl+E` can export just those. Marks are
+  keyed by content rather than position, so they survive filtering and tailing —
+  and they are session-only, never written to disk.
+- 📤 **Get the view out.** `Ctrl+E` writes the filtered entries as JSON Lines,
+  CSV or raw text — the whole filtered set, not just the lines on screen. `y`
+  copies what is on screen to your local clipboard through the terminal, so it
+  works over SSH and tmux where a mouse selection does not.
 - 🧩 **Plugins.** `LogSourceProvider`, `FilterStage` and `Exporter` interfaces,
   loaded from `clv/plugins/` or from installed packages via the `clv.plugins`
   entry point group. A broken plugin is reported, never fatal.
@@ -105,15 +120,16 @@ use.
 | --- | --- | --- |
 | `log_dirs` | Folders **and/or files** to monitor, comma separated. Folders are searched recursively. | `/var/log` |
 | `include_globs` | Only list files matching these globs. Empty means every text file. | *(empty)* |
-| `exclude_globs` | Never list files matching these globs. | archives + binary journals |
+| `exclude_globs` | Never list files matching these globs. | archives, binary journals, PDFs |
 | `follow_symlinks` | Follow symlinked directories (cycles are detected). | `false` |
-| `skip_binary` | Skip files whose first block contains NUL bytes. | `true` |
+| `skip_binary` | Skip files whose first block decodes to NUL characters. UTF-16 text and extractable documents (`.ods`) are exempt. | `true` |
 | `max_files` | Stop discovery after this many files. | `5000` |
 | `max_buffer_lines` | Lines held in memory per source. | `5000` |
 | `default_show_lines` / `min_show_lines` / `show_step` | Visible-line window and its `+`/`-` step. | `500 / 10 / 50` |
 | `refresh_hz` | Poll frequency for new content. | `2` |
 | `tree_width` | Starting width of the source tree, in columns. | `38` |
 | `csv_max_rows` / `csv_max_cols` | Structured payload preview limits. | `20 / 10` |
+| `clipboard_max_bytes` | Most log text one `y` clipboard copy may carry. Oversized copies are truncated at a line boundary and say so. | `65536` |
 
 Invalid values fall back to safe defaults; the app never fails to start because
 of a malformed settings file. Most discovery options are also editable at
@@ -128,22 +144,142 @@ clv              # launch the TUI
 python -m clv    # module entry point
 ```
 
+### Getting help
+
+Press `?` for an overlay listing every keybinding, grouped by what it does. The
+footer only has room for the first handful at narrow widths, so the overlay is
+the complete list — it is generated from the bindings themselves and cannot
+fall out of date. Dismiss it with `?`, `Esc` or `q`.
+
+One wrinkle worth knowing: while the cursor is in the query input, `?` types a
+literal question mark, because it is a valid regex character. Press `Esc` first
+if the input has focus. Tailing continues while the overlay is open.
+
+### Inspecting an event
+
+The log pane has a cursor. Arrow keys move it a line at a time, `PgUp`/`PgDn` a
+screen at a time, `Home`/`End` to either end, and a mouse click selects the line
+you click on.
+
+`Enter` on the selected line opens the **detail pane**, which lists:
+
+| Property | |
+| --- | --- |
+| The raw line | Exactly as it appears in the file |
+| `Timestamp` | Normalised, or `—` when the line carries none |
+| `Level` | The canonical severity, or `—` |
+| `Format` | Which format matched — down to *unrecognised* |
+| `Continuation` | Whether the timestamp and level were inherited from the line above |
+| …then every field | `host`, `tag`, `pid`, `status`, or a JSON payload's keys flattened to dotted paths |
+
+`d` opens and closes the pane without moving the cursor, and there is a **Detail
+pane** switch in the Advanced drawer. Whether it is open is remembered between
+runs; which line you had selected is not.
+
+Not every line has fields — four of the formats CLV recognises carry none, and
+an unrecognised line carries nothing but its text. The pane says which case it
+is rather than showing you an empty list.
+
+Where the pane goes depends on the width: beside the log from 130 columns,
+below it between 90 and 130, and in place of the log at 80, where the two
+cannot share the screen. Press `d` to get the log back.
+
+**Moving the cursor pauses follow mode.** Otherwise incoming lines would drag
+the view out from under the line you just pointed at. The status bar says so —
+*"paused — cursor moved, End resumes"* — and `End` or `w` starts following
+again.
+
+### Marking lines
+
+`m` marks the line under the cursor and `M` steps between the marks, wrapping
+with a notification. Marked lines carry a `●` in the gutter — a glyph, not just
+a colour, so it reads on a monochrome terminal — and the status bar keeps a
+count. `Ctrl+E` then offers **Marked lines only**, which is the point: mark the
+three lines that matter while reading a five-thousand-line buffer, then export
+exactly those.
+
+A mark is recorded as the source path plus a digest of the line's text, not as
+a position. That is what lets it survive the ring buffer evicting lines above
+it, and lets a line a filter hid come back still marked. Two consequences worth
+knowing: identical lines in one source share a mark, and once a line has rotated
+out of the buffer entirely its mark is dropped.
+
+**Marks are never written to disk.** They are session-only, and they stay that
+way on purpose: the digest is derived from log content, and `session.json`
+records paths and settings, never anything about what a log contained. Closing
+CLV forgets them.
+
+### Exporting
+
+`Ctrl+E` writes the entries the filters kept to a file. Three formats ship:
+
+| Format | What it contains |
+| --- | --- |
+| JSON Lines | One object per entry — raw line, timestamp, level, message, detected format, continuation flag and every parsed field. The only lossless option. |
+| CSV | A fixed, rectangular table of the same columns, with the parsed fields as one JSON column. |
+| Plain text | The raw lines, byte-identical to what is on screen. |
+
+Two things worth knowing:
+
+- It exports the **whole filtered set**, not just the lines that fit on screen.
+  The dialog states the count before it writes, so `+`/`-` never changes what an
+  export contains.
+- Writing is atomic (a sibling temp file, then a rename), and overwriting an
+  existing file takes a second press of Export. A permission error is reported
+  as a notification, not a traceback.
+
+Any `Exporter` plugin you have installed is listed in the same dialog, below the
+built-ins. The Advanced drawer shows the full list read-only, so you can see
+what is available without opening the dialog.
+
+One wrinkle: while the cursor is in the query input, `Ctrl+E` moves it to the end
+of the line — that binding belongs to the input. Press `Tab` or click the log
+pane first.
+
+### Copying to the clipboard
+
+`y` copies the lines currently on screen — filters and the visible-line window
+included — to your **local** clipboard using an OSC 52 escape sequence.
+
+`y` and `Ctrl+L` solve the same problem from opposite ends and both are kept:
+
+| | Needs | Works over SSH / tmux |
+| --- | --- | --- |
+| `y` | A terminal that honours OSC 52 | Yes |
+| `Ctrl+L` copy mode | A local mouse selection | No |
+
+A copy larger than `clipboard_max_bytes` is truncated at a line boundary,
+keeping the newest lines, and the notification says how many were dropped —
+there is no silent partial copy. If your terminal renders the sequence as
+garbage, turn it off with the **Clipboard (OSC 52)** switch in the Advanced
+drawer; the setting is remembered, and `Ctrl+L` remains.
+
 ### Keyboard shortcuts
 
 | Key | Action |
 | --- | --- |
+| `?` | Show every keybinding |
 | `/` | Focus the query input |
-| `Enter` | Apply filters |
+| `Enter` | Apply filters (in the query input) · open the detail pane (in the log pane) |
 | `Esc` | Clear the query |
 | `a` | Add a log source |
 | `t` / `s` | Cycle time window / severity |
 | `f` | Toggle the Advanced drawer |
 | `*` | Star / unstar the log under the cursor |
+| `↑` / `↓` | Move the line cursor |
+| `PgUp` / `PgDn` | Move the line cursor a screen at a time |
+| `Home` / `End` | First / last line (`End` also resumes following) |
+| `n` / `N` | Next / previous match (or warning-and-worse, with no query) |
+| `g` | Go to a timestamp |
+| `m` / `M` | Mark the cursor line / jump to the next mark |
+| `d` | Show / hide the event detail pane |
 | `w` | Follow new lines (auto-scroll) on/off |
 | `o` | Structured output on/off |
 | `Ctrl+B` | Switch between tree and log pane (compact widths) |
 | `[` / `]` | Narrow / widen the source tree |
 | `+` / `-` | Show more / fewer lines |
+| `Ctrl+E` | Export the filtered entries to a file |
+| `y` | Copy the visible lines to the clipboard (OSC 52) |
 | `Ctrl+L` | Copy mode (hides all chrome) |
 | `Ctrl+S` | Save added sources to `settings.conf` |
 | `Ctrl+R` | Reload configuration and rescan |
@@ -163,6 +299,24 @@ Understanding two rules explains everything the pane does:
    asked for** — and when they do, the empty pane says so, e.g. *"No matches —
    12 have no detected severity (nothing in this source declares a level)."*
 
+### Navigating what you filtered to
+
+`n` and `N` move the line cursor forward and back through the lines worth
+stopping at, wrapping at either end with a notification rather than going quiet.
+What counts as "worth stopping at" depends on what is active:
+
+| Active | `n` steps between |
+| --- | --- |
+| A query | Its matches — and since the query *filters*, that is every visible line. What `n` adds here is the position: *"match 12 of 47"*, in the hit counter and the status bar. |
+| A severity bucket | Entries in that bucket. |
+| Neither | **WARN and above.** Stepping every entry would only duplicate the down arrow; warnings are included because they usually precede the failure. |
+
+`g` asks for a time and moves the cursor to the first entry **at or after** it.
+It takes an absolute timestamp (`2026-08-07 09:25:01`) or an offset from now
+(`-15m`, `-6h`, `-2d`; a bare `15m` means the past). Entries with no parsed
+timestamp cannot answer a question about time, so they are skipped — and the
+notification says how many, rather than quietly ignoring part of the source.
+
 ---
 
 ## Architecture
@@ -170,7 +324,7 @@ Understanding two rules explains everything the pane does:
 | Layer | Location | Responsibility |
 | --- | --- | --- |
 | App shell | `clv/app.py` | Layout, routing, lifecycle. No parsing or IO. |
-| Services | `clv/services/` | `parsing`, `filtering`, `discovery`, `reader`, `config`, `sources`. UI-free and independently testable. |
+| Services | `clv/services/` | `parsing`, `filtering`, `discovery`, `reader`, `config`, `sources`, `export`, `clipboard`. UI-free and independently testable. |
 | Widgets | `clv/widgets/` | Self-contained UI components owning their own CSS. |
 | Plugins | `clv/plugins/` | Extension interfaces and the loader. |
 | State | `clv/storage.py` | JSON session persistence (atomic writes). |
@@ -207,6 +361,12 @@ Return `None` from `apply` to drop a line. A plugin that fails to import, fails
 its version check, or raises at runtime is disabled and reported in the
 Advanced drawer — it cannot take the app down.
 
+`Exporter` plugins are reachable from the UI: `Ctrl+E` lists them alongside the
+three built-in formats and hands the selected one the whole filtered set. An
+exporter chooses its own destination (`export` receives the entries and a
+`FilterContext`, not a path), and one that raises is reported and skipped like
+any other plugin failure.
+
 ---
 
 ## Development
@@ -214,6 +374,6 @@ Advanced drawer — it cannot take the app down.
 ```bash
 python -m pip install -e .
 python -m pip install pytest
-python -m pytest            # 94 tests
+python -m pytest            # 290 tests
 python -m textual run clv/app.py --dev
 ```

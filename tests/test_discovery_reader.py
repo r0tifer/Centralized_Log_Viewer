@@ -42,9 +42,10 @@ def test_binary_and_archive_files_are_skipped_and_counted(tmp_path: Path) -> Non
     names = {item.path.name for item in report.files}
     assert "archive.gz" not in names  # excluded by glob
     assert "corrupt.log" not in names  # caught by the NUL-byte sniff
-    assert report.skipped_excluded >= 1
-    assert report.skipped_binary >= 1
-    assert "Skipped:" in "\n".join(report.summary_lines())
+    # Both are the same thing to an operator: CLV cannot show this file.
+    assert report.skipped_unsupported == 2
+    assert report.skipped_filtered == 0
+    assert "Skipped: 2 unsupported file types" in "\n".join(report.summary_lines())
 
 
 def test_binary_skip_can_be_disabled(tmp_path: Path) -> None:
@@ -235,3 +236,80 @@ def test_reader_survives_a_deleted_file(tmp_path: Path) -> None:
     path.unlink()
 
     assert reader.poll().lines == []
+
+
+# --- how a skip is explained ------------------------------------------------
+#
+# "Excluded" used to mean two unrelated things -- CLV cannot display this file
+# type, and your own glob hid it -- so the count could not be acted on. The
+# labels below keep those apart and name a skipped source rather than folding
+# it into a tally.
+
+
+def test_unsupported_types_and_user_filters_are_counted_apart(tmp_path: Path) -> None:
+    root = tmp_path / "mixed"
+    root.mkdir()
+    (root / "report.pdf").write_bytes(b"%PDF-1.6\n\x00binary")
+    (root / "notes.tmp").write_text("scratch\n", encoding="utf-8")
+    (root / "app.log").write_text("one\n", encoding="utf-8")
+
+    report = discover([root], DiscoverySettings.from_strings(exclude="*.pdf, *.tmp"))
+
+    assert [item.path.name for item in report.files] == ["app.log"]
+    # *.pdf ships as a default and describes a file type; *.tmp is the
+    # operator's own filter and must not be blamed on the file.
+    assert report.skipped_unsupported == 1
+    assert report.skipped_filtered == 1
+    summary = "\n".join(report.summary_lines())
+    assert "Skipped: 1 unsupported file type, 1 filtered out" in summary
+
+
+def test_include_globs_count_as_filtered_not_unsupported(tmp_path: Path) -> None:
+    root = tmp_path / "logs"
+    root.mkdir()
+    (root / "app.log").write_text("one\n", encoding="utf-8")
+    (root / "notes.txt").write_text("two\n", encoding="utf-8")
+
+    report = discover([root], DiscoverySettings(include_globs=("*.log",)))
+
+    assert report.skipped_filtered == 1
+    assert report.skipped_unsupported == 0
+
+
+def test_a_named_source_that_is_skipped_is_named_back(tmp_path: Path) -> None:
+    """A source the operator typed out must never vanish without explanation."""
+    target = tmp_path / "addendum.pdf"
+    target.write_bytes(b"%PDF-1.6\n\x00binary")
+
+    report = discover([target])
+
+    assert report.files == []
+    assert report.skipped_sources == [(target, "unsupported file type")]
+    assert f"File skipped - unsupported file type: {target}" in "\n".join(
+        report.summary_lines()
+    )
+
+
+def test_a_named_source_bypasses_the_operators_own_globs(tmp_path: Path) -> None:
+    """Naming a file is the operator saying they want it; filters narrow walks."""
+    target = tmp_path / "notes.tmp"
+    target.write_text("scratch\n", encoding="utf-8")
+
+    report = discover([target], DiscoverySettings.from_strings(exclude="*.tmp"))
+
+    assert [item.path for item in report.files] == [target]
+    assert report.skipped_sources == []
+
+
+def test_a_named_document_is_still_listed(tmp_path: Path) -> None:
+    """Type-based exclusions apply to named files, but .ods is a supported type."""
+    import zipfile
+
+    target = tmp_path / "hosts.ods"
+    with zipfile.ZipFile(target, "w") as archive:
+        archive.writestr("content.xml", "<x/>")
+
+    report = discover([target])
+
+    assert [item.path for item in report.files] == [target]
+    assert report.skipped_sources == []

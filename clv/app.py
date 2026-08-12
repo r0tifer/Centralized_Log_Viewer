@@ -32,34 +32,64 @@ from rich.table import Table
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Container, Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.reactive import reactive
 from textual.timer import Timer
-from textual.widgets import Button, Footer, Input, Label, RichLog, Static, Switch, Tree
+from textual.widgets import Button, Footer, Input, Label, Static, Switch, Tree
 from textual.widgets._tree import TreeNode
 
-from .plugins import FilterContext, PluginRegistry, load_plugins
+from .plugins import Exporter, FilterContext, PluginError, PluginRegistry, load_plugins
 from .services import SourceManager, persist_log_sources
+from .services.clipboard import prepare_payload
 from .services.config import LogConfig, get_config_file, load_config, user_config_path
 from .services.discovery import DiscoveryReport, discover
+from .services.export import (
+    BUILTIN_FORMATS,
+    builtin_format,
+    default_stem,
+    describe_formats,
+    write_atomically,
+)
 from .services.filtering import (
     FilterSpec,
     QueryError,
     TimeWindow,
+    align_moments,
+    compile_query,
     describe_empty_result,
     filter_entries,
     parse_absolute_window,
+    parse_moment,
     parse_relative_window,
 )
-from .services.parsing import LogEntry, LogParser
-from .services.reader import SourceReader
+from .services.marks import MarkSet
+from .services.parsing import (
+    LEVEL_CRITICAL,
+    LEVEL_ERROR,
+    LEVEL_WARN,
+    LogEntry,
+    LogParser,
+    level_matches,
+)
+from .services.reader import AnyReader, open_reader
 from .storage import SessionState, StateStore
 from .widgets.add_source_dialog import AddSourceDialog
 from .widgets.advanced_drawer import AdvancedFiltersDrawer, AdvancedSettings
 from .widgets.custom_time_dialog import CustomTimeRangeDialog
+from .widgets.detail_pane import DetailPane
+from .widgets.export_dialog import ExportChoice, ExportDialog, ExportRequest
 from .widgets.filter_chip import FilterChip, FilterChips
+from .widgets.goto_dialog import GotoDialog
+from .widgets.help_overlay import HelpOverlay, HelpSection
+from .widgets.log_view import LogView
 from .widgets.query_bar import QueryBar
+
+#: What `n`/`N` step between when there is no query and no severity bucket to
+#: take the definition from. Stepping every entry would just duplicate the down
+#: arrow; WARN and above is what someone scanning a tail is looking for, and
+#: warnings are included because they are usually what precedes the failure.
+NOTABLE_LEVELS: frozenset[str] = frozenset({LEVEL_WARN, LEVEL_ERROR, LEVEL_CRITICAL})
 
 SEVERITY_COLORS: dict[str, str] = {
     "CRITICAL": "#fb7185",
@@ -77,9 +107,12 @@ STRUCTURED_PAYLOAD_MAX_CHARS = 8_192
 BREAKPOINT_COMPACT = 90
 BREAKPOINT_NARROW = 130
 #: Width at which the time presets, toggles and action buttons fit on a single
-#: line together. Measured against their natural widths (48 + 21 + 55 columns
-#: plus padding), not guessed, and asserted in tests/test_query_bar.py.
-BREAKPOINT_MERGE = 136
+#: line together. Measured, not guessed: the row needs 147 columns, so this
+#: leaves one to spare. It moved from 136 when the Star button was added to the
+#: action row, and tests/test_query_bar.py checks that nothing sits off-screen
+#: at exactly this width — so widening that row again fails the build until the
+#: number is re-measured.
+BREAKPOINT_MERGE = 148
 
 SOURCES_PANEL_MIN_WIDTH = 20
 SOURCES_PANEL_MAX_WIDTH = 120
@@ -91,6 +124,91 @@ ICON_FILE = "📄"
 #: starring never changes a row's width.
 ICON_STAR = "⭐"
 STARRED_GROUP = f"{ICON_STAR} Starred"
+
+#: Help categories, in the order the overlay lists them. A category with no
+#: bindings is skipped, so a group can be declared before the item that fills
+#: it: Navigation is empty until a line cursor exists to navigate with.
+HELP_CATEGORY_ORDER: tuple[str, ...] = (
+    "Help",
+    "Search",
+    "Navigation",
+    "View",
+    "Sources",
+    "Session",
+    "Other",
+)
+
+#: Which category each binding belongs to, keyed by action name. Kept parallel
+#: to ``BINDINGS`` rather than as a ``Binding`` argument so binding
+#: construction stays exactly what Textual documents. An action missing here
+#: still appears in the overlay under "Other" — help is generated, so it can
+#: never go stale — and ``test_help_overlay`` fails on the omission so the
+#: fallback stays a safety net rather than a destination.
+BINDING_CATEGORIES: dict[str, str] = {
+    "show_help": "Help",
+    "focus_query": "Search",
+    "clear_query": "Search",
+    "cycle_time": "Search",
+    "cycle_severity": "Search",
+    "toggle_advanced": "Search",
+    # LogView owns the cursor keys. They are bound on the widget rather than
+    # the app so they cannot fight the source tree or a text input, and they
+    # are folded into the overlay by build_help_sections rather than written
+    # out by hand — help stays generated.
+    "cursor_up": "Navigation",
+    "cursor_down": "Navigation",
+    "cursor_page_up": "Navigation",
+    "cursor_page_down": "Navigation",
+    "cursor_home": "Navigation",
+    "cursor_end": "Navigation",
+    "select_cursor": "Navigation",
+    "toggle_detail": "Navigation",
+    "next_match": "Navigation",
+    "previous_match": "Navigation",
+    "goto_timestamp": "Navigation",
+    "toggle_mark": "Navigation",
+    "next_mark": "Navigation",
+    "toggle_auto_scroll": "View",
+    "toggle_structured": "View",
+    "export_view": "View",
+    "copy_view": "View",
+    "toggle_pane": "View",
+    "shrink_sources_panel": "View",
+    "expand_sources_panel": "View",
+    "more_lines": "View",
+    "fewer_lines": "View",
+    "toggle_copy_mode": "View",
+    "add_source": "Sources",
+    "toggle_star": "Sources",
+    "reload_sources": "Sources",
+    "save_session": "Session",
+    "quit_app": "Session",
+}
+
+
+def build_help_sections(
+    bindings: Iterable[Binding],
+    categories: dict[str, str] | None = None,
+) -> list[HelpSection]:
+    """Group *bindings* into the overlay's sections, in declaration order.
+
+    Pure and app-free so the grouping can be tested without running the app,
+    and so the overlay widget never has to reach back into ``clv.app``.
+    """
+
+    lookup = BINDING_CATEGORIES if categories is None else categories
+    grouped: dict[str, list[tuple[str, str]]] = {}
+    for binding in bindings:
+        category = lookup.get(binding.action, "Other")
+        grouped.setdefault(category, []).append(
+            (binding.key, binding.description or binding.action)
+        )
+
+    ordered = [name for name in HELP_CATEGORY_ORDER if name in grouped]
+    # A category invented by a caller's map is still listed, after the known
+    # ones, rather than silently dropping the bindings it holds.
+    ordered += [name for name in grouped if name not in HELP_CATEGORY_ORDER]
+    return [HelpSection(name, tuple(grouped[name])) for name in ordered]
 
 
 class LogTree(Tree[Path]):
@@ -176,7 +294,19 @@ class LogViewerApp(App[None]):
         padding: 0 1;
     }
 
+    /* Holds the log pane and the detail pane. The split direction is the only
+       thing decided here — how much room the detail pane takes is its own CSS,
+       keyed off the breakpoint class mirrored onto it. */
+    #log-area {
+        layout: vertical;
+        width: 1fr;
+        height: 1fr;
+    }
+
+    LogViewerApp.-wide #log-area { layout: horizontal; }
+
     #log-stream {
+        width: 1fr;
         height: 1fr;
         border: solid $surface 20%;
         scrollbar-gutter: stable;
@@ -211,12 +341,19 @@ class LogViewerApp(App[None]):
     LogViewerApp.-compact.-viewer-focused #sources-panel { display: none; }
     LogViewerApp.-compact.-viewer-focused #viewer-panel { display: block; width: 100%; }
 
-    /* Copy mode strips the chrome so a mouse selection grabs log text only. */
+    /* 80 columns cannot hold both panes at a readable width, so the detail
+       pane takes the viewer and the log goes behind it. Esc-free by design:
+       `d` closes it and the log is back. */
+    LogViewerApp.-compact #log-area.-detail #log-stream { display: none; }
+
+    /* Copy mode strips the chrome so a mouse selection grabs log text only —
+       which includes the detail pane, whose property table is not log text. */
     LogViewerApp.-copy-mode #query-bar,
     LogViewerApp.-copy-mode #chip-bar,
     LogViewerApp.-copy-mode #advanced-drawer,
     LogViewerApp.-copy-mode #sources-panel,
     LogViewerApp.-copy-mode #status-bar,
+    LogViewerApp.-copy-mode DetailPane,
     LogViewerApp.-copy-mode Footer,
     LogViewerApp.-copy-mode .panel-title {
         display: none;
@@ -232,24 +369,44 @@ class LogViewerApp(App[None]):
     """
 
     BINDINGS = [
+        # First in the list on purpose. The footer fills from the left and
+        # drops from the right, so the binding that documents all the others
+        # is the one that must never be the entry that falls off.
+        Binding("question_mark", "show_help", "Help", show=True),
         Binding("/", "focus_query", "Query", show=True),
         Binding("escape", "clear_query", "Clear", show=True),
         Binding("a", "add_source", "Add source", show=True),
+        # Ordered before the filter bindings deliberately. The footer drops
+        # entries from the right as it runs out of room, and at 80 columns
+        # Star was being truncated to a bare "*".
+        Binding("asterisk", "toggle_star", "Star", show=True),
         Binding("t", "cycle_time", "Time", show=True),
         Binding("s", "cycle_severity", "Severity", show=True),
         Binding("f", "toggle_advanced", "Advanced", show=True),
-        Binding("asterisk", "toggle_star", "Star", show=True),
         # The auto-scroll and structured switches are only shown when the query
         # bar merges its rows, so they need a keyboard path that does not
         # depend on terminal width.
         Binding("w", "toggle_auto_scroll", "Follow", show=True),
         Binding("o", "toggle_structured", "Structured", show=False),
+        Binding("d", "toggle_detail", "Detail pane", show=False),
+        Binding("n", "next_match", "Next match", show=False),
+        Binding("N", "previous_match", "Previous match", show=False),
+        Binding("g", "goto_timestamp", "Go to timestamp", show=False),
+        Binding("m", "toggle_mark", "Mark / unmark this line", show=False),
+        Binding("M", "next_mark", "Jump to next mark", show=False),
         Binding("ctrl+b", "toggle_pane", "Switch pane", show=True),
         Binding("[", "shrink_sources_panel", "Narrower", show=False),
         Binding("]", "expand_sources_panel", "Wider", show=False),
         Binding("+", "more_lines", "More lines", show=False),
         Binding("-", "fewer_lines", "Fewer lines", show=False),
         Binding("ctrl+l", "toggle_copy_mode", "Copy mode", show=True),
+        # Hidden, like every binding added after the footer filled up at 80
+        # columns; `?` is how they are found. Note that Textual's Input binds
+        # ctrl+e to end-of-line, so this fires everywhere except inside the
+        # query input — deliberately not `priority`, since stealing a
+        # text-editing key from the input is the worse trade.
+        Binding("ctrl+e", "export_view", "Export view", show=False),
+        Binding("y", "copy_view", "Copy to clipboard", show=False),
         Binding("ctrl+s", "save_session", "Save sources", show=True),
         Binding("ctrl+r", "reload_sources", "Reload", show=True),
         Binding("q", "quit_app", "Quit", show=True),
@@ -268,7 +425,7 @@ class LogViewerApp(App[None]):
         self._source_manager = SourceManager([], [])
         self._report: DiscoveryReport | None = None
         self._selected_source: Optional[Path] = None
-        self._reader: SourceReader | None = None
+        self._reader: AnyReader | None = None
         self._parser = LogParser()
         self._entries: deque[LogEntry] = deque(maxlen=self._config.max_buffer_lines)
         self._tail_timer: Timer | None = None
@@ -280,15 +437,32 @@ class LogViewerApp(App[None]):
         self._merged = False
         self._plugins: PluginRegistry = PluginRegistry()
 
+        #: Set when the cursor moved off the last line and suspended follow, so
+        #: the status line can say *why* it is paused rather than just that it
+        #: is. Cleared by anything that resumes following.
+        self._follow_suspended_by_cursor = False
+        #: (position, total, label) from the last `n`/`N`, mirrored into the
+        #: status bar. The query bar has its own copy, but #match-count is
+        #: hidden at the compact breakpoint and this is not.
+        self._match_position: tuple[int, int, str] | None = None
+        #: Rows `n`/`N` step between, cached per render. Recomputing per cursor
+        #: move would re-run the query regex over every visible line on every
+        #: arrow keypress; the set only changes when the pane is rebuilt.
+        self._navigation_cache: tuple[list[int], str] | None = None
+        #: Marked lines, keyed by content. Session-only and never written to
+        #: disk — see clv/services/marks.py for why that is a constraint rather
+        #: than a gap.
+        self._marks = MarkSet()
+
         self.query_bar = QueryBar()
         self.chip_bar = FilterChips(id="chip-bar")
         self.advanced_drawer = AdvancedFiltersDrawer()
-        self.log_panel = RichLog(
+        self.log_panel = LogView(
             id="log-stream",
             wrap=True,
-            markup=False,
-            max_lines=self._config.max_buffer_lines,
+            max_rows=self._config.max_buffer_lines,
         )
+        self.detail_pane = DetailPane(id="detail-pane")
 
     # --- composition --------------------------------------------------------
 
@@ -302,7 +476,9 @@ class LogViewerApp(App[None]):
                 yield Vertical(id="tree-panel")
             with Vertical(id="viewer-panel"):
                 yield Label("Log Output", classes="panel-title")
-                yield self.log_panel
+                with Container(id="log-area"):
+                    yield self.log_panel
+                    yield self.detail_pane
         yield Static("", id="status-bar")
         yield Footer()
 
@@ -322,6 +498,11 @@ class LogViewerApp(App[None]):
         self._open_starred_on_launch()
 
         self._refresh_chips()
+        self._sync_star_button()
+        self._sync_detail_pane()
+        # Filled at mount rather than only when the drawer opens, so the plugin
+        # and exporter lines are correct the first time it is seen.
+        self._refresh_plugin_status()
         self._update_status()
         self._persist_state = True
 
@@ -372,6 +553,8 @@ class LogViewerApp(App[None]):
         self.advanced_drawer.sync_view_toggles(
             auto_scroll=self.state.auto_scroll,
             structured=self.state.pretty_rendering,
+            clipboard=self.state.clipboard_osc52,
+            detail_pane=self.state.detail_pane,
         )
 
     # --- responsiveness -----------------------------------------------------
@@ -401,7 +584,7 @@ class LogViewerApp(App[None]):
         if breakpoint_name == self._breakpoint and merged == self._merged:
             return
 
-        targets = [self, self.query_bar, self.advanced_drawer]
+        targets = [self, self.query_bar, self.advanced_drawer, self.detail_pane]
         for name in ("-compact", "-narrow", "-wide"):
             active = name == breakpoint_name
             for target in targets:
@@ -562,7 +745,7 @@ class LogViewerApp(App[None]):
         self._parser.reset()
         self._entries = deque(maxlen=self._config.max_buffer_lines)
 
-        reader = SourceReader(resolved, max_lines=self._config.max_buffer_lines)
+        reader = open_reader(resolved, max_lines=self._config.max_buffer_lines)
         try:
             initial = reader.prime()
         except OSError as exc:
@@ -579,6 +762,7 @@ class LogViewerApp(App[None]):
         self._start_tail()
         self._update_status()
         self._sync_compact_pane()
+        self._sync_star_button()
         return True
 
     def _start_tail(self) -> None:
@@ -613,7 +797,8 @@ class LogViewerApp(App[None]):
             self._entries.clear()
             self._entries.extend(self._parser.feed(result.lines))
             self._render_log(scroll_end=self.state.auto_scroll)
-            self._notify(f"{self._reader.path.name} was rotated; reloaded.", "warning")
+            notice = self._reader.RELOAD_NOTICE.format(name=self._reader.path.name)
+            self._notify(notice, "warning")
             return
 
         if not result.lines:
@@ -667,34 +852,83 @@ class LogViewerApp(App[None]):
     def _render_log(self, *, scroll_end: bool = False) -> None:
         if self._is_shutting_down:
             return
+        # Which line the cursor was on, so a filter change does not send it
+        # back to the top. Captured before the pane is cleared.
+        previous_entry = self.log_panel.cursor_entry
+        previous_index = self.log_panel.cursor
+        # The visible set is about to change, so both the navigation targets
+        # and any position into them are stale.
+        self._navigation_cache = None
+        self._match_position = None
         self.log_panel.clear()
 
         if self._selected_source is None:
             if self._report is not None:
                 self._show_discovery_summary(self._report)
+            self._sync_detail_pane()
             return
 
         if not self._entries:
             self.log_panel.write(Text("No log entries in the selected source.", style="dim"))
+            self._sync_detail_pane()
             return
 
         try:
             result = self._visible_entries(self._entries)
         except QueryError as exc:
             self.log_panel.write(Text(f"Invalid query: {exc}", style="bold #f87171"))
+            self._sync_detail_pane()
             return
 
         if not result.entries:
             message = describe_empty_result(result.stats, self._filter_spec())
             self.log_panel.write(Text(message, style="dim"))
+            self._sync_detail_pane()
             return
 
-        for entry in result.entries[-self._show_lines :]:
-            self.log_panel.write(self._renderable_for(entry))
+        # Drop marks whose lines the ring buffer has evicted, so the count in
+        # the status line stays honest as the source tails.
+        self._marks.prune(self._selected_source, self._entries)
 
+        for entry in result.entries[-self._show_lines :]:
+            self.log_panel.write_entry(self._renderable_for(entry), entry)
+        # Rows are created unmarked, so with an empty set there is nothing to do
+        # — and an empty set is the overwhelmingly common case.
+        if self._marks:
+            self._sync_marks()
+
+        self._restore_cursor(previous_entry, previous_index)
         if scroll_end or self.state.auto_scroll:
             self.log_panel.scroll_end(animate=False)
         self._update_status()
+
+    def _sync_marks(self) -> None:
+        """Set every visible row's gutter from the mark set.
+
+        Marks are content-keyed, so they reattach themselves after a re-render:
+        a line a filter hid and then brought back comes back marked, with
+        nothing to restore. ``set_row_marked`` is a no-op when the value is
+        unchanged, so this costs a re-strip only for rows that actually flipped.
+        """
+
+        source = self._selected_source
+        for index, entry in self.log_panel.entry_rows():
+            self.log_panel.set_row_marked(index, self._marks.contains(source, entry))
+
+    def _restore_cursor(self, entry: LogEntry | None, index: int) -> None:
+        """Put the cursor back where it was, or as near as the new view allows.
+
+        Resetting to the top on every keystroke in the query box would make the
+        cursor useless while filtering, which is exactly when it is wanted. The
+        selected line wins when it survived; when it did not, the nearest
+        surviving line does — never the top.
+        """
+
+        if entry is None or index < 0:
+            return
+        if self.log_panel.move_cursor_to_entry(entry, near=index):
+            return
+        self.log_panel.clamp_cursor(index)
 
     def _append_entries(self, entries: list[LogEntry]) -> None:
         """Incremental render for tailed lines.
@@ -709,8 +943,15 @@ class LogViewerApp(App[None]):
             result = self._visible_entries(entries)
         except QueryError:
             return
+        # A tailed line can be one an operator marked earlier and that rotated
+        # back in, so the gutter has to be set as it arrives — but only when
+        # there are marks at all, keeping the common path a plain append.
+        source = self._selected_source
+        marked = bool(self._marks)
         for entry in result.entries:
-            self.log_panel.write(self._renderable_for(entry))
+            self.log_panel.write_entry(self._renderable_for(entry), entry)
+            if marked and self._marks.contains(source, entry):
+                self.log_panel.set_row_marked(len(self.log_panel.rows) - 1, True)
 
     def _renderable_for(self, entry: LogEntry) -> RenderableType:
         if self.state.pretty_rendering:
@@ -847,8 +1088,25 @@ class LogViewerApp(App[None]):
         except QueryError:
             detail = "invalid query"
 
-        follow = "following" if self.state.auto_scroll else "paused"
-        status.update(f"{self._selected_source} · {detail} · {follow}")
+        if self.state.auto_scroll:
+            follow = "following"
+        elif self._follow_suspended_by_cursor:
+            # Say *why* it stopped. Incoming lines fighting a cursor the
+            # operator just moved is the failure mode this avoids, and a bare
+            # "paused" would look like the app had decided on its own.
+            follow = "paused — cursor moved, End resumes"
+        else:
+            follow = "paused"
+
+        parts = [str(self._selected_source), detail]
+        marks = self._marks.count_for(self._selected_source)
+        if marks:
+            parts.append(f"{marks} marked")
+        if self._match_position is not None:
+            position, total, label = self._match_position
+            parts.append(f"{label} {position} of {total}")
+        parts.append(follow)
+        status.update(" · ".join(parts))
 
     def _refresh_chips(self) -> None:
         if self._is_shutting_down or not self.chip_bar.is_attached:
@@ -934,6 +1192,161 @@ class LogViewerApp(App[None]):
             "Following new lines." if self.state.auto_scroll else "Auto-scroll paused."
         )
 
+    # --- match navigation ---------------------------------------------------
+
+    def _navigation_targets(self) -> tuple[list[int], str]:
+        """Rows `n`/`N` step between, and what to call one in a notification.
+
+        With a query active these are the query's matches. Because the query
+        *filters* rather than highlights, that is normally every line on
+        screen — the value `n` adds there is the "3 of 47" position readout and
+        the wrap notice, not a different destination. With `Invert match` on it
+        genuinely differs, and with no query at all it falls back to severity,
+        which is the case that earns the key.
+        """
+
+        if self._navigation_cache is not None:
+            return self._navigation_cache
+        targets = self._compute_navigation_targets()
+        self._navigation_cache = targets
+        return targets
+
+    def _compute_navigation_targets(self) -> tuple[list[int], str]:
+        spec = self._filter_spec()
+        rows = self.log_panel.entry_rows()
+
+        if spec.query:
+            try:
+                pattern = compile_query(
+                    spec.query, case_sensitive=spec.case_sensitive, regex=spec.regex
+                )
+            except QueryError:
+                return [], "match"
+            if pattern is not None:
+                return [
+                    index for index, entry in rows if pattern.search(entry.raw)
+                ], "match"
+
+        if spec.severity != "all":
+            return [
+                index for index, entry in rows if level_matches(entry.level, spec.severity)
+            ], f"{spec.severity} entry"
+
+        return [
+            index for index, entry in rows if entry.level in NOTABLE_LEVELS
+        ], "warning or worse"
+
+    def action_next_match(self) -> None:
+        self._step_match(1)
+
+    def action_previous_match(self) -> None:
+        self._step_match(-1)
+
+    def _step_match(self, direction: int) -> None:
+        if self._selected_source is None:
+            self._notify("Open a log before navigating matches.", "warning")
+            return
+
+        targets, label = self._navigation_targets()
+        if not targets:
+            self._notify(f"No {label} to jump to.", "warning")
+            self._sync_match_position()
+            return
+
+        cursor = self.log_panel.cursor
+        if direction > 0:
+            following = [index for index in targets if index > cursor]
+            target = following[0] if following else targets[0]
+            wrapped = not following
+        else:
+            preceding = [index for index in targets if index < cursor]
+            target = preceding[-1] if preceding else targets[-1]
+            wrapped = not preceding
+
+        self.log_panel.move_cursor(target)
+        self._sync_match_position()
+        self._update_status()
+        if wrapped:
+            # Say it rather than stopping dead at the end: silently refusing to
+            # move looks like a broken key.
+            position = targets.index(target) + 1
+            self._notify(
+                f"Wrapped to the {'first' if direction > 0 else 'last'} {label} "
+                f"({position} of {len(targets)})."
+            )
+
+    def _sync_match_position(self) -> None:
+        """Report where the cursor sits within the navigation targets.
+
+        Recomputed on every cursor move, not only on `n`/`N`, so arrowing onto
+        a match updates the counter instead of leaving a stale one on screen.
+        """
+
+        targets, label = self._navigation_targets()
+        cursor = self.log_panel.cursor
+        if cursor >= 0 and cursor in targets:
+            position = targets.index(cursor) + 1
+            self._match_position = (position, len(targets), label)
+        else:
+            self._match_position = None
+        self.query_bar.set_match_position(
+            None if self._match_position is None else self._match_position[0]
+        )
+
+    def action_goto_timestamp(self) -> None:
+        self.run_worker(self._prompt_goto(), group="dialogs", exit_on_error=False)
+
+    # --- marks --------------------------------------------------------------
+
+    def action_toggle_mark(self) -> None:
+        """Mark or unmark the cursor line."""
+
+        entry = self.log_panel.cursor_entry
+        if entry is None:
+            self._notify("Move the cursor to a line to mark it.", "warning")
+            return
+        marked = self._marks.toggle(self._selected_source, entry)
+        # Content-keyed, so identical lines share one mark: resync every row
+        # rather than only the cursor's, or the copies would disagree.
+        self._sync_marks()
+        self._update_status()
+        self._notify("Marked this line." if marked else "Unmarked this line.")
+
+    def action_next_mark(self) -> None:
+        """Move the cursor to the next marked line, wrapping with a notice."""
+
+        if self._selected_source is None:
+            self._notify("Open a log before jumping between marks.", "warning")
+            return
+
+        source = self._selected_source
+        marked = [
+            index
+            for index, entry in self.log_panel.entry_rows()
+            if self._marks.contains(source, entry)
+        ]
+        if not marked:
+            self._notify("No marked lines — press m to mark one.", "warning")
+            return
+
+        cursor = self.log_panel.cursor
+        following = [index for index in marked if index > cursor]
+        target = following[0] if following else marked[0]
+        self.log_panel.move_cursor(target)
+        self._update_status()
+        position = marked.index(target) + 1
+        if not following:
+            self._notify(f"Wrapped to the first mark ({position} of {len(marked)}).")
+        else:
+            self._notify(f"Mark {position} of {len(marked)}.")
+
+    def action_toggle_detail(self) -> None:
+        """Show or hide the event detail pane."""
+        self._set_detail_pane(not self.state.detail_pane)
+        self._notify(
+            "Detail pane open." if self.state.detail_pane else "Detail pane closed."
+        )
+
     def action_toggle_structured(self) -> None:
         """Flip structured rendering of JSON/XML/CSV payloads."""
         self._set_structured(not self.state.pretty_rendering)
@@ -943,17 +1356,49 @@ class LogViewerApp(App[None]):
             else "Structured output off."
         )
 
-    async def action_toggle_star(self) -> None:
-        """Star or unstar the log under the tree cursor."""
+    def _star_target(self) -> Optional[Path]:
+        """The log that starring would act on.
+
+        The tree cursor wins while the tree has focus — that is what the
+        operator is pointing at. Otherwise it is the log on screen, so the
+        toolbar button stars what you are reading rather than something the
+        cursor happens to be resting on.
+        """
 
         try:
             tree = self.query_one("#source-tree", LogTree)
         except NoMatches:
+            tree = None
+
+        def cursor_file() -> Optional[Path]:
+            if tree is None or tree.cursor_node is None:
+                return None
+            data = tree.cursor_node.data
+            return data if isinstance(data, Path) and data.is_file() else None
+
+        if tree is not None and tree.has_focus:
+            target = cursor_file()
+            if target is not None:
+                return target
+        if self._selected_source is not None:
+            return self._selected_source
+        return cursor_file()
+
+    def _sync_star_button(self) -> None:
+        """Show whether the star target is starred, or disable when there is none."""
+
+        if self._is_shutting_down or not self.is_mounted:
             return
-        node = tree.cursor_node
-        data = node.data if node is not None else None
-        if not isinstance(data, Path) or not data.is_file():
-            self._notify("Move the cursor to a log file to star it.", "warning")
+        target = self._star_target()
+        starred = None if target is None else str(_resolve(target)) in self.state.starred
+        self.query_bar.set_star_state(starred)
+
+    async def action_toggle_star(self) -> None:
+        """Star or unstar the log the star target resolves to."""
+
+        data = self._star_target()
+        if data is None:
+            self._notify("Open a log, or move the tree cursor to one, to star it.", "warning")
             return
 
         key = str(_resolve(data))
@@ -971,6 +1416,7 @@ class LogViewerApp(App[None]):
         if self._report is not None:
             await self._build_tree(self._report)
             self._highlight_source(data, select=False)
+        self._sync_star_button()
         self._notify(message)
 
     def _open_starred_on_launch(self) -> None:
@@ -996,6 +1442,20 @@ class LogViewerApp(App[None]):
 
         if len(present) == 1:
             self._select_source(present[0], announce=False)
+
+    def action_show_help(self) -> None:
+        """Open the binding list. Tailing continues behind it."""
+
+        # `?` reaches this action from the overlay too, where it closes rather
+        # than reopening; guard anyway so it can never stack two overlays.
+        if isinstance(self.screen, HelpOverlay):
+            return
+        # LogView's cursor keys are bound on the widget, not the app, so they
+        # have to be handed in explicitly — still generated from Binding
+        # objects, so a key added there can no more go missing from the overlay
+        # than one added here.
+        bindings = list(self.BINDINGS) + list(LogView.BINDINGS)
+        self.push_screen(HelpOverlay(build_help_sections(bindings)))
 
     def action_toggle_advanced(self) -> None:
         self.advanced_drawer.toggle()
@@ -1063,6 +1523,57 @@ class LogViewerApp(App[None]):
         self._render_log()
         self._notify(f"Showing up to {self._show_lines} lines.")
 
+    def action_copy_view(self) -> None:
+        """Put the visible lines on the local clipboard via OSC 52.
+
+        The counterpart to `Ctrl+L`, not a replacement for it: copy mode needs a
+        local terminal selection, which is exactly what is unavailable over tmux
+        or SSH, and this path needs a terminal that honours OSC 52. Whichever
+        one an operator's setup supports, one of them works.
+        """
+
+        if self._selected_source is None:
+            self._notify("Open a log before copying.", "warning")
+            return
+        if not self.state.clipboard_osc52:
+            self._notify(
+                "Clipboard copy is off — enable it in the Advanced drawer, "
+                "or use Ctrl+L copy mode.",
+                "warning",
+            )
+            return
+
+        try:
+            result = self._visible_entries(self._entries)
+        except QueryError as exc:
+            self._notify(f"Cannot copy while the query is invalid: {exc}", "error")
+            return
+
+        # The lines on screen, filter and window included — the same slice
+        # _render_log writes. Ctrl+E is the path for the whole filtered set.
+        visible = result.entries[-self._show_lines :]
+        payload = prepare_payload(
+            [entry.raw for entry in visible],
+            max_bytes=self._config.clipboard_max_bytes,
+        )
+        if payload.empty:
+            self._notify(
+                payload.summary
+                if not payload.truncated
+                else "That line is larger than clipboard_max_bytes; nothing copied.",
+                "warning",
+            )
+            return
+
+        try:
+            self.copy_to_clipboard(payload.text)
+        except Exception as exc:  # noqa: BLE001 - terminal-dependent
+            # Guarded so a terminal that rejects the sequence cannot leave a
+            # half-written escape on screen or take the app down with it.
+            self._notify(f"Clipboard copy failed: {exc}", "error")
+            return
+        self._notify(payload.summary, "warning" if payload.truncated else "info")
+
     def action_toggle_copy_mode(self) -> None:
         self._copy_mode = not self._copy_mode
         self.set_class(self._copy_mode, "-copy-mode")
@@ -1074,6 +1585,10 @@ class LogViewerApp(App[None]):
 
     def action_add_source(self) -> None:
         self.run_worker(self._prompt_add_source(), group="dialogs", exit_on_error=False)
+
+    def action_export_view(self) -> None:
+        """Write the entries the filters kept to a file."""
+        self.run_worker(self._prompt_export(), group="dialogs", exit_on_error=False)
 
     def action_save_session(self) -> None:
         new_paths = self._source_manager.added_paths
@@ -1132,6 +1647,164 @@ class LogViewerApp(App[None]):
         elif addition.path and self._source_manager.contains(addition.path):
             self._highlight_source(addition.path)
 
+    async def _prompt_goto(self) -> None:
+        """Move the cursor to the first entry at or after a moment in time."""
+
+        if self._selected_source is None:
+            self._notify("Open a log before jumping to a timestamp.", "warning")
+            return
+
+        typed = await self.push_screen(GotoDialog(), wait_for_dismiss=True)
+        if typed is None:
+            return
+
+        moment = parse_moment(typed)
+        if moment is None:
+            self._notify(
+                f"Could not read {typed!r} as a time. Try 2026-08-07 09:25:01 or -15m.",
+                "warning",
+            )
+            return
+
+        rows = self.log_panel.entry_rows()
+        # Entries with no timestamp cannot answer a question about time, so they
+        # are skipped — and counted, because a pane that quietly ignored half a
+        # source would be the same silent loss the severity filter is careful to
+        # avoid.
+        undated = sum(1 for _, entry in rows if entry.timestamp is None)
+
+        def at_or_after(entry: LogEntry) -> bool:
+            if entry.timestamp is None:
+                return False
+            stamp, target_moment = align_moments(entry.timestamp, moment)
+            return stamp >= target_moment
+
+        target = next((index for index, entry in rows if at_or_after(entry)), None)
+
+        skipped = f" ({undated} with no timestamp skipped)" if undated else ""
+        if target is None:
+            self._notify(
+                f"No entry at or after {moment:%Y-%m-%d %H:%M:%S}{skipped}.", "warning"
+            )
+            return
+
+        self.log_panel.move_cursor(target)
+        self._update_status()
+        self._notify(f"Moved to {moment:%Y-%m-%d %H:%M:%S} or later{skipped}.")
+
+    def _exporter_choices(self) -> list[ExportChoice]:
+        """Built-ins first, then whatever the plugin registry supplied.
+
+        Plugin exporters are marked ``needs_path=False``: ``Exporter.export``
+        receives the entries and a :class:`FilterContext` and nothing else, so
+        the destination is theirs to choose and the dialog's path input does not
+        apply to them.
+        """
+
+        choices = [
+            ExportChoice(f"builtin:{fmt.key}", fmt.label, fmt.extension)
+            for fmt in BUILTIN_FORMATS
+        ]
+        choices += [
+            ExportChoice(
+                f"plugin:{index}", f"{_plugin_name(exporter)} (plugin)", needs_path=False
+            )
+            for index, exporter in enumerate(self._plugins.exporters)
+        ]
+        return choices
+
+    async def _prompt_export(self) -> None:
+        if self._selected_source is None:
+            self._notify("Open a log before exporting.", "warning")
+            return
+
+        try:
+            # The whole filtered set, deliberately not the `_show_lines` window:
+            # an export is the answer to "save what I filtered", not "save what
+            # happens to fit on screen".
+            result = self._visible_entries(self._entries)
+        except QueryError as exc:
+            self._notify(f"Cannot export while the query is invalid: {exc}", "error")
+            return
+
+        entries = list(result.entries)
+        if not entries:
+            self._notify("Nothing to export — no entries match the filters.", "warning")
+            return
+
+        source = self._selected_source
+        marked = [entry for entry in entries if self._marks.contains(source, entry)]
+
+        dialog = ExportDialog(
+            self._exporter_choices(),
+            entry_count=len(entries),
+            default_name=default_stem(source),
+            marked_count=len(marked),
+        )
+        request = await self.push_screen(dialog, wait_for_dismiss=True)
+        if request is None:
+            self._notify("Export canceled.")
+            return
+
+        if request.marked_only:
+            if not marked:  # pragma: no cover - the checkbox is disabled then
+                self._notify("Nothing marked to export.", "warning")
+                return
+            entries = marked
+        self._run_export(request, entries)
+
+    def _run_export(self, request: ExportRequest, entries: list[LogEntry]) -> None:
+        if request.key.startswith("builtin:"):
+            self._export_builtin(request, entries)
+        else:
+            self._export_via_plugin(request, entries)
+
+    def _export_builtin(self, request: ExportRequest, entries: list[LogEntry]) -> None:
+        fmt = builtin_format(request.key.split(":", 1)[1])
+        if fmt is None or request.path is None:  # pragma: no cover - defensive
+            self._notify("Unknown export format.", "error")
+            return
+        try:
+            written = write_atomically(request.path, entries, fmt.writer)
+        except OSError as exc:
+            # Permissions, a missing directory, a full disk: reported, never a
+            # traceback, and the destination is left as it was.
+            self._notify(f"Export failed: {exc}", "error")
+            return
+        self._notify(f"Exported {_plural(written, 'entry', 'entries')} to {request.path}.")
+
+    def _export_via_plugin(self, request: ExportRequest, entries: list[LogEntry]) -> None:
+        exporter = self._exporter_at(request.key)
+        if exporter is None:  # pragma: no cover - defensive
+            self._notify("That exporter is no longer available.", "error")
+            return
+        name = _plugin_name(exporter)
+        try:
+            outcome = exporter.export(entries, self._plugin_context())
+        except Exception as exc:  # noqa: BLE001 - third-party code
+            # Same contract as a FilterStage that raises: recorded, surfaced,
+            # and survivable. An export must never take down the app.
+            self._plugins.errors.append(PluginError(name, f"raised: {exc}"))
+            self._refresh_plugin_status()
+            self._notify(f"Exporter {name} failed: {exc}", "error")
+            return
+
+        if outcome is None or not getattr(outcome, "ok", False):
+            detail = getattr(outcome, "detail", "") or "reported a failure"
+            self._notify(f"Exporter {name}: {detail}", "warning")
+            return
+        detail = outcome.detail or f"exported {_plural(len(entries), 'entry', 'entries')}"
+        destination = f" → {outcome.destination}" if outcome.destination else ""
+        self._notify(f"Exporter {name}: {detail}{destination}")
+
+    def _exporter_at(self, key: str) -> Optional[Exporter]:
+        try:
+            index = int(key.split(":", 1)[1])
+        except (IndexError, ValueError):
+            return None
+        exporters = self._plugins.exporters
+        return exporters[index] if 0 <= index < len(exporters) else None
+
     async def _prompt_custom_range(self) -> None:
         dialog = CustomTimeRangeDialog(
             initial_start=self.state.custom_start,
@@ -1151,7 +1824,21 @@ class LogViewerApp(App[None]):
         if isinstance(data, Path) and data.is_file():
             self._select_source(data)
 
+    def on_tree_node_highlighted(self, _event: Tree.NodeHighlighted[Path]) -> None:
+        # The star target follows the cursor while the tree has focus, so the
+        # button has to follow it too.
+        self._sync_star_button()
+
+    def on_descendant_focus(self, _event) -> None:
+        # Focus moving between the tree and the rest of the UI changes which
+        # log the star button would act on.
+        self._sync_star_button()
+
     def on_query_bar_action_triggered(self, message: QueryBar.ActionTriggered) -> None:
+        if message.action_id == "toggle-star":
+            # Async action, so it runs as a worker rather than blocking here.
+            self.run_worker(self.action_toggle_star(), group="star", exit_on_error=False)
+            return
         handlers = {
             "add-source": self.action_add_source,
             "run-query": self._render_log,
@@ -1224,8 +1911,38 @@ class LogViewerApp(App[None]):
     ) -> None:
         if message.field == "auto_scroll":
             self._set_auto_scroll(message.value)
+        elif message.field == "clipboard":
+            self._set_clipboard_enabled(message.value)
+        elif message.field == "detail_pane":
+            self._set_detail_pane(message.value)
         else:
             self._set_structured(message.value)
+
+    def on_log_view_cursor_moved(self, message: LogView.CursorMoved) -> None:
+        """Follow mode and the detail pane both track the cursor.
+
+        Moving the cursor off the last line suspends following, because the
+        alternative is incoming lines dragging the view out from under whoever
+        just pointed at something. `End` (or `w`) puts it back.
+        """
+
+        if self.state.auto_scroll and not message.at_end:
+            self._set_auto_scroll(False, cursor_suspended=True)
+            self._notify("Auto-scroll paused — End resumes following.")
+        elif message.at_end and self._follow_suspended_by_cursor:
+            self._set_auto_scroll(True)
+            self._notify("Following new lines.")
+        if self.state.detail_pane:
+            self.detail_pane.show(message.entry)
+        self._sync_match_position()
+        self._update_status()
+
+    def on_log_view_entry_selected(self, message: LogView.EntrySelected) -> None:
+        """Enter on a line opens the detail pane on it."""
+
+        if not self.state.detail_pane:
+            self._set_detail_pane(True)
+        self.detail_pane.show(message.entry)
 
     # --- view state -----------------------------------------------------------
     #
@@ -1234,18 +1951,34 @@ class LogViewerApp(App[None]):
     # at a time. Both funnel through here so the state has a single owner and
     # the two copies cannot drift apart.
 
-    def _set_auto_scroll(self, value: bool) -> None:
+    def _set_auto_scroll(self, value: bool, *, cursor_suspended: bool = False) -> None:
         self._update_state(auto_scroll=value)
         self.log_panel.auto_scroll = value
+        # Resuming clears the reason, whichever control resumed it.
+        self._follow_suspended_by_cursor = cursor_suspended and not value
         if value:
             self.log_panel.scroll_end(animate=False)
         self._sync_view_toggles()
         self._update_status()
 
+    def _set_detail_pane(self, value: bool) -> None:
+        self._update_state(detail_pane=value)
+        self._sync_view_toggles()
+        self._sync_detail_pane()
+
     def _set_structured(self, value: bool) -> None:
         self._update_state(pretty_rendering=value)
         self._sync_view_toggles()
         self._render_log()
+
+    def _set_clipboard_enabled(self, value: bool) -> None:
+        """Terminal capability, not a filter: nothing needs re-rendering."""
+        self._update_state(clipboard_osc52=value)
+        self._notify(
+            "Clipboard copy (y) enabled."
+            if value
+            else "Clipboard copy off — Ctrl+L copy mode still works."
+        )
 
     def _sync_view_toggles(self) -> None:
         """Push the canonical view state onto both sets of controls."""
@@ -1264,7 +1997,30 @@ class LogViewerApp(App[None]):
         self.advanced_drawer.sync_view_toggles(
             auto_scroll=self.state.auto_scroll,
             structured=self.state.pretty_rendering,
+            clipboard=self.state.clipboard_osc52,
+            detail_pane=self.state.detail_pane,
         )
+
+    def _sync_detail_pane(self) -> None:
+        """Show or hide the detail pane and refresh what it is showing.
+
+        The `-detail` class on the container is what the compact breakpoint
+        keys off to hide the log behind the pane; the pane's own visibility is
+        its `-visible` class.
+        """
+
+        # is_running, not is_mounted: rendering is unit-tested without a screen,
+        # and query_one needs one. Same guard _update_status uses.
+        if self._is_shutting_down or not self.is_running:
+            return
+        visible = self.state.detail_pane
+        self.detail_pane.set_class(visible, "-visible")
+        try:
+            self.query_one("#log-area", Container).set_class(visible, "-detail")
+        except NoMatches:
+            pass
+        if visible:
+            self.detail_pane.show(self.log_panel.cursor_entry)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:  # type: ignore[override]
         if (event.button.id or "") == "toggle-advanced":
@@ -1312,6 +2068,14 @@ class LogViewerApp(App[None]):
                 str(error) for error in self._plugins.errors[:3]
             ))
         self.advanced_drawer.set_plugin_status(" · ".join(parts))
+        # Read-only, so an operator can see what Ctrl+E offers without opening
+        # the dialog.
+        self.advanced_drawer.set_export_status(
+            describe_formats(
+                [fmt.label for fmt in BUILTIN_FORMATS]
+                + [_plugin_name(exporter) for exporter in self._plugins.exporters]
+            )
+        )
 
     async def on_unmount(self) -> None:
         self._is_shutting_down = True
@@ -1320,6 +2084,16 @@ class LogViewerApp(App[None]):
             # Persist as-is: the selected source is deliberately kept so the
             # next launch reopens it.
             self._store.save(self.state)
+
+
+def _plugin_name(plugin: object) -> str:
+    """A plugin's own name, without trusting it to have set one."""
+    name = getattr(plugin, "name", "") or ""
+    return name if isinstance(name, str) and name else type(plugin).__name__
+
+
+def _plural(count: int, singular: str, plural: str) -> str:
+    return f"{count} {singular if count == 1 else plural}"
 
 
 def _compact_path(path: Path) -> str:

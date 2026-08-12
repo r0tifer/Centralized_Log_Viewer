@@ -25,6 +25,15 @@ class SessionState:
     custom_end: str = ""
     auto_scroll: bool = True
     pretty_rendering: bool = False
+    #: Whether `y` may emit an OSC 52 clipboard sequence. A property of the
+    #: terminal the operator is on, not of any log: some multiplexers and
+    #: hardened terminals render the sequence as garbage, and turning it off
+    #: leaves `Ctrl+L` copy mode as the fallback.
+    clipboard_osc52: bool = True
+    #: Whether the event detail pane is open. A layout preference, so it
+    #: survives a restart; the *selected line* does not, because that would
+    #: record which log content someone was reading.
+    detail_pane: bool = False
     # Advanced drawer state
     include_globs: str = ""
     exclude_globs: str = ""
@@ -54,6 +63,8 @@ class SessionState:
         "custom_end",
         "auto_scroll",
         "pretty_rendering",
+        "clipboard_osc52",
+        "detail_pane",
         "include_globs",
         "exclude_globs",
         "follow_symlinks",

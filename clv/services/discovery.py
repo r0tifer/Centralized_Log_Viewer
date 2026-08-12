@@ -16,11 +16,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from .documents import document_format_for
 from .reader import looks_binary
 
 #: Skipped unless the user opts in. These are readable files that are not
 #: usefully viewable as text: compressed archives and binary journals. Rotated
 #: plain-text logs (``app.log.1``) are NOT excluded — those are still text.
+#:
+#: ``*.pdf`` is here for a different reason than the rest. Its text is
+#: extractable, but only into reflowed prose with no line structure, no
+#: timestamps and no severity — every line would land in the parser's
+#: unrecognised bucket. Listing it explicitly means PDFs are reported as an
+#: unsupported file type rather than vanishing with no explanation, and an
+#: operator who disagrees can drop it from ``exclude_globs``.
+#:
+#: Membership of this tuple is also what separates "CLV cannot display this"
+#: from "your glob hid it" when a skip is reported — see :func:`skip_reason`.
 DEFAULT_EXCLUDE_GLOBS: tuple[str, ...] = (
     "*.gz",
     "*.bz2",
@@ -34,6 +45,7 @@ DEFAULT_EXCLUDE_GLOBS: tuple[str, ...] = (
     "*.db",
     "*.sqlite",
     "*.sqlite3",
+    "*.pdf",
 )
 
 #: Ceiling on files returned from one discovery pass, so pointing CLV at a huge
@@ -94,6 +106,21 @@ class DiscoveredFile:
             return Path(self.path.name)
 
 
+#: Why a file was not listed, in the operator's terms rather than the
+#: implementation's. "Excluded" used to cover both of the first two, which
+#: made the count useless: it could not distinguish "CLV cannot display this"
+#: from "your own glob hid it", and only one of those is worth acting on.
+UNSUPPORTED = "unsupported file type"
+FILTERED = "filtered out"
+UNREADABLE = "unreadable"
+
+_SKIP_PLURALS = {
+    UNSUPPORTED: "unsupported file types",
+    FILTERED: FILTERED,
+    UNREADABLE: UNREADABLE,
+}
+
+
 @dataclass
 class DiscoveryReport:
     """What discovery found, and what it declined to list."""
@@ -101,10 +128,18 @@ class DiscoveryReport:
     files: list[DiscoveredFile] = field(default_factory=list)
     roots: list[Path] = field(default_factory=list)
     directories: set[Path] = field(default_factory=set)
-    skipped_binary: int = 0
-    skipped_excluded: int = 0
+    #: Content CLV cannot show as text: a binary, an archive, a PDF.
+    skipped_unsupported: int = 0
+    #: Hidden by the operator's own include_globs / exclude_globs.
+    skipped_filtered: int = 0
+    #: Present and of a supported type, but the read failed.
     skipped_unreadable: int = 0
     unreadable_roots: list[Path] = field(default_factory=list)
+    #: Named sources that were skipped, with the reason. A file the operator
+    #: typed out by hand deserves to be named back at them rather than folded
+    #: into a count -- otherwise adding a PDF as a source looks like CLV did
+    #: nothing at all.
+    skipped_sources: list[tuple[Path, str]] = field(default_factory=list)
     #: True when max_files stopped the walk early.
     truncated: bool = False
 
@@ -114,7 +149,7 @@ class DiscoveryReport:
 
     @property
     def skipped_total(self) -> int:
-        return self.skipped_binary + self.skipped_excluded + self.skipped_unreadable
+        return self.skipped_unsupported + self.skipped_filtered + self.skipped_unreadable
 
     def summary_lines(self) -> list[str]:
         """Human-readable discovery summary for the empty viewer pane."""
@@ -124,27 +159,37 @@ class DiscoveryReport:
             f"Folders containing logs: {len(self.directories)}",
             f"Log files found: {self.file_count}",
         ]
-        skipped: list[str] = []
-        if self.skipped_binary:
-            skipped.append(f"{self.skipped_binary} binary")
-        if self.skipped_excluded:
-            skipped.append(f"{self.skipped_excluded} excluded")
-        if self.skipped_unreadable:
-            skipped.append(f"{self.skipped_unreadable} unreadable")
+        counts = (
+            (self.skipped_unsupported, UNSUPPORTED),
+            (self.skipped_filtered, FILTERED),
+            (self.skipped_unreadable, UNREADABLE),
+        )
+        skipped = [
+            f"{count} {label if count == 1 else _SKIP_PLURALS[label]}"
+            for count, label in counts
+            if count
+        ]
         if skipped:
             lines.append("Skipped: " + ", ".join(skipped))
         if self.truncated:
             lines.append(f"Stopped at the {self.file_count}-file limit; narrow the include filter to see more.")
+        for path, reason in self.skipped_sources:
+            lines.append(f"File skipped - {reason}: {path}")
         for root in self.unreadable_roots:
             lines.append(f"Could not read source: {root}")
         return lines
 
 
-def matches_any(path: Path, root: Path, globs: Sequence[str]) -> bool:
-    """Test *path* against *globs* by name and by root-relative path."""
+def matched_glob(path: Path, root: Path, globs: Sequence[str]) -> str | None:
+    """The first of *globs* matching *path*, by name and by root-relative path.
+
+    Returns the pattern rather than a bool because *which* glob matched decides
+    how the skip is reported: a default like ``*.pdf`` describes a file type,
+    while one the operator added describes a filter they chose.
+    """
 
     if not globs:
-        return False
+        return None
     name = path.name
     try:
         relative = str(path.relative_to(root))
@@ -157,24 +202,88 @@ def matches_any(path: Path, root: Path, globs: Sequence[str]) -> bool:
             or fnmatch.fnmatch(relative, pattern)
             or fnmatch.fnmatch(full, pattern)
         ):
-            return True
-    return False
+            return pattern
+    return None
+
+
+def matches_any(path: Path, root: Path, globs: Sequence[str]) -> bool:
+    """Test *path* against *globs* by name and by root-relative path."""
+
+    return matched_glob(path, root, globs) is not None
+
+
+def skip_reason(
+    path: Path,
+    root: Path,
+    settings: DiscoverySettings,
+    *,
+    named: bool = False,
+) -> str | None:
+    """Why *path* would not be listed, or None if it is a valid source.
+
+    Shared by the folder walk and by directly named files so both describe the
+    same file the same way.
+
+    *named* marks a file the operator listed individually rather than one found
+    by walking a folder. Their own globs do not apply to it — they already said
+    they want this one, and filters exist to narrow a walk — but the type-based
+    exclusions still do, because those describe what can be displayed at all
+    rather than what was asked for.
+    """
+
+    exclude_globs = settings.exclude_globs
+    if named:
+        exclude_globs = tuple(
+            glob for glob in exclude_globs if glob in DEFAULT_EXCLUDE_GLOBS
+        )
+
+    excluded_by = matched_glob(path, root, exclude_globs)
+    if excluded_by is not None:
+        # The shipped exclusions are all statements about file type: an
+        # archive, a database, a PDF. A glob the operator added instead is
+        # their filter, and calling that "unsupported" would blame CLV for a
+        # choice they made.
+        return UNSUPPORTED if excluded_by in DEFAULT_EXCLUDE_GLOBS else FILTERED
+    if (
+        not named
+        and settings.include_globs
+        and not matches_any(path, root, settings.include_globs)
+    ):
+        return FILTERED
+    if not os.access(path, os.R_OK):
+        return UNREADABLE
+    if settings.skip_binary and not _is_document(path) and looks_binary(path):
+        return UNSUPPORTED
+    return None
+
+
+def _count_skip(report: DiscoveryReport, reason: str) -> None:
+    if reason == UNSUPPORTED:
+        report.skipped_unsupported += 1
+    elif reason == FILTERED:
+        report.skipped_filtered += 1
+    else:
+        report.skipped_unreadable += 1
 
 
 def _accepts(path: Path, root: Path, settings: DiscoverySettings, report: DiscoveryReport) -> bool:
-    if matches_any(path, root, settings.exclude_globs):
-        report.skipped_excluded += 1
-        return False
-    if settings.include_globs and not matches_any(path, root, settings.include_globs):
-        report.skipped_excluded += 1
-        return False
-    if not os.access(path, os.R_OK):
-        report.skipped_unreadable += 1
-        return False
-    if settings.skip_binary and looks_binary(path):
-        report.skipped_binary += 1
-        return False
-    return True
+    reason = skip_reason(path, root, settings)
+    if reason is None:
+        return True
+    _count_skip(report, reason)
+    return False
+
+
+def _is_document(path: Path) -> bool:
+    """True for container formats whose text CLV can extract.
+
+    The binary test asks "can this be shown as text", and for these the answer
+    is yes even though the bytes on disk say otherwise: an ODS file is a ZIP,
+    so content sniffing will always call it binary. Checked before sniffing so
+    a document costs no read at all during discovery.
+    """
+
+    return document_format_for(path) is not None
 
 
 def _walk_directory(
@@ -249,18 +358,19 @@ def discover(
                 continue
             _walk_directory(root, settings, report, seen_dirs)
         elif is_file:
-            # A directly named file bypasses the include filter: the operator
-            # already said they want this one. Exclusions still apply so a
-            # named binary is reported rather than silently listed.
+            # A directly named file bypasses the operator's own globs: they
+            # already said they want this one. Type-based exclusions still
+            # apply, and a skip is named back at them rather than folded into
+            # a count -- a source you typed out yourself going missing with no
+            # explanation is the worst version of this.
             if report.file_count >= settings.max_files:
                 report.truncated = True
                 continue
             try:
-                if settings.skip_binary and looks_binary(root):
-                    report.skipped_binary += 1
-                    continue
-                if not os.access(root, os.R_OK):
-                    report.unreadable_roots.append(root)
+                reason = skip_reason(root, root, settings, named=True)
+                if reason is not None:
+                    _count_skip(report, reason)
+                    report.skipped_sources.append((root, reason))
                     continue
                 size = root.stat().st_size
             except OSError:

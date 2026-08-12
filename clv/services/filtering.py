@@ -167,6 +167,42 @@ def parse_absolute_window(start: str, end: str) -> Optional[TimeWindow]:
     return TimeWindow(start=parsed_start, end=parsed_end)
 
 
+def parse_moment(text: str, *, now: Optional[datetime] = None) -> Optional[datetime]:
+    """Resolve a single point in time from what an operator typed.
+
+    Two forms, both already understood elsewhere in this module: an ISO-ish
+    absolute (``datetime.fromisoformat``, as :func:`parse_absolute_window` uses)
+    and a signed relative offset built from the same ``_RELATIVE_RE`` table as
+    :func:`parse_relative_window`. ``-15m`` is a quarter hour ago and ``+2h`` is
+    two hours ahead; a bare ``15m`` means the past, because "go to 15m" in a log
+    is never a request to look forward.
+
+    Returns ``None`` rather than raising: this is prompt input, and the caller
+    reports a bad value to whoever typed it.
+    """
+
+    token = text.strip()
+    if not token:
+        return None
+
+    sign = -1
+    body = token
+    if body[0] in "+-":
+        sign = 1 if body[0] == "+" else -1
+        body = body[1:]
+
+    match = _RELATIVE_RE.match(body.lower())
+    if match:
+        amount = int(match.group("amount"))
+        delta = timedelta(**{_UNIT_TO_DELTA[match.group("unit")]: amount})
+        return (now or datetime.now()) + sign * delta
+
+    try:
+        return datetime.fromisoformat(token)
+    except ValueError:
+        return None
+
+
 # --- the filter itself ------------------------------------------------------
 
 
@@ -184,6 +220,18 @@ def _comparable(moment: datetime, reference: Optional[datetime]) -> datetime:
     if moment.tzinfo is not None:
         return moment.replace(tzinfo=None)
     return moment
+
+
+def align_moments(left: datetime, right: datetime) -> tuple[datetime, datetime]:
+    """Make two timestamps comparable, whatever their tz-awareness.
+
+    The public form of :func:`_comparable`, for callers that need to *order*
+    two moments rather than test one against a window — jumping the cursor to a
+    timestamp, for instance. Same rule: drop the offset from the aware side
+    rather than refuse to compare.
+    """
+
+    return _comparable(left, right), _comparable(right, left)
 
 
 def filter_entries(entries: Sequence[LogEntry], spec: FilterSpec) -> FilterResult:

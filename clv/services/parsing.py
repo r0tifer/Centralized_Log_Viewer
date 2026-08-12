@@ -9,15 +9,56 @@ to work with, so searching never silently drops lines it failed to parse.
 Continuation lines (stack traces, wrapped payloads) inherit the timestamp and
 level of the entry above them, which keeps a traceback attached to the ERROR
 that produced it when time or severity filters are active.
+
+Fields
+------
+
+Every matcher already captures more than a timestamp and a level, so
+:attr:`LogEntry.fields` carries that structure forward instead of discarding
+it. Key names are **normalised across formats**: ``host`` means the same thing
+whether it came from syslog or from an access log, so a field query does not
+have to know which format produced the line.
+
+===============  ==========================================================
+Format           Keys
+===============  ==========================================================
+``syslog``       ``host``, ``tag``, ``pid``
+``syslog-5424``  ``host``, ``tag``, ``pid``, ``msgid``
+``access-log``   ``host``, ``ident``, ``user``, ``request``, ``status``,
+                 ``size``
+``json``         every key of the object, flattened to dotted paths
+others           none
+===============  ==========================================================
+
+RFC 5424's APP-NAME is deliberately filed under ``tag``, the same key BSD
+syslog uses for the program name, so ``tag:sshd`` answers the question against
+either dialect. A source that reports a genuinely different concept — systemd's
+``_SYSTEMD_UNIT``, say — should use its own key rather than overloading this
+one.
+
+Values are stored as **strings and never coerced**: an HTTP status is
+``"500"``, not ``500``. Comparison semantics belong to whatever runs the query,
+not to the parser. A group that says nothing (empty, or the ``-`` that RFC 5424
+uses for NILVALUE and CLF for an absent ident) is left out entirely, so an
+absent field reads as absent rather than as the literal ``"-"``.
+
+The mapping is read-only and shared when empty, so the common case allocates
+nothing. It is excluded from equality and hashing because it is derived from
+``raw``: two entries with the same raw text always have the same fields, and
+leaving it out keeps :class:`LogEntry` hashable. One consequence worth knowing:
+``copy.deepcopy`` (and therefore :func:`dataclasses.asdict`) cannot handle a
+``mappingproxy``, so a consumer that needs a plain dict should call
+``dict(entry.fields)``.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
-from typing import Iterable, Optional, Sequence
+from types import MappingProxyType
+from typing import Iterable, Mapping, Optional, Sequence
 
 #: How far past "now" an inferred syslog year may land before we roll it back.
 _FUTURE_TOLERANCE = timedelta(days=1)
@@ -119,6 +160,11 @@ def level_matches(level: Optional[str], bucket: str) -> bool:
 
 # --- entries ----------------------------------------------------------------
 
+#: Shared read-only empty mapping. Most lines carry no fields, and a line is
+#: the unit this parser handles millions of, so the common case allocates
+#: nothing.
+_EMPTY_FIELDS: Mapping[str, str] = MappingProxyType({})
+
 
 @dataclass(frozen=True, slots=True)
 class LogEntry:
@@ -132,6 +178,10 @@ class LogEntry:
     #: True when timestamp/level were inherited from the preceding entry
     #: because this line is a continuation (stack trace, wrapped payload).
     continuation: bool = False
+    #: Structure recovered from the line, keyed by the normalised names in the
+    #: module docstring. ``compare=False`` because this is derived from ``raw``
+    #: and a mapping member would otherwise make ``LogEntry`` unhashable.
+    fields: Mapping[str, str] = field(default=_EMPTY_FIELDS, compare=False)
 
     @property
     def structured(self) -> bool:
@@ -221,6 +271,111 @@ def _parse_clf_timestamp(text: str) -> Optional[datetime]:
         except ValueError:
             return parsed
     return parsed
+
+
+# --- field extraction -------------------------------------------------------
+
+#: How many dotted segments a flattened JSON key may have. Deeper objects are
+#: kept, but as one compact JSON string rather than as more keys.
+_MAX_FIELD_DEPTH = 4
+
+#: How many fields one line may contribute. A payload with ten thousand keys is
+#: a pathological line, not ten thousand useful facts about it.
+_MAX_FIELDS = 64
+
+#: Group names that carry no information. ``-`` is RFC 5424's NILVALUE and
+#: CLF's placeholder for an absent ident or user.
+_NIL_VALUES = frozenset({"", "-"})
+
+#: ``(field keys, regex group names)`` per format. The two differ only where a
+#: format's own vocabulary disagrees with the normalised one — RFC 5424 calls
+#: the program name APP-NAME, and we file it under ``tag`` alongside BSD
+#: syslog's so one query reaches both dialects. They are kept as parallel
+#: tuples so the groups can be pulled in a single ``match.group(*names)`` call.
+_SYSLOG_FIELDS = (("host", "tag", "pid"), ("host", "tag", "pid"))
+_SYSLOG_5424_FIELDS = (
+    ("host", "tag", "pid", "msgid"),
+    ("host", "app", "pid", "msgid"),
+)
+_CLF_FIELDS = (
+    ("host", "ident", "user", "request", "status", "size"),
+    ("host", "ident", "user", "request", "status", "size"),
+)
+
+
+def _freeze_fields(values: dict[str, str]) -> Mapping[str, str]:
+    """Wrap extracted fields read-only, reusing the shared empty mapping."""
+
+    return MappingProxyType(values) if values else _EMPTY_FIELDS
+
+
+def _match_fields(
+    match: re.Match[str], spec: tuple[tuple[str, ...], tuple[str, ...]]
+) -> Mapping[str, str]:
+    """Collect named groups into fields, dropping the ones that say nothing.
+
+    Values are not stripped: every group these specs name is delimited by
+    whitespace in its pattern, so there is none to remove, and this runs once
+    per structured line.
+    """
+
+    keys, groups = spec
+    values: dict[str, str] = {}
+    for key, value in zip(keys, match.group(*groups)):
+        if value is not None and value not in _NIL_VALUES:
+            values[key] = value
+    return _freeze_fields(values)
+
+
+def _compact_json(value: object) -> str:
+    """Render a container as one compact JSON string."""
+
+    try:
+        return json.dumps(value, separators=(",", ":"), default=str)
+    except (TypeError, ValueError, RecursionError):
+        return str(value)
+
+
+def _stringify(value: object) -> str:
+    """Render a JSON value as text, without inventing a type for it."""
+
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    if isinstance(value, bool):  # before int: bool is an int
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    # Lists and over-deep objects are stringified rather than exploded: a list
+    # has no key names to flatten into, and inventing indices would let one
+    # line contribute an unbounded number of fields.
+    return _compact_json(value)
+
+
+def _walk_json(
+    node: Mapping[str, object], prefix: str, depth: int, values: dict[str, str]
+) -> None:
+    """Flatten one nesting level of *node* into *values*."""
+
+    for key, value in node.items():
+        if len(values) >= _MAX_FIELDS:
+            return
+        name = f"{prefix}{key}"
+        if type(value) is str:  # much the commonest case in log JSON
+            values[name] = value
+        elif isinstance(value, dict) and value and depth < _MAX_FIELD_DEPTH:
+            _walk_json(value, f"{name}.", depth + 1, values)
+        else:
+            values[name] = _stringify(value)
+
+
+def _flatten_json(payload: Mapping[str, object]) -> Mapping[str, str]:
+    """Flatten a JSON object to dotted keys, bounded in depth and in count."""
+
+    values: dict[str, str] = {}
+    _walk_json(payload, "", 1, values)
+    return _freeze_fields(values)
 
 
 # --- format matchers --------------------------------------------------------
@@ -331,6 +486,9 @@ def _parse_json(line: str) -> Optional[LogEntry]:
         level=level,
         message=message,
         format_name="json",
+        # Every key is kept, including the ones consumed above: a JSON line
+        # says what it says, and nothing normalised is written over it.
+        fields=_flatten_json(payload),
     )
 
 
@@ -358,6 +516,7 @@ def _parse_structured(line: str, *, now: Optional[datetime] = None) -> Optional[
                 level=_SYSLOG_SEVERITY.get(priority % 8),
                 message=match.group("msg"),
                 format_name="syslog-5424",
+                fields=_match_fields(match, _SYSLOG_5424_FIELDS),
             )
 
     if first.isdigit() and len(stripped) > 10 and stripped[4:5] == "-":
@@ -406,6 +565,7 @@ def _parse_structured(line: str, *, now: Optional[datetime] = None) -> Optional[
                 level=_scan_level(message),
                 message=message,
                 format_name="syslog",
+                fields=_match_fields(match, _SYSLOG_FIELDS),
             )
 
     match = _RE_CLF.match(stripped)
@@ -416,6 +576,7 @@ def _parse_structured(line: str, *, now: Optional[datetime] = None) -> Optional[
             level=_status_to_level(match.group("status")),
             message=match.group("request"),
             format_name="access-log",
+            fields=_match_fields(match, _CLF_FIELDS),
         )
 
     return None
@@ -454,6 +615,12 @@ def parse_lines(
     A line no format recognised, following a line that one did, is treated as a
     continuation: it borrows the timestamp and level above it so a stack trace
     stays with the ERROR it belongs to under time and severity filters.
+
+    It does **not** inherit ``fields``. A timestamp and a level are properties
+    of the event a continuation belongs to; a host or a PID is a property of
+    the line that reported it, and a stack trace frame has none of its own to
+    report. Claiming its parent's would put facts on a line that never stated
+    them.
     """
 
     entries: list[LogEntry] = []
@@ -498,7 +665,11 @@ class LogParser:
         self._last_level = None
 
     def feed(self, lines: Sequence[str], *, now: Optional[datetime] = None) -> list[LogEntry]:
-        """Parse *lines*, carrying structure forward from previous calls."""
+        """Parse *lines*, carrying structure forward from previous calls.
+
+        Carry-forward covers timestamp and level only; see :func:`parse_lines`
+        for why a continuation does not inherit ``fields``.
+        """
         entries: list[LogEntry] = []
         for line in lines:
             entry = parse_line(line, now=now)

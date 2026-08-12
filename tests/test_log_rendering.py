@@ -8,23 +8,38 @@ from unittest.mock import MagicMock
 
 from rich.console import Group
 from rich.text import Text
-from textual.widgets import RichLog
 
 from clv.app import LogViewerApp
 from clv.services.discovery import DiscoveryReport, DiscoveredFile
 from clv.services.parsing import parse_lines
 from clv.storage import SessionState
+from clv.widgets.log_view import LogView
 
 
 def _make_app(**state) -> LogViewerApp:
     app = LogViewerApp()
-    app.log_panel = MagicMock(spec=RichLog)
+    app.log_panel = MagicMock(spec=LogView)
+    # The cursor properties are read before every re-render so it can be put
+    # back afterwards; a bare MagicMock would answer with another MagicMock.
+    app.log_panel.cursor_entry = None
+    app.log_panel.cursor = -1
     app.state = SessionState(auto_scroll=False, **state)
     return app
 
 
 def _written(app) -> list:
-    return [call.args[0] for call in app.log_panel.write.call_args_list]
+    """Renderables that reached the pane, in the order they were written.
+
+    Read off ``mock_calls`` rather than one method's ``call_args_list`` because
+    entries go through ``write_entry`` and messages through ``write``, and a
+    render can interleave them.
+    """
+
+    return [
+        call.args[0]
+        for call in app.log_panel.mock_calls
+        if call[0] in ("write", "write_entry") and call.args
+    ]
 
 
 def _plain(app) -> list[str]:
@@ -163,7 +178,7 @@ def test_append_only_renders_the_new_entries() -> None:
     app._selected_source = Path("/tmp/example.log")
     app._entries = deque(parse_lines([f"line {i}" for i in range(50)]))
 
-    app.log_panel.write.reset_mock()
+    app.log_panel.reset_mock()
     app._append_entries(parse_lines(["brand new line"]))
 
     assert _plain(app) == ["brand new line"]

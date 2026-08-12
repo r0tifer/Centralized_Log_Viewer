@@ -163,6 +163,37 @@ def test_local_discovery_loads_drop_in_modules(tmp_path: Path, monkeypatch) -> N
         module_path.unlink()
 
 
+def test_local_discovery_loads_drop_in_exporters() -> None:
+    """clv/plugins/exporters/ stays a drop-in directory.
+
+    The three formats CLV ships are core (``clv.services.export``) so that a
+    built-in cannot fail to load and the plugin count keeps meaning "installed
+    plugins" — but the directory is still a live extension point, and this is
+    the test that says so.
+    """
+
+    import clv.plugins as plugins_pkg
+
+    plugin_dir = Path(plugins_pkg.__file__).resolve().parent / "exporters"
+    plugin_dir.mkdir(exist_ok=True)
+    module_path = plugin_dir / "tmp_test_exporter.py"
+    module_path.write_text(
+        "from clv.plugins import Exporter, ExportResult\n"
+        "class Sink(Exporter):\n"
+        "    name = 'tmp-sink'\n"
+        "    def export(self, entries, context):\n"
+        "        return ExportResult(ok=True, detail='ok')\n"
+        "def register():\n"
+        "    return Sink()\n",
+        encoding="utf-8",
+    )
+    try:
+        registry = load_plugins(clv_version="2.1.0", include_entry_points=False)
+        assert "tmp-sink" in [p.name for p in registry.exporters]
+    finally:
+        module_path.unlink()
+
+
 def test_broken_drop_in_module_is_reported_not_fatal() -> None:
     import clv.plugins as plugins_pkg
 

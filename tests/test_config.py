@@ -117,6 +117,31 @@ def test_values_are_clamped_not_trusted(tmp_path) -> None:
     assert config.tree_width >= 20
 
 
+def test_clipboard_cap_is_read_and_clamped(tmp_path) -> None:
+    """A cap of zero would make `y` a no-op; a huge one would be dropped by tmux."""
+
+    assert (
+        load_config(
+            _write(
+                tmp_path / "settings.conf",
+                "[log_viewer]\nlog_dirs = /var/log\nclipboard_max_bytes = 4096\n",
+            )
+        ).clipboard_max_bytes
+        == 4096
+    )
+
+    clamped = load_config(
+        _write(
+            tmp_path / "low.conf",
+            "[log_viewer]\nlog_dirs = /var/log\nclipboard_max_bytes = 0\n",
+        )
+    )
+    assert clamped.clipboard_max_bytes >= 1024
+
+    default = load_config(_write(tmp_path / "none.conf", "[log_viewer]\nlog_dirs = /var/log\n"))
+    assert default.clipboard_max_bytes == LogConfig().clipboard_max_bytes
+
+
 def test_garbage_values_fall_back_to_defaults(tmp_path) -> None:
     config = load_config(
         _write(

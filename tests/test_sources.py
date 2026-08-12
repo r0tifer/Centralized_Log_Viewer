@@ -146,9 +146,7 @@ def test_messages_are_toasts_and_do_not_pollute_the_log_pane() -> None:
             assert mock_notify.call_args_list[-1].kwargs["severity"] == "error"
 
             # Nothing landed in the log pane.
-            rendered = "\n".join(
-                getattr(strip, "plain", str(strip)) for strip in app.log_panel.lines
-            )
+            rendered = "\n".join(app.log_panel.text_lines)
             for text in ("All good", "Heads up", "Bad"):
                 assert text not in rendered
 
@@ -376,9 +374,7 @@ def test_launch_shows_the_summary_not_the_last_source(tmp_path: Path) -> None:
             assert second._selected_source is None, "a source was reopened on launch"
             assert second._tail_timer is None, "a tail was started on launch"
 
-            rendered = "\n".join(
-                getattr(line, "plain", str(line)) for line in second.log_panel.lines
-            )
+            rendered = "\n".join(second.log_panel.text_lines)
             assert "Log files found" in rendered
             assert "Select a log from the tree to begin." in rendered
 
@@ -437,9 +433,7 @@ def test_starring_marks_the_log_without_opening_it(tmp_path: Path) -> None:
 
             assert app.state.starred == (str(target.resolve()),)
             assert app._selected_source is None, "starring opened the log"
-            rendered = "\n".join(
-                getattr(line, "plain", str(line)) for line in app.log_panel.lines
-            )
+            rendered = "\n".join(app.log_panel.text_lines)
             assert "Log files found" in rendered
 
     asyncio.run(scenario())
@@ -588,3 +582,156 @@ def test_a_corrupt_starred_list_degrades_to_the_usable_entries(tmp_path: Path) -
     )
 
     assert store.load().starred == ("/var/log/a.log", "/var/log/b.log")
+
+
+def test_star_button_reflects_and_toggles_the_star(tmp_path: Path) -> None:
+    """The on-screen path to starring, for anyone who never finds the keybinding."""
+
+    root = _nested_tree(tmp_path)
+    target = root / "alpha" / "a.log"
+
+    async def scenario() -> None:
+        from textual.widgets import Button
+
+        from clv.services import SourceManager
+        from clv.widgets.query_bar import STAR_OFF, STAR_ON
+
+        app = LogViewerApp()
+        async with app.run_test(size=(160, 32)) as pilot:
+            app._source_manager = SourceManager([root], [])
+            await app._rescan()
+            await pilot.pause()
+
+            button = app.query_bar.query_one("#toggle-star", Button)
+
+            # Nothing to star yet, so the control says so rather than lying.
+            assert button.disabled is True
+            assert str(button.label) == STAR_OFF
+
+            app._select_source(target)
+            await pilot.pause()
+            assert button.disabled is False
+            assert str(button.label) == STAR_OFF
+
+            button.press()
+            await pilot.pause()
+            await pilot.pause()
+            assert app.state.starred == (str(target.resolve()),)
+            assert str(button.label) == STAR_ON
+            assert button.has_class("-starred")
+
+            button.press()
+            await pilot.pause()
+            await pilot.pause()
+            assert app.state.starred == ()
+            assert str(button.label) == STAR_OFF
+            assert not button.has_class("-starred")
+
+    asyncio.run(scenario())
+
+
+def test_button_and_keybinding_stay_in_agreement(tmp_path: Path) -> None:
+    root = _nested_tree(tmp_path)
+    target = root / "alpha" / "a.log"
+
+    async def scenario() -> None:
+        from textual.widgets import Button
+
+        from clv.services import SourceManager
+        from clv.widgets.query_bar import STAR_ON
+
+        app = LogViewerApp()
+        async with app.run_test(size=(160, 32)) as pilot:
+            app._source_manager = SourceManager([root], [])
+            await app._rescan()
+            app._select_source(target)
+            app.set_focus(app.log_panel)
+            await pilot.pause()
+
+            await pilot.press("*")
+            await pilot.pause()
+            await pilot.pause()
+
+            button = app.query_bar.query_one("#toggle-star", Button)
+            assert app.state.starred == (str(target.resolve()),)
+            assert str(button.label) == STAR_ON, "button did not follow the keybinding"
+
+    asyncio.run(scenario())
+
+
+def test_star_target_follows_the_tree_cursor_when_the_tree_has_focus(tmp_path: Path) -> None:
+    """Otherwise the toolbar button would star whatever the cursor rested on."""
+
+    root = _nested_tree(tmp_path)
+    opened = root / "alpha" / "a.log"
+    pointed_at = root / "beta" / "a.log"
+
+    async def scenario() -> None:
+        from clv.services import SourceManager
+
+        app = LogViewerApp()
+        async with app.run_test(size=(160, 32)) as pilot:
+            app._source_manager = SourceManager([root], [])
+            await app._rescan()
+            app._select_source(opened)
+            await pilot.pause()
+
+            # Focus away from the tree: the star acts on what is on screen.
+            app.set_focus(app.log_panel)
+            await pilot.pause()
+            assert app._star_target() == opened.resolve()
+
+            # Focus the tree and point elsewhere: the cursor wins.
+            tree = app.query_one("#source-tree", LogTree)
+            app._highlight_source(pointed_at, select=False)
+            await pilot.pause()
+            await pilot.pause()
+            tree.focus()
+            await pilot.pause()
+            assert app._star_target() == pointed_at
+
+    asyncio.run(scenario())
+
+
+def test_star_binding_survives_footer_truncation_at_eighty_columns() -> None:
+    """The footer drops entries from the right; Star must not be one of them.
+
+    It sits ahead of the filter bindings for this reason — at 80 columns it was
+    previously cut to a bare "*" with no label.
+
+    Textual separately hides bindings that cannot fire, so with the query input
+    focused every single-letter binding disappears. That is correct (the key
+    really would type into the box) and is why the toolbar button exists: it is
+    the only way to star while typing a query.
+    """
+
+    async def footer_at(width: int, focus_input: bool) -> str:
+        from textual.widgets import Input
+
+        app = LogViewerApp()
+        async with app.run_test(size=(width, 30)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            if focus_input:
+                app.set_focus(app.query_bar.query_one("#query-input", Input))
+            else:
+                app.set_focus(app.log_panel)
+            await pilot.pause()
+            strips = app.screen._compositor.render_strips()
+            return "".join(segment.text for segment in strips[-1])
+
+    async def scenario() -> None:
+        narrow = await footer_at(80, focus_input=False)
+        assert "Star" in narrow, f"Star missing from the footer: {narrow!r}"
+
+        typing = await footer_at(80, focus_input=True)
+        assert "Star" not in typing
+        # ...and the button covers that state.
+        from textual.widgets import Button
+
+        app = LogViewerApp()
+        async with app.run_test(size=(160, 32)) as pilot:
+            await pilot.pause()
+            assert app.query_bar.query_one("#toggle-star", Button) is not None
+
+    asyncio.run(scenario())
