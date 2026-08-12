@@ -115,6 +115,12 @@ distros.
   built-in cannot fail to load and the drawer's plugin count keeps meaning
   "installed plugins"; `clv/plugins/exporters/` is still a live extension point.
   Does **not** import `clv.plugins` — that dependency already runs the other way.
+- `marks.py` — the lines an operator bookmarked with `m`. Keyed by source path
+  plus a digest of the line's raw text, **not** by buffer index: the buffer is a
+  bounded deque, so an index-keyed mark would silently start pointing at a
+  different line as lines were evicted. `MarkSet` is deliberately not
+  serialisable — a digest is derived from log content, and session state holds
+  paths and settings only.
 - `clipboard.py` — assembles and size-caps the payload `y` hands to
   `App.copy_to_clipboard`. OSC 52 has no continuation form, so an oversized
   payload is truncated at a line boundary and reported, never chunked and never
@@ -164,7 +170,7 @@ config.load_config ─→ SourceManager ─→ discovery.discover (thread)
 | `FilterChip` | `Dismissed` | Revert the named filter |
 | `AdvancedFiltersDrawer` | `SettingsChanged` | Full before/after snapshot; `needs_rescan` says whether discovery must re-run |
 | `AdvancedFiltersDrawer` | `ViewToggleChanged` | Auto-scroll / structured / clipboard flipped from a drawer switch |
-| `ExportDialog` | dismiss value | `ExportRequest(key, path)`, or `None` when canceled |
+| `ExportDialog` | dismiss value | `ExportRequest(key, path, marked_only)`, or `None` when canceled |
 | `AdvancedFiltersDrawer` | `RescanRequested` / `Closed` | Explicit rescan / dismissal |
 
 ### Controls with two homes
@@ -222,7 +228,7 @@ or break a render.
 - Layout regressions are caught by asserting widget `region` bounds at a given
   terminal size rather than by eyeballing screenshots.
 
-Run: `python -m pytest` (343 tests).
+Run: `python -m pytest` (362 tests).
 
 ---
 
@@ -231,7 +237,8 @@ Run: `python -m pytest` (343 tests).
 - Read only what the operator configured or explicitly selected.
 - Local only: no network, no telemetry, no exfiltration.
 - Treat log contents as sensitive; never copy them into caches or temp files.
-  Session state stores paths and filter settings, never log content.
+  Session state stores paths and filter settings, never log content — which
+  is why marks (`services/marks.py`) live for the session only.
 
 ---
 

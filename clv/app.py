@@ -63,6 +63,7 @@ from .services.filtering import (
     parse_moment,
     parse_relative_window,
 )
+from .services.marks import MarkSet
 from .services.parsing import (
     LEVEL_CRITICAL,
     LEVEL_ERROR,
@@ -165,6 +166,8 @@ BINDING_CATEGORIES: dict[str, str] = {
     "next_match": "Navigation",
     "previous_match": "Navigation",
     "goto_timestamp": "Navigation",
+    "toggle_mark": "Navigation",
+    "next_mark": "Navigation",
     "toggle_auto_scroll": "View",
     "toggle_structured": "View",
     "export_view": "View",
@@ -389,6 +392,8 @@ class LogViewerApp(App[None]):
         Binding("n", "next_match", "Next match", show=False),
         Binding("N", "previous_match", "Previous match", show=False),
         Binding("g", "goto_timestamp", "Go to timestamp", show=False),
+        Binding("m", "toggle_mark", "Mark / unmark this line", show=False),
+        Binding("M", "next_mark", "Jump to next mark", show=False),
         Binding("ctrl+b", "toggle_pane", "Switch pane", show=True),
         Binding("[", "shrink_sources_panel", "Narrower", show=False),
         Binding("]", "expand_sources_panel", "Wider", show=False),
@@ -444,6 +449,10 @@ class LogViewerApp(App[None]):
         #: move would re-run the query regex over every visible line on every
         #: arrow keypress; the set only changes when the pane is rebuilt.
         self._navigation_cache: tuple[list[int], str] | None = None
+        #: Marked lines, keyed by content. Session-only and never written to
+        #: disk — see clv/services/marks.py for why that is a constraint rather
+        #: than a gap.
+        self._marks = MarkSet()
 
         self.query_bar = QueryBar()
         self.chip_bar = FilterChips(id="chip-bar")
@@ -877,13 +886,34 @@ class LogViewerApp(App[None]):
             self._sync_detail_pane()
             return
 
+        # Drop marks whose lines the ring buffer has evicted, so the count in
+        # the status line stays honest as the source tails.
+        self._marks.prune(self._selected_source, self._entries)
+
         for entry in result.entries[-self._show_lines :]:
             self.log_panel.write_entry(self._renderable_for(entry), entry)
+        # Rows are created unmarked, so with an empty set there is nothing to do
+        # — and an empty set is the overwhelmingly common case.
+        if self._marks:
+            self._sync_marks()
 
         self._restore_cursor(previous_entry, previous_index)
         if scroll_end or self.state.auto_scroll:
             self.log_panel.scroll_end(animate=False)
         self._update_status()
+
+    def _sync_marks(self) -> None:
+        """Set every visible row's gutter from the mark set.
+
+        Marks are content-keyed, so they reattach themselves after a re-render:
+        a line a filter hid and then brought back comes back marked, with
+        nothing to restore. ``set_row_marked`` is a no-op when the value is
+        unchanged, so this costs a re-strip only for rows that actually flipped.
+        """
+
+        source = self._selected_source
+        for index, entry in self.log_panel.entry_rows():
+            self.log_panel.set_row_marked(index, self._marks.contains(source, entry))
 
     def _restore_cursor(self, entry: LogEntry | None, index: int) -> None:
         """Put the cursor back where it was, or as near as the new view allows.
@@ -913,8 +943,15 @@ class LogViewerApp(App[None]):
             result = self._visible_entries(entries)
         except QueryError:
             return
+        # A tailed line can be one an operator marked earlier and that rotated
+        # back in, so the gutter has to be set as it arrives — but only when
+        # there are marks at all, keeping the common path a plain append.
+        source = self._selected_source
+        marked = bool(self._marks)
         for entry in result.entries:
             self.log_panel.write_entry(self._renderable_for(entry), entry)
+            if marked and self._marks.contains(source, entry):
+                self.log_panel.set_row_marked(len(self.log_panel.rows) - 1, True)
 
     def _renderable_for(self, entry: LogEntry) -> RenderableType:
         if self.state.pretty_rendering:
@@ -1062,6 +1099,9 @@ class LogViewerApp(App[None]):
             follow = "paused"
 
         parts = [str(self._selected_source), detail]
+        marks = self._marks.count_for(self._selected_source)
+        if marks:
+            parts.append(f"{marks} marked")
         if self._match_position is not None:
             position, total, label = self._match_position
             parts.append(f"{label} {position} of {total}")
@@ -1255,6 +1295,50 @@ class LogViewerApp(App[None]):
 
     def action_goto_timestamp(self) -> None:
         self.run_worker(self._prompt_goto(), group="dialogs", exit_on_error=False)
+
+    # --- marks --------------------------------------------------------------
+
+    def action_toggle_mark(self) -> None:
+        """Mark or unmark the cursor line."""
+
+        entry = self.log_panel.cursor_entry
+        if entry is None:
+            self._notify("Move the cursor to a line to mark it.", "warning")
+            return
+        marked = self._marks.toggle(self._selected_source, entry)
+        # Content-keyed, so identical lines share one mark: resync every row
+        # rather than only the cursor's, or the copies would disagree.
+        self._sync_marks()
+        self._update_status()
+        self._notify("Marked this line." if marked else "Unmarked this line.")
+
+    def action_next_mark(self) -> None:
+        """Move the cursor to the next marked line, wrapping with a notice."""
+
+        if self._selected_source is None:
+            self._notify("Open a log before jumping between marks.", "warning")
+            return
+
+        source = self._selected_source
+        marked = [
+            index
+            for index, entry in self.log_panel.entry_rows()
+            if self._marks.contains(source, entry)
+        ]
+        if not marked:
+            self._notify("No marked lines — press m to mark one.", "warning")
+            return
+
+        cursor = self.log_panel.cursor
+        following = [index for index in marked if index > cursor]
+        target = following[0] if following else marked[0]
+        self.log_panel.move_cursor(target)
+        self._update_status()
+        position = marked.index(target) + 1
+        if not following:
+            self._notify(f"Wrapped to the first mark ({position} of {len(marked)}).")
+        else:
+            self._notify(f"Mark {position} of {len(marked)}.")
 
     def action_toggle_detail(self) -> None:
         """Show or hide the event detail pane."""
@@ -1648,15 +1732,25 @@ class LogViewerApp(App[None]):
             self._notify("Nothing to export — no entries match the filters.", "warning")
             return
 
+        source = self._selected_source
+        marked = [entry for entry in entries if self._marks.contains(source, entry)]
+
         dialog = ExportDialog(
             self._exporter_choices(),
             entry_count=len(entries),
-            default_name=default_stem(self._selected_source),
+            default_name=default_stem(source),
+            marked_count=len(marked),
         )
         request = await self.push_screen(dialog, wait_for_dismiss=True)
         if request is None:
             self._notify("Export canceled.")
             return
+
+        if request.marked_only:
+            if not marked:  # pragma: no cover - the checkbox is disabled then
+                self._notify("Nothing marked to export.", "warning")
+                return
+            entries = marked
         self._run_export(request, entries)
 
     def _run_export(self, request: ExportRequest, entries: list[LogEntry]) -> None:

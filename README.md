@@ -35,6 +35,10 @@ desktop terminal and on a headless 80-column SSH session.
 - 📐 **Responsive layout.** Breakpoints at 90 and 130 columns reflow the
   controls; every control stays on screen and keyboard-reachable down to 80
   columns.
+- 🔖 **Mark the lines that matter.** `m` bookmarks the line under the cursor,
+  `M` steps between the marks, and `Ctrl+E` can export just those. Marks are
+  keyed by content rather than position, so they survive filtering and tailing —
+  and they are session-only, never written to disk.
 - 📤 **Get the view out.** `Ctrl+E` writes the filtered entries as JSON Lines,
   CSV or raw text — the whole filtered set, not just the lines on screen. `y`
   copies what is on screen to your local clipboard through the terminal, so it
@@ -185,6 +189,26 @@ the view out from under the line you just pointed at. The status bar says so —
 *"paused — cursor moved, End resumes"* — and `End` or `w` starts following
 again.
 
+### Marking lines
+
+`m` marks the line under the cursor and `M` steps between the marks, wrapping
+with a notification. Marked lines carry a `●` in the gutter — a glyph, not just
+a colour, so it reads on a monochrome terminal — and the status bar keeps a
+count. `Ctrl+E` then offers **Marked lines only**, which is the point: mark the
+three lines that matter while reading a five-thousand-line buffer, then export
+exactly those.
+
+A mark is recorded as the source path plus a digest of the line's text, not as
+a position. That is what lets it survive the ring buffer evicting lines above
+it, and lets a line a filter hid come back still marked. Two consequences worth
+knowing: identical lines in one source share a mark, and once a line has rotated
+out of the buffer entirely its mark is dropped.
+
+**Marks are never written to disk.** They are session-only, and they stay that
+way on purpose: the digest is derived from log content, and `session.json`
+records paths and settings, never anything about what a log contained. Closing
+CLV forgets them.
+
 ### Exporting
 
 `Ctrl+E` writes the entries the filters kept to a file. Three formats ship:
@@ -247,6 +271,7 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `Home` / `End` | First / last line (`End` also resumes following) |
 | `n` / `N` | Next / previous match (or warning-and-worse, with no query) |
 | `g` | Go to a timestamp |
+| `m` / `M` | Mark the cursor line / jump to the next mark |
 | `d` | Show / hide the event detail pane |
 | `w` | Follow new lines (auto-scroll) on/off |
 | `o` | Structured output on/off |

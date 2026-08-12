@@ -3,7 +3,7 @@
 Modelled on :class:`~clv.widgets.add_source_dialog.AddSourceDialog`: one
 container, its own ``DEFAULT_CSS``, `Esc` cancels, `Enter` confirms.
 
-Two things it does that a plain path prompt does not:
+Three things it does that a plain path prompt does not:
 
 * It states the number of entries it is about to write, because "export the
   view" is ambiguous the moment a filter is active and an operator should not
@@ -13,11 +13,14 @@ Two things it does that a plain path prompt does not:
   changing format disarms it again. This keeps the confirmation inside one
   modal — a second stacked modal would need its own focus restore and its own
   region test at 80 columns for no gain.
+* It offers **marked lines only**, disabled with an explanatory caption when
+  nothing is marked rather than silently writing an empty file.
 
-The dialog knows nothing about exporters. The app hands it a list of
-:class:`ExportChoice` (built-ins plus whatever the plugin registry supplied) and
-gets back an :class:`ExportRequest`, so this widget never imports ``clv.app`` or
-the registry.
+The dialog knows nothing about exporters, and nothing about marks. The app
+hands it a list of :class:`ExportChoice` (built-ins plus whatever the plugin
+registry supplied) plus a count of marked lines, and gets back an
+:class:`ExportRequest`, so this widget never imports ``clv.app`` or the
+registry.
 """
 
 from __future__ import annotations
@@ -31,7 +34,8 @@ from textual import events
 from textual.app import ComposeResult
 from textual.containers import Container
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Label, OptionList, Static
+from textual.css.query import NoMatches
+from textual.widgets import Button, Checkbox, Input, Label, OptionList, Static
 from textual.widgets.option_list import Option
 
 
@@ -54,6 +58,9 @@ class ExportRequest:
 
     key: str
     path: Path | None
+    #: Write only the lines the operator marked. The dialog does not know what
+    #: a mark is; it reports the choice and the app narrows the entry list.
+    marked_only: bool = False
 
 
 class ExportDialog(ModalScreen[ExportRequest | None]):
@@ -93,6 +100,16 @@ class ExportDialog(ModalScreen[ExportRequest | None]):
         max-height: 6;
         border: tall $surface 20%;
         background: $surface 8%;
+    }
+
+    /* One row, no border: the dialog has to stay inside 24 rows, and a
+       default-styled ToggleButton costs three of them for one line of text. */
+    #export-marked-only {
+        height: 1;
+        margin-top: 1;
+        border: none;
+        padding: 0;
+        background: transparent;
     }
 
     #export-path {
@@ -138,10 +155,14 @@ class ExportDialog(ModalScreen[ExportRequest | None]):
         *,
         entry_count: int,
         default_name: str = "clv-export",
+        marked_count: int = 0,
     ) -> None:
         super().__init__()
         self._choices = list(choices)
         self._entry_count = entry_count
+        #: How many of those entries are marked. Zero disables the checkbox
+        #: with a caption, rather than offering a filter that writes nothing.
+        self._marked_count = marked_count
         # The stem the app derived from the source; the extension follows the
         # highlighted format.
         self._default_name = default_name
@@ -159,6 +180,12 @@ class ExportDialog(ModalScreen[ExportRequest | None]):
             yield OptionList(
                 *(Option(Text(choice.label), id=choice.key) for choice in self._choices),
                 id="export-format",
+            )
+            yield Checkbox(
+                self._marked_label(),
+                value=False,
+                id="export-marked-only",
+                disabled=self._marked_count == 0,
             )
             yield Input(
                 value=self._filename_for(self._choice_at(0)),
@@ -178,6 +205,20 @@ class ExportDialog(ModalScreen[ExportRequest | None]):
         if self._entry_count == 1:
             return "1 entry matches the current filters."
         return f"{self._entry_count} entries match the current filters."
+
+    def _marked_label(self) -> str:
+        if self._marked_count == 0:
+            return "Marked lines only (nothing marked — press m in the log pane)"
+        if self._marked_count == 1:
+            return "Marked lines only (1 line)"
+        return f"Marked lines only ({self._marked_count} lines)"
+
+    @property
+    def marked_only(self) -> bool:
+        try:
+            return bool(self.query_one("#export-marked-only", Checkbox).value)
+        except NoMatches:  # not composed yet
+            return False
 
     # --- choices ------------------------------------------------------------
 
@@ -276,7 +317,7 @@ class ExportDialog(ModalScreen[ExportRequest | None]):
             return
 
         if not choice.needs_path:
-            self.dismiss(ExportRequest(choice.key, None))
+            self.dismiss(ExportRequest(choice.key, None, self.marked_only))
             return
 
         text = self.query_one("#export-path", Input).value.strip()
@@ -295,4 +336,4 @@ class ExportDialog(ModalScreen[ExportRequest | None]):
             self._warn(f"{path.name} exists — press Export again to overwrite.")
             return
 
-        self.dismiss(ExportRequest(choice.key, path))
+        self.dismiss(ExportRequest(choice.key, path, self.marked_only))
