@@ -670,3 +670,256 @@ def test_a_malformed_merged_list_in_a_view_is_dropped_not_fatal() -> None:
 
     assert view is not None
     assert view.merged == ("/a.log",)
+
+
+# --- the tree, while the set is edited --------------------------------------
+
+
+def _expanded_folders(tree) -> set[str]:
+    """Expanded *folders* only — a group node is not a folder, and the merged
+    group legitimately appears and disappears as the set is edited."""
+
+    return {
+        str(node.label)
+        for node in _walk(tree.root)
+        if node.allow_expand
+        and node.is_expanded
+        and node is not tree.root
+        and isinstance(node.data, Path)
+    }
+
+
+def _group_labels(tree) -> list[str]:
+    return [str(node.label) for node in tree.root.children if node.data is None]
+
+
+def test_toggling_merge_leaves_the_tree_expansion_alone(tmp_path: Path) -> None:
+    """Rebuilding the tree collapses every folder the operator had opened."""
+
+    alpha, beta = _sources(tmp_path)
+    nested = alpha.parent / "nested"
+    nested.mkdir()
+    _write(nested / "deep.log", ["2026-08-11 10:00:00 - INFO - deep"])
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            app._source_manager = SourceManager([alpha.parent], [])
+            await app._rescan()
+            await pilot.pause()
+
+            from clv.app import LogTree
+
+            tree = app.query_one("#source-tree", LogTree)
+            for node in _walk(tree.root):
+                if node.allow_expand and node is not tree.root:
+                    node.expand()
+            await pilot.pause()
+            before = _expanded_folders(tree)
+            assert before, "fixture should have folders to expand"
+
+            app._highlight_source(alpha, select=False)
+            await pilot.pause()
+            app.action_toggle_merge()
+            await pilot.pause()
+
+            assert _expanded_folders(tree) == before, "adding to the set collapsed the tree"
+
+            app.action_toggle_merge()
+            await pilot.pause()
+
+            assert _expanded_folders(tree) == before, "removing from the set collapsed the tree"
+
+    asyncio.run(scenario())
+
+
+def test_toggling_merge_does_not_re_run_discovery(tmp_path: Path) -> None:
+    """Membership says nothing about what is on disk."""
+
+    alpha, _beta = _sources(tmp_path)
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            app._source_manager = SourceManager([alpha.parent], [])
+            await app._rescan()
+            await pilot.pause()
+
+            calls = {"n": 0}
+            original = app._rescan
+
+            async def counting():
+                calls["n"] += 1
+                await original()
+
+            app._rescan = counting
+            app._highlight_source(alpha, select=False)
+            await pilot.pause()
+            app.action_toggle_merge()
+            await pilot.pause()
+
+            assert calls["n"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_the_merged_group_appears_below_starred_and_above_the_roots(
+    tmp_path: Path,
+) -> None:
+    alpha, beta = _sources(tmp_path)
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            app._source_manager = SourceManager([alpha.parent], [])
+            app._update_state(starred=(str(beta.resolve()),))
+            await app._rescan()
+            await pilot.pause()
+
+            from clv.app import LogTree
+
+            tree = app.query_one("#source-tree", LogTree)
+            assert "⧉ Merged" not in _group_labels(tree)
+
+            app._highlight_source(alpha, select=False)
+            await pilot.pause()
+            app.action_toggle_merge()
+            await pilot.pause()
+
+            labels = [str(node.label) for node in tree.root.children]
+            assert labels.index("⭐ Starred") < labels.index("⧉ Merged")
+            # And above the configured root, which is the last thing here.
+            assert labels.index("⧉ Merged") < len(labels) - 1
+
+            group = next(n for n in tree.root.children if str(n.label) == "⧉ Merged")
+            assert [Path(str(child.data)).name for child in group.children] == ["alpha.log"]
+
+    asyncio.run(scenario())
+
+
+def test_the_group_grows_shrinks_and_disappears_with_the_set(tmp_path: Path) -> None:
+    alpha, beta = _sources(tmp_path)
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            app._source_manager = SourceManager([alpha.parent], [])
+            await app._rescan()
+            await pilot.pause()
+
+            from clv.app import LogTree
+
+            tree = app.query_one("#source-tree", LogTree)
+            for path in (beta, alpha):
+                app._highlight_source(path, select=False)
+                await pilot.pause()
+                app.action_toggle_merge()
+                await pilot.pause()
+
+            group = next(n for n in tree.root.children if str(n.label) == "⧉ Merged")
+            assert [Path(str(c.data)).name for c in group.children] == [
+                "alpha.log",
+                "beta.log",
+            ]
+
+            for path in (alpha, beta):
+                app._highlight_source(path, select=False)
+                await pilot.pause()
+                app.action_toggle_merge()
+                await pilot.pause()
+
+            # An empty group is a row that explains nothing.
+            assert "⧉ Merged" not in _group_labels(tree)
+
+    asyncio.run(scenario())
+
+
+def test_the_indicator_tracks_membership_on_the_file_itself(tmp_path: Path) -> None:
+    alpha, _beta = _sources(tmp_path)
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            app._source_manager = SourceManager([alpha.parent], [])
+            app._update_state(starred=(str(alpha.resolve()),))
+            await app._rescan()
+            await pilot.pause()
+
+            from clv.app import LogTree
+
+            tree = app.query_one("#source-tree", LogTree)
+
+            def labels_for(path: Path) -> list[str]:
+                group = app._merged_group(tree)
+                return [
+                    str(node.label)
+                    for node in _walk(tree.root)
+                    if isinstance(node.data, Path)
+                    and node.data.resolve() == path.resolve()
+                    and node.parent is not group
+                ]
+
+            assert all("⧉" not in label for label in labels_for(alpha))
+
+            app._highlight_source(alpha, select=False)
+            await pilot.pause()
+            app.action_toggle_merge()
+            await pilot.pause()
+
+            marked = labels_for(alpha)
+            # Both copies: the file under its folder, and the starred entry.
+            assert len(marked) == 2
+            assert all(label.startswith("⧉") for label in marked)
+            # The star still owns the icon slot; the indicator is a prefix.
+            assert any("⭐" in label for label in marked)
+
+            app.action_toggle_merge()
+            await pilot.pause()
+            assert all("⧉" not in label for label in labels_for(alpha))
+
+    asyncio.run(scenario())
+
+
+def test_the_group_survives_a_rescan(tmp_path: Path) -> None:
+    alpha, _beta = _sources(tmp_path)
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            app._source_manager = SourceManager([alpha.parent], [])
+            app._update_state(merged=(str(alpha),))
+            await app._rescan()
+            await pilot.pause()
+
+            from clv.app import LogTree
+
+            tree = app.query_one("#source-tree", LogTree)
+            assert "⧉ Merged" in _group_labels(tree)
+
+    asyncio.run(scenario())
+
+
+def test_a_merged_member_that_vanished_is_still_listed(tmp_path: Path) -> None:
+    """It was chosen one keystroke at a time; it should be visible to remove."""
+
+    alpha, beta = _sources(tmp_path)
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            app._source_manager = SourceManager([alpha.parent], [])
+            app._update_state(merged=(str(alpha), str(beta)))
+            beta.unlink()
+            await app._rescan()
+            await pilot.pause()
+
+            from clv.app import LogTree
+
+            tree = app.query_one("#source-tree", LogTree)
+            group = next(n for n in tree.root.children if str(n.label) == "⧉ Merged")
+            assert [Path(str(c.data)).name for c in group.children] == [
+                "alpha.log",
+                "beta.log",
+            ]
+
+    asyncio.run(scenario())

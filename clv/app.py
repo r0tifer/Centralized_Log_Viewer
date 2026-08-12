@@ -23,7 +23,7 @@ from dataclasses import replace
 from datetime import datetime
 from time import monotonic
 from pathlib import Path
-from typing import Iterable, Literal, Optional, Sequence
+from typing import Iterable, Iterator, Literal, Optional, Sequence
 from xml.dom import minidom
 
 from rich.console import Group, RenderableType
@@ -166,6 +166,15 @@ PROVIDERS_GROUP = f"{ICON_PROVIDER} Providers"
 #: for the file icon: membership is a second fact about a log, unlike starring,
 #: which replaces the icon precisely so a row never changes width.
 ICON_MERGED = "⧉"
+#: The merged set, repeated as a group. Below the starred group: a star is a
+#: standing favourite, while membership here is the working set for the next
+#: `u`, and the two are read in that order.
+MERGED_GROUP = f"{ICON_MERGED} Merged"
+
+#: Groups that sit above the configured roots, in the order they are built.
+#: Used to place the merged group correctly when it appears mid-session,
+#: without rebuilding the tree around it.
+TREE_GROUP_LABELS: tuple[str, ...] = (VIEWS_GROUP, PROVIDERS_GROUP, STARRED_GROUP)
 
 #: Width of the source column in a merged view, per breakpoint. Content, not
 #: layout — the column is part of the line the pane renders, so CSS never sees
@@ -799,6 +808,16 @@ class LogViewerApp(App[None]):
             for path in present:
                 group.add_leaf(f"{ICON_STAR} {_compact_path(path)}", data=path)
 
+        # The merged set, below the stars: a star is a standing favourite, this
+        # is the working set for the next `u`. Listed whether or not discovery
+        # found each member — they were chosen one keystroke at a time, and one
+        # that has since rotated away should be visible enough to press `x` on
+        # rather than silently absent.
+        if self.state.merged:
+            group = tree.root.add(MERGED_GROUP, data=None, expand=True)
+            for path in self._merged_display_paths():
+                group.add_leaf(f"{ICON_MERGED} {_compact_path(path)}", data=path)
+
         # One branch per configured root, then a folder hierarchy beneath it.
         by_root: dict[Path, list] = {}
         for item in report.files:
@@ -982,15 +1001,19 @@ class LogViewerApp(App[None]):
         current = list(self.state.merged)
         if str(resolved) in current:
             current.remove(str(resolved))
-            action = "Removed from"
+            member, action = False, "Removed from"
         else:
             current.append(str(resolved))
-            action = "Added to"
+            member, action = True, "Added to"
         self._update_state(merged=tuple(sorted(current)))
+        # Edited in place rather than rebuilt. Membership says nothing about
+        # what is on disk, so a rescan would be a filesystem walk per keystroke
+        # — and rebuilding the tree collapses every folder the operator had
+        # opened, which is a heavy price for adding one indicator.
+        self._sync_merge_membership(resolved, member)
         self._notify(
             f"{action} the merged set ({len(current)} source(s)). Press u to open it."
         )
-        self.run_worker(self._rescan(), group="discovery", exit_on_error=False)
 
     def action_open_merged(self) -> None:
         """Open every source in the merged set as one timestamp-ordered stream."""
@@ -1026,6 +1049,87 @@ class LogViewerApp(App[None]):
     @property
     def _merged_paths(self) -> set[Path]:
         return {_resolve(Path(entry)) for entry in self.state.merged}
+
+    def _merged_display_paths(self) -> list[Path]:
+        """The merged set in the order the group lists it."""
+
+        return sorted(
+            (Path(entry) for entry in self.state.merged),
+            key=lambda path: (path.name.lower(), str(path).lower()),
+        )
+
+    def _sync_merge_membership(self, path: Path, member: bool) -> None:
+        """Reflect one membership change in the tree, touching nothing else.
+
+        The alternative is rebuilding, which is what starring does — and which
+        collapses every folder the operator had expanded, because `_build_tree`
+        creates them shut. Membership changes one indicator and one group row,
+        so that is all this touches, and expansion state is left alone by
+        construction rather than restored afterwards.
+        """
+
+        try:
+            tree = self.query_one("#source-tree", LogTree)
+        except NoMatches:
+            return
+
+        group = self._merged_group(tree)
+
+        if member:
+            if group is None:
+                # Mid-session, so it has to be placed rather than appended:
+                # below the other groups and above the configured roots.
+                group = tree.root.add(
+                    MERGED_GROUP, data=None, expand=True, before=self._group_count(tree)
+                )
+            ordered = self._merged_display_paths()
+            position = ordered.index(next(p for p in ordered if _resolve(p) == path))
+            group.add_leaf(
+                f"{ICON_MERGED} {_compact_path(path)}", data=path, before=position
+            )
+        elif group is not None:
+            for node in list(group.children):
+                if isinstance(node.data, Path) and _resolve(node.data) == path:
+                    node.remove()
+            if not group.children:
+                # An empty group is a row that explains nothing.
+                group.remove()
+                group = None
+
+        # Every other node carrying this path — the file in its folder, and its
+        # copy in the starred group — gains or loses the indicator.
+        for node in _walk_nodes(tree.root):
+            if node.parent is group or not isinstance(node.data, Path):
+                continue
+            if _resolve(node.data) != path:
+                continue
+            plain = node.label.plain
+            if plain.startswith(ICON_MERGED):
+                plain = plain[len(ICON_MERGED) :]
+            node.set_label(f"{ICON_MERGED}{plain}" if member else plain)
+
+    @staticmethod
+    def _merged_group(tree: LogTree) -> Optional[TreeNode[object]]:
+        return next(
+            (
+                node
+                for node in tree.root.children
+                if node.data is None and node.label.plain == MERGED_GROUP
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _group_count(tree: LogTree) -> int:
+        """How many group rows lead the tree, so a new one lands after them."""
+
+        count = 0
+        for node in tree.root.children:
+            if node.data is None and node.label.plain in TREE_GROUP_LABELS:
+                count += 1
+            else:
+                break
+        return count
 
     def _merged_name(self) -> str:
         """What to call the merged set — in the status line and in an export."""
@@ -2989,6 +3093,14 @@ def _resolve(path: Path) -> Path:
         return path.resolve()
     except OSError:
         return path
+
+
+def _walk_nodes(node: TreeNode[object]) -> Iterator[TreeNode[object]]:
+    """Every node under *node*, itself included."""
+
+    yield node
+    for child in node.children:
+        yield from _walk_nodes(child)
 
 
 def _find_node(node: TreeNode[Path], target: Path) -> Optional[TreeNode[Path]]:

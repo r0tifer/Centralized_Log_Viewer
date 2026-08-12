@@ -176,15 +176,23 @@ The name promises centralized logs, and until now it delivered centralized
 it to the **merged set**; `u` opens the set as one timestamp-ordered stream:
 
 ```
-⧉📄 alpha.log        alpha.log   2026-08-11 10:00:00 INFO  request accepted
-⧉📄 beta.log         beta.log    2026-08-11 10:00:01 INFO  upstream connect
- 📄 auth.log         alpha.log   2026-08-11 10:00:02 ERROR upstream timeout
-                     beta.log    2026-08-11 10:00:03 WARN  retrying
+⭐ Starred
+  ⭐ logs/auth.log       alpha.log   2026-08-11 10:00:00 INFO  request accepted
+⧉ Merged                beta.log    2026-08-11 10:00:01 INFO  upstream connect
+  ⧉ logs/alpha.log      alpha.log   2026-08-11 10:00:02 ERROR upstream timeout
+  ⧉ logs/beta.log       beta.log    2026-08-11 10:00:03 WARN  retrying
+📂 /var/log
+   ⧉📄 alpha.log
+   ⧉📄 beta.log
+    📄 auth.log
 ```
 
-Members are marked with `⧉` in the tree, a source column names the origin of
-every row (abbreviated as the terminal narrows), and the status line names the
-set. **Every other feature works exactly as it does on a single log** — filters,
+The set is repeated as a group below the starred logs, so it is one keystroke
+away however deep its members are buried; each member also carries a `⧉` where
+it sits in the folder tree. A source column names the origin of every row
+(abbreviated as the terminal narrows), and the status line names the set.
+Adding or removing a source edits those rows in place — it never re-runs
+discovery, and it never collapses folders you had opened. **Every other feature works exactly as it does on a single log** — filters,
 `n`/`N` navigation, `g`, marks, the detail pane and `Ctrl+E`. That is the point:
 merging is not a mode with its own reduced feature set. The origin travels as a
 field, so `source:beta.log` is a query you can write, and it shows up in the
