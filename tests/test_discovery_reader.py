@@ -20,6 +20,8 @@ def _tree(tmp_path: Path) -> Path:
     (root / "notes.txt").write_text("plain text\n", encoding="utf-8")
     (root / "report.json").write_text('{"a":1}\n', encoding="utf-8")
     (root / "nested" / "service.log").write_text("nested\n", encoding="utf-8")
+    # Claims to be gzip and is not. Since CLV reads .gz, this is a *damaged*
+    # file rather than an unsupported one, and the two are counted apart.
     (root / "archive.gz").write_bytes(b"\x1f\x8b fake gzip")
     # Named like a log but actually binary: only the content sniff catches it.
     (root / "corrupt.log").write_bytes(b"\x00\x01binary payload")
@@ -35,17 +37,26 @@ def test_discovery_is_not_limited_to_log_files(tmp_path: Path) -> None:
     assert names == {"app.log", "notes.txt", "report.json", "service.log"}
 
 
-def test_binary_and_archive_files_are_skipped_and_counted(tmp_path: Path) -> None:
+def test_binary_and_damaged_files_are_skipped_and_counted_apart(tmp_path: Path) -> None:
+    """The two skips are different answers and must not be merged into one.
+
+    A binary is something CLV cannot display at all; a truncated archive is a
+    format CLV *does* read, in a file that is broken. Only the second is worth
+    an operator's time, which is the whole reason these counters are separate.
+    """
+
     root = _tree(tmp_path)
     report = discover([root])
 
     names = {item.path.name for item in report.files}
-    assert "archive.gz" not in names  # excluded by glob
     assert "corrupt.log" not in names  # caught by the NUL-byte sniff
-    # Both are the same thing to an operator: CLV cannot show this file.
-    assert report.skipped_unsupported == 2
+    assert "archive.gz" not in names  # opens as gzip, and does not
+    assert report.skipped_unsupported == 1
+    assert report.skipped_unreadable == 1
     assert report.skipped_filtered == 0
-    assert "Skipped: 2 unsupported file types" in "\n".join(report.summary_lines())
+    summary = "\n".join(report.summary_lines())
+    assert "1 unsupported file type" in summary
+    assert "1 unreadable" in summary
 
 
 def test_binary_skip_can_be_disabled(tmp_path: Path) -> None:

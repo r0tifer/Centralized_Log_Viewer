@@ -1,4 +1,11 @@
-from .sources import ACCESS_HINT, SourceAddition, SourceManager, SourceMessage, persist_log_sources
+from .sources import (
+    ACCESS_HINT,
+    SourceAddition,
+    SourceManager,
+    SourceMessage,
+    persist_log_sources,
+    persist_setting,
+)
 
 __all__ = [
     "ACCESS_HINT",
@@ -6,4 +13,5 @@ __all__ = [
     "SourceManager",
     "SourceMessage",
     "persist_log_sources",
+    "persist_setting",
 ]

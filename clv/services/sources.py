@@ -181,6 +181,44 @@ class SourceManager:
         return SourceAddition(success=True, path=resolved, messages=messages)
 
 
+def persist_setting(settings_path: Path, option: str, value: str) -> None:
+    """Write ``option = value`` into *settings_path*, in place.
+
+    The same edit-in-place approach as :func:`persist_log_sources`, and for the
+    same reason: the settings file is the operator's, full of their comments,
+    so it is edited rather than regenerated. Used for choices made through the
+    UI that must outlive the session — enabling the journal is the case that
+    needed it, because consent to run a subprocess is not something to ask for
+    again every launch.
+    """
+
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if settings_path.exists():
+        lines = settings_path.read_text(encoding="utf-8").splitlines()
+    else:
+        lines = ["[log_viewer]", ""]
+
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("#") or "=" not in stripped:
+            continue
+        if stripped.split("=", 1)[0].strip() != option:
+            continue
+        leading = line[: len(line) - len(line.lstrip())]
+        lines[index] = f"{leading}{option} = {value}"
+        break
+    else:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append(f"{option} = {value}")
+
+    payload = "\n".join(lines)
+    if not payload.endswith("\n"):
+        payload += "\n"
+    settings_path.write_text(payload, encoding="utf-8")
+
+
 def persist_log_sources(settings_path: Path, entries: Sequence[Path]) -> None:
     """Merge *entries* into the `log_dirs` line within *settings_path*."""
 

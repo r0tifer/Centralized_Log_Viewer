@@ -64,6 +64,42 @@ class MySource(LogSourceProvider):
                 yield line
 ```
 
+Sources are wired: whatever `discover()` returns appears in a **Providers**
+group in the source tree, and selecting one opens it like any other source.
+Return `ProviderSource(path, label)` records rather than bare identifiers when
+you have a better name than the identifier's last component.
+
+**A provider source is not a file, and CLV does not treat it as one.** Starring,
+include/exclude globs and rotated-set grouping all test for a real `Path` and
+skip yours. That is deliberate rather than an omission: a provider identifier
+persisted into `session.json` would be a path that does not exist.
+
+#### Tailing a live source
+
+`open()` returns an iterator, which is enough for a finite list of lines and
+nothing more: it cannot express tailing, cannot be asked to stop, and has
+nowhere to put cleanup. For a live stream, implement the optional
+`open_reader()` instead:
+
+```python
+    def open_reader(self, path, *, max_lines):
+        return MyReader(path, max_lines=max_lines)   # or None to use open()
+```
+
+The returned object must expose `path`, `prime()`, `poll()` and
+`RELOAD_NOTICE`, and should expose `close()` if it holds anything — CLV calls
+it on every source switch and again at shutdown. Optionally expose
+`set_severity(bucket) -> bool` to filter at the source, returning whether that
+required a restart.
+
+Returning `None` (the default) means "use `open()`", so a provider written
+before this existed keeps working unchanged.
+
+**Subprocesses need consent.** A plugin must not run one because it was
+installed. The shipped `journald` provider is the pattern: a `settings.conf`
+opt-in, read fresh on every `discover()`, returning no sources at all until it
+is true — and reporting, never raising, where the tool it needs is absent.
+
 ### 2. FilterStage
 
 Transforms or drops entries before they reach the pane.

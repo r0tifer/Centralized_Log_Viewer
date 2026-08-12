@@ -26,12 +26,17 @@ desktop terminal and on a headless 80-column SSH session.
   payload.
 - 🪶 **Bounded memory, whatever the file size.** Opening a source seeks
   backwards from the end of the file; a 160 MB log opens in ~2 ms using under a
-  megabyte. Tailing reads only what was appended.
+  megabyte. Tailing reads only what was appended. Compressed members are the
+  honest exception — see [Compressed and rotated logs](#compressed-and-rotated-logs).
 - 🧭 **Any file, not just `*.log`.** Name folders or files; every readable text
   file counts — including UTF-16 exports from Windows and PowerShell, and
   `.ods` spreadsheets, which are unpacked into tab-separated rows. Binary
   files are detected by content and skipped, and include/exclude globs are
   yours to set.
+- 🗂 **Compressed and rotated logs.** `.gz`, `.bz2` and `.xz` are read directly,
+  and `app.log` + `app.log.1` + `app.log.2.gz` are presented as **one source**
+  spanning all three, oldest lines first. Only the live member is tailed; the
+  rotated-out ones are read once, and only as far back as your buffer needs.
 - 📐 **Responsive layout.** Breakpoints at 90 and 130 columns reflow the
   controls; every control stays on screen and keyboard-reachable down to 80
   columns.
@@ -41,8 +46,13 @@ desktop terminal and on a headless 80-column SSH session.
   and they are session-only, never written to disk.
 - 📤 **Get the view out.** `Ctrl+E` writes the filtered entries as JSON Lines,
   CSV or raw text — the whole filtered set, not just the lines on screen. `y`
-  copies what is on screen to your local clipboard through the terminal, so it
-  works over SSH and tmux where a mouse selection does not.
+  copies the selected line — or the whole visible view — to your local clipboard
+  through the terminal, so it works over SSH and tmux where a mouse selection
+  does not.
+- ⧉ **Merge several logs into one stream.** `x` adds a log to the merged set,
+  `u` opens the set as one timestamp-ordered pane with a source column. Filters,
+  navigation, marks, the detail pane and export all work there exactly as they
+  do on a single file. Local only — remote aggregation stays a non-goal.
 - 🧩 **Plugins.** `LogSourceProvider`, `FilterStage` and `Exporter` interfaces,
   loaded from `clv/plugins/` or from installed packages via the `clv.plugins`
   entry point group. A broken plugin is reported, never fatal.
@@ -122,14 +132,18 @@ use.
 | `include_globs` | Only list files matching these globs. Empty means every text file. | *(empty)* |
 | `exclude_globs` | Never list files matching these globs. | archives, binary journals, PDFs |
 | `follow_symlinks` | Follow symlinked directories (cycles are detected). | `false` |
-| `skip_binary` | Skip files whose first block decodes to NUL characters. UTF-16 text and extractable documents (`.ods`) are exempt. | `true` |
+| `skip_binary` | Skip files whose first block decodes to NUL characters. UTF-16 text, extractable documents (`.ods`) and compressed members are exempt. | `true` |
 | `max_files` | Stop discovery after this many files. | `5000` |
+| `group_rotated` | Present a rotated log's members as one source. Overridden by the drawer's **Group rotated** switch once you touch it. | `true` |
 | `max_buffer_lines` | Lines held in memory per source. | `5000` |
 | `default_show_lines` / `min_show_lines` / `show_step` | Visible-line window and its `+`/`-` step. | `500 / 10 / 50` |
 | `refresh_hz` | Poll frequency for new content. | `2` |
 | `tree_width` | Starting width of the source tree, in columns. | `38` |
 | `csv_max_rows` / `csv_max_cols` | Structured payload preview limits. | `20 / 10` |
 | `clipboard_max_bytes` | Most log text one `y` clipboard copy may carry. Oversized copies are truncated at a line boundary and say so. | `65536` |
+| `watch_rate_limit` | Seconds a watch rule waits before notifying again; matches inside the window are counted and reported together. | `60` |
+| `watch_bell` | Ring the terminal bell when a watch rule notifies. | `false` |
+| `enable_journald` | Offer the systemd journal as a source. Off by default: reading it runs `journalctl`, and CLV spawns no subprocess unasked. The drawer's switch writes this line for you. | `false` |
 
 Invalid values fall back to safe defaults; the app never fails to start because
 of a malformed settings file. Most discovery options are also editable at
@@ -154,6 +168,136 @@ fall out of date. Dismiss it with `?`, `Esc` or `q`.
 One wrinkle worth knowing: while the cursor is in the query input, `?` types a
 literal question mark, because it is a valid regex character. Press `Esc` first
 if the input has focus. Tailing continues while the overlay is open.
+
+### Merging sources
+
+The name promises centralized logs, and until now it delivered centralized
+*discovery* — you still read one file at a time. `x` on any log in the tree adds
+it to the **merged set**; `u` opens the set as one timestamp-ordered stream:
+
+```
+⧉📄 alpha.log        alpha.log   2026-08-11 10:00:00 INFO  request accepted
+⧉📄 beta.log         beta.log    2026-08-11 10:00:01 INFO  upstream connect
+ 📄 auth.log         alpha.log   2026-08-11 10:00:02 ERROR upstream timeout
+                     beta.log    2026-08-11 10:00:03 WARN  retrying
+```
+
+Members are marked with `⧉` in the tree, a source column names the origin of
+every row (abbreviated as the terminal narrows), and the status line names the
+set. **Every other feature works exactly as it does on a single log** — filters,
+`n`/`N` navigation, `g`, marks, the detail pane and `Ctrl+E`. That is the point:
+merging is not a mode with its own reduced feature set. The origin travels as a
+field, so `source:beta.log` is a query you can write, and it shows up in the
+detail pane's property list for free.
+
+Some specifics worth knowing:
+
+- **`max_buffer_lines` applies per source**, so three merged logs cost three
+  buffers and no member is crowded out by a louder one. The merged stream is a
+  *view* over those buffers, never a fourth copy of the lines.
+- **Lines without a timestamp are never dropped.** They are anchored directly
+  after the last timestamped line from their own source — which is what keeps a
+  stack trace attached to the error above it — and the status line counts them,
+  because they were placed by inference rather than by their own clock.
+- **Mixed timezone-aware and naive timestamps merge** rather than refusing to.
+  If any source is naive the offsets are dropped, matching what the time-window
+  filter already does; if every source is aware they are kept, so two time zones
+  order correctly.
+- **Only members you merged are polled**, at the same rate one source was. A
+  merged view does not multiply the poll frequency by the member count.
+- A member that disappears from disk is reported and the rest keep going.
+- The set persists in `session.json` and can be captured in a saved view.
+
+**Merging is local only.** Remote collection and multi-node aggregation are a
+documented non-goal and are not coming: CLV reads what the machine it runs on
+can read. If you want several machines in one pane, ship their logs to one host
+by whatever means you already use and merge them here.
+
+### Compressed and rotated logs
+
+`.gz`, `.bz2` and `.xz` files are read directly — no `zcat`, no unpacking to a
+temp file, and nothing written anywhere. `.zst` is still excluded, because
+there is no decompressor for it in the Python standard library and adding one
+would be CLV's first new runtime dependency.
+
+More usefully, the members of a rotated log are presented as **one source**:
+
+```
+📂 /var/log
+   🗂 syslog (4 files)
+      📄 syslog
+      📄 syslog.1
+      📄 syslog.2.gz
+      📄 syslog.3.gz
+   📄 auth.log
+```
+
+Selecting the `syslog` set reads all four in order, oldest lines first, into one
+pane — so a query, a time window or a `g` jump crosses a rotation boundary
+without you opening anything else. The status line names the member the cursor
+is currently in. Every member is still listed underneath and can still be opened
+on its own.
+
+Recognised names, after any compression suffix: `app.log.1`, `app.log-20260811`,
+`app.log.2026-08-11`. A gap in the numbering is fine. Turn grouping off with
+`group_rotated` in `settings.conf` or the **Group rotated** switch in the
+Advanced drawer.
+
+**On bounded memory.** CLV's usual promise is that nothing reads a whole file:
+opening a source seeks backwards from the end. A deflate stream has no cheap
+backwards seek, so a compressed member is the exception, and it is worth being
+precise about what is and is not bounded:
+
+- **Memory is bounded**, by `max_buffer_lines`. Lines stream through a
+  fixed-size buffer, so a 400 MB decompressed member costs no more than a small
+  one.
+- **Work is proportional to the member**, not to what you see. Reading the last
+  500 lines of a `.gz` means decompressing it to get there. A second cap on
+  decompressed bytes stops a decompression bomb, degrading to "here is what was
+  read" rather than exhausting the machine.
+- **The budget is shared across the set and spent newest-first.** Members are
+  read back from the live one until `max_buffer_lines` is met, then no further.
+  A set whose newest member already fills the buffer opens as fast as a single
+  file, and CLV says how many members it actually read.
+- **Only the live member tails.** Nothing appends to `syslog.2.gz`, so it is
+  read once and never polled again.
+
+### The systemd journal
+
+On Linux the OS event log *is* the journal — binary, so no amount of file
+discovery will ever find it. CLV reads it through a plugin that shells out to
+`journalctl -o json --follow`, and offers:
+
+| Source | |
+| --- | --- |
+| **System journal** | everything, as one stream |
+| **This boot** / **Previous boot** | `--boot 0`, `--boot -1` |
+| One node per `.service` unit | the closest thing to Event Viewer's *Windows Logs → Application / Security / System* |
+
+Journal sources appear in a **Providers** group in the tree and behave like any
+other source from there on: the same filters, cursor, marks, detail pane and
+export. Because the plugin normalises the journal's own fields, field queries
+work immediately — `unit:sshd.service`, `host:web01`, `pid:991`, and the raw
+`_SYSTEMD_UNIT` spelling too.
+
+**It is off by default, and turning it on is a decision you make explicitly.**
+Reading the journal means running a subprocess, and CLV does not spawn one
+unless asked — which is also why the journal ships as a plugin rather than as
+part of core. With `enable_journald` false, nothing is spawned and nothing is
+enumerated. Enable it either by setting `enable_journald = true` in
+`settings.conf`, or with the **Journal (systemd)** switch in the Advanced
+drawer, which turns it on and writes that line back to your settings file so the
+choice is made once rather than every launch.
+
+On a machine without systemd — or without `journalctl` on `PATH` — CLV runs
+normally, the switch is disabled, and the drawer says why.
+
+Two details worth knowing. A severity bucket is pushed down to
+`journalctl --priority` where that actually filters something (`error`, `warn`,
+`info`), so debug records are not carried across a pipe just to be discarded;
+`debug` and `trace` map to priority 7, which is everything, so nothing is pushed
+down and CLV does not pretend otherwise. And the initial read is bounded by
+`--lines`, the journal's equivalent of the backwards seek CLV does on a file.
 
 ### Inspecting an event
 
@@ -209,6 +353,65 @@ way on purpose: the digest is derived from log content, and `session.json`
 records paths and settings, never anything about what a log contained. Closing
 CLV forgets them.
 
+### Saved views
+
+A filter set you had to think about is worth keeping. `V` names the one that is
+active; `v` opens the list of saved ones.
+
+```
+V  →  name it "5xx on web01"      (query, severity, time window, search
+                                   options, globs and the open log)
+v  →  Enter applies it            r renames · d deletes (twice) · Esc closes
+```
+
+Saved views also appear as a group at the top of the source tree, above the
+starred logs, so applying one is a single click or a couple of arrow keys.
+
+Applying a view puts everything back at once — one repaint, not one per field —
+and reopens the log it was saved against. If that log has since gone, the
+filters are applied anyway and a notification says which source was missing: a
+rotated-away file should not turn a view into a dead end.
+
+Views live in `session.json`, so they survive restarts. Like everything else
+there, a view records **settings and one path only** — never a log line, never
+what it matched.
+
+### Watch rules
+
+Tailing means waiting for something. A watch rule says what, so you can stop
+reading every line: `W` opens the manager, `a` adds a rule, `Enter` edits one,
+`space` enables or disables it, `d` twice deletes it.
+
+A rule is a name, a pattern in the same syntax the query box uses (so
+`tag:kernel oom-killer` works), and an action:
+
+| Action | Effect |
+| --- | --- |
+| Highlight only | Matching lines are drawn with a distinct background |
+| Notify only | A notification, nothing visual |
+| Highlight + notify | Both (the default) |
+
+The highlight is a **background**, deliberately: severity is carried in the
+text colour, so a watched INFO line reads as watched rather than as an error.
+
+**Notifications are rate limited.** The first match for a rule is reported at
+once; anything else inside the window is counted and reported together — *"Watch
+'oom-killer' matched 143 lines."* The window is `watch_rate_limit` in
+`settings.conf` (60 seconds by default), and a rule matching every line
+therefore costs one message a minute rather than one per line. Set
+`watch_bell = true` if you want the terminal bell as well; it is off by default.
+
+Opening a log highlights the lines already in the buffer that match, but says
+nothing about them — you asked to be told about what happens next, not about
+what happened before you asked. Enabled rules appear as chips beside the filter
+chips, and dismissing a chip disables that rule without deleting it. The
+Advanced drawer has a switch for the whole set and a count of what is live.
+
+Rules persist in `session.json`, the same as saved views: a pattern is
+something you typed, not something a log contained. Everything runs in-process
+for the life of the session — no daemon, no desktop notification service, no
+subprocess.
+
 ### Exporting
 
 `Ctrl+E` writes the entries the filters kept to a file. Three formats ship:
@@ -238,8 +441,11 @@ pane first.
 
 ### Copying to the clipboard
 
-`y` copies the lines currently on screen — filters and the visible-line window
-included — to your **local** clipboard using an OSC 52 escape sequence.
+`y` copies to your **local** clipboard using an OSC 52 escape sequence. It
+copies the **selected line** when the cursor is on one, and the lines currently
+on screen — filters and the visible-line window included — when it is not.
+Nothing is selected until you move the cursor, so `y` on a freshly opened log
+still copies the view.
 
 `y` and `Ctrl+L` solve the same problem from opposite ends and both are kept:
 
@@ -266,12 +472,16 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `t` / `s` | Cycle time window / severity |
 | `f` | Toggle the Advanced drawer |
 | `*` | Star / unstar the log under the cursor |
+| `x` | Add / remove the log under the cursor from the merged set |
+| `u` | Open the merged set as one timestamp-ordered stream |
 | `↑` / `↓` | Move the line cursor |
 | `PgUp` / `PgDn` | Move the line cursor a screen at a time |
 | `Home` / `End` | First / last line (`End` also resumes following) |
 | `n` / `N` | Next / previous match (or warning-and-worse, with no query) |
 | `g` | Go to a timestamp |
 | `m` / `M` | Mark the cursor line / jump to the next mark |
+| `v` / `V` | Open saved views / save the current filters as a view |
+| `W` | Manage watch rules (live highlights and alerts) |
 | `d` | Show / hide the event detail pane |
 | `w` | Follow new lines (auto-scroll) on/off |
 | `o` | Structured output on/off |
@@ -279,7 +489,7 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `[` / `]` | Narrow / widen the source tree |
 | `+` / `-` | Show more / fewer lines |
 | `Ctrl+E` | Export the filtered entries to a file |
-| `y` | Copy the visible lines to the clipboard (OSC 52) |
+| `y` | Copy the selected line, or the visible lines, to the clipboard (OSC 52) |
 | `Ctrl+L` | Copy mode (hides all chrome) |
 | `Ctrl+S` | Save added sources to `settings.conf` |
 | `Ctrl+R` | Reload configuration and rescan |
@@ -298,6 +508,48 @@ Understanding two rules explains everything the pane does:
 2. **Severity and time filters only hide lines that demonstrably lack what you
    asked for** — and when they do, the empty pane says so, e.g. *"No matches —
    12 have no detected severity (nothing in this source declares a level)."*
+
+### Field queries
+
+The parser recovers more than a timestamp and a level from each line — a
+hostname, a program tag, an HTTP status, every key of a JSON payload — and the
+query box can ask about any of it:
+
+```
+tag:sshd host:web01 status>=500 timeout|refused
+└──────────── field terms ─────┘ └─── regex ──┘
+```
+
+Terms combine with **and**. Anything that is not a term is the regex it has
+always been, matched against the whole raw line.
+
+| Operator | Means | Example |
+| --- | --- | --- |
+| `key:value` | contains, smart-case (case-sensitive only if you type a capital) | `host:web` |
+| `key:` | the field is present at all | `pid:` |
+| `key=value` | exactly equal, case-sensitive | `host=web01` |
+| `key!=value` | not equal | `tag!=cron` |
+| `key>value` `key>=value` `key<value` `key<=value` | numeric when both sides are numbers, alphabetical otherwise | `status>=500` |
+
+Quote a value to keep spaces or colons inside it: `msg:"disk full"`.
+
+Which names work depends on the source. The parser's own vocabulary — `host`,
+`tag`, `pid`, `msgid`, `ident`, `user`, `request`, `status`, `size` — is always
+available, and every key a JSON line carries is added as soon as one is read.
+Start typing a name and the field list drops down under the input: `Tab` takes
+the first suggestion, `↓` steps into the list, `Esc` dismisses it. The Advanced
+drawer keeps a one-line reminder of the syntax under Search options.
+
+**Nothing you already search for changes.** A word that is not a known field
+name is text, so `sshd:` and `kernel: oom-killer` search for exactly what they
+always did, and so does a timestamp like `10:30:00`. The cost of that guarantee
+is that a mistyped field name (`hsot:web01`) is searched for as text rather
+than reported — which is why the completions exist.
+
+A line that has no such field is hidden and **counted**, like every other
+filter here: *"No matches — 214 carry no 'status' field (this source's format
+does not report it)."* If you are filtering a syslog with `status>=500`, that
+sentence is the answer.
 
 ### Navigating what you filtered to
 
@@ -366,6 +618,20 @@ three built-in formats and hands the selected one the whole filtered set. An
 exporter chooses its own destination (`export` receives the entries and a
 `FilterContext`, not a path), and one that raises is reported and skipped like
 any other plugin failure.
+
+`LogSourceProvider` plugins are wired too: whatever `discover()` returns appears
+in a **Providers** group in the tree, and selecting one opens it like any other
+source. Implement `discover()` and `open()` and CLV wraps your iterator; for a
+source that tails, implement the optional `open_reader(path, *, max_lines)`
+instead and return an object with `prime()`, `poll()`, `path`, `RELOAD_NOTICE`
+and — if it holds anything — `close()`, which CLV calls on every source switch
+and at shutdown. The shipped [`journald`](clv/plugins/sources/journald.py)
+provider is the worked example.
+
+Provider sources are **not** filesystem paths, and CLV does not pretend they
+are: starring, include/exclude globs and rotated-set grouping all test for a
+real `Path` and so skip them. That is deliberate — a provider identifier in
+your `session.json` would be a path that does not exist.
 
 ---
 

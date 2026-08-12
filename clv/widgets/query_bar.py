@@ -27,6 +27,8 @@ from textual.widget import Widget
 from textual.widgets import Button, Input, Label, Static, Switch
 
 from ..services.filtering import QueryError, compile_query, count_matches
+from ..services.query import parse_query
+from .completions import FieldCompletions
 from .segmented import SegmentedButtons
 
 #: Time presets, in cycle order. "range" opens the custom range dialog.
@@ -283,9 +285,13 @@ class QueryBar(Container):
         super().__init__(id="query-bar")
         self.severity_segmented = SegmentedButtons(SEVERITY_OPTIONS, id="severity-segments")
         self.time_segmented = SegmentedButtons(TIME_PRESETS, id="time-segments")
+        self.completions = FieldCompletions(id="field-completions")
         # Canonical selection, kept here so "Custom" can be shown as active
         # while the dialog is open without trusting widget state.
         self._time_selection = "all"
+        #: Field names the current source reports, offered as completions. The
+        #: app owns the list; this is a display copy.
+        self._field_names: tuple[str, ...] = ()
 
     # --- composition --------------------------------------------------------
 
@@ -293,11 +299,18 @@ class QueryBar(Container):
         with Horizontal(id="query-row", classes="qb-row"):
             yield LabeledField(
                 "Query",
-                Input(placeholder="regex — try: error|timeout", id="query-input"),
+                Input(
+                    placeholder="regex or field:value — error|timeout, host:web01, status>=500",
+                    id="query-input",
+                ),
                 id="query-field",
             )
             yield Static("", id="match-count")
             yield LabeledField("Severity", self.severity_segmented, id="severity-field")
+
+        # Costs no rows until it has something to offer: hidden by its own
+        # class, not by anything this bar has to remember to do.
+        yield self.completions
 
         # Time presets, toggles and actions share one row when there is width
         # for it: presets left, toggles centred between the flexible spacers,
@@ -334,6 +347,8 @@ class QueryBar(Container):
 
     def set_query_value(self, value: str) -> None:
         self.query_one("#query-input", Input).value = value
+        # Whatever was being completed is no longer what is in the box.
+        self.completions.close()
 
     def validate_regex(self, sample: Iterable[str]) -> None:
         """Recompute regex validity and the approximate hit count."""
@@ -350,19 +365,106 @@ class QueryBar(Container):
         matches = sum(1 for line in sample if pattern is not None and pattern.search(line))
         self.regex_status = RegexStatus(True, matches=matches)
 
-    def validate_entries(self, entries) -> None:
-        """Variant of :meth:`validate_regex` for already-parsed entries."""
+    def validate_entries(self, entries, known_fields: Iterable[str] = ()) -> None:
+        """Variant of :meth:`validate_regex` for already-parsed entries.
+
+        Field terms are split off before compiling, so the hit count reflects
+        the same thing the pane shows and a malformed term reports here rather
+        than raising — the path Item 8 asked for.
+        """
 
         query = self.get_query_value()
         if not query:
             self.regex_status = RegexStatus(True)
             return
         try:
-            pattern = compile_query(query)
+            parsed = parse_query(query, known_fields)
+            pattern = compile_query(parsed.text)
         except QueryError as exc:
             self.regex_status = RegexStatus(False, str(exc))
             return
-        self.regex_status = RegexStatus(True, matches=count_matches(entries, pattern))
+        self.regex_status = RegexStatus(
+            True, matches=count_matches(entries, pattern, parsed.terms)
+        )
+
+    # --- field completions --------------------------------------------------
+
+    def set_field_names(self, names: Iterable[str]) -> None:
+        """Tell the bar which field names this source reports."""
+
+        updated = tuple(sorted(names))
+        if updated == self._field_names:
+            return
+        self._field_names = updated
+        self._refresh_completions()
+
+    def _query_input(self) -> Input:
+        return self.query_one("#query-input", Input)
+
+    @staticmethod
+    def token_bounds(text: str, caret: int) -> tuple[int, int]:
+        """Start and end of the whitespace-delimited token holding *caret*."""
+
+        caret = max(0, min(caret, len(text)))
+        start = caret
+        while start > 0 and not text[start - 1].isspace():
+            start -= 1
+        end = caret
+        while end < len(text) and not text[end].isspace():
+            end += 1
+        return start, end
+
+    def _partial_key(self) -> str:
+        """The token at the caret, when it could still become a field name.
+
+        Anything with an operator in it is already a term (or a regex), and a
+        completion would be an interruption rather than help.
+        """
+
+        try:
+            query_input = self._query_input()
+        except NoMatches:
+            return ""
+        start, end = self.token_bounds(query_input.value, query_input.cursor_position)
+        token = query_input.value[start:end]
+        if not token or any(char in token for char in ":=<>"):
+            return ""
+        return token
+
+    def _refresh_completions(self) -> None:
+        token = self._partial_key()
+        if not token:
+            self.completions.close()
+            return
+        folded = token.lower()
+        matches = [
+            name
+            for name in self._field_names
+            if name.lower().startswith(folded) and name.lower() != folded
+        ]
+        self.completions.offer(matches)
+
+    def _accept_completion(self, name: str) -> None:
+        """Replace the token at the caret with ``name:`` and carry on typing."""
+
+        query_input = self._query_input()
+        start, end = self.token_bounds(query_input.value, query_input.cursor_position)
+        query_input.value = f"{query_input.value[:start]}{name}:{query_input.value[end:]}"
+        query_input.cursor_position = start + len(name) + 1
+        self.completions.close()
+        query_input.focus()
+
+    def on_field_completions_accepted(self, event: FieldCompletions.Accepted) -> None:
+        event.stop()
+        self._accept_completion(event.name)
+
+    def on_field_completions_dismissed(self, event: FieldCompletions.Dismissed) -> None:
+        event.stop()
+        self.completions.close()
+        try:
+            self._query_input().focus()
+        except NoMatches:  # pragma: no cover - defensive
+            pass
 
     def set_match_position(self, position: Optional[int]) -> None:
         """Show where the cursor sits within the hits, as `n`/`N` move it.
@@ -510,9 +612,54 @@ class QueryBar(Container):
         }:
             self.post_message(self.ActionTriggered(event.button.id))
 
+    def on_input_changed(self, event: Input.Changed) -> None:  # type: ignore[override]
+        # Deliberately *not* stopped: the app filters on this message. The bar
+        # only listens in so the completion list can follow what is typed.
+        if event.input.id == "query-input":
+            self._refresh_completions()
+
+    def on_descendant_blur(self, _event) -> None:
+        """Close the dropdown when focus leaves the query controls entirely.
+
+        Checked after a refresh because a blur says only what lost focus, not
+        what gained it — and moving from the input *into* the list must not
+        close the thing being moved into.
+        """
+
+        if not self.completions.open:
+            return
+
+        def _close_if_focus_left() -> None:
+            try:
+                focused = self.screen.focused
+            except Exception:  # noqa: BLE001 - no screen while unmounting
+                return
+            if focused is not None and focused in (self.completions, *self.query("#query-input")):
+                return
+            self.completions.close()
+
+        self.call_after_refresh(_close_if_focus_left)
+
     async def on_key(self, event: events.Key) -> None:
         # Enter in the query box applies; Escape clears it. Arrow keys are
         # handled by the segmented controls themselves.
+        if self.completions.open and event.key in ("down", "tab", "escape"):
+            query_input = self.query("#query-input").first(Input)
+            if query_input.has_focus:
+                event.stop()
+                event.prevent_default()
+                # Down steps into the list to browse it; Tab takes the first
+                # candidate outright, which is what a shell has trained
+                # everyone to expect; Escape shuts the dropdown *before* it
+                # means "clear the query", so dismissing a suggestion never
+                # throws away what was being typed.
+                if event.key == "down":
+                    self.completions.focus()
+                elif event.key == "tab":
+                    self.completions.accept_highlighted()
+                else:
+                    self.completions.close()
+                return
         if event.key == "enter":
             self.post_message(self.ActionTriggered("run-query"))
         elif event.key == "escape":

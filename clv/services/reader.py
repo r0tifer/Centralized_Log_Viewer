@@ -104,6 +104,11 @@ class TailRead:
     truncated: bool = False
     #: True when the file shrank or was replaced since the last read.
     rotated: bool = False
+    #: Which file each line came from, parallel to ``lines``, for readers that
+    #: span more than one -- a rotated set is one source made of several files.
+    #: ``None`` for the ordinary case, where every line came from ``path`` and
+    #: a per-line answer would be the same answer repeated.
+    origins: tuple[Path, ...] | None = None
 
 
 def looks_binary(path: Path, *, sniff: int = _SNIFF_SIZE) -> bool:
@@ -431,18 +436,27 @@ class DocumentReader:
         )
 
 
-#: Either reader; they expose the same ``path``/``prime``/``poll`` surface.
+#: Any reader; they all expose the same ``path``/``prime``/``poll`` surface.
+#: Deliberately not an exhaustive union any more -- a plugin-supplied reader is
+#: one of these too, and the contract is the surface rather than the class.
 AnyReader = SourceReader | DocumentReader
 
 
 def open_reader(path: Path, *, max_lines: int, **kwargs) -> AnyReader:
     """Build the right reader for *path*.
 
-    Container documents get :class:`DocumentReader`; everything else is a
+    Container documents get :class:`DocumentReader`, compressed members get a
+    :class:`~clv.services.compressed.CompressedReader`; everything else is a
     stream of text lines and gets :class:`SourceReader`.
     """
 
     document_format = document_format_for(path)
     if document_format is not None:
         return DocumentReader(path, max_lines=max_lines, document_format=document_format)
+    # Imported here rather than at module scope: compressed.py needs this
+    # module's BOM detection, so the dependency has to run one way only.
+    from .compressed import CompressedReader, is_compressed
+
+    if is_compressed(path):
+        return CompressedReader(path, max_lines=max_lines)
     return SourceReader(path, max_lines=max_lines, **kwargs)

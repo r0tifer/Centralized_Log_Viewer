@@ -16,12 +16,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from .compressed import is_compressed, probe
 from .documents import document_format_for
 from .reader import looks_binary
 
 #: Skipped unless the user opts in. These are readable files that are not
-#: usefully viewable as text: compressed archives and binary journals. Rotated
-#: plain-text logs (``app.log.1``) are NOT excluded — those are still text.
+#: usefully viewable as text: archives and binary journals. Rotated plain-text
+#: logs (``app.log.1``) are NOT excluded — those are still text.
+#:
+#: ``*.gz``, ``*.bz2`` and ``*.xz`` left this list when CLV learned to read
+#: them (see :mod:`clv.services.compressed`): a single compressed *file* is a
+#: log, and excluding it kept the rotated half of ``/var/log`` out of reach.
+#: ``*.zst`` stays because there is no stdlib decompressor for it, and the
+#: archive formats stay because an archive is a container of files rather than
+#: a log — the two are excluded for different reasons that happen to agree.
 #:
 #: ``*.pdf`` is here for a different reason than the rest. Its text is
 #: extractable, but only into reflowed prose with no line structure, no
@@ -33,9 +41,6 @@ from .reader import looks_binary
 #: Membership of this tuple is also what separates "CLV cannot display this"
 #: from "your glob hid it" when a skip is reported — see :func:`skip_reason`.
 DEFAULT_EXCLUDE_GLOBS: tuple[str, ...] = (
-    "*.gz",
-    "*.bz2",
-    "*.xz",
     "*.zst",
     "*.zip",
     "*.tar",
@@ -64,6 +69,11 @@ class DiscoverySettings:
     follow_symlinks: bool = False
     skip_binary: bool = True
     max_files: int = DEFAULT_MAX_FILES
+    #: Present ``app.log`` + ``app.log.1`` + ``app.log.2.gz`` as one source.
+    #: A presentation rule rather than a walk rule — every member is still
+    #: discovered and still individually openable — but it lives here because
+    #: it is the operator's answer to "what counts as a source".
+    group_rotated: bool = True
 
     @classmethod
     def from_strings(
@@ -74,6 +84,7 @@ class DiscoverySettings:
         follow_symlinks: bool = False,
         skip_binary: bool = True,
         max_files: int = DEFAULT_MAX_FILES,
+        group_rotated: bool = True,
     ) -> "DiscoverySettings":
         """Build settings from comma-separated glob strings (config/drawer input)."""
 
@@ -83,6 +94,7 @@ class DiscoverySettings:
             follow_symlinks=follow_symlinks,
             skip_binary=skip_binary,
             max_files=max_files,
+            group_rotated=group_rotated,
         )
 
 
@@ -252,6 +264,13 @@ def skip_reason(
         return FILTERED
     if not os.access(path, os.R_OK):
         return UNREADABLE
+    if is_compressed(path):
+        # The binary sniff would reject every one of these for looking like
+        # the compressed bytes they are, so the question asked instead is
+        # whether the archive opens at all. A corrupt one is `unreadable` --
+        # CLV supports the format, this particular file is damaged -- which is
+        # a different answer from `unsupported` and the actionable one.
+        return None if probe(path) else UNREADABLE
     if settings.skip_binary and not _is_document(path) and looks_binary(path):
         return UNSUPPORTED
     return None

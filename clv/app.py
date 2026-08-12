@@ -21,8 +21,9 @@ import json
 from collections import deque
 from dataclasses import replace
 from datetime import datetime
+from time import monotonic
 from pathlib import Path
-from typing import Iterable, Literal, Optional
+from typing import Iterable, Literal, Optional, Sequence
 from xml.dom import minidom
 
 from rich.console import Group, RenderableType
@@ -39,11 +40,18 @@ from textual.timer import Timer
 from textual.widgets import Button, Footer, Input, Label, Static, Switch, Tree
 from textual.widgets._tree import TreeNode
 
-from .plugins import Exporter, FilterContext, PluginError, PluginRegistry, load_plugins
-from .services import SourceManager, persist_log_sources
+from .plugins import (
+    Exporter,
+    FilterContext,
+    PluginError,
+    PluginRegistry,
+    ProviderSource,
+    load_plugins,
+)
+from .services import SourceManager, persist_log_sources, persist_setting
 from .services.clipboard import prepare_payload
 from .services.config import LogConfig, get_config_file, load_config, user_config_path
-from .services.discovery import DiscoveryReport, discover
+from .services.discovery import DiscoveredFile, DiscoveryReport, discover
 from .services.export import (
     BUILTIN_FORMATS,
     builtin_format,
@@ -63,17 +71,30 @@ from .services.filtering import (
     parse_moment,
     parse_relative_window,
 )
-from .services.marks import MarkSet
+from .services.marks import MarkSet, mark_key
 from .services.parsing import (
     LEVEL_CRITICAL,
     LEVEL_ERROR,
     LEVEL_WARN,
     LogEntry,
-    LogParser,
     level_matches,
 )
-from .services.reader import AnyReader, open_reader
-from .storage import SessionState, StateStore
+from .services.query import (
+    NORMALISED_FIELD_KEYS,
+    collect_field_names,
+    entry_matches,
+)
+from .services.rotation import RotatedSet, describe_set, group_rotated
+from .services.session import ORIGIN_FIELD, SourceSession
+from .services.watch import (
+    WatchIndex,
+    WatchNotifier,
+    WatchRule,
+    describe_rules,
+    notifying,
+    toggled,
+)
+from .storage import SavedView, SessionState, StateStore
 from .widgets.add_source_dialog import AddSourceDialog
 from .widgets.advanced_drawer import AdvancedFiltersDrawer, AdvancedSettings
 from .widgets.custom_time_dialog import CustomTimeRangeDialog
@@ -84,6 +105,8 @@ from .widgets.goto_dialog import GotoDialog
 from .widgets.help_overlay import HelpOverlay, HelpSection
 from .widgets.log_view import LogView
 from .widgets.query_bar import QueryBar
+from .widgets.view_dialogs import SaveViewDialog, ViewPickerDialog, ViewRequest
+from .widgets.watch_dialog import WatchRulesDialog
 
 #: What `n`/`N` step between when there is no query and no severity bucket to
 #: take the definition from. Stepping every entry would just duplicate the down
@@ -114,6 +137,9 @@ BREAKPOINT_NARROW = 130
 #: number is re-measured.
 BREAKPOINT_MERGE = 148
 
+#: Watch rules shown as individual chips before they collapse into a count.
+MAX_WATCH_CHIPS = 3
+
 SOURCES_PANEL_MIN_WIDTH = 20
 SOURCES_PANEL_MAX_WIDTH = 120
 SOURCES_PANEL_STEP = 4
@@ -124,6 +150,27 @@ ICON_FILE = "📄"
 #: starring never changes a row's width.
 ICON_STAR = "⭐"
 STARRED_GROUP = f"{ICON_STAR} Starred"
+#: Saved views sit above the starred group, in the same repeated-shortcuts
+#: spirit: both are things the operator chose to keep, and both would otherwise
+#: cost a walk down the hierarchy on every launch.
+ICON_VIEW = "📑"
+VIEWS_GROUP = f"{ICON_VIEW} Views"
+#: A rotated set: several files, one log. Distinct from the folder icon
+#: because expanding it lists members rather than a directory's contents.
+ICON_ROTATED = "🗂"
+#: A source a plugin supplies rather than one found on disk. Its own group and
+#: its own icon, because none of the things that assume a file apply to it.
+ICON_PROVIDER = "🔌"
+PROVIDERS_GROUP = f"{ICON_PROVIDER} Providers"
+#: Marks a source that is in the merged set. A prefix rather than a replacement
+#: for the file icon: membership is a second fact about a log, unlike starring,
+#: which replaces the icon precisely so a row never changes width.
+ICON_MERGED = "⧉"
+
+#: Width of the source column in a merged view, per breakpoint. Content, not
+#: layout — the column is part of the line the pane renders, so CSS never sees
+#: it — but it still has to shrink before the log text does.
+MERGED_COLUMN_WIDTHS: dict[str, int] = {"-compact": 8, "-narrow": 14, "-wide": 20}
 
 #: Help categories, in the order the overlay lists them. A category with no
 #: bindings is skipped, so a group can be declared before the item that fills
@@ -151,6 +198,8 @@ BINDING_CATEGORIES: dict[str, str] = {
     "cycle_time": "Search",
     "cycle_severity": "Search",
     "toggle_advanced": "Search",
+    "open_views": "Search",
+    "save_view": "Search",
     # LogView owns the cursor keys. They are bound on the widget rather than
     # the app so they cannot fight the source tree or a text input, and they
     # are folded into the overlay by build_help_sections rather than written
@@ -170,6 +219,7 @@ BINDING_CATEGORIES: dict[str, str] = {
     "next_mark": "Navigation",
     "toggle_auto_scroll": "View",
     "toggle_structured": "View",
+    "watch_rules": "View",
     "export_view": "View",
     "copy_view": "View",
     "toggle_pane": "View",
@@ -180,6 +230,8 @@ BINDING_CATEGORIES: dict[str, str] = {
     "toggle_copy_mode": "View",
     "add_source": "Sources",
     "toggle_star": "Sources",
+    "toggle_merge": "Sources",
+    "open_merged": "Sources",
     "reload_sources": "Sources",
     "save_session": "Session",
     "quit_app": "Session",
@@ -211,13 +263,19 @@ def build_help_sections(
     return [HelpSection(name, tuple(grouped[name])) for name in ordered]
 
 
-class LogTree(Tree[Path]):
+class LogTree(Tree[object]):
     """Source tree.
 
     A single tree holds every configured root. The previous build mounted one
     Tree per root inside a scrolling container, which required manual cursor
     hand-off between trees and manual scroll synchronisation against private
     node internals. One tree scrolls itself.
+
+    Typed on ``object`` rather than ``Path`` since Item 9: the saved-views group
+    hangs :class:`~clv.storage.SavedView` records off its nodes, and selection
+    dispatches on what the node carries. Everything that walks the tree for a
+    file already tests ``isinstance(data, Path)``, so a view node is invisible
+    to it.
     """
 
     COMPONENT_CLASSES = Tree.COMPONENT_CLASSES | {
@@ -394,6 +452,11 @@ class LogViewerApp(App[None]):
         Binding("g", "goto_timestamp", "Go to timestamp", show=False),
         Binding("m", "toggle_mark", "Mark / unmark this line", show=False),
         Binding("M", "next_mark", "Jump to next mark", show=False),
+        Binding("v", "open_views", "Saved views", show=False),
+        Binding("V", "save_view", "Save current filters as a view", show=False),
+        Binding("W", "watch_rules", "Watch rules", show=False),
+        Binding("x", "toggle_merge", "Add / remove from the merged set", show=False),
+        Binding("u", "open_merged", "Open the merged view", show=False),
         Binding("ctrl+b", "toggle_pane", "Switch pane", show=True),
         Binding("[", "shrink_sources_panel", "Narrower", show=False),
         Binding("]", "expand_sources_panel", "Wider", show=False),
@@ -424,10 +487,14 @@ class LogViewerApp(App[None]):
 
         self._source_manager = SourceManager([], [])
         self._report: DiscoveryReport | None = None
-        self._selected_source: Optional[Path] = None
-        self._reader: AnyReader | None = None
-        self._parser = LogParser()
-        self._entries: deque[LogEntry] = deque(maxlen=self._config.max_buffer_lines)
+        #: What the loaded providers offered on the last scan. Kept apart from
+        #: the report because these are not files and must not end up anywhere
+        #: that assumes they are.
+        self._provider_sources: list[ProviderSource] = []
+        #: Readers and buffers, owned by a UI-free service. A single open log is
+        #: a session of one, so nothing below has a single-source path of its
+        #: own to keep in step — see clv/services/session.py.
+        self._session = SourceSession(max_lines=self._config.max_buffer_lines)
         self._tail_timer: Timer | None = None
 
         self._show_lines = self._config.default_show_lines
@@ -453,6 +520,18 @@ class LogViewerApp(App[None]):
         #: disk — see clv/services/marks.py for why that is a constraint rather
         #: than a gap.
         self._marks = MarkSet()
+        #: Which lines matched which watch rules, evaluated once per line so a
+        #: re-render is a lookup rather than a rule sweep.
+        self._watch_index = WatchIndex()
+        #: Coalesces watch notifications. Drained from the tail poll, so no
+        #: second timer exists to keep in step with the first.
+        self._watch_notifier = WatchNotifier(window=self._config.watch_rate_limit)
+        #: Field names present in the buffer, offered as query completions.
+        self._field_names: frozenset[str] = frozenset()
+        #: Names a query term may use: the parser's normalised vocabulary plus
+        #: whatever this source turned out to carry. Anything else stays a
+        #: regex, which is what keeps `sshd:` searching for text.
+        self._known_fields: frozenset[str] = NORMALISED_FIELD_KEYS
 
         self.query_bar = QueryBar()
         self.chip_bar = FilterChips(id="chip-bar")
@@ -463,6 +542,39 @@ class LogViewerApp(App[None]):
             max_rows=self._config.max_buffer_lines,
         )
         self.detail_pane = DetailPane(id="detail-pane")
+
+    # --- the session, and the three names the app knows it by ---------------
+
+    @property
+    def _selected_source(self) -> Optional[Path]:
+        """The log the pane is showing, or None.
+
+        A property over the session rather than an attribute of the shell, so
+        "which source" has exactly one answer and the merged case cannot grow a
+        second one behind its back. Settable because a caller with lines of its
+        own still has to be able to say where they came from.
+        """
+
+        return self._session.primary_path
+
+    @_selected_source.setter
+    def _selected_source(self, value: Optional[Path]) -> None:
+        self._session.set_primary_path(value)
+
+    @property
+    def _entries(self):
+        """Every buffered entry the filters will see."""
+
+        return self._session.entries
+
+    @_entries.setter
+    def _entries(self, value) -> None:
+        self._session.set_entries(value)
+
+    @property
+    def _reader(self):
+        buffer = self._session.primary
+        return buffer.reader if buffer is not None else None
 
     # --- composition --------------------------------------------------------
 
@@ -500,9 +612,11 @@ class LogViewerApp(App[None]):
         self._refresh_chips()
         self._sync_star_button()
         self._sync_detail_pane()
+        self._sync_watch_rules()
         # Filled at mount rather than only when the drawer opens, so the plugin
         # and exporter lines are correct the first time it is seen.
         self._refresh_plugin_status()
+        self._sync_journald_status()
         self._update_status()
         self._persist_state = True
 
@@ -543,6 +657,7 @@ class LogViewerApp(App[None]):
             exclude_globs=self.state.exclude_globs,
             follow_symlinks=self.state.follow_symlinks,
             skip_binary=self.state.skip_binary,
+            group_rotated=self.state.group_rotated,
             max_buffer_lines=self._config.max_buffer_lines,
             case_sensitive=self.state.case_sensitive,
             use_regex=self.state.use_regex,
@@ -555,7 +670,18 @@ class LogViewerApp(App[None]):
             structured=self.state.pretty_rendering,
             clipboard=self.state.clipboard_osc52,
             detail_pane=self.state.detail_pane,
+            watch_rules=self._watching,
         )
+
+    @property
+    def _watching(self) -> bool:
+        """Whether any watch rule is live — what the drawer's switch shows.
+
+        Any rather than all: the switch answers "is anything being watched",
+        and flipping it off must be able to quieten a partly-enabled set.
+        """
+
+        return any(rule.enabled for rule in self.state.watch_rules)
 
     # --- responsiveness -----------------------------------------------------
 
@@ -619,6 +745,12 @@ class LogViewerApp(App[None]):
         if report is None:
             report = DiscoveryReport()
         self._report = report
+        # Providers are asked on the same pass, but never in the same thread:
+        # a provider may shell out, and a plugin's idea of "quick" is not
+        # something discovery should have to trust. It is guarded instead —
+        # one that raises is recorded and skipped, like a filter stage.
+        self._provider_sources = self._plugins.discover_sources()
+        self._refresh_plugin_status()
         await self._build_tree(report)
         if self._selected_source is None:
             self._show_discovery_summary(report)
@@ -631,12 +763,28 @@ class LogViewerApp(App[None]):
         # first one left registered.
         await panel.remove_children()
 
-        if not report.files:
+        if not report.files and not self.state.views and not self._provider_sources:
             await panel.mount(Static("No log sources found.", classes="empty-tree"))
             return
 
         tree: LogTree = LogTree("Sources", id="source-tree")
         await panel.mount(tree)
+
+        # Saved views first: they are filter bundles rather than files, they
+        # are few, and they are the fastest way back into a piece of work.
+        # Above the starred group because a view usually names a starred log.
+        if self.state.views:
+            group = tree.root.add(VIEWS_GROUP, data=None, expand=True)
+            for view in self.state.views:
+                group.add_leaf(f"{ICON_VIEW} {view.name}", data=view)
+
+        # Provider sources next: few, named rather than pathed, and nothing
+        # below this point in the tree can hold one — a folder hierarchy is
+        # exactly what they do not have.
+        if self._provider_sources:
+            group = tree.root.add(PROVIDERS_GROUP, data=None, expand=True)
+            for source in self._provider_sources:
+                group.add_leaf(f"{ICON_PROVIDER} {source.name}", data=source)
 
         # Starred logs are repeated in a group at the top. With the tree
         # collapsed by default, a favourite would otherwise cost a walk down
@@ -668,29 +816,74 @@ class LogViewerApp(App[None]):
             # tree of any size; the operator opens the branch they want.
             # _highlight_source still expands ancestors on demand.
             root_node = tree.root.add(f"{ICON_FOLDER} {root}", data=root, expand=False)
-            folders: dict[Path, TreeNode[Path]] = {root: root_node}
-            for item in items:
+            folders: dict[Path, TreeNode[object]] = {root: root_node}
+            for folder, entries in self._by_folder(items).items():
                 parent = root_node
                 current = root
-                for part in item.relative.parts[:-1]:
+                for part in folder.parts:
                     current = current / part
                     if current not in folders:
                         folders[current] = parent.add(
                             f"{ICON_FOLDER} {part}", data=current, expand=False
                         )
                     parent = folders[current]
-                parent.add_leaf(
-                    self._leaf_label(item.path, item.path.name), data=item.path
-                )
+                self._add_files(parent, entries)
 
         tree.focus()
+
+    @staticmethod
+    def _by_folder(items: Sequence[DiscoveredFile]) -> dict[Path, list[Path]]:
+        """Group one root's files by their folder, relative to that root.
+
+        Insertion order is the report's order, which is already sorted by
+        path — so the tree is built in the same sequence as before.
+        """
+
+        folders: dict[Path, list[Path]] = {}
+        for item in items:
+            relative = item.relative.parent
+            folders.setdefault(Path() if relative == Path(".") else relative, []).append(
+                item.path
+            )
+        return folders
+
+    def _add_files(self, parent: TreeNode[object], paths: Sequence[Path]) -> None:
+        """Add one folder's files, folding rotated members into single nodes.
+
+        Grouping happens per folder rather than per root: ``app.log.1`` is a
+        rotation of the ``app.log`` beside it, never of one two directories
+        away that happens to share a name.
+        """
+
+        if not self.advanced_drawer.settings.group_rotated:
+            for path in paths:
+                parent.add_leaf(self._leaf_label(path, path.name), data=path)
+            return
+
+        sets, singles = group_rotated(paths)
+        for rotated in sets:
+            # A branch, not a leaf: the set is the source, and its members stay
+            # individually openable underneath it. Collapsed, because the whole
+            # point of the node is not having to look at the members.
+            node = parent.add(
+                f"{ICON_ROTATED} {rotated.name} ({len(rotated)} files)",
+                data=rotated,
+                expand=False,
+            )
+            for member in rotated.members:
+                node.add_leaf(self._leaf_label(member.path, member.name), data=member.path)
+        for path in singles:
+            parent.add_leaf(self._leaf_label(path, path.name), data=path)
 
     def _starred_paths(self) -> set[Path]:
         return {_resolve(Path(entry)) for entry in self.state.starred}
 
     def _leaf_label(self, path: Path, text: str) -> str:
         icon = ICON_STAR if _resolve(path) in self._starred_paths() else ICON_FILE
-        return f"{icon} {text}"
+        # Merge membership prefixes rather than replaces: a starred log can be
+        # merged too, and the star already owns the icon slot.
+        merged = ICON_MERGED if _resolve(path) in self._merged_paths else ""
+        return f"{merged}{icon} {text}"
 
     def _highlight_source(self, path: Path, *, select: bool = True) -> None:
         """Reveal *path* in the tree.
@@ -742,28 +935,153 @@ class LogViewerApp(App[None]):
             return False
 
         self._stop_tail()
-        self._parser.reset()
-        self._entries = deque(maxlen=self._config.max_buffer_lines)
-
-        reader = open_reader(resolved, max_lines=self._config.max_buffer_lines)
         try:
-            initial = reader.prime()
+            # Only commits on success, so a source that will not open does not
+            # also cost the one that was working.
+            self._session.open_single(resolved)
         except OSError as exc:
             self._notify(f"Failed to read {resolved}: {exc}", "error")
             return False
 
-        self._reader = reader
-        self._selected_source = resolved
-        self._entries.extend(self._parser.feed(initial.lines))
         self._show_lines = min(self._config.default_show_lines, self._config.max_buffer_lines)
+        self._after_source_change()
+        return True
 
+    def _select_rotated_set(self, rotated_set: RotatedSet) -> bool:
+        """Open a whole rotated log as one source.
+
+        The one path in CLV that is not instant: older members have to be
+        decompressed from the front, so this says what it read rather than
+        going quiet for a second and hoping nobody notices.
+        """
+
+        self._stop_tail()
+        try:
+            buffer = self._session.open_rotated(rotated_set)
+        except OSError as exc:
+            self._notify(f"Failed to read {rotated_set.name}: {exc}", "error")
+            return False
+
+        self._show_lines = min(self._config.default_show_lines, self._config.max_buffer_lines)
+        self._after_source_change()
+        reader = buffer.reader
+        self._notify(describe_set(rotated_set, getattr(reader, "members_read", 0)))
+        return True
+
+    # --- the merged set ------------------------------------------------------
+
+    def action_toggle_merge(self) -> None:
+        """Add or remove the source under the tree cursor from the merged set."""
+
+        target = self._star_target()
+        if target is None:
+            self._notify("Move to a log in the tree to merge it.", "warning")
+            return
+
+        resolved = _resolve(target)
+        current = list(self.state.merged)
+        if str(resolved) in current:
+            current.remove(str(resolved))
+            action = "Removed from"
+        else:
+            current.append(str(resolved))
+            action = "Added to"
+        self._update_state(merged=tuple(sorted(current)))
+        self._notify(
+            f"{action} the merged set ({len(current)} source(s)). Press u to open it."
+        )
+        self.run_worker(self._rescan(), group="discovery", exit_on_error=False)
+
+    def action_open_merged(self) -> None:
+        """Open every source in the merged set as one timestamp-ordered stream."""
+
+        paths = [Path(entry) for entry in self.state.merged]
+        if not paths:
+            self._notify("No sources merged yet — press x on a log to add one.", "warning")
+            return
+        if len(paths) == 1:
+            # One member is not a merge, and opening it as one would show a
+            # source column with one value in it.
+            self._select_source(paths[0])
+            return
+
+        self._stop_tail()
+        opened, failed = self._session.open_many(paths)
+        for path, reason in failed:
+            self._notify(f"{path.name} could not be opened: {reason}", "warning")
+        if not opened:
+            self._notify("None of the merged sources could be opened.", "error")
+            return
+
+        self._show_lines = min(self._config.default_show_lines, self._config.max_buffer_lines)
+        self._after_source_change()
+        anchored = self._session.anchored
+        detail = (
+            f" · {anchored} line(s) with no timestamp anchored to their own source"
+            if anchored
+            else ""
+        )
+        self._notify(f"Merged {len(opened)} sources.{detail}")
+
+    @property
+    def _merged_paths(self) -> set[Path]:
+        return {_resolve(Path(entry)) for entry in self.state.merged}
+
+    def _merged_name(self) -> str:
+        """What to call the merged set — in the status line and in an export."""
+
+        names = [Path(entry).name for entry in self.state.merged]
+        if len(names) <= 2:
+            return "+".join(names) or "merged"
+        return f"{names[0]}+{len(names) - 1}-more"
+
+    def _select_provider_source(self, source: ProviderSource) -> bool:
+        """Open a source a plugin supplied.
+
+        Everything past the reader is identical to a file: the same buffer, the
+        same filters, the same cursor. What is different is that the failure
+        modes belong to third-party code, so opening is guarded the way a
+        filter stage is and a provider that throws costs only its own source.
+        """
+
+        self._stop_tail()
+        reader = self._plugins.open_source(
+            source, max_lines=self._config.max_buffer_lines
+        )
+        if reader is None:
+            self._refresh_plugin_status()
+            self._notify(f"{source.name} could not be opened — see the drawer.", "error")
+            return False
+
+        try:
+            self._session.adopt(source.path, reader)
+            # The severity bucket may be answerable at the source rather than
+            # after the fact; a journal follow can filter before the pipe.
+            self._session.push_severity(self.state.severity)
+        except Exception as exc:  # noqa: BLE001 - third-party reader
+            self._plugins.errors.append(PluginError(source.provider, f"raised: {exc}"))
+            self._refresh_plugin_status()
+            self._notify(f"Failed to read {source.name}: {exc}", "error")
+            return False
+
+        self._show_lines = min(self._config.default_show_lines, self._config.max_buffer_lines)
+        self._after_source_change()
+        return True
+
+    def _after_source_change(self) -> None:
+        """Everything that has to be rebuilt when the buffer becomes new."""
+
+        self._sync_field_names()
         self._sync_regex_validation()
+        # Rules are recompiled against this source's vocabulary and the primed
+        # buffer is matched for highlighting — silently; see _sync_watch_rules.
+        self._watch_index.reset()
+        self._sync_watch_rules()
         self._render_log(scroll_end=True)
         self._start_tail()
         self._update_status()
         self._sync_compact_pane()
         self._sync_star_button()
-        return True
 
     def _start_tail(self) -> None:
         """Tail regardless of auto-scroll.
@@ -774,7 +1092,7 @@ class LogViewerApp(App[None]):
         """
 
         self._stop_tail()
-        if self._reader is None:
+        if not self._session:
             return
         interval = 1 / max(1, self._config.refresh_hz)
         self._tail_timer = self.set_interval(interval, self._poll_tail)
@@ -785,33 +1103,45 @@ class LogViewerApp(App[None]):
             self._tail_timer = None
 
     def _poll_tail(self) -> None:
-        if self._reader is None or self._is_shutting_down:
+        if not self._session or self._is_shutting_down:
             return
-        try:
-            result = self._reader.poll()
-        except OSError:
+        outcomes = self._session.poll()
+        if not outcomes:
             return
 
-        if result.rotated:
-            self._parser.reset()
-            self._entries.clear()
-            self._entries.extend(self._parser.feed(result.lines))
+        rotated = [outcome for outcome in outcomes if outcome.rotated]
+        if rotated:
+            # A rotated file can be a different shape entirely, so the field
+            # vocabulary is rebuilt rather than extended, and the watch index
+            # starts again on what is effectively a new source.
+            self._field_names = frozenset()
+            self._sync_field_names()
+            self._watch_index.reset()
+            self._sync_watch_rules()
             self._render_log(scroll_end=self.state.auto_scroll)
-            notice = self._reader.RELOAD_NOTICE.format(name=self._reader.path.name)
-            self._notify(notice, "warning")
+            for outcome in rotated:
+                self._notify(outcome.notice, "warning")
             return
 
-        if not result.lines:
+        new_entries = [entry for outcome in outcomes for entry in outcome.entries]
+        if not new_entries:
             return
 
-        new_entries = self._parser.feed(result.lines)
-        overflowing = len(self._entries) + len(new_entries) > (self._entries.maxlen or 0)
-        self._entries.extend(new_entries)
+        self._sync_field_names(new_entries)
         self._sync_regex_validation()
+        # Before the rows are written, so a watched line is highlighted the
+        # moment it appears rather than on the render after it.
+        self._poll_watch(new_entries)
 
-        if overflowing:
+        if any(outcome.overflowed for outcome in outcomes):
             # The ring buffer dropped old lines, so the visible window shifted:
             # a full redraw is the only correct option.
+            self._render_log()
+        elif not self._session.lands_at_the_end(new_entries):
+            # A merged view where a line sorted into the middle: appending it
+            # would put it in the wrong place. Tailing several live logs at
+            # once does not take this path — they are all producing "now" —
+            # so the incremental render survives the case it exists for.
             self._render_log()
         else:
             self._append_entries(new_entries)
@@ -828,6 +1158,7 @@ class LogViewerApp(App[None]):
             case_sensitive=True if settings.case_sensitive else None,
             regex=settings.use_regex,
             invert=settings.invert_match,
+            known_fields=self._known_fields,
         )
 
     def _time_window(self) -> TimeWindow:
@@ -841,6 +1172,38 @@ class LogViewerApp(App[None]):
 
     def _plugin_context(self) -> FilterContext:
         return FilterContext(spec=self._filter_spec(), source=self._selected_source)
+
+    def _origin(self, entry: LogEntry) -> Optional[Path]:
+        """Which source *entry* came from.
+
+        Marks and watch answers are keyed on this rather than on "the open
+        log", so that when a session holds more than one member two identical
+        lines from two different logs stay two different lines.
+        """
+
+        return self._session.origin_of(entry)
+
+    def _origins(self) -> list[Optional[Path]]:
+        """Every source the open session draws from.
+
+        One entry for an ordinary log; one per member for a merge, and one per
+        rotated member for a set — which is why this asks the buffers rather
+        than assuming the answer is `_selected_source`.
+        """
+
+        sources: list[Optional[Path]] = [buffer.path for buffer in self._session.buffers]
+        if self._session.is_merged or any(
+            entry.fields.get(ORIGIN_FIELD) for entry in self._entries
+        ):
+            sources += [
+                Path(value)
+                for value in {
+                    entry.fields.get(ORIGIN_FIELD)
+                    for entry in self._entries
+                    if entry.fields.get(ORIGIN_FIELD)
+                }
+            ]
+        return sources or [None]
 
     def _visible_entries(self, entries: Iterable[LogEntry]):
         """Apply plugin stages, then the user's filters."""
@@ -886,9 +1249,15 @@ class LogViewerApp(App[None]):
             self._sync_detail_pane()
             return
 
-        # Drop marks whose lines the ring buffer has evicted, so the count in
-        # the status line stays honest as the source tails.
-        self._marks.prune(self._selected_source, self._entries)
+        # Drop marks — and cached watch answers — whose lines the ring buffer
+        # has evicted, so the count in the status line stays honest as the
+        # source tails and the index cannot grow without bound. Keyed per
+        # entry: in a merged view the lines on screen belong to different
+        # sources, and pruning one at a time would see every other source's
+        # lines as missing and throw its marks away.
+        live = {mark_key(self._origin(entry), entry) for entry in self._entries}
+        self._marks.retain(live, sources=self._origins())
+        self._watch_index.retain(live)
 
         for entry in result.entries[-self._show_lines :]:
             self.log_panel.write_entry(self._renderable_for(entry), entry)
@@ -896,6 +1265,8 @@ class LogViewerApp(App[None]):
         # — and an empty set is the overwhelmingly common case.
         if self._marks:
             self._sync_marks()
+        if self._watch_index.active:
+            self._sync_watch_highlights()
 
         self._restore_cursor(previous_entry, previous_index)
         if scroll_end or self.state.auto_scroll:
@@ -911,9 +1282,10 @@ class LogViewerApp(App[None]):
         unchanged, so this costs a re-strip only for rows that actually flipped.
         """
 
-        source = self._selected_source
         for index, entry in self.log_panel.entry_rows():
-            self.log_panel.set_row_marked(index, self._marks.contains(source, entry))
+            self.log_panel.set_row_marked(
+                index, self._marks.contains(self._origin(entry), entry)
+            )
 
     def _restore_cursor(self, entry: LogEntry | None, index: int) -> None:
         """Put the cursor back where it was, or as near as the new view allows.
@@ -946,19 +1318,44 @@ class LogViewerApp(App[None]):
         # A tailed line can be one an operator marked earlier and that rotated
         # back in, so the gutter has to be set as it arrives — but only when
         # there are marks at all, keeping the common path a plain append.
-        source = self._selected_source
         marked = bool(self._marks)
+        watching = self._watch_index.active
         for entry in result.entries:
             self.log_panel.write_entry(self._renderable_for(entry), entry)
-            if marked and self._marks.contains(source, entry):
+            if marked and self._marks.contains(self._origin(entry), entry):
                 self.log_panel.set_row_marked(len(self.log_panel.rows) - 1, True)
+            # A lookup, not a match: _poll_watch already asked the rules about
+            # this line before it reached the pane.
+            if watching and self._watch_index.watched(self._origin(entry), entry):
+                self.log_panel.set_row_watched(len(self.log_panel.rows) - 1, True)
 
     def _renderable_for(self, entry: LogEntry) -> RenderableType:
         if self.state.pretty_rendering:
             structured = self._structured_renderable(entry)
             if structured is not None:
                 return structured
-        return self._colorize(entry)
+        text = self._colorize(entry)
+        if self._session.is_merged:
+            return self._with_source_column(text, entry)
+        return text
+
+    def _with_source_column(self, text: Text, entry: LogEntry) -> Text:
+        """Prefix a line with the source it came from.
+
+        Only in a merged view, where the pane is the one place the answer can
+        be. The width follows the breakpoint so the column gives way before the
+        log text does — this is line *content*, which is why it is composed
+        here and not in CSS.
+        """
+
+        width = MERGED_COLUMN_WIDTHS.get(self._breakpoint, MERGED_COLUMN_WIDTHS["-narrow"])
+        origin = self._origin(entry)
+        name = origin.name if origin is not None else "?"
+        if len(name) > width:
+            # From the left: rotated members and unit names differ at the end.
+            name = "…" + name[-(width - 1) :]
+        column = Text(f"{name:<{width}} ", style="#7aa3d1")
+        return column.append_text(text)
 
     def _colorize(self, entry: LogEntry) -> Text:
         text = Text(entry.raw)
@@ -1098,8 +1495,21 @@ class LogViewerApp(App[None]):
         else:
             follow = "paused"
 
-        parts = [str(self._selected_source), detail]
-        marks = self._marks.count_for(self._selected_source)
+        if self._session.is_merged:
+            parts = [f"{self._merged_name()} ({len(self._session)} sources)", detail]
+            anchored = self._session.anchored
+            if anchored:
+                # Placed by inference rather than by their own timestamp, so
+                # the count is on screen rather than left to be noticed.
+                parts.append(f"{anchored} anchored")
+        else:
+            parts = [str(self._selected_source), detail]
+        member = self._cursor_member()
+        if member is not None:
+            # One source made of several files: which one the cursor is in is
+            # not deducible from anything else on screen.
+            parts.append(f"in {member}")
+        marks = self._marks.count_for(*self._origins())
         if marks:
             parts.append(f"{marks} marked")
         if self._match_position is not None:
@@ -1107,6 +1517,24 @@ class LogViewerApp(App[None]):
             parts.append(f"{label} {position} of {total}")
         parts.append(follow)
         status.update(" · ".join(parts))
+
+    def _cursor_member(self) -> Optional[str]:
+        """The name of the file the cursor line came from, when that varies.
+
+        Empty for an ordinary source: the status line already names it, and
+        repeating it beside itself would be noise.
+        """
+
+        if self._session.is_merged:
+            # The source column already says this, on every row.
+            return None
+        entry = self.log_panel.cursor_entry
+        if entry is None:
+            return None
+        origin = self._origin(entry)
+        if origin is None or origin == self._selected_source:
+            return None
+        return origin.name
 
     def _refresh_chips(self) -> None:
         if self._is_shutting_down or not self.chip_bar.is_attached:
@@ -1132,10 +1560,45 @@ class LogViewerApp(App[None]):
         if settings.include_globs:
             chips.append(FilterChip(f"Include: {settings.include_globs}", key="include"))
 
+        # Watch rules are not filters, but they are active state the operator
+        # should be able to see and switch off from one place. Past a handful
+        # they collapse into one chip: the bar is a single row, and a dozen
+        # named chips would push the filters out of sight at 80 columns.
+        enabled = [rule for rule in self.state.watch_rules if rule.enabled]
+        if len(enabled) > MAX_WATCH_CHIPS:
+            chips.append(FilterChip(f"Watching: {len(enabled)} rules", key="watch:*"))
+        else:
+            chips.extend(
+                FilterChip(f"Watch: {rule.name}", key=f"watch:{rule.name}")
+                for rule in enabled
+            )
+
         self.chip_bar.update_chips(chips)
 
     def _sync_regex_validation(self) -> None:
-        self.query_bar.validate_entries(list(self._entries))
+        self.query_bar.validate_entries(list(self._entries), self._known_fields)
+
+    def _sync_field_names(self, arrived: Iterable[LogEntry] | None = None) -> None:
+        """Refresh the vocabulary field terms and completions are drawn from.
+
+        ``arrived`` is the incremental case: tailed lines can only *add* names,
+        so a poll unions instead of re-walking the buffer. The union is never
+        pruned as the ring buffer evicts lines, which means a name can outlive
+        the last entry carrying it — harmless, since a term naming a field no
+        entry has is hidden and counted like any other, and the alternative is
+        an O(buffer) rescan on every poll.
+        """
+
+        names = (
+            collect_field_names(self._entries)
+            if arrived is None
+            else self._field_names | collect_field_names(arrived)
+        )
+        if names == self._field_names:
+            return
+        self._field_names = names
+        self._known_fields = NORMALISED_FIELD_KEYS | names
+        self.query_bar.set_field_names(names)
 
     # --- state --------------------------------------------------------------
 
@@ -1217,14 +1680,19 @@ class LogViewerApp(App[None]):
 
         if spec.query:
             try:
+                parsed = spec.parse()
                 pattern = compile_query(
-                    spec.query, case_sensitive=spec.case_sensitive, regex=spec.regex
+                    parsed.text, case_sensitive=spec.case_sensitive, regex=spec.regex
                 )
             except QueryError:
                 return [], "match"
-            if pattern is not None:
+            # Terms without free text still define a match set, so this cannot
+            # key off the pattern alone the way it did before Item 8.
+            if pattern is not None or parsed.terms:
                 return [
-                    index for index, entry in rows if pattern.search(entry.raw)
+                    index
+                    for index, entry in rows
+                    if entry_matches(entry, parsed.terms, pattern)
                 ], "match"
 
         if spec.severity != "all":
@@ -1305,7 +1773,7 @@ class LogViewerApp(App[None]):
         if entry is None:
             self._notify("Move the cursor to a line to mark it.", "warning")
             return
-        marked = self._marks.toggle(self._selected_source, entry)
+        marked = self._marks.toggle(self._origin(entry), entry)
         # Content-keyed, so identical lines share one mark: resync every row
         # rather than only the cursor's, or the copies would disagree.
         self._sync_marks()
@@ -1319,11 +1787,10 @@ class LogViewerApp(App[None]):
             self._notify("Open a log before jumping between marks.", "warning")
             return
 
-        source = self._selected_source
         marked = [
             index
             for index, entry in self.log_panel.entry_rows()
-            if self._marks.contains(source, entry)
+            if self._marks.contains(self._origin(entry), entry)
         ]
         if not marked:
             self._notify("No marked lines — press m to mark one.", "warning")
@@ -1339,6 +1806,332 @@ class LogViewerApp(App[None]):
             self._notify(f"Wrapped to the first mark ({position} of {len(marked)}).")
         else:
             self._notify(f"Mark {position} of {len(marked)}.")
+
+    # --- watch rules --------------------------------------------------------
+
+    def action_watch_rules(self) -> None:
+        """Add, edit, enable, disable or delete the live-alert rules."""
+        self.run_worker(self._prompt_watch_rules(), group="dialogs", exit_on_error=False)
+
+    def _sync_watch_rules(self) -> None:
+        """Recompile the rules and re-read the buffer against them.
+
+        Lines already buffered are matched so they *look* watched — a rule that
+        highlighted nothing already on screen would read as broken — but they
+        raise no notification. Nobody asked to be told about lines that arrived
+        before the rule existed, and a source switch would otherwise open with
+        a burst of toasts about history.
+        """
+
+        self._watch_index.set_rules(self.state.watch_rules, self._known_fields)
+        self._watch_notifier.reset()
+        if self._watch_index.active and self._session:
+            self._evaluate_watches(self._entries)
+        self._refresh_watch_status()
+
+    def _evaluate_watches(self, entries: Sequence[LogEntry]) -> list[tuple[str, ...]]:
+        """Ask the rules about *entries*, each keyed to the source it came from.
+
+        Grouped by origin rather than evaluated one at a time, because
+        `WatchIndex.evaluate` caches per distinct line within a source and
+        calling it per entry would defeat that. In the ordinary case there is
+        one group and this is the call it always was.
+        """
+
+        grouped: dict[Optional[Path], list[LogEntry]] = {}
+        for entry in entries:
+            grouped.setdefault(self._origin(entry), []).append(entry)
+        fired: list[tuple[str, ...]] = []
+        for source, group in grouped.items():
+            fired += [names for _entry, names in self._watch_index.evaluate(source, group)]
+        return fired
+
+    def _refresh_watch_status(self) -> None:
+        self.advanced_drawer.set_watch_status(describe_rules(self.state.watch_rules))
+
+    def _poll_watch(self, entries: Sequence[LogEntry]) -> None:
+        """Match newly arrived lines and say something, at most so often.
+
+        Driven from the tail poll rather than a timer of its own: there is
+        already a clock running at ``refresh_hz`` and a second one would only
+        create ways for the two to disagree.
+        """
+
+        if not self._watch_index.active:
+            return
+        for names in self._evaluate_watches(entries):
+            self._watch_notifier.record(notifying(names, self.state.watch_rules))
+
+        messages = self._watch_notifier.due(monotonic())
+        for message in messages:
+            self._notify(message, "warning")
+        if messages and self._config.watch_bell:
+            # Opt-in only, and guarded: a terminal that cannot ring is not a
+            # reason to lose the notification that went with it.
+            try:
+                self.bell()
+            except Exception:  # noqa: BLE001 - terminal-dependent
+                pass
+
+    def _sync_watch_highlights(self) -> None:
+        """Set every visible row's highlight from the index.
+
+        A lookup per row, never a match: the answer was computed when the line
+        arrived. This is what keeps re-rendering independent of how many rules
+        are enabled.
+        """
+
+        for index, entry in self.log_panel.entry_rows():
+            self.log_panel.set_row_watched(
+                index, self._watch_index.watched(self._origin(entry), entry)
+            )
+
+    def _set_watch_rules(self, rules: Iterable[WatchRule]) -> None:
+        self._update_state(watch_rules=tuple(rules))
+        self._sync_watch_rules()
+        self._sync_view_toggles()
+        self._render_log()
+
+    def _set_watch_enabled(self, value: bool) -> None:
+        """The drawer's switch: all rules on, or all off."""
+
+        if not self.state.watch_rules:
+            self._notify("No watch rules yet — press W to add one.", "warning")
+            return
+        self._set_watch_rules(
+            replace(rule, enabled=value) for rule in self.state.watch_rules
+        )
+        self._notify("Watch rules on." if value else "Watch rules off.")
+
+    async def _prompt_watch_rules(self) -> None:
+        rules = await self.push_screen(
+            WatchRulesDialog(self.state.watch_rules, self._known_fields),
+            wait_for_dismiss=True,
+        )
+        if rules is None:
+            # Nothing changed: not worth re-indexing the buffer over a dialog
+            # that was only looked at.
+            return
+        self._set_watch_rules(rules)
+        self._notify(describe_rules(rules))
+
+    # --- saved views --------------------------------------------------------
+
+    def action_save_view(self) -> None:
+        """Name the filters that are active and keep them."""
+        self.run_worker(self._prompt_save_view(), group="dialogs", exit_on_error=False)
+
+    def action_open_views(self) -> None:
+        """Apply, rename or delete a saved view."""
+        self.run_worker(self._prompt_views(), group="dialogs", exit_on_error=False)
+
+    def _capture_view(self, name: str) -> SavedView:
+        """Everything the current filter state consists of, under *name*.
+
+        The open source is recorded by path so applying the view puts the
+        filters back where they mean something. Nothing about what those
+        filters *matched* is captured — see :class:`SavedView`.
+        """
+
+        settings = self.advanced_drawer.settings
+        return SavedView(
+            name=name,
+            query=self.state.query,
+            severity=self.state.severity,
+            time_window=self.state.time_window,
+            custom_start=self.state.custom_start,
+            custom_end=self.state.custom_end,
+            case_sensitive=settings.case_sensitive,
+            use_regex=settings.use_regex,
+            invert_match=settings.invert_match,
+            include_globs=settings.include_globs,
+            exclude_globs=settings.exclude_globs,
+            source=str(self._selected_source) if self._selected_source else "",
+            # Item 9 left this out because there was no merged set to capture.
+            # Recorded only when a merge is actually open, so a view saved on
+            # one log does not quietly carry someone else's set around.
+            merged=tuple(self.state.merged) if self._session.is_merged else (),
+        )
+
+    def _view_named(self, name: str) -> Optional[SavedView]:
+        return next((view for view in self.state.views if view.name == name), None)
+
+    async def _store_views(self, views: Iterable[SavedView]) -> None:
+        """Persist *views* sorted by name, and rebuild the tree group.
+
+        Rebuilt from the report already in hand rather than by re-walking the
+        filesystem, the same way starring does it.
+        """
+
+        self._update_state(views=tuple(sorted(views, key=lambda view: view.name.lower())))
+        if self._report is not None:
+            await self._build_tree(self._report)
+
+    def _default_view_name(self) -> str:
+        """A name worth pressing Enter on, derived from what is filtered."""
+
+        if self.state.query:
+            query = self.state.query
+            return query if len(query) <= 24 else query[:23] + "…"
+        parts = [
+            part
+            for part in (
+                self.state.severity if self.state.severity != "all" else "",
+                self.state.time_window if self.state.time_window not in {"", "all"} else "",
+                self._selected_source.name if self._selected_source else "",
+            )
+            if part
+        ]
+        return " ".join(parts) if parts else f"View {len(self.state.views) + 1}"
+
+    def _apply_view(self, view: SavedView) -> None:
+        """Put every filter the view records back, in a single re-render.
+
+        Field by field this would repaint the pane five times and fight the
+        cursor restore on each one, so the state is assembled first, the
+        controls are synced with their own messages suppressed, and exactly one
+        render happens at the end — either `_select_source`'s or this method's.
+        """
+
+        settings = self.advanced_drawer.settings
+        updated = replace(
+            settings,
+            include_globs=view.include_globs,
+            exclude_globs=view.exclude_globs,
+            case_sensitive=view.case_sensitive,
+            use_regex=view.use_regex,
+            invert_match=view.invert_match,
+        )
+        rescan = updated.affects_discovery(settings)
+        self.advanced_drawer.sync_settings(updated)
+
+        # prevent(), not a flag: assigning to the input posts Input.Changed
+        # asynchronously, and the app's handler would render a second time.
+        with self.prevent(Input.Changed):
+            self.query_bar.set_query_value(view.query)
+        self.query_bar.set_severity(view.severity)
+        if view.time_window == "range" and view.custom_start and view.custom_end:
+            self.query_bar.apply_custom_time_range(
+                view.custom_start, view.custom_end, emit=False
+            )
+        else:
+            self.query_bar.select_time(view.time_window)
+
+        self._update_state(
+            query=view.query,
+            severity=view.severity,
+            time_window=view.time_window,
+            custom_start=view.custom_start,
+            custom_end=view.custom_end,
+            case_sensitive=view.case_sensitive,
+            use_regex=view.use_regex,
+            invert_match=view.invert_match,
+            include_globs=view.include_globs,
+            exclude_globs=view.exclude_globs,
+        )
+
+        missing = ""
+        opened = False
+        if view.merged:
+            # A merged view reopens the whole set: its filters were written
+            # against all of it, and half the set is a different question.
+            self._update_state(merged=tuple(view.merged))
+            self.action_open_merged()
+            opened = True
+        elif view.source:
+            source = Path(view.source)
+            if source.is_file():
+                # _select_source renders once; nothing below may render again.
+                opened = self._select_source(source, announce=False)
+                if opened:
+                    self._highlight_source(source, select=False)
+            else:
+                # The filters still describe something worth seeing, so they go
+                # on regardless. Refusing would make a rotated log a dead view.
+                missing = view.source
+
+        if not opened:
+            self._sync_regex_validation()
+            self._render_log()
+        if rescan:
+            self.run_worker(self._rescan(), group="discovery", exit_on_error=False)
+        if missing:
+            self._notify(
+                f"View '{view.name}' names a source that is no longer there: {missing}",
+                "warning",
+            )
+
+    async def _prompt_save_view(self) -> None:
+        dialog = SaveViewDialog(
+            default_name=self._default_view_name(),
+            summary=self._capture_view("preview").summary(),
+        )
+        name = await self.push_screen(dialog, wait_for_dismiss=True)
+        if name is None:
+            self._notify("Save view canceled.")
+            return
+
+        replaced = self._view_named(name) is not None
+        view = self._capture_view(name)
+        await self._store_views(
+            [existing for existing in self.state.views if existing.name != name] + [view]
+        )
+        self._notify(
+            f"Replaced view '{name}'." if replaced else f"Saved view '{name}'."
+        )
+
+    async def _prompt_views(self) -> None:
+        """Show the picker until the operator applies one or closes it.
+
+        Rename and delete reopen it: the list the modal is holding is stale the
+        moment either lands, and reopening is cheaper — in code and in
+        surprises — than teaching the dialog to edit its own copy.
+        """
+
+        while True:
+            if not self.state.views:
+                self._notify(
+                    "No saved views yet — press V to save the current filters.", "warning"
+                )
+                return
+
+            request = await self.push_screen(
+                ViewPickerDialog(self.state.views), wait_for_dismiss=True
+            )
+            if request is None:
+                return
+            if not await self._handle_view_request(request):
+                return
+
+    async def _handle_view_request(self, request: ViewRequest) -> bool:
+        """Act on the picker's answer. True when the picker should reopen."""
+
+        view = self._view_named(request.name)
+        if view is None:  # pragma: no cover - the list came from this state
+            return False
+
+        if request.action == "apply":
+            self._apply_view(view)
+            self._notify(f"Applied view '{view.name}'.")
+            return False
+        if request.action == "delete":
+            await self._store_views(
+                other for other in self.state.views if other.name != view.name
+            )
+            self._notify(f"Deleted view '{view.name}'.")
+            return True
+
+        renamed = replace(view, name=request.new_name)
+        await self._store_views(
+            [
+                other
+                for other in self.state.views
+                if other.name not in {view.name, request.new_name}
+            ]
+            + [renamed]
+        )
+        self._notify(f"Renamed '{view.name}' to '{renamed.name}'.")
+        return True
 
     def action_toggle_detail(self) -> None:
         """Show or hide the event detail pane."""
@@ -1524,12 +2317,16 @@ class LogViewerApp(App[None]):
         self._notify(f"Showing up to {self._show_lines} lines.")
 
     def action_copy_view(self) -> None:
-        """Put the visible lines on the local clipboard via OSC 52.
+        """Put the selection on the local clipboard via OSC 52.
 
         The counterpart to `Ctrl+L`, not a replacement for it: copy mode needs a
         local terminal selection, which is exactly what is unavailable over tmux
         or SSH, and this path needs a terminal that honours OSC 52. Whichever
         one an operator's setup supports, one of them works.
+
+        "Selection" means the cursor line when there is one, and the visible
+        view when there is not. Once a line can be pointed at, copying the whole
+        pane instead of the line under the cursor is the surprising answer.
         """
 
         if self._selected_source is None:
@@ -1543,19 +2340,20 @@ class LogViewerApp(App[None]):
             )
             return
 
-        try:
-            result = self._visible_entries(self._entries)
-        except QueryError as exc:
-            self._notify(f"Cannot copy while the query is invalid: {exc}", "error")
-            return
+        cursor_entry = self.log_panel.cursor_entry
+        if cursor_entry is not None:
+            lines = [cursor_entry.raw]
+        else:
+            try:
+                result = self._visible_entries(self._entries)
+            except QueryError as exc:
+                self._notify(f"Cannot copy while the query is invalid: {exc}", "error")
+                return
+            # The lines on screen, filter and window included — the same slice
+            # _render_log writes. Ctrl+E is the path for the whole filtered set.
+            lines = [entry.raw for entry in result.entries[-self._show_lines :]]
 
-        # The lines on screen, filter and window included — the same slice
-        # _render_log writes. Ctrl+E is the path for the whole filtered set.
-        visible = result.entries[-self._show_lines :]
-        payload = prepare_payload(
-            [entry.raw for entry in visible],
-            max_bytes=self._config.clipboard_max_bytes,
-        )
+        payload = prepare_payload(lines, max_bytes=self._config.clipboard_max_bytes)
         if payload.empty:
             self._notify(
                 payload.summary
@@ -1610,6 +2408,9 @@ class LogViewerApp(App[None]):
         self._stop_tail()
         self._config = load_config()
         self._settings_path = get_config_file() or user_config_path()
+        # The cap can have changed under us, so the session adopts the new one
+        # before anything is read against it.
+        self._session.resize(self._config.max_buffer_lines)
         self._entries = deque(maxlen=self._config.max_buffer_lines)
         self._source_manager = SourceManager(*self._split_roots(self._config.log_dirs))
         for path in added:
@@ -1733,12 +2534,19 @@ class LogViewerApp(App[None]):
             return
 
         source = self._selected_source
-        marked = [entry for entry in entries if self._marks.contains(source, entry)]
+        marked = [
+            entry for entry in entries if self._marks.contains(self._origin(entry), entry)
+        ]
 
         dialog = ExportDialog(
             self._exporter_choices(),
             entry_count=len(entries),
-            default_name=default_stem(source),
+            # A merged export is named for the set, not for whichever member
+            # happens to be first — "auth.log-20260812" would be a lie about
+            # what is in the file.
+            default_name=default_stem(
+                Path(self._merged_name()) if self._session.is_merged else source
+            ),
             marked_count=len(marked),
         )
         request = await self.push_screen(dialog, wait_for_dismiss=True)
@@ -1819,10 +2627,17 @@ class LogViewerApp(App[None]):
 
     # --- events -------------------------------------------------------------
 
-    def on_tree_node_selected(self, event: Tree.NodeSelected[Path]) -> None:
+    def on_tree_node_selected(self, event: Tree.NodeSelected[object]) -> None:
         data = event.node.data
         if isinstance(data, Path) and data.is_file():
             self._select_source(data)
+        elif isinstance(data, RotatedSet):
+            self._select_rotated_set(data)
+        elif isinstance(data, ProviderSource):
+            self._select_provider_source(data)
+        elif isinstance(data, SavedView):
+            self._apply_view(data)
+            self._notify(f"Applied view '{data.name}'.")
 
     def on_tree_node_highlighted(self, _event: Tree.NodeHighlighted[Path]) -> None:
         # The star target follows the cursor while the tree has focus, so the
@@ -1851,6 +2666,13 @@ class LogViewerApp(App[None]):
 
     def on_query_bar_severity_changed(self, message: QueryBar.SeverityChanged) -> None:
         self._update_state(severity=message.value)
+        # Offered to the source first: a reader that can filter before the data
+        # reaches us re-primes, and what it handed over earlier answered a
+        # different question. Every other reader ignores this entirely.
+        if self._session.push_severity(message.value):
+            self._sync_field_names()
+            self._watch_index.reset()
+            self._sync_watch_rules()
         self._render_log()
 
     def on_query_bar_time_window_changed(self, message: QueryBar.TimeWindowChanged) -> None:
@@ -1874,6 +2696,7 @@ class LogViewerApp(App[None]):
             exclude_globs=settings.exclude_globs,
             follow_symlinks=settings.follow_symlinks,
             skip_binary=settings.skip_binary,
+            group_rotated=settings.group_rotated,
             case_sensitive=settings.case_sensitive,
             use_regex=settings.use_regex,
             invert_match=settings.invert_match,
@@ -1915,6 +2738,10 @@ class LogViewerApp(App[None]):
             self._set_clipboard_enabled(message.value)
         elif message.field == "detail_pane":
             self._set_detail_pane(message.value)
+        elif message.field == "watch_rules":
+            self._set_watch_enabled(message.value)
+        elif message.field == "journald":
+            self._set_journald(message.value)
         else:
             self._set_structured(message.value)
 
@@ -1980,6 +2807,44 @@ class LogViewerApp(App[None]):
             else "Clipboard copy off — Ctrl+L copy mode still works."
         )
 
+    def _set_journald(self, value: bool) -> None:
+        """Turn the journal on or off, and record the choice in settings.conf.
+
+        Flipping this switch *is* the consent the plugin rule requires, so it
+        takes effect now — but consent given once should not have to be given
+        again every launch, and the settings file is where CLV already writes
+        an operator's decision (`Ctrl+S` does exactly this with `log_dirs`).
+        The plugin re-reads the file on every scan, so no reload is needed.
+        """
+
+        try:
+            persist_setting(self._settings_path, "enable_journald", str(value).lower())
+        except OSError as exc:
+            self._notify(f"Could not save the journal setting: {exc}", "error")
+            self._sync_journald_status()
+            return
+
+        self._config = replace(self._config, enable_journald=value)
+        self._notify(
+            f"systemd journal enabled — written to {self._settings_path}."
+            if value
+            else "systemd journal disabled."
+        )
+        self.run_worker(self._rescan(), group="discovery", exit_on_error=False)
+
+    def _sync_journald_status(self) -> None:
+        """Show journal state in the drawer, including why it may be off."""
+
+        from .plugins.sources.journald import availability
+
+        available, reason = availability()
+        self.advanced_drawer.set_journald(
+            self._config.enable_journald and available,
+            available=available,
+            reason=reason
+            or ("reading /var/log/journal via journalctl" if self._config.enable_journald else ""),
+        )
+
     def _sync_view_toggles(self) -> None:
         """Push the canonical view state onto both sets of controls."""
 
@@ -1999,6 +2864,7 @@ class LogViewerApp(App[None]):
             structured=self.state.pretty_rendering,
             clipboard=self.state.clipboard_osc52,
             detail_pane=self.state.detail_pane,
+            watch_rules=self._watching,
         )
 
     def _sync_detail_pane(self) -> None:
@@ -2033,6 +2899,16 @@ class LogViewerApp(App[None]):
         if key == "query":
             self.action_clear_query()
             return
+        if key.startswith("watch:"):
+            # Dismissing a watch chip disables the rule rather than deleting
+            # it: a chip is a way to quieten something, not to throw it away.
+            name = key.split(":", 1)[1]
+            if name == "*":
+                self._set_watch_enabled(False)
+            else:
+                self._set_watch_rules(toggled(self.state.watch_rules, name, False))
+                self._notify(f"Watch rule '{name}' disabled.")
+            return
         if key == "severity":
             self.query_bar.set_severity("all")
             self._update_state(severity="all")
@@ -2040,13 +2916,15 @@ class LogViewerApp(App[None]):
             self.query_bar.select_time("all")
             self._update_state(time_window="all", custom_start="", custom_end="")
         elif key == "invert":
-            self.advanced_drawer._settings = replace(
-                self.advanced_drawer.settings, invert_match=False
+            # sync_settings, not a bare assignment: the drawer's switch has to
+            # follow the setting, or dismissing the chip leaves it showing on.
+            self.advanced_drawer.sync_settings(
+                replace(self.advanced_drawer.settings, invert_match=False)
             )
             self._update_state(invert_match=False)
         elif key == "include":
-            self.advanced_drawer._settings = replace(
-                self.advanced_drawer.settings, include_globs=""
+            self.advanced_drawer.sync_settings(
+                replace(self.advanced_drawer.settings, include_globs="")
             )
             self._update_state(include_globs="")
             self.run_worker(self._rescan(), group="discovery", exit_on_error=False)
@@ -2080,6 +2958,10 @@ class LogViewerApp(App[None]):
     async def on_unmount(self) -> None:
         self._is_shutting_down = True
         self._stop_tail()
+        # Readers may hold more than a file handle — a provider-backed source
+        # owns a subprocess — so shutdown releases them explicitly rather than
+        # leaving it to garbage collection.
+        self._session.close()
         if self._persist_state:
             # Persist as-is: the selected source is deliberately kept so the
             # next launch reopens it.

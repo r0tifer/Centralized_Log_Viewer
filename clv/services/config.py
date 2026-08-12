@@ -35,6 +35,11 @@ _LIMITS: dict[str, tuple[int, int, int]] = {
     # ~74 kB passthrough limit with room for base64 expansion, so a copy that
     # fits the cap is a copy the terminal will actually accept.
     "clipboard_max_bytes": (65_536, 1_024, 1_000_000),
+    # Seconds a watch rule waits before it may notify again. The floor is not
+    # zero on purpose: a rule matching every tailed line would otherwise raise
+    # a toast per line, which is the behaviour that gets a feature like this
+    # switched off for good.
+    "watch_rate_limit": (60, 5, 3_600),
 }
 
 DEFAULT_SETTINGS_TEMPLATE = f"""[{CONFIG_SECTION}]
@@ -62,6 +67,10 @@ skip_binary = true
 # Stop discovery after this many files.
 max_files = {DEFAULT_MAX_FILES}
 
+# Present app.log, app.log.1 and app.log.2.gz as one source spanning all three.
+# Every member is still listed underneath it and still openable on its own.
+group_rotated = true
+
 # Lines held in memory per source. Older lines are dropped.
 max_buffer_lines = 5000
 
@@ -83,6 +92,19 @@ csv_max_cols = 10
 # Most log text one 'y' (OSC 52 clipboard copy) may carry. Oversized copies are
 # truncated at a line boundary and the notification says how much was dropped.
 clipboard_max_bytes = 65536
+
+# Watch rules (W). Seconds one rule waits before it may notify again; matches
+# inside the window are counted and reported together.
+watch_rate_limit = 60
+
+# Ring the terminal bell when a watch rule notifies. Off by default.
+watch_bell = false
+
+# Read the systemd journal (per unit and per boot) as a source. Off by default:
+# reading it means running journalctl, and CLV does not spawn a subprocess
+# without being asked. The Advanced drawer's "Journal (systemd)" switch turns
+# this on and writes it back here.
+enable_journald = false
 """
 
 
@@ -101,6 +123,14 @@ class LogConfig:
     csv_max_cols: int = _LIMITS["csv_max_cols"][0]
     tree_width: int = _LIMITS["tree_width"][0]
     clipboard_max_bytes: int = _LIMITS["clipboard_max_bytes"][0]
+    watch_rate_limit: int = _LIMITS["watch_rate_limit"][0]
+    #: Ring the terminal bell when a watch rule notifies. Off by default: a
+    #: bell is a thing an operator opts into, never a thing a log does to them.
+    watch_bell: bool = False
+    #: Read the systemd journal. Off by default because reading it means
+    #: running `journalctl`, and a plugin may not spawn a subprocess without
+    #: consent — which is the argument for the journal being a plugin at all.
+    enable_journald: bool = False
 
     def with_discovery(self, **changes) -> "LogConfig":
         """Return a copy with individual discovery settings replaced."""
@@ -290,6 +320,7 @@ def load_config(path: Optional[Path] = None) -> LogConfig:
         follow_symlinks=_read_bool(section, "follow_symlinks", False),
         skip_binary=_read_bool(section, "skip_binary", True),
         max_files=_read_int(section, "max_files"),
+        group_rotated=_read_bool(section, "group_rotated", True),
     )
 
     config = LogConfig(
@@ -304,6 +335,9 @@ def load_config(path: Optional[Path] = None) -> LogConfig:
         csv_max_cols=_read_int(section, "csv_max_cols"),
         tree_width=_read_int(section, "tree_width"),
         clipboard_max_bytes=_read_int(section, "clipboard_max_bytes"),
+        watch_rate_limit=_read_int(section, "watch_rate_limit"),
+        watch_bell=_read_bool(section, "watch_bell", False),
+        enable_journald=_read_bool(section, "enable_journald", False),
     )
 
     # default_show_lines must not exceed what the buffer can hold.

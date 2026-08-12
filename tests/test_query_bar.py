@@ -421,3 +421,182 @@ def test_hidden_switches_remain_reachable_from_the_keyboard() -> None:
             assert app.state.auto_scroll is auto_before
 
     _run(scenario)
+
+
+# --- field completions (Item 8) ---------------------------------------------
+
+
+async def _typed(pilot, app: _Harness, text: str) -> None:
+    """Put *text* in the query box the way a person would, caret at the end."""
+
+    query_input = app.query_bar.query_one("#query-input", Input)
+    app.set_focus(query_input)
+    await pilot.pause()
+    for char in text:
+        await pilot.press(char)
+    await pilot.pause()
+
+
+def test_completions_appear_for_a_partial_field_name() -> None:
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.query_bar.set_field_names(["host", "status", "tag"])
+            await pilot.pause()
+
+            assert not app.query_bar.completions.open
+
+            await _typed(pilot, app, "st")
+            assert app.query_bar.completions.open
+            assert app.query_bar.completions.names == ("status",)
+
+    _run(scenario)
+
+
+def test_completions_stay_shut_for_text_that_is_not_a_field_prefix() -> None:
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.query_bar.set_field_names(["host", "status"])
+            await pilot.pause()
+
+            await _typed(pilot, app, "error")
+            assert not app.query_bar.completions.open
+
+            # An operator already appears in the token: it is a term or a
+            # regex, and a completion would be an interruption.
+            await _typed(pilot, app, " host:")
+            assert not app.query_bar.completions.open
+
+    _run(scenario)
+
+
+def test_tab_accepts_the_first_candidate_and_leaves_the_caret_after_the_colon() -> None:
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.query_bar.set_field_names(["host", "status"])
+            await pilot.pause()
+
+            await _typed(pilot, app, "error ho")
+            assert app.query_bar.completions.open
+
+            await pilot.press("tab")
+            await pilot.pause()
+
+            query_input = app.query_bar.query_one("#query-input", Input)
+            assert query_input.value == "error host:"
+            assert query_input.cursor_position == len("error host:")
+            assert not app.query_bar.completions.open
+            assert query_input.has_focus
+
+    _run(scenario)
+
+
+def test_down_enters_the_list_and_enter_accepts_the_highlighted_name() -> None:
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.query_bar.set_field_names(["status", "status_code"])
+            await pilot.pause()
+
+            await _typed(pilot, app, "stat")
+            await pilot.press("down")
+            await pilot.pause()
+            assert app.query_bar.completions.has_focus
+
+            await pilot.press("down")  # move to the second candidate
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert app.query_bar.query_one("#query-input", Input).value == "status_code:"
+
+    _run(scenario)
+
+
+def test_escape_closes_the_list_without_clearing_the_query() -> None:
+    """Escape is bound to 'clear the query', which must not happen here."""
+
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.query_bar.set_field_names(["host"])
+            await pilot.pause()
+
+            await _typed(pilot, app, "ho")
+            await pilot.press("down")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+
+            assert not app.query_bar.completions.open
+            assert app.query_bar.get_query_value() == "ho"
+            assert "clear-query" not in app.actions
+
+    _run(scenario)
+
+
+def test_the_open_dropdown_stays_on_screen_at_eighty_columns() -> None:
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app.query_bar.set_field_names(["host", "hostname"])
+            await pilot.pause()
+
+            await _typed(pilot, app, "ho")
+            await pilot.pause()
+
+            region = app.query_bar.completions.region
+            assert region.width > 0 and region.height > 0
+            assert region.right <= 80
+            assert region.bottom <= 24
+
+    _run(scenario)
+
+
+def test_the_dropdown_costs_no_rows_while_it_is_shut() -> None:
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            closed = app.query_bar.region.height
+
+            app.query_bar.set_field_names(["host"])
+            await _typed(pilot, app, "ho")
+            assert app.query_bar.region.height > closed
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.query_bar.region.height == closed
+
+    _run(scenario)
+
+
+def test_escape_shuts_the_dropdown_before_it_clears_the_query() -> None:
+    """Two presses, two meanings: dismiss the suggestion, then clear the box."""
+
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.query_bar.set_field_names(["host"])
+            await _typed(pilot, app, "ho")
+            assert app.query_bar.completions.open
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not app.query_bar.completions.open
+            assert app.query_bar.get_query_value() == "ho"
+            assert "clear-query" not in app.actions
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert "clear-query" in app.actions
+
+    _run(scenario)

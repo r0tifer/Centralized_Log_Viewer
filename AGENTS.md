@@ -49,12 +49,22 @@ file. Tailing reads only appended bytes and renders only new lines. Memory is
 capped by `max_buffer_lines` regardless of on-disk size. Discovery runs off the
 UI thread and is capped by `max_files`.
 
-**Container documents are the one exception**, and they invert two of these
-rules on purpose. A deflated archive has no cheap tail, so `DocumentReader`
+**Two exceptions exist, both because deflate has no cheap tail**, and both
+state so in their own module docstring rather than leaving it to be discovered:
+
+*Container documents* invert two of these rules on purpose. `DocumentReader`
 extracts the document whole, bounded by a **line** budget rather than a byte
 one, and re-extracts on change instead of tailing. It also keeps the **first**
 lines rather than the last: a spreadsheet's header row names its columns, and
 a document has no "newest" end the way a log does.
+
+*Compressed members* (`compressed.py`) are read forward under a line budget and
+a **decompressed-byte cap**. Memory stays bounded by the budget; work is
+proportional to the member, which is the part that cannot be fixed and must
+therefore be said out loud. They keep the **last** lines, unlike a document —
+this is a log, and its newest content is at the end. A rotated set spends one
+shared budget newest-member-first, so older members are often never opened at
+all, and only the live member is ever polled.
 
 ### 4) Nothing off-screen, ever
 Layout must scale cleanly from 80 columns up. Every control stays on screen and
@@ -78,10 +88,10 @@ distros.
 | Layer | Location | Owns | Must not |
 | --- | --- | --- | --- |
 | **App shell** | `clv/app.py` | Layout, routing, lifecycle, breakpoints | Parse, filter, read files, or define widget visuals |
-| **Services** | `clv/services/` | Parsing, filtering, discovery, reading, config, source management | Touch the UI or import Textual |
+| **Services** | `clv/services/` | Parsing, filtering, discovery, reading, buffering, config, source management | Touch the UI or import Textual |
 | **Widgets** | `clv/widgets/` | Self-contained UI + own `DEFAULT_CSS` | Depend on other widgets' internals or import `clv.app` |
 | **Plugins** | `clv/plugins/` | Extension interfaces + loader | Break interface contracts |
-| **State** | `clv/storage.py` | JSON session persistence (atomic) | Depend on the UI |
+| **State** | `clv/storage.py` | JSON session persistence (atomic), including `SavedView` records | Depend on the UI |
 
 ### Services
 - `parsing.py` — multi-format line parsing, canonical severity vocabulary,
@@ -90,11 +100,19 @@ distros.
   normalised across formats — `host` means the same thing whether it came from
   syslog or from an access log. Values are strings and are never coerced; a
   continuation inherits timestamp and level but never fields.
+- `query.py` — the grammar behind `host:web01 status>=500`: tokenising,
+  operators, and the rule that decides what is a field term at all. A token is
+  one only when its key is a name the parser normalises or a key the buffer
+  actually carries; everything else stays part of the regex, which is what
+  keeps `sshd:` searching for text. A query with no recognised term is passed
+  through byte-for-byte, so nothing anyone had saved changes meaning.
 - `filtering.py` — `FilterSpec` → `FilterResult` with per-reason hidden counts.
   Also owns time parsing: `parse_relative_window` / `parse_absolute_window` for
   the presets, `parse_moment` for the single point `g` jumps to, and
   `align_moments` so an aware JSON stamp and a naive syslog one can be ordered
-  rather than refused.
+  rather than refused. Field terms come from `query.py`; an entry that lacks a
+  field the query named is hidden into its own `hidden_missing_field` counter,
+  never merged with "did not match".
 - `discovery.py` — walks roots into a `DiscoveryReport`; pure and synchronous
   so callers can thread it. Every skip is attributed to exactly one of
   **`unsupported file type`** (CLV cannot display it), **`filtered out`** (the
@@ -108,6 +126,28 @@ distros.
   between `SourceReader` (streams) and `DocumentReader` (container documents);
   both expose `path` / `prime()` / `poll()` and a `RELOAD_NOTICE` template.
 - `documents.py` — stdlib-only text extraction for container formats.
+- `compressed.py` — `gzip`/`bz2`/`lzma` members, bounded by a line budget and a
+  decompressed-byte cap. The second stated exception to Requirement 3.
+- `rotation.py` — what makes `app.log`, `app.log.1` and `app.log.2.gz` one
+  source. Grouping is by name after the compression suffix is stripped; reading
+  spends one shared budget newest-first, so a set whose head fills the buffer
+  opens as fast as a single file. Lines come back carrying which member they
+  came from, because with several files behind one source "where is this line
+  from" stops having a constant answer.
+- `session.py` — who owns the readers and the lines they produced, including
+  the k-way merge behind `u`. A
+  `SourceBuffer` is one reader plus its parser and its bounded deque; a
+  `SourceSession` is the ordered set of buffers the pane is showing. **A single
+  open log is a session of one**, which is the point: there is no separate
+  single-source path for a feature to be written against by accident. Marks and
+  watch answers key on `origin_of(entry)` rather than on "the open log", so two
+  identical lines from two logs stay two lines. The tail *clock* stays in the
+  app — `poll()` is called from the timer that already runs, never a second one.
+  A merge is a **view** over the buffers rather than a fourth copy, cached
+  against their revisions so it costs one merge per poll rather than one per
+  keystroke; `max_buffer_lines` applies per member. An entry with no timestamp
+  is anchored after the last timestamped line from **its own source** and
+  counted, never dropped — "never silently lose a line" applied to ordering.
 - `config.py` — settings resolution, validation, clamping.
 - `sources.py` — session source management and settings persistence.
 - `export.py` — the three built-in output formats (JSON Lines, CSV, plain text)
@@ -121,6 +161,13 @@ distros.
   different line as lines were evicted. `MarkSet` is deliberately not
   serialisable — a digest is derived from log content, and session state holds
   paths and settings only.
+- `watch.py` — the patterns `W` manages. `WatchIndex` answers "which rules did
+  this line hit" **once per line**, keyed the way `marks.py` keys a bookmark, so
+  a re-render is a dict lookup rather than a rule sweep over every visible row.
+  `WatchNotifier` coalesces: first match immediately, everything else in the
+  window counted and reported together, because a rule matching every line is
+  what makes people switch a feature like this off. Both are driven from the
+  existing tail poll — no second clock.
 - `clipboard.py` — assembles and size-caps the payload `y` hands to
   `App.copy_to_clipboard`. OSC 52 has no continuation form, so an oversized
   payload is truncated at a line boundary and reported, never chunked and never
@@ -132,7 +179,9 @@ config.load_config ─→ SourceManager ─→ discovery.discover (thread)
                                               ↓
                                         DiscoveryReport ─→ tree
                                               ↓
-   reader.SourceReader.prime/poll ─→ parsing.LogParser.feed ─→ deque[LogEntry]
+   reader.prime/poll ─→ parsing.LogParser.feed ─→ session.SourceBuffer
+                                              ↓
+                            session.SourceSession (one buffer, or several)
                                               ↓
         plugins.apply_filters ─→ filtering.filter_entries ─→ LogView
                                                                ↓
@@ -169,8 +218,11 @@ config.load_config ─→ SourceManager ─→ discovery.discover (thread)
 | `SegmentedButtons` | `ValueChanged` / `Reselected` | Segment activated / re-activated |
 | `FilterChip` | `Dismissed` | Revert the named filter |
 | `AdvancedFiltersDrawer` | `SettingsChanged` | Full before/after snapshot; `needs_rescan` says whether discovery must re-run |
-| `AdvancedFiltersDrawer` | `ViewToggleChanged` | Auto-scroll / structured / clipboard flipped from a drawer switch |
+| `AdvancedFiltersDrawer` | `ViewToggleChanged` | Auto-scroll / structured / clipboard / detail pane / watch rules flipped from a drawer switch |
 | `ExportDialog` | dismiss value | `ExportRequest(key, path, marked_only)`, or `None` when canceled |
+| `SaveViewDialog` | dismiss value | The name to save the current filters under, or `None` |
+| `ViewPickerDialog` | dismiss value | `ViewRequest(action, name, new_name)`, or `None` when closed. The dialog never edits state; the app acts and reopens it |
+| `WatchRulesDialog` | dismiss value | The edited rule set, or `None` when nothing changed — so a dialog that was only looked at costs no re-indexing |
 | `AdvancedFiltersDrawer` | `RescanRequested` / `Closed` | Explicit rescan / dismissal |
 
 ### Controls with two homes
@@ -203,7 +255,7 @@ Three interfaces in `clv/plugins/__init__.py`:
 
 | Interface | Method | Purpose |
 | --- | --- | --- |
-| `LogSourceProvider` | `discover()`, `open(path)` | New ingestion backends |
+| `LogSourceProvider` | `discover()`, `open(path)`, optional `open_reader(path)` | New ingestion backends |
 | `FilterStage` | `apply(entry, context) -> LogEntry \| None` | Transform or drop entries |
 | `Exporter` | `export(entries, context) -> ExportResult` | Send the current view somewhere |
 
@@ -214,7 +266,32 @@ group. Optional `requires_clv` constraints are enforced.
 **Loading never raises.** Import failures, bad version constraints, and stages
 that throw at runtime are recorded in `PluginRegistry.errors`, surfaced in the
 Advanced drawer, and skipped. A third-party plugin must never stop CLV starting
-or break a render.
+or break a render. The same contract covers providers: one that raises in
+`discover()` or `open()` costs only its own sources, never the operator's real
+ones.
+
+`open()` returns an iterator, which cannot express tailing, cannot be asked to
+stop, and has nowhere to put cleanup. A provider that follows a live stream
+implements `open_reader()` instead and returns the same `path`/`prime()`/
+`poll()`/`RELOAD_NOTICE` surface every core reader has, plus `close()` when it
+holds something. A provider that only implements `open()` still works — core
+wraps it in `IteratorReader` — which is what let this be added without breaking
+anything already written against the interface.
+
+**A provider source is not a path.** `ProviderSource` is its own type, and
+starring, glob filtering and rotated-set grouping all test `isinstance(data,
+Path)` and therefore cannot see one. None of those were generalised to
+accommodate them, deliberately: a journal unit has no directory to walk and no
+file to persist, and putting one in `session.json` would record a path that
+does not exist.
+
+**The journal is a plugin because of consent, not because of layering.**
+Reading it runs `journalctl`, and a plugin may not spawn a subprocess without
+the operator asking; core shipping that would put a subprocess behind a default.
+`enable_journald` is read fresh on every scan, so the drawer switch takes effect
+without a reload. The one cost is that the drawer's plugin count now includes a
+shipped provider, which Item 3 wanted to keep meaning "plugins someone
+installed" — the trade Item 12 asked for.
 
 ---
 
@@ -228,7 +305,7 @@ or break a render.
 - Layout regressions are caught by asserting widget `region` bounds at a given
   terminal size rather than by eyeballing screenshots.
 
-Run: `python -m pytest` (362 tests).
+Run: `python -m pytest` (620 tests).
 
 ---
 

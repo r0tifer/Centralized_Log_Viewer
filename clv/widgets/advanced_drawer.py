@@ -18,6 +18,13 @@ from textual.widgets import Button, Input, Label, Static, Switch
 
 from ..services.discovery import DiscoverySettings
 
+#: One-line reminder of the query grammar, shown under Search options. Kept
+#: short enough to survive 80 columns without wrapping into the plugin status.
+QUERY_SYNTAX_HINT = (
+    'Query: plain text is a regex · field terms: host:web01 · status>=500 · '
+    'tag!=cron · msg:"disk full"'
+)
+
 
 @dataclass(frozen=True)
 class AdvancedSettings:
@@ -31,6 +38,7 @@ class AdvancedSettings:
     case_sensitive: bool = False
     use_regex: bool = True
     invert_match: bool = False
+    group_rotated: bool = True
 
     def to_discovery(self, base: DiscoverySettings) -> DiscoverySettings:
         """Fold the discovery-related fields into a DiscoverySettings."""
@@ -40,6 +48,7 @@ class AdvancedSettings:
             exclude_globs=_split(self.exclude_globs) or base.exclude_globs,
             follow_symlinks=self.follow_symlinks,
             skip_binary=self.skip_binary,
+            group_rotated=self.group_rotated,
         )
 
     def affects_discovery(self, other: "AdvancedSettings") -> bool:
@@ -49,6 +58,11 @@ class AdvancedSettings:
             or self.exclude_globs != other.exclude_globs
             or self.follow_symlinks != other.follow_symlinks
             or self.skip_binary != other.skip_binary
+            # Grouping only changes how the tree is built, not what the walk
+            # finds — but the tree is built from a report, so it is rebuilt the
+            # same way as any other discovery change rather than by a second
+            # path that exists only for this.
+            or self.group_rotated != other.group_rotated
         )
 
 
@@ -117,6 +131,14 @@ class AdvancedFiltersDrawer(Static):
 
     AdvancedFiltersDrawer Switch { height: 3; }
 
+    /* Wraps rather than truncates at 80 columns: the syntax is only useful
+       if all of it is readable. */
+    AdvancedFiltersDrawer #query-syntax {
+        color: $text-muted;
+        height: auto;
+        padding-top: 1;
+    }
+
     AdvancedFiltersDrawer #plugin-status {
         color: $text-muted;
         height: auto;
@@ -126,7 +148,9 @@ class AdvancedFiltersDrawer(Static):
     /* Read-only list of what Ctrl+E can write, so the exporters are visible
        without opening the dialog. No top padding: it sits directly under the
        plugin line as a second detail of the same block. */
-    AdvancedFiltersDrawer #export-status {
+    AdvancedFiltersDrawer #export-status,
+    AdvancedFiltersDrawer #journald-status,
+    AdvancedFiltersDrawer #watch-status {
         color: $text-muted;
         height: auto;
     }
@@ -188,6 +212,8 @@ class AdvancedFiltersDrawer(Static):
         self._structured = False
         self._clipboard = True
         self._detail_pane = False
+        self._watch_rules = True
+        self._journald = False
         self.add_class("-hidden")
 
     # --- composition --------------------------------------------------------
@@ -225,7 +251,14 @@ class AdvancedFiltersDrawer(Static):
                 with Vertical(classes="drawer-toggle"):
                     yield Label("Detail pane")
                     yield Switch(value=self._detail_pane, id="drawer-detail-pane")
-                yield Static("", classes="drawer-field")
+                # Takes the spacer's place rather than adding a row: this
+                # drawer scrolls at max-height 16, and a new row here is what
+                # pushes "Source discovery" below the fold. Single-home like
+                # its neighbours — `W` manages the rules, this switches the
+                # whole set on or off.
+                with Vertical(classes="drawer-toggle"):
+                    yield Label("Watch rules")
+                    yield Switch(value=self._watch_rules, id="drawer-watch-rules")
 
         yield Label("Source discovery", classes="drawer-heading")
         with Horizontal(classes="drawer-row"):
@@ -251,6 +284,20 @@ class AdvancedFiltersDrawer(Static):
             with Vertical(classes="drawer-toggle"):
                 yield Label("Skip binary")
                 yield Switch(value=self._settings.skip_binary, id="skip-binary")
+            # Added to this row rather than a row of its own, for the reason
+            # recorded above the watch-rules switch: the drawer is capped at
+            # max-height 16 and every new row pushes what follows below the
+            # fold, where it lays out and paints nothing.
+            with Vertical(classes="drawer-toggle"):
+                yield Label("Group rotated")
+                yield Switch(value=self._settings.group_rotated, id="group-rotated")
+            # Discovery, not output: the journal is a source, and this is where
+            # an operator looks for "what counts as a source". Disabled with a
+            # caption where journalctl is unavailable, so the answer to "why is
+            # there no journal here" is on screen rather than in the docs.
+            with Vertical(classes="drawer-toggle"):
+                yield Label("Journal (systemd)")
+                yield Switch(value=self._journald, id="drawer-journald")
             with Vertical(classes="drawer-field"):
                 yield Label("Buffered lines per source")
                 yield Input(
@@ -272,8 +319,15 @@ class AdvancedFiltersDrawer(Static):
                 yield Switch(value=self._settings.invert_match, id="invert-match")
             yield Static("", classes="drawer-field")
 
+        # One line, not a section: the drawer is capped at max-height 16 and a
+        # whole new heading here is what once pushed "Source discovery" below
+        # the fold, where it laid out and painted nothing.
+        yield Static(QUERY_SYNTAX_HINT, id="query-syntax")
+
         yield Static("", id="plugin-status")
         yield Static("", id="export-status")
+        yield Static("", id="watch-status")
+        yield Static("", id="journald-status")
 
         with Container(id="drawer-actions"):
             yield Button("Rescan sources", id="rescan-sources", variant="primary")
@@ -298,8 +352,59 @@ class AdvancedFiltersDrawer(Static):
         except NoMatches:
             pass
 
+    def set_watch_status(self, text: str) -> None:
+        """Show how many watch rules are live. Read-only: `W` manages them."""
+        try:
+            self.query_one("#watch-status", Static).update(text)
+        except NoMatches:
+            pass
+
+    def set_journald(self, enabled: bool, *, available: bool = True, reason: str = "") -> None:
+        """Show whether the journal is on, and disable the switch when it cannot be.
+
+        A switch that silently does nothing is worse than no switch: where
+        `journalctl` is missing this one is disabled and the status line says
+        why, so "there is no journal here" is answered on screen.
+        """
+
+        self._journald = enabled
+        try:
+            switch = self.query_one("#drawer-journald", Switch)
+            with self.prevent(Switch.Changed):
+                switch.value = enabled
+            switch.disabled = not available
+            self.query_one("#journald-status", Static).update(
+                f"Journal: {reason}" if reason else ""
+            )
+        except NoMatches:  # not composed yet
+            pass
+
     def _emit(self, previous: AdvancedSettings) -> None:
         self.post_message(self.SettingsChanged(self._settings, previous))
+
+    def sync_settings(self, settings: AdvancedSettings) -> None:
+        """Adopt a settings snapshot and show it, without emitting.
+
+        For the times something other than this drawer decides a search or
+        discovery option — a saved view being applied, a chip being dismissed.
+        Without it the switches keep displaying the old answer while the filter
+        uses the new one. Suppression is ``prevent`` rather than a flag, for the
+        reason spelled out in :meth:`sync_view_toggles`.
+        """
+
+        self._settings = settings
+        try:
+            with self.prevent(Switch.Changed, Input.Changed):
+                self.query_one("#include-globs", Input).value = settings.include_globs
+                self.query_one("#exclude-globs", Input).value = settings.exclude_globs
+                self.query_one("#follow-symlinks", Switch).value = settings.follow_symlinks
+                self.query_one("#skip-binary", Switch).value = settings.skip_binary
+                self.query_one("#group-rotated", Switch).value = settings.group_rotated
+                self.query_one("#case-sensitive", Switch).value = settings.case_sensitive
+                self.query_one("#use-regex", Switch).value = settings.use_regex
+                self.query_one("#invert-match", Switch).value = settings.invert_match
+        except NoMatches:  # not composed yet
+            pass
 
     def sync_view_toggles(
         self,
@@ -308,6 +413,7 @@ class AdvancedFiltersDrawer(Static):
         structured: bool,
         clipboard: bool | None = None,
         detail_pane: bool | None = None,
+        watch_rules: bool | None = None,
     ) -> None:
         """Mirror the app's view state onto this drawer's switches.
 
@@ -317,9 +423,9 @@ class AdvancedFiltersDrawer(Static):
         a flag cleared at the end of this method is already back to False by
         the time the handler runs.
 
-        ``clipboard`` and ``detail_pane`` are optional because neither switch
-        has a second copy in the query bar: they only need seeding, not
-        continuous mirroring.
+        ``clipboard``, ``detail_pane`` and ``watch_rules`` are optional because
+        none of those switches has a second copy in the query bar: they only
+        need seeding, not continuous mirroring.
         """
 
         self._auto_scroll = auto_scroll
@@ -328,6 +434,8 @@ class AdvancedFiltersDrawer(Static):
             self._clipboard = clipboard
         if detail_pane is not None:
             self._detail_pane = detail_pane
+        if watch_rules is not None:
+            self._watch_rules = watch_rules
         try:
             with self.prevent(Switch.Changed):
                 self.query_one("#drawer-auto-scroll", Switch).value = auto_scroll
@@ -336,6 +444,8 @@ class AdvancedFiltersDrawer(Static):
                     self.query_one("#drawer-clipboard", Switch).value = clipboard
                 if detail_pane is not None:
                     self.query_one("#drawer-detail-pane", Switch).value = detail_pane
+                if watch_rules is not None:
+                    self.query_one("#drawer-watch-rules", Switch).value = watch_rules
         except NoMatches:  # not composed yet
             pass
 
@@ -349,6 +459,12 @@ class AdvancedFiltersDrawer(Static):
             "drawer-structured": "structured",
             "drawer-clipboard": "clipboard",
             "drawer-detail-pane": "detail_pane",
+            "drawer-watch-rules": "watch_rules",
+            # A view toggle in mechanism only: the app owns it, acts on it, and
+            # syncs it back. What it actually does is grant consent to run a
+            # subprocess, which is why it is the app's decision and not this
+            # widget's — see LogViewerApp._set_journald.
+            "drawer-journald": "journald",
         }.get(switch_id)
         if view_field is not None:
             event.stop()
@@ -359,6 +475,7 @@ class AdvancedFiltersDrawer(Static):
         field = {
             "follow-symlinks": "follow_symlinks",
             "skip-binary": "skip_binary",
+            "group-rotated": "group_rotated",
             "case-sensitive": "case_sensitive",
             "use-regex": "use_regex",
             "invert-match": "invert_match",
