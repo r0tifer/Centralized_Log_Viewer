@@ -15,7 +15,7 @@ would mean reworking every feature built on top of them.
 | 1 — Close the dangling loops | 3, 4 | ✅ **Complete** (`48822ed`, `08edb3c`) |
 | 2 — The line cursor and what it unlocks | 5, 6, 7 | ✅ **Complete** (`63354f9`, `1c9fd27`, `20e4ffd`) |
 | 3 — Query and view power | 8, 9, 10 | ✅ **Complete** (`b882cfb`, `3fbbf75`, `bd174af`) |
-| 4 — The source layer | 11, 12, 13 | Not started |
+| 4 — The source layer | 11, 12, 13 | ✅ **Complete** (`24647af`, `eb25ed7`, `ec03023`) |
 | 5 — Analysis | 14, 15 | Not started |
 
 Completed items are kept in full rather than deleted: the "production ready
@@ -81,8 +81,8 @@ counts against the same key budget and appears in the same help overlay.
 | `v` | Open saved views | 9 | hidden | ✅ |
 | `V` | Save current filters as a view | 9 | hidden | ✅ |
 | `W` | Watch rules manager | 10 | hidden | ✅ |
-| `x` | Toggle source into the merged set | 13 | hidden | |
-| `u` | Open the merged (unified) view | 13 | hidden | |
+| `x` | Toggle source into the merged set | 13 | hidden | ✅ |
+| `u` | Open the merged (unified) view | 13 | hidden | ✅ |
 | `b` | Toggle the severity timeline | 14 | hidden | |
 | `c` | Toggle repeat clustering | 15 | hidden | |
 
@@ -718,9 +718,9 @@ event*:
 
 ---
 
-# Phase 4 — The source layer
+# Phase 4 — The source layer ✅
 
-## 11. Compressed and rotated-set sources
+## 11. Compressed and rotated-set sources ✅
 
 **Goal.** `/var/log` is mostly `syslog.1` and `syslog.2.gz`, and
 `.gz`/`.bz2`/`.xz`/`.zst` are all in
@@ -823,7 +823,7 @@ where the failure is reported.
 
 ---
 
-## 12. Wire `LogSourceProvider` and ship a journald plugin
+## 12. Wire `LogSourceProvider` and ship a journald plugin ✅
 
 **Goal.** Event Viewer's entire premise is reading *the OS event log*. On Linux
 that is the systemd journal — and CLV excludes it (`*.journal` is in
@@ -954,7 +954,7 @@ poll — that would be a fork bomb with a nice name — and there is a test for 
 
 ---
 
-## 13. Merged multi-source view
+## 13. Merged multi-source view ✅
 
 **Goal.** The app tracks a single `_selected_source` and a single entry buffer,
 so "centralized" currently means centralized *discovery* — you still read one

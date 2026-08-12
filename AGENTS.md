@@ -305,7 +305,7 @@ installed" — the trade Item 12 asked for.
 - Layout regressions are caught by asserting widget `region` bounds at a given
   terminal size rather than by eyeballing screenshots.
 
-Run: `python -m pytest` (508 tests).
+Run: `python -m pytest` (620 tests).
 
 ---
 
