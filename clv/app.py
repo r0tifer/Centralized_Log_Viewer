@@ -44,7 +44,7 @@ from .plugins import Exporter, FilterContext, PluginError, PluginRegistry, load_
 from .services import SourceManager, persist_log_sources
 from .services.clipboard import prepare_payload
 from .services.config import LogConfig, get_config_file, load_config, user_config_path
-from .services.discovery import DiscoveryReport, discover
+from .services.discovery import DiscoveredFile, DiscoveryReport, discover
 from .services.export import (
     BUILTIN_FORMATS,
     builtin_format,
@@ -77,6 +77,7 @@ from .services.query import (
     collect_field_names,
     entry_matches,
 )
+from .services.rotation import RotatedSet, describe_set, group_rotated
 from .services.session import SourceSession
 from .services.watch import (
     WatchIndex,
@@ -147,6 +148,9 @@ STARRED_GROUP = f"{ICON_STAR} Starred"
 #: cost a walk down the hierarchy on every launch.
 ICON_VIEW = "📑"
 VIEWS_GROUP = f"{ICON_VIEW} Views"
+#: A rotated set: several files, one log. Distinct from the folder icon
+#: because expanding it lists members rather than a directory's contents.
+ICON_ROTATED = "🗂"
 
 #: Help categories, in the order the overlay lists them. A category with no
 #: bindings is skipped, so a group can be declared before the item that fills
@@ -624,6 +628,7 @@ class LogViewerApp(App[None]):
             exclude_globs=self.state.exclude_globs,
             follow_symlinks=self.state.follow_symlinks,
             skip_binary=self.state.skip_binary,
+            group_rotated=self.state.group_rotated,
             max_buffer_lines=self._config.max_buffer_lines,
             case_sensitive=self.state.case_sensitive,
             use_regex=self.state.use_regex,
@@ -768,22 +773,64 @@ class LogViewerApp(App[None]):
             # tree of any size; the operator opens the branch they want.
             # _highlight_source still expands ancestors on demand.
             root_node = tree.root.add(f"{ICON_FOLDER} {root}", data=root, expand=False)
-            folders: dict[Path, TreeNode[Path]] = {root: root_node}
-            for item in items:
+            folders: dict[Path, TreeNode[object]] = {root: root_node}
+            for folder, entries in self._by_folder(items).items():
                 parent = root_node
                 current = root
-                for part in item.relative.parts[:-1]:
+                for part in folder.parts:
                     current = current / part
                     if current not in folders:
                         folders[current] = parent.add(
                             f"{ICON_FOLDER} {part}", data=current, expand=False
                         )
                     parent = folders[current]
-                parent.add_leaf(
-                    self._leaf_label(item.path, item.path.name), data=item.path
-                )
+                self._add_files(parent, entries)
 
         tree.focus()
+
+    @staticmethod
+    def _by_folder(items: Sequence[DiscoveredFile]) -> dict[Path, list[Path]]:
+        """Group one root's files by their folder, relative to that root.
+
+        Insertion order is the report's order, which is already sorted by
+        path — so the tree is built in the same sequence as before.
+        """
+
+        folders: dict[Path, list[Path]] = {}
+        for item in items:
+            relative = item.relative.parent
+            folders.setdefault(Path() if relative == Path(".") else relative, []).append(
+                item.path
+            )
+        return folders
+
+    def _add_files(self, parent: TreeNode[object], paths: Sequence[Path]) -> None:
+        """Add one folder's files, folding rotated members into single nodes.
+
+        Grouping happens per folder rather than per root: ``app.log.1`` is a
+        rotation of the ``app.log`` beside it, never of one two directories
+        away that happens to share a name.
+        """
+
+        if not self.advanced_drawer.settings.group_rotated:
+            for path in paths:
+                parent.add_leaf(self._leaf_label(path, path.name), data=path)
+            return
+
+        sets, singles = group_rotated(paths)
+        for rotated in sets:
+            # A branch, not a leaf: the set is the source, and its members stay
+            # individually openable underneath it. Collapsed, because the whole
+            # point of the node is not having to look at the members.
+            node = parent.add(
+                f"{ICON_ROTATED} {rotated.name} ({len(rotated)} files)",
+                data=rotated,
+                expand=False,
+            )
+            for member in rotated.members:
+                node.add_leaf(self._leaf_label(member.path, member.name), data=member.path)
+        for path in singles:
+            parent.add_leaf(self._leaf_label(path, path.name), data=path)
 
     def _starred_paths(self) -> set[Path]:
         return {_resolve(Path(entry)) for entry in self.state.starred}
@@ -851,6 +898,32 @@ class LogViewerApp(App[None]):
             return False
 
         self._show_lines = min(self._config.default_show_lines, self._config.max_buffer_lines)
+        self._after_source_change()
+        return True
+
+    def _select_rotated_set(self, rotated_set: RotatedSet) -> bool:
+        """Open a whole rotated log as one source.
+
+        The one path in CLV that is not instant: older members have to be
+        decompressed from the front, so this says what it read rather than
+        going quiet for a second and hoping nobody notices.
+        """
+
+        self._stop_tail()
+        try:
+            buffer = self._session.open_rotated(rotated_set)
+        except OSError as exc:
+            self._notify(f"Failed to read {rotated_set.name}: {exc}", "error")
+            return False
+
+        self._show_lines = min(self._config.default_show_lines, self._config.max_buffer_lines)
+        self._after_source_change()
+        reader = buffer.reader
+        self._notify(describe_set(rotated_set, getattr(reader, "members_read", 0)))
+        return True
+
+    def _after_source_change(self) -> None:
+        """Everything that has to be rebuilt when the buffer becomes new."""
 
         self._sync_field_names()
         self._sync_regex_validation()
@@ -863,7 +936,6 @@ class LogViewerApp(App[None]):
         self._update_status()
         self._sync_compact_pane()
         self._sync_star_button()
-        return True
 
     def _start_tail(self) -> None:
         """Tail regardless of auto-scroll.
@@ -1225,6 +1297,11 @@ class LogViewerApp(App[None]):
             follow = "paused"
 
         parts = [str(self._selected_source), detail]
+        member = self._cursor_member()
+        if member is not None:
+            # One source made of several files: which one the cursor is in is
+            # not deducible from anything else on screen.
+            parts.append(f"in {member}")
         marks = self._marks.count_for(self._selected_source)
         if marks:
             parts.append(f"{marks} marked")
@@ -1233,6 +1310,21 @@ class LogViewerApp(App[None]):
             parts.append(f"{label} {position} of {total}")
         parts.append(follow)
         status.update(" · ".join(parts))
+
+    def _cursor_member(self) -> Optional[str]:
+        """The name of the file the cursor line came from, when that varies.
+
+        Empty for an ordinary source: the status line already names it, and
+        repeating it beside itself would be noise.
+        """
+
+        entry = self.log_panel.cursor_entry
+        if entry is None:
+            return None
+        origin = self._origin(entry)
+        if origin is None or origin == self._selected_source:
+            return None
+        return origin.name
 
     def _refresh_chips(self) -> None:
         if self._is_shutting_down or not self.chip_bar.is_attached:
@@ -2297,6 +2389,8 @@ class LogViewerApp(App[None]):
         data = event.node.data
         if isinstance(data, Path) and data.is_file():
             self._select_source(data)
+        elif isinstance(data, RotatedSet):
+            self._select_rotated_set(data)
         elif isinstance(data, SavedView):
             self._apply_view(data)
             self._notify(f"Applied view '{data.name}'.")
@@ -2351,6 +2445,7 @@ class LogViewerApp(App[None]):
             exclude_globs=settings.exclude_globs,
             follow_symlinks=settings.follow_symlinks,
             skip_binary=settings.skip_binary,
+            group_rotated=settings.group_rotated,
             case_sensitive=settings.case_sensitive,
             use_regex=settings.use_regex,
             invert_match=settings.invert_match,

@@ -49,12 +49,22 @@ file. Tailing reads only appended bytes and renders only new lines. Memory is
 capped by `max_buffer_lines` regardless of on-disk size. Discovery runs off the
 UI thread and is capped by `max_files`.
 
-**Container documents are the one exception**, and they invert two of these
-rules on purpose. A deflated archive has no cheap tail, so `DocumentReader`
+**Two exceptions exist, both because deflate has no cheap tail**, and both
+state so in their own module docstring rather than leaving it to be discovered:
+
+*Container documents* invert two of these rules on purpose. `DocumentReader`
 extracts the document whole, bounded by a **line** budget rather than a byte
 one, and re-extracts on change instead of tailing. It also keeps the **first**
 lines rather than the last: a spreadsheet's header row names its columns, and
 a document has no "newest" end the way a log does.
+
+*Compressed members* (`compressed.py`) are read forward under a line budget and
+a **decompressed-byte cap**. Memory stays bounded by the budget; work is
+proportional to the member, which is the part that cannot be fixed and must
+therefore be said out loud. They keep the **last** lines, unlike a document —
+this is a log, and its newest content is at the end. A rotated set spends one
+shared budget newest-member-first, so older members are often never opened at
+all, and only the live member is ever polled.
 
 ### 4) Nothing off-screen, ever
 Layout must scale cleanly from 80 columns up. Every control stays on screen and
@@ -116,6 +126,14 @@ distros.
   between `SourceReader` (streams) and `DocumentReader` (container documents);
   both expose `path` / `prime()` / `poll()` and a `RELOAD_NOTICE` template.
 - `documents.py` — stdlib-only text extraction for container formats.
+- `compressed.py` — `gzip`/`bz2`/`lzma` members, bounded by a line budget and a
+  decompressed-byte cap. The second stated exception to Requirement 3.
+- `rotation.py` — what makes `app.log`, `app.log.1` and `app.log.2.gz` one
+  source. Grouping is by name after the compression suffix is stripped; reading
+  spends one shared budget newest-first, so a set whose head fills the buffer
+  opens as fast as a single file. Lines come back carrying which member they
+  came from, because with several files behind one source "where is this line
+  from" stops having a constant answer.
 - `session.py` — who owns the readers and the lines they produced. A
   `SourceBuffer` is one reader plus its parser and its bounded deque; a
   `SourceSession` is the ordered set of buffers the pane is showing. **A single

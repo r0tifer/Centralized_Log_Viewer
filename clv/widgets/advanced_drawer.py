@@ -38,6 +38,7 @@ class AdvancedSettings:
     case_sensitive: bool = False
     use_regex: bool = True
     invert_match: bool = False
+    group_rotated: bool = True
 
     def to_discovery(self, base: DiscoverySettings) -> DiscoverySettings:
         """Fold the discovery-related fields into a DiscoverySettings."""
@@ -47,6 +48,7 @@ class AdvancedSettings:
             exclude_globs=_split(self.exclude_globs) or base.exclude_globs,
             follow_symlinks=self.follow_symlinks,
             skip_binary=self.skip_binary,
+            group_rotated=self.group_rotated,
         )
 
     def affects_discovery(self, other: "AdvancedSettings") -> bool:
@@ -56,6 +58,11 @@ class AdvancedSettings:
             or self.exclude_globs != other.exclude_globs
             or self.follow_symlinks != other.follow_symlinks
             or self.skip_binary != other.skip_binary
+            # Grouping only changes how the tree is built, not what the walk
+            # finds — but the tree is built from a report, so it is rebuilt the
+            # same way as any other discovery change rather than by a second
+            # path that exists only for this.
+            or self.group_rotated != other.group_rotated
         )
 
 
@@ -275,6 +282,13 @@ class AdvancedFiltersDrawer(Static):
             with Vertical(classes="drawer-toggle"):
                 yield Label("Skip binary")
                 yield Switch(value=self._settings.skip_binary, id="skip-binary")
+            # Added to this row rather than a row of its own, for the reason
+            # recorded above the watch-rules switch: the drawer is capped at
+            # max-height 16 and every new row pushes what follows below the
+            # fold, where it lays out and paints nothing.
+            with Vertical(classes="drawer-toggle"):
+                yield Label("Group rotated")
+                yield Switch(value=self._settings.group_rotated, id="group-rotated")
             with Vertical(classes="drawer-field"):
                 yield Label("Buffered lines per source")
                 yield Input(
@@ -355,6 +369,7 @@ class AdvancedFiltersDrawer(Static):
                 self.query_one("#exclude-globs", Input).value = settings.exclude_globs
                 self.query_one("#follow-symlinks", Switch).value = settings.follow_symlinks
                 self.query_one("#skip-binary", Switch).value = settings.skip_binary
+                self.query_one("#group-rotated", Switch).value = settings.group_rotated
                 self.query_one("#case-sensitive", Switch).value = settings.case_sensitive
                 self.query_one("#use-regex", Switch).value = settings.use_regex
                 self.query_one("#invert-match", Switch).value = settings.invert_match
@@ -425,6 +440,7 @@ class AdvancedFiltersDrawer(Static):
         field = {
             "follow-symlinks": "follow_symlinks",
             "skip-binary": "skip_binary",
+            "group-rotated": "group_rotated",
             "case-sensitive": "case_sensitive",
             "use-regex": "use_regex",
             "invert-match": "invert_match",

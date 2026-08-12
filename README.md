@@ -26,12 +26,17 @@ desktop terminal and on a headless 80-column SSH session.
   payload.
 - 🪶 **Bounded memory, whatever the file size.** Opening a source seeks
   backwards from the end of the file; a 160 MB log opens in ~2 ms using under a
-  megabyte. Tailing reads only what was appended.
+  megabyte. Tailing reads only what was appended. Compressed members are the
+  honest exception — see [Compressed and rotated logs](#compressed-and-rotated-logs).
 - 🧭 **Any file, not just `*.log`.** Name folders or files; every readable text
   file counts — including UTF-16 exports from Windows and PowerShell, and
   `.ods` spreadsheets, which are unpacked into tab-separated rows. Binary
   files are detected by content and skipped, and include/exclude globs are
   yours to set.
+- 🗂 **Compressed and rotated logs.** `.gz`, `.bz2` and `.xz` are read directly,
+  and `app.log` + `app.log.1` + `app.log.2.gz` are presented as **one source**
+  spanning all three, oldest lines first. Only the live member is tailed; the
+  rotated-out ones are read once, and only as far back as your buffer needs.
 - 📐 **Responsive layout.** Breakpoints at 90 and 130 columns reflow the
   controls; every control stays on screen and keyboard-reachable down to 80
   columns.
@@ -123,8 +128,9 @@ use.
 | `include_globs` | Only list files matching these globs. Empty means every text file. | *(empty)* |
 | `exclude_globs` | Never list files matching these globs. | archives, binary journals, PDFs |
 | `follow_symlinks` | Follow symlinked directories (cycles are detected). | `false` |
-| `skip_binary` | Skip files whose first block decodes to NUL characters. UTF-16 text and extractable documents (`.ods`) are exempt. | `true` |
+| `skip_binary` | Skip files whose first block decodes to NUL characters. UTF-16 text, extractable documents (`.ods`) and compressed members are exempt. | `true` |
 | `max_files` | Stop discovery after this many files. | `5000` |
+| `group_rotated` | Present a rotated log's members as one source. Overridden by the drawer's **Group rotated** switch once you touch it. | `true` |
 | `max_buffer_lines` | Lines held in memory per source. | `5000` |
 | `default_show_lines` / `min_show_lines` / `show_step` | Visible-line window and its `+`/`-` step. | `500 / 10 / 50` |
 | `refresh_hz` | Poll frequency for new content. | `2` |
@@ -157,6 +163,55 @@ fall out of date. Dismiss it with `?`, `Esc` or `q`.
 One wrinkle worth knowing: while the cursor is in the query input, `?` types a
 literal question mark, because it is a valid regex character. Press `Esc` first
 if the input has focus. Tailing continues while the overlay is open.
+
+### Compressed and rotated logs
+
+`.gz`, `.bz2` and `.xz` files are read directly — no `zcat`, no unpacking to a
+temp file, and nothing written anywhere. `.zst` is still excluded, because
+there is no decompressor for it in the Python standard library and adding one
+would be CLV's first new runtime dependency.
+
+More usefully, the members of a rotated log are presented as **one source**:
+
+```
+📂 /var/log
+   🗂 syslog (4 files)
+      📄 syslog
+      📄 syslog.1
+      📄 syslog.2.gz
+      📄 syslog.3.gz
+   📄 auth.log
+```
+
+Selecting the `syslog` set reads all four in order, oldest lines first, into one
+pane — so a query, a time window or a `g` jump crosses a rotation boundary
+without you opening anything else. The status line names the member the cursor
+is currently in. Every member is still listed underneath and can still be opened
+on its own.
+
+Recognised names, after any compression suffix: `app.log.1`, `app.log-20260811`,
+`app.log.2026-08-11`. A gap in the numbering is fine. Turn grouping off with
+`group_rotated` in `settings.conf` or the **Group rotated** switch in the
+Advanced drawer.
+
+**On bounded memory.** CLV's usual promise is that nothing reads a whole file:
+opening a source seeks backwards from the end. A deflate stream has no cheap
+backwards seek, so a compressed member is the exception, and it is worth being
+precise about what is and is not bounded:
+
+- **Memory is bounded**, by `max_buffer_lines`. Lines stream through a
+  fixed-size buffer, so a 400 MB decompressed member costs no more than a small
+  one.
+- **Work is proportional to the member**, not to what you see. Reading the last
+  500 lines of a `.gz` means decompressing it to get there. A second cap on
+  decompressed bytes stops a decompression bomb, degrading to "here is what was
+  read" rather than exhausting the machine.
+- **The budget is shared across the set and spent newest-first.** Members are
+  read back from the live one until `max_buffer_lines` is met, then no further.
+  A set whose newest member already fills the buffer opens as fast as a single
+  file, and CLV says how many members it actually read.
+- **Only the live member tails.** Nothing appends to `syslog.2.gz`, so it is
+  read once and never polled again.
 
 ### Inspecting an event
 

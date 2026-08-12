@@ -22,16 +22,46 @@ rules.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Optional
+from typing import Callable, Iterable, Iterator, Optional, Sequence
 
 from .parsing import LogEntry, LogParser
-from .reader import AnyReader, open_reader
+from .reader import AnyReader, TailRead, open_reader
 
 #: Builds the reader for a path. Injectable so a provider-backed source (a
 #: journal unit, say) can supply its own without this module learning about it.
 ReaderFactory = Callable[..., AnyReader]
+
+#: Field name carrying which file a line came from, set on entries whose
+#: source is not simply "the open log" — a member of a rotated set, or a
+#: member of a merged view.
+#:
+#: Deliberately **not** in ``query.NORMALISED_FIELD_KEYS``: a key is a query
+#: term only when it is known, and the buffer's own field names are part of
+#: that vocabulary. So `source:app.log.1` filters exactly when entries carry an
+#: origin, and stays plain text everywhere else — which is what keeps every
+#: query anyone had saved meaning what it did.
+ORIGIN_FIELD = "source"
+
+
+def tag_origins(
+    entries: Sequence[LogEntry], origins: Sequence[Path]
+) -> list[LogEntry]:
+    """Record on each entry which file it came from.
+
+    Provenance rather than parsed structure, which is why this happens here and
+    not in the parser: a continuation line has no host of its own to report,
+    but it certainly came from a file, so unlike the parser's fields this is
+    honest to carry forward onto one.
+    """
+
+    tagged: list[LogEntry] = []
+    for entry, origin in zip(entries, origins):
+        tagged.append(
+            replace(entry, fields={**entry.fields, ORIGIN_FIELD: str(origin)})
+        )
+    return tagged
 
 
 @dataclass(slots=True)
@@ -94,7 +124,19 @@ class SourceBuffer:
         result = self.reader.prime()
         self.parser.reset()
         self.entries.clear()
-        self.entries.extend(self.parser.feed(result.lines))
+        self.entries.extend(self._feed(result))
+
+    def _feed(self, result: TailRead) -> list[LogEntry]:
+        """Parse a read's lines, recording where each one came from.
+
+        ``LogParser.feed`` is one entry per line, which is what lets the
+        reader's parallel ``origins`` line up with the entries produced.
+        """
+
+        entries = self.parser.feed(result.lines)
+        if result.origins:
+            return tag_origins(entries, result.origins)
+        return entries
 
     def poll(self) -> PollOutcome:
         """Read whatever arrived since the last poll."""
@@ -114,14 +156,14 @@ class SourceBuffer:
             # starts over rather than carrying state across the boundary.
             self.parser.reset()
             self.entries.clear()
-            entries = self.parser.feed(result.lines)
+            entries = self._feed(result)
             self.entries.extend(entries)
             return PollOutcome(self, entries, rotated=True)
 
         if not result.lines:
             return PollOutcome(self)
 
-        entries = self.parser.feed(result.lines)
+        entries = self._feed(result)
         overflowed = len(self.entries) + len(entries) > (self.entries.maxlen or 0)
         self.entries.extend(entries)
         return PollOutcome(self, entries, overflowed=overflowed)
@@ -219,6 +261,24 @@ class SourceSession:
         self._buffers = [buffer]
         return buffer
 
+    def open_rotated(self, rotated_set) -> SourceBuffer:
+        """Replace the set with one buffer spanning a whole rotated log.
+
+        Same contract as :meth:`open_single` — several files, still one source,
+        and the lines come back tagged with the member each one is from.
+        Imported where it is used because rotation builds on this module's
+        readers rather than the other way round.
+        """
+
+        from .rotation import RotatedSetReader
+
+        reader = RotatedSetReader(rotated_set, max_lines=self._max_lines)
+        buffer = SourceBuffer(reader.path, max_lines=self._max_lines, reader=reader)
+        buffer.prime()
+        self.close()
+        self._buffers = [buffer]
+        return buffer
+
     def close(self) -> None:
         """Drop every buffer, releasing whatever their readers hold."""
 
@@ -274,11 +334,17 @@ class SourceSession:
         """Which source *entry* came from.
 
         Marks and watch rules key on this rather than on "the open log", so two
-        identical lines from two different logs stay two different lines. With
-        one member the answer is that member, which is why this costs nothing
-        until there is more than one.
+        identical lines from two different logs stay two different lines.
+
+        An entry that was tagged at read time answers for itself — that is the
+        rotated-set case, where one source is several files. Otherwise the
+        answer is the one open source, which is why this costs nothing at all
+        in the ordinary case.
         """
 
+        tagged = entry.fields.get(ORIGIN_FIELD)
+        if tagged:
+            return Path(tagged)
         if len(self._buffers) == 1:
             return self._buffers[0].path
         return None

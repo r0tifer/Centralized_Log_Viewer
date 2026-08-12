@@ -780,6 +780,47 @@ and rotated sets; new `settings.conf` row for `group_rotated`; a paragraph
 under "Bounded memory" honestly stating that compressed members are the
 exception and why.
 
+**As shipped.** Four things this item did not spell out:
+
+- **The exception this item asks for is a *byte* cap, not a line budget.** The
+  item says compressed members are "read forward under a *line* budget,
+  exactly as `DocumentReader` already does". A line budget bounds *memory*, and
+  for a document that is the whole story because extraction stops as soon as
+  the budget is met. It cannot do the same job here, because these keep the
+  **last** lines rather than the first — a log's newest content is at the end,
+  which is the one place a document has nothing worth keeping. Reaching the end
+  of a deflate stream means decompressing all of it, so work stays proportional
+  to the member no matter what the budget says. The decompressed-byte cap is
+  what actually bounds the work, and `compressed.py`'s docstring and the README
+  both state the split rather than implying the line budget covers both.
+- **A corrupt archive changed what an existing skip *means*.** `*.gz` leaving
+  `DEFAULT_EXCLUDE_GLOBS` moved a damaged archive from "unsupported file type"
+  to "unreadable", because CLV now supports the format and it is this file that
+  is broken. That is the more actionable of the two answers and the reason
+  those counters are separate at all, but it did edit an existing test — the
+  only one in this phase that needed it. Discovery asks `compressed.probe()`
+  instead of the NUL-byte sniff, which would reject every compressed file for
+  looking like the compressed bytes it is.
+- **Lines carry their origin, and that is what the status line reads.** "The
+  status line names which member the cursor is in" needs a per-*entry* answer,
+  and the buffer is a bounded deque, so nothing positional survives eviction.
+  `TailRead` gained an optional `origins` tuple parallel to `lines`, and
+  `SourceBuffer` tags entries with `fields["source"]` when a reader supplies
+  one. Deliberately not added to `NORMALISED_FIELD_KEYS`: a key is a query term
+  only when it is known, and the buffer's own field names already count, so
+  `source:app.log.1` filters exactly when entries carry an origin and stays
+  plain text everywhere else. This is the same mechanism Item 13 needs for its
+  source column, built once.
+- **Grouping is per folder, not per root.** `app.log.1` is a rotation of the
+  `app.log` beside it, never of one two directories away that happens to share
+  a name.
+
+Two smaller notes: a set with no live head (`app.log.1` + `app.log.2.gz`, the
+head already deleted) still groups, and its newest member is what gets tailed —
+harmless, since nothing will append to it. And a damaged member costs only
+itself: the rest of the set still reads, and opening that member directly is
+where the failure is reported.
+
 ---
 
 ## 12. Wire `LogSourceProvider` and ship a journald plugin

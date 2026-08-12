@@ -123,6 +123,10 @@ class SessionState:
     exclude_globs: str = ""
     follow_symlinks: bool = False
     skip_binary: bool = True
+    #: Present a rotated log's members as one source. Persisted beside the
+    #: other discovery switches, and like them it takes precedence over
+    #: `settings.conf` once the operator has touched it.
+    group_rotated: bool = True
     case_sensitive: bool = False
     use_regex: bool = True
     invert_match: bool = False
@@ -160,6 +164,7 @@ class SessionState:
         "exclude_globs",
         "follow_symlinks",
         "skip_binary",
+        "group_rotated",
         "case_sensitive",
         "use_regex",
         "invert_match",

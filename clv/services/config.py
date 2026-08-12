@@ -67,6 +67,10 @@ skip_binary = true
 # Stop discovery after this many files.
 max_files = {DEFAULT_MAX_FILES}
 
+# Present app.log, app.log.1 and app.log.2.gz as one source spanning all three.
+# Every member is still listed underneath it and still openable on its own.
+group_rotated = true
+
 # Lines held in memory per source. Older lines are dropped.
 max_buffer_lines = 5000
 
@@ -306,6 +310,7 @@ def load_config(path: Optional[Path] = None) -> LogConfig:
         follow_symlinks=_read_bool(section, "follow_symlinks", False),
         skip_binary=_read_bool(section, "skip_binary", True),
         max_files=_read_int(section, "max_files"),
+        group_rotated=_read_bool(section, "group_rotated", True),
     )
 
     config = LogConfig(
