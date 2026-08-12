@@ -219,6 +219,18 @@ Some specifics worth knowing:
 - A member that disappears from disk is reported and the rest keep going.
 - The set persists in `session.json` and can be captured in a saved view.
 
+**Naming a set.** A merged set is not limited to one: with the set open, `V`
+saves it as a named view, and `v` (or the **Views** group at the top of the
+tree) switches between them. So `web tier` and `db tier` can be two different
+groups of logs, each one keystroke away, and applying one moves the merged
+group in the tree to match.
+
+The set has to be **open** when you save — press `u` first. A view saved while
+a single log is on screen deliberately records no set, so a view about one file
+never drags someone else's merged group around with it. Note also that a view
+is a filter bundle first: it captures your query, severity and time window
+alongside the set, so save it with the filters you want to come back to.
+
 **Merging is local only.** Remote collection and multi-node aggregation are a
 documented non-goal and are not coming: CLV reads what the machine it runs on
 can read. If you want several machines in one pane, ship their logs to one host

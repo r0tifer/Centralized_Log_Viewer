@@ -1020,16 +1020,16 @@ class LogViewerApp(App[None]):
         current = list(self.state.merged)
         if str(resolved) in current:
             current.remove(str(resolved))
-            member, action = False, "Removed from"
+            action = "Removed from"
         else:
             current.append(str(resolved))
-            member, action = True, "Added to"
+            action = "Added to"
         self._update_state(merged=tuple(sorted(current)))
         # Edited in place rather than rebuilt. Membership says nothing about
         # what is on disk, so a rescan would be a filesystem walk per keystroke
         # — and rebuilding the tree collapses every folder the operator had
         # opened, which is a heavy price for adding one indicator.
-        self._sync_merge_membership(resolved, member)
+        self._sync_merged_tree()
         self._notify(
             f"{action} the merged set ({len(current)} source(s)). Press u to open it."
         )
@@ -1087,14 +1087,19 @@ class LogViewerApp(App[None]):
             key=lambda path: (path.name.lower(), str(path).lower()),
         )
 
-    def _sync_merge_membership(self, path: Path, member: bool) -> None:
-        """Reflect one membership change in the tree, touching nothing else.
+    def _sync_merged_tree(self) -> None:
+        """Make the tree's merged group and indicators match the current set.
 
-        The alternative is rebuilding, which is what starring does — and which
-        collapses every folder the operator had expanded, because `_build_tree`
-        creates them shut. Membership changes one indicator and one group row,
-        so that is all this touches, and expansion state is left alone by
-        construction rather than restored afterwards.
+        Reconciles from state rather than applying a delta, so every way the
+        set can change goes through one path: `x` on a source, and applying a
+        saved view that carries a set of its own. A delta cannot express the
+        second — a view replaces the whole set at once — and having two ways
+        to update the same rows is how one of them ends up stale.
+
+        In place, never a rebuild: `_build_tree` creates folders shut, so
+        rebuilding would collapse everything the operator had expanded. The
+        group node itself is kept and only its children are swapped, so a
+        collapsed group stays collapsed.
         """
 
         try:
@@ -1102,46 +1107,39 @@ class LogViewerApp(App[None]):
         except NoMatches:
             return
 
+        merged = self._merged_paths
         group = self._merged_group(tree)
 
-        if member:
+        if merged:
             if group is None:
-                # Mid-session, so it has to be placed rather than appended:
-                # below the other groups and above the configured roots.
+                # Appearing mid-session, so it has to be placed rather than
+                # appended: below the other groups, above the configured roots.
                 group = tree.root.add(
                     self._merged_label(),
                     data=MERGED_VIEW,
                     expand=True,
                     before=self._group_count(tree),
                 )
-            ordered = self._merged_display_paths()
-            position = ordered.index(next(p for p in ordered if _resolve(p) == path))
-            group.add_leaf(
-                f"{ICON_MERGED} {_compact_path(path)}", data=path, before=position
-            )
-        elif group is not None:
-            for node in list(group.children):
-                if isinstance(node.data, Path) and _resolve(node.data) == path:
-                    node.remove()
-            if not group.children:
-                # An empty group is a row that explains nothing.
-                group.remove()
-                group = None
-
-        if group is not None:
+            else:
+                group.remove_children()
             # The count is part of what makes the row read as a control.
             group.set_label(self._merged_label())
+            for path in self._merged_display_paths():
+                group.add_leaf(f"{ICON_MERGED} {_compact_path(path)}", data=path)
+        elif group is not None:
+            # An empty group is a row that explains nothing.
+            group.remove()
+            group = None
 
-        # Every other node carrying this path — the file in its folder, and its
-        # copy in the starred group — gains or loses the indicator.
+        # Every other node carrying a path — the file in its folder, and any
+        # copy of it in the starred group — gains or loses the indicator.
         for node in _walk_nodes(tree.root):
             if node.parent is group or not isinstance(node.data, Path):
-                continue
-            if _resolve(node.data) != path:
                 continue
             plain = node.label.plain
             if plain.startswith(ICON_MERGED):
                 plain = plain[len(ICON_MERGED) :]
+            member = _resolve(node.data) in merged
             node.set_label(f"{ICON_MERGED}{plain}" if member else plain)
 
     @staticmethod
@@ -2171,6 +2169,9 @@ class LogViewerApp(App[None]):
             # A merged view reopens the whole set: its filters were written
             # against all of it, and half the set is a different question.
             self._update_state(merged=tuple(view.merged))
+            # The tree has to follow, or the group keeps listing the set that
+            # was open before this one — the same rows, quietly wrong.
+            self._sync_merged_tree()
             self.action_open_merged()
             opened = True
         elif view.source:

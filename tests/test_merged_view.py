@@ -1044,3 +1044,63 @@ def test_the_merged_set_is_reachable_after_a_restart(tmp_path: Path) -> None:
 
     asyncio.run(first_run())
     asyncio.run(second_run())
+
+
+def test_applying_a_view_moves_the_merged_group_to_its_set(tmp_path: Path) -> None:
+    """Two named sets, switched between — the tree must follow the open one.
+
+    A delta cannot express this: a view replaces the whole set at once, so the
+    tree is reconciled from state rather than patched per source.
+    """
+
+    root = tmp_path / "logs"
+    root.mkdir()
+    web = [_write(root / f"web{i}.log", [f"2026-08-12 10:00:0{i} - INFO - w{i}"]) for i in (1, 2)]
+    db = [_write(root / f"db{i}.log", [f"2026-08-12 10:00:0{i} - INFO - d{i}"]) for i in (1, 2)]
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            app._source_manager = SourceManager([root], [])
+            await app._rescan()
+            await pilot.pause()
+
+            from clv.app import LogTree
+
+            tree = app.query_one("#source-tree", LogTree)
+
+            def listed() -> list[str]:
+                group = _merged_row(tree)
+                return [Path(str(c.data)).name for c in group.children] if group else []
+
+            def marked() -> set[str]:
+                return {
+                    Path(str(node.data)).name
+                    for node in _walk(tree.root)
+                    if isinstance(node.data, Path)
+                    and node.parent is not _merged_row(tree)
+                    and str(node.label).startswith("⧉")
+                }
+
+            views = []
+            for members, name in ((web, "web tier"), (db, "db tier")):
+                app._update_state(merged=tuple(str(m) for m in members))
+                app._sync_merged_tree()
+                app.action_open_merged()
+                await pilot.pause()
+                views.append(app._capture_view(name))
+
+            assert [view.name for view in views] == ["web tier", "db tier"]
+            assert all(len(view.merged) == 2 for view in views)
+
+            for view, expected in ((views[0], "web"), (views[1], "db"), (views[0], "web")):
+                app._apply_view(view)
+                await pilot.pause()
+
+                names = {f"{expected}1.log", f"{expected}2.log"}
+                assert app._session.is_merged is True
+                assert set(listed()) == names, f"group lists {listed()} for '{view.name}'"
+                assert marked() == names, f"indicators say {marked()} for '{view.name}'"
+                assert str(_merged_row(tree).label) == "⧉ Merged (2 sources)"
+
+    asyncio.run(scenario())
