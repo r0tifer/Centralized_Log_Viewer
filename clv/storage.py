@@ -45,6 +45,10 @@ class SavedView:
     #: Absolute path of the log this view was saved against. Empty means the
     #: view is about filters alone and applying it leaves the source as it is.
     source: str = ""
+    #: The merged set, when the view was saved on one. Paths only, like every
+    #: other field here — a view records what you were looking at, never what
+    #: was in it.
+    merged: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, raw: Any) -> Optional["SavedView"]:
@@ -70,6 +74,12 @@ class SavedView:
                 continue
             if expected == "str" and not isinstance(value, str):
                 continue
+            if expected == "tuple[str, ...]":
+                # Same rule as SessionState's: one bad element must not cost
+                # the whole list, and JSON has no tuples.
+                if not isinstance(value, (list, tuple)):
+                    continue
+                value = tuple(item for item in value if isinstance(item, str))
             values[key] = value
         return cls(**values)
 
@@ -93,7 +103,9 @@ class SavedView:
             parts.append("case-sensitive")
         if self.include_globs:
             parts.append(f"include {self.include_globs}")
-        if self.source:
+        if self.merged:
+            parts.append(f"{len(self.merged)} merged sources")
+        elif self.source:
             parts.append(Path(self.source).name)
         return " · ".join(parts) if parts else "no filters"
 
@@ -138,6 +150,9 @@ class SessionState:
     #: Named filter bundles, sorted by name. Same argument as `starred`: an
     #: explicit choice, and settings only — see :class:`SavedView`.
     views: tuple[SavedView, ...] = ()
+    #: Absolute paths in the merged set. Chosen one `x` at a time, so keeping
+    #: them is recording a decision rather than a trace of what was read.
+    merged: tuple[str, ...] = ()
     #: Watch rules. A pattern is something the operator typed, like a query, so
     #: keeping it is recording their setup and not their reading — which is
     #: exactly the line marks fall on the other side of.
@@ -171,6 +186,7 @@ class SessionState:
         "tree_width",
         "starred",
         "views",
+        "merged",
         "watch_rules",
     )
 

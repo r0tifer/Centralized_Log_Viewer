@@ -93,17 +93,37 @@ class MarkSet:
         Returns how many were dropped.
         """
 
-        prefix = f"{source or ''}\0"
-        live = {mark_key(source, entry) for entry in entries}
-        stale = {key for key in self._keys if key.startswith(prefix) and key not in live}
+        return self.retain(
+            {mark_key(source, entry) for entry in entries}, sources=[source]
+        )
+
+    def retain(self, live: set[str], *, sources: Iterable[Optional[Path]]) -> int:
+        """Keep only *live* marks among those belonging to *sources*.
+
+        The general form, for a pane showing several sources at once: pruning
+        one source at a time cannot work there, because the entries on screen
+        belong to different ones and a per-source pass would see every other
+        source's lines as missing. Marks outside *sources* are untouched.
+        """
+
+        prefixes = tuple(f"{source or ''}\0" for source in sources)
+        if not prefixes:
+            return 0
+        stale = {
+            key
+            for key in self._keys
+            if key.startswith(prefixes) and key not in live
+        }
         self._keys -= stale
         return len(stale)
 
-    def count_for(self, source: Optional[Path]) -> int:
-        """How many marks belong to *source* — what the status line reports."""
+    def count_for(self, *sources: Optional[Path]) -> int:
+        """How many marks belong to *sources* — what the status line reports."""
 
-        prefix = f"{source or ''}\0"
-        return sum(1 for key in self._keys if key.startswith(prefix))
+        prefixes = tuple(f"{source or ''}\0" for source in sources)
+        if not prefixes:
+            return 0
+        return sum(1 for key in self._keys if key.startswith(prefixes))
 
 
 __all__ = ["MarkSet", "mark_key"]

@@ -1010,6 +1010,47 @@ paragraph stating that merging is local-only and that remote aggregation
 remains out of scope, so the non-goal does not have to be relitigated in every
 issue.
 
+**As shipped.** The acceptance bar — "no feature becomes single-source-only" —
+was met by making the *session* the unit rather than by adding a merged branch
+to each feature, which is why the extraction landed first as its own commit.
+Six things worth recording:
+
+- **The origin is a field, not a column that had to be plumbed.** Entries in a
+  merged view carry `fields["source"]`, tagged once as they are read, so the
+  detail pane lists it, `source:beta.log` filters on it, and marks key on it
+  with no changes to any of the three. The source *column* is then only a
+  rendering of something already there. This is the mechanism Item 11 built.
+- **Sorting each member before merging is not optional.** `heapq.merge` trusts
+  its inputs, and a log is not guaranteed to be written in timestamp order —
+  one out-of-order line would have silently misplaced everything after it. The
+  per-member sort is what the cache pays for: cached against buffer revisions,
+  so the cost is one merge per *poll* rather than one per keystroke in the
+  query box.
+- **Ties are broken by member order, then by position.** Two lines sharing a
+  timestamp appear in merged-set order. Arbitrary but stable, which is what
+  matters — the alternative is a view that reshuffles itself on every render.
+- **Appending is conditional now.** A tailed line that sorts into the *middle*
+  of a merged stream cannot be appended to the pane, so `lands_at_the_end`
+  decides between an append and a redraw. Tailing several live logs at once
+  does not take the redraw path — they are all producing "now" — so the
+  incremental render survives the case it exists for.
+- **`prune` grew a general form.** `MarkSet.prune(source, entries)` cannot work
+  on a merged pane: the lines on screen belong to different sources, so a
+  per-source pass sees every other source's lines as missing and throws their
+  marks away. `retain(live, sources=…)` is the general version, and `prune` is
+  now a one-source call to it. `WatchIndex` got the same treatment.
+- **One member is not a merge.** `u` with a single source in the set opens it
+  as an ordinary log rather than as a merge of one, which would show a source
+  column with one value in it.
+
+Two smaller notes. Timezone alignment is decided once for the whole set rather
+than pairwise as `filtering._comparable` does it — a k-way merge needs a single
+key — so a set that is entirely aware keeps its offsets and orders across time
+zones correctly, and only a mixed set drops them. And a saved view captures the
+merged set **only when a merge is actually open**, so a view saved on one log
+does not quietly carry someone else's set around; applying one reopens the whole
+set, because its filters were written against all of it.
+
 ---
 
 # Phase 5 — Analysis

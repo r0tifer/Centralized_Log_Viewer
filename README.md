@@ -49,6 +49,10 @@ desktop terminal and on a headless 80-column SSH session.
   copies the selected line — or the whole visible view — to your local clipboard
   through the terminal, so it works over SSH and tmux where a mouse selection
   does not.
+- ⧉ **Merge several logs into one stream.** `x` adds a log to the merged set,
+  `u` opens the set as one timestamp-ordered pane with a source column. Filters,
+  navigation, marks, the detail pane and export all work there exactly as they
+  do on a single file. Local only — remote aggregation stays a non-goal.
 - 🧩 **Plugins.** `LogSourceProvider`, `FilterStage` and `Exporter` interfaces,
   loaded from `clv/plugins/` or from installed packages via the `clv.plugins`
   entry point group. A broken plugin is reported, never fatal.
@@ -164,6 +168,50 @@ fall out of date. Dismiss it with `?`, `Esc` or `q`.
 One wrinkle worth knowing: while the cursor is in the query input, `?` types a
 literal question mark, because it is a valid regex character. Press `Esc` first
 if the input has focus. Tailing continues while the overlay is open.
+
+### Merging sources
+
+The name promises centralized logs, and until now it delivered centralized
+*discovery* — you still read one file at a time. `x` on any log in the tree adds
+it to the **merged set**; `u` opens the set as one timestamp-ordered stream:
+
+```
+⧉📄 alpha.log        alpha.log   2026-08-11 10:00:00 INFO  request accepted
+⧉📄 beta.log         beta.log    2026-08-11 10:00:01 INFO  upstream connect
+ 📄 auth.log         alpha.log   2026-08-11 10:00:02 ERROR upstream timeout
+                     beta.log    2026-08-11 10:00:03 WARN  retrying
+```
+
+Members are marked with `⧉` in the tree, a source column names the origin of
+every row (abbreviated as the terminal narrows), and the status line names the
+set. **Every other feature works exactly as it does on a single log** — filters,
+`n`/`N` navigation, `g`, marks, the detail pane and `Ctrl+E`. That is the point:
+merging is not a mode with its own reduced feature set. The origin travels as a
+field, so `source:beta.log` is a query you can write, and it shows up in the
+detail pane's property list for free.
+
+Some specifics worth knowing:
+
+- **`max_buffer_lines` applies per source**, so three merged logs cost three
+  buffers and no member is crowded out by a louder one. The merged stream is a
+  *view* over those buffers, never a fourth copy of the lines.
+- **Lines without a timestamp are never dropped.** They are anchored directly
+  after the last timestamped line from their own source — which is what keeps a
+  stack trace attached to the error above it — and the status line counts them,
+  because they were placed by inference rather than by their own clock.
+- **Mixed timezone-aware and naive timestamps merge** rather than refusing to.
+  If any source is naive the offsets are dropped, matching what the time-window
+  filter already does; if every source is aware they are kept, so two time zones
+  order correctly.
+- **Only members you merged are polled**, at the same rate one source was. A
+  merged view does not multiply the poll frequency by the member count.
+- A member that disappears from disk is reported and the rest keep going.
+- The set persists in `session.json` and can be captured in a saved view.
+
+**Merging is local only.** Remote collection and multi-node aggregation are a
+documented non-goal and are not coming: CLV reads what the machine it runs on
+can read. If you want several machines in one pane, ship their logs to one host
+by whatever means you already use and merge them here.
 
 ### Compressed and rotated logs
 
@@ -424,6 +472,8 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `t` / `s` | Cycle time window / severity |
 | `f` | Toggle the Advanced drawer |
 | `*` | Star / unstar the log under the cursor |
+| `x` | Add / remove the log under the cursor from the merged set |
+| `u` | Open the merged set as one timestamp-ordered stream |
 | `↑` / `↓` | Move the line cursor |
 | `PgUp` / `PgDn` | Move the line cursor a screen at a time |
 | `Home` / `End` | First / last line (`End` also resumes following) |

@@ -134,7 +134,8 @@ distros.
   opens as fast as a single file. Lines come back carrying which member they
   came from, because with several files behind one source "where is this line
   from" stops having a constant answer.
-- `session.py` — who owns the readers and the lines they produced. A
+- `session.py` — who owns the readers and the lines they produced, including
+  the k-way merge behind `u`. A
   `SourceBuffer` is one reader plus its parser and its bounded deque; a
   `SourceSession` is the ordered set of buffers the pane is showing. **A single
   open log is a session of one**, which is the point: there is no separate
@@ -142,6 +143,11 @@ distros.
   watch answers key on `origin_of(entry)` rather than on "the open log", so two
   identical lines from two logs stay two lines. The tail *clock* stays in the
   app — `poll()` is called from the timer that already runs, never a second one.
+  A merge is a **view** over the buffers rather than a fourth copy, cached
+  against their revisions so it costs one merge per poll rather than one per
+  keystroke; `max_buffer_lines` applies per member. An entry with no timestamp
+  is anchored after the last timestamped line from **its own source** and
+  counted, never dropped — "never silently lose a line" applied to ordering.
 - `config.py` — settings resolution, validation, clamping.
 - `sources.py` — session source management and settings persistence.
 - `export.py` — the three built-in output formats (JSON Lines, CSV, plain text)

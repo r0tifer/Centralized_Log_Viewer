@@ -71,7 +71,7 @@ from .services.filtering import (
     parse_moment,
     parse_relative_window,
 )
-from .services.marks import MarkSet
+from .services.marks import MarkSet, mark_key
 from .services.parsing import (
     LEVEL_CRITICAL,
     LEVEL_ERROR,
@@ -85,7 +85,7 @@ from .services.query import (
     entry_matches,
 )
 from .services.rotation import RotatedSet, describe_set, group_rotated
-from .services.session import SourceSession
+from .services.session import ORIGIN_FIELD, SourceSession
 from .services.watch import (
     WatchIndex,
     WatchNotifier,
@@ -162,6 +162,15 @@ ICON_ROTATED = "🗂"
 #: its own icon, because none of the things that assume a file apply to it.
 ICON_PROVIDER = "🔌"
 PROVIDERS_GROUP = f"{ICON_PROVIDER} Providers"
+#: Marks a source that is in the merged set. A prefix rather than a replacement
+#: for the file icon: membership is a second fact about a log, unlike starring,
+#: which replaces the icon precisely so a row never changes width.
+ICON_MERGED = "⧉"
+
+#: Width of the source column in a merged view, per breakpoint. Content, not
+#: layout — the column is part of the line the pane renders, so CSS never sees
+#: it — but it still has to shrink before the log text does.
+MERGED_COLUMN_WIDTHS: dict[str, int] = {"-compact": 8, "-narrow": 14, "-wide": 20}
 
 #: Help categories, in the order the overlay lists them. A category with no
 #: bindings is skipped, so a group can be declared before the item that fills
@@ -221,6 +230,8 @@ BINDING_CATEGORIES: dict[str, str] = {
     "toggle_copy_mode": "View",
     "add_source": "Sources",
     "toggle_star": "Sources",
+    "toggle_merge": "Sources",
+    "open_merged": "Sources",
     "reload_sources": "Sources",
     "save_session": "Session",
     "quit_app": "Session",
@@ -444,6 +455,8 @@ class LogViewerApp(App[None]):
         Binding("v", "open_views", "Saved views", show=False),
         Binding("V", "save_view", "Save current filters as a view", show=False),
         Binding("W", "watch_rules", "Watch rules", show=False),
+        Binding("x", "toggle_merge", "Add / remove from the merged set", show=False),
+        Binding("u", "open_merged", "Open the merged view", show=False),
         Binding("ctrl+b", "toggle_pane", "Switch pane", show=True),
         Binding("[", "shrink_sources_panel", "Narrower", show=False),
         Binding("]", "expand_sources_panel", "Wider", show=False),
@@ -867,7 +880,10 @@ class LogViewerApp(App[None]):
 
     def _leaf_label(self, path: Path, text: str) -> str:
         icon = ICON_STAR if _resolve(path) in self._starred_paths() else ICON_FILE
-        return f"{icon} {text}"
+        # Merge membership prefixes rather than replaces: a starred log can be
+        # merged too, and the star already owns the icon slot.
+        merged = ICON_MERGED if _resolve(path) in self._merged_paths else ""
+        return f"{merged}{icon} {text}"
 
     def _highlight_source(self, path: Path, *, select: bool = True) -> None:
         """Reveal *path* in the tree.
@@ -951,6 +967,73 @@ class LogViewerApp(App[None]):
         reader = buffer.reader
         self._notify(describe_set(rotated_set, getattr(reader, "members_read", 0)))
         return True
+
+    # --- the merged set ------------------------------------------------------
+
+    def action_toggle_merge(self) -> None:
+        """Add or remove the source under the tree cursor from the merged set."""
+
+        target = self._star_target()
+        if target is None:
+            self._notify("Move to a log in the tree to merge it.", "warning")
+            return
+
+        resolved = _resolve(target)
+        current = list(self.state.merged)
+        if str(resolved) in current:
+            current.remove(str(resolved))
+            action = "Removed from"
+        else:
+            current.append(str(resolved))
+            action = "Added to"
+        self._update_state(merged=tuple(sorted(current)))
+        self._notify(
+            f"{action} the merged set ({len(current)} source(s)). Press u to open it."
+        )
+        self.run_worker(self._rescan(), group="discovery", exit_on_error=False)
+
+    def action_open_merged(self) -> None:
+        """Open every source in the merged set as one timestamp-ordered stream."""
+
+        paths = [Path(entry) for entry in self.state.merged]
+        if not paths:
+            self._notify("No sources merged yet — press x on a log to add one.", "warning")
+            return
+        if len(paths) == 1:
+            # One member is not a merge, and opening it as one would show a
+            # source column with one value in it.
+            self._select_source(paths[0])
+            return
+
+        self._stop_tail()
+        opened, failed = self._session.open_many(paths)
+        for path, reason in failed:
+            self._notify(f"{path.name} could not be opened: {reason}", "warning")
+        if not opened:
+            self._notify("None of the merged sources could be opened.", "error")
+            return
+
+        self._show_lines = min(self._config.default_show_lines, self._config.max_buffer_lines)
+        self._after_source_change()
+        anchored = self._session.anchored
+        detail = (
+            f" · {anchored} line(s) with no timestamp anchored to their own source"
+            if anchored
+            else ""
+        )
+        self._notify(f"Merged {len(opened)} sources.{detail}")
+
+    @property
+    def _merged_paths(self) -> set[Path]:
+        return {_resolve(Path(entry)) for entry in self.state.merged}
+
+    def _merged_name(self) -> str:
+        """What to call the merged set — in the status line and in an export."""
+
+        names = [Path(entry).name for entry in self.state.merged]
+        if len(names) <= 2:
+            return "+".join(names) or "merged"
+        return f"{names[0]}+{len(names) - 1}-more"
 
     def _select_provider_source(self, source: ProviderSource) -> bool:
         """Open a source a plugin supplied.
@@ -1054,6 +1137,12 @@ class LogViewerApp(App[None]):
             # The ring buffer dropped old lines, so the visible window shifted:
             # a full redraw is the only correct option.
             self._render_log()
+        elif not self._session.lands_at_the_end(new_entries):
+            # A merged view where a line sorted into the middle: appending it
+            # would put it in the wrong place. Tailing several live logs at
+            # once does not take this path — they are all producing "now" —
+            # so the incremental render survives the case it exists for.
+            self._render_log()
         else:
             self._append_entries(new_entries)
         self._update_status()
@@ -1093,6 +1182,28 @@ class LogViewerApp(App[None]):
         """
 
         return self._session.origin_of(entry)
+
+    def _origins(self) -> list[Optional[Path]]:
+        """Every source the open session draws from.
+
+        One entry for an ordinary log; one per member for a merge, and one per
+        rotated member for a set — which is why this asks the buffers rather
+        than assuming the answer is `_selected_source`.
+        """
+
+        sources: list[Optional[Path]] = [buffer.path for buffer in self._session.buffers]
+        if self._session.is_merged or any(
+            entry.fields.get(ORIGIN_FIELD) for entry in self._entries
+        ):
+            sources += [
+                Path(value)
+                for value in {
+                    entry.fields.get(ORIGIN_FIELD)
+                    for entry in self._entries
+                    if entry.fields.get(ORIGIN_FIELD)
+                }
+            ]
+        return sources or [None]
 
     def _visible_entries(self, entries: Iterable[LogEntry]):
         """Apply plugin stages, then the user's filters."""
@@ -1140,9 +1251,13 @@ class LogViewerApp(App[None]):
 
         # Drop marks — and cached watch answers — whose lines the ring buffer
         # has evicted, so the count in the status line stays honest as the
-        # source tails and the index cannot grow without bound.
-        self._marks.prune(self._selected_source, self._entries)
-        self._watch_index.prune(self._selected_source, self._entries)
+        # source tails and the index cannot grow without bound. Keyed per
+        # entry: in a merged view the lines on screen belong to different
+        # sources, and pruning one at a time would see every other source's
+        # lines as missing and throw its marks away.
+        live = {mark_key(self._origin(entry), entry) for entry in self._entries}
+        self._marks.retain(live, sources=self._origins())
+        self._watch_index.retain(live)
 
         for entry in result.entries[-self._show_lines :]:
             self.log_panel.write_entry(self._renderable_for(entry), entry)
@@ -1219,7 +1334,28 @@ class LogViewerApp(App[None]):
             structured = self._structured_renderable(entry)
             if structured is not None:
                 return structured
-        return self._colorize(entry)
+        text = self._colorize(entry)
+        if self._session.is_merged:
+            return self._with_source_column(text, entry)
+        return text
+
+    def _with_source_column(self, text: Text, entry: LogEntry) -> Text:
+        """Prefix a line with the source it came from.
+
+        Only in a merged view, where the pane is the one place the answer can
+        be. The width follows the breakpoint so the column gives way before the
+        log text does — this is line *content*, which is why it is composed
+        here and not in CSS.
+        """
+
+        width = MERGED_COLUMN_WIDTHS.get(self._breakpoint, MERGED_COLUMN_WIDTHS["-narrow"])
+        origin = self._origin(entry)
+        name = origin.name if origin is not None else "?"
+        if len(name) > width:
+            # From the left: rotated members and unit names differ at the end.
+            name = "…" + name[-(width - 1) :]
+        column = Text(f"{name:<{width}} ", style="#7aa3d1")
+        return column.append_text(text)
 
     def _colorize(self, entry: LogEntry) -> Text:
         text = Text(entry.raw)
@@ -1359,13 +1495,21 @@ class LogViewerApp(App[None]):
         else:
             follow = "paused"
 
-        parts = [str(self._selected_source), detail]
+        if self._session.is_merged:
+            parts = [f"{self._merged_name()} ({len(self._session)} sources)", detail]
+            anchored = self._session.anchored
+            if anchored:
+                # Placed by inference rather than by their own timestamp, so
+                # the count is on screen rather than left to be noticed.
+                parts.append(f"{anchored} anchored")
+        else:
+            parts = [str(self._selected_source), detail]
         member = self._cursor_member()
         if member is not None:
             # One source made of several files: which one the cursor is in is
             # not deducible from anything else on screen.
             parts.append(f"in {member}")
-        marks = self._marks.count_for(self._selected_source)
+        marks = self._marks.count_for(*self._origins())
         if marks:
             parts.append(f"{marks} marked")
         if self._match_position is not None:
@@ -1381,6 +1525,9 @@ class LogViewerApp(App[None]):
         repeating it beside itself would be noise.
         """
 
+        if self._session.is_merged:
+            # The source column already says this, on every row.
+            return None
         entry = self.log_panel.cursor_entry
         if entry is None:
             return None
@@ -1678,9 +1825,26 @@ class LogViewerApp(App[None]):
 
         self._watch_index.set_rules(self.state.watch_rules, self._known_fields)
         self._watch_notifier.reset()
-        if self._watch_index.active and self._selected_source is not None:
-            self._watch_index.evaluate(self._selected_source, self._entries)
+        if self._watch_index.active and self._session:
+            self._evaluate_watches(self._entries)
         self._refresh_watch_status()
+
+    def _evaluate_watches(self, entries: Sequence[LogEntry]) -> list[tuple[str, ...]]:
+        """Ask the rules about *entries*, each keyed to the source it came from.
+
+        Grouped by origin rather than evaluated one at a time, because
+        `WatchIndex.evaluate` caches per distinct line within a source and
+        calling it per entry would defeat that. In the ordinary case there is
+        one group and this is the call it always was.
+        """
+
+        grouped: dict[Optional[Path], list[LogEntry]] = {}
+        for entry in entries:
+            grouped.setdefault(self._origin(entry), []).append(entry)
+        fired: list[tuple[str, ...]] = []
+        for source, group in grouped.items():
+            fired += [names for _entry, names in self._watch_index.evaluate(source, group)]
+        return fired
 
     def _refresh_watch_status(self) -> None:
         self.advanced_drawer.set_watch_status(describe_rules(self.state.watch_rules))
@@ -1695,7 +1859,7 @@ class LogViewerApp(App[None]):
 
         if not self._watch_index.active:
             return
-        for _entry, names in self._watch_index.evaluate(self._selected_source, entries):
+        for names in self._evaluate_watches(entries):
             self._watch_notifier.record(notifying(names, self.state.watch_rules))
 
         messages = self._watch_notifier.due(monotonic())
@@ -1783,6 +1947,10 @@ class LogViewerApp(App[None]):
             include_globs=settings.include_globs,
             exclude_globs=settings.exclude_globs,
             source=str(self._selected_source) if self._selected_source else "",
+            # Item 9 left this out because there was no merged set to capture.
+            # Recorded only when a merge is actually open, so a view saved on
+            # one log does not quietly carry someone else's set around.
+            merged=tuple(self.state.merged) if self._session.is_merged else (),
         )
 
     def _view_named(self, name: str) -> Optional[SavedView]:
@@ -1864,7 +2032,13 @@ class LogViewerApp(App[None]):
 
         missing = ""
         opened = False
-        if view.source:
+        if view.merged:
+            # A merged view reopens the whole set: its filters were written
+            # against all of it, and half the set is a different question.
+            self._update_state(merged=tuple(view.merged))
+            self.action_open_merged()
+            opened = True
+        elif view.source:
             source = Path(view.source)
             if source.is_file():
                 # _select_source renders once; nothing below may render again.
@@ -2367,7 +2541,12 @@ class LogViewerApp(App[None]):
         dialog = ExportDialog(
             self._exporter_choices(),
             entry_count=len(entries),
-            default_name=default_stem(source),
+            # A merged export is named for the set, not for whichever member
+            # happens to be first — "auth.log-20260812" would be a lie about
+            # what is in the file.
+            default_name=default_stem(
+                Path(self._merged_name()) if self._session.is_merged else source
+            ),
             marked_count=len(marked),
         )
         request = await self.push_screen(dialog, wait_for_dismiss=True)

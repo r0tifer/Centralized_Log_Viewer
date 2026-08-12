@@ -235,9 +235,19 @@ class WatchIndex:
     def prune(self, source: Optional[Path], entries: Iterable[LogEntry]) -> None:
         """Drop cached answers for lines no longer in the buffer."""
 
+        self.retain({mark_key(source, entry) for entry in entries})
+
+    def retain(self, live: set[str]) -> None:
+        """Keep only the cached answers for *live* keys.
+
+        The general form, for a pane showing several sources at once, where
+        the caller has already keyed each entry against the source it actually
+        came from. Unlike marks this needs no per-source scoping: an answer is
+        only ever worth keeping while the line it is about is on screen.
+        """
+
         if not self._hits:
             return
-        live = {mark_key(source, entry) for entry in entries}
         self._hits = {key: value for key, value in self._hits.items() if key in live}
 
 
