@@ -49,6 +49,14 @@ SCHEME = "journal:"
 #: applied to a source that has no seeking: --lines bounds it at the source.
 DEFAULT_LINES = 2_000
 
+#: Seconds a one-shot enumeration query may take. Generous because the work is
+#: proportional to the journal: `--field=_SYSTEMD_UNIT` walks it, and several
+#: gigabytes with a cold page cache is well past ten seconds. Timing out here
+#: costs the unit list silently, so the bound is set to be reached only by
+#: something genuinely wedged. Affordable because discovery runs in a worker
+#: thread — on the event loop this would have been ten seconds of frozen UI.
+QUERY_TIMEOUT = 45
+
 #: Severity buckets that are worth pushing down to `journalctl --priority`.
 #: `debug` and `trace` map to priority 7, which is everything, so pushing them
 #: down would filter nothing while pretending to. A pushed-down priority is
@@ -363,6 +371,9 @@ class JournaldProvider(LogSourceProvider):
         self._runner = runner or _run
         self._max_lines = max_lines
         self.status = "disabled"
+        #: Why the last unit enumeration came back empty, when it did. Empty
+        #: for "it worked", which is not the same as "it returned nothing".
+        self.unit_error = ""
 
     # --- discovery -----------------------------------------------------------
 
@@ -389,17 +400,39 @@ class JournaldProvider(LogSourceProvider):
         sources += [
             ProviderSource(Path(f"{SCHEME}boot/-1"), "Previous boot", self.name)
         ] if self._has_previous_boot() else []
+        units = self._units()
         sources += [
             ProviderSource(Path(f"{SCHEME}unit/{unit.name}"), unit.name, self.name)
-            for unit in self._units()
+            for unit in units
         ]
-        self.status = f"{len(sources)} journal source(s)"
+        # Says what it found *and* what it could not, because "two sources and
+        # no units" is the shape of a failure and looked identical to success.
+        detail = f"{len(units)} unit(s)"
+        if not units:
+            detail = (
+                f"no units listed ({self.unit_error})"
+                if self.unit_error
+                else "no units listed — journalctl reported none"
+            )
+        self.status = f"{len(sources)} journal source(s), {detail}"
         return sources
+
+    def _query(self, argv: list[str]) -> tuple[str, str]:
+        """Run a journalctl query as ``(stdout, why it failed)``.
+
+        Injected runners may return a bare string — that is the whole contract
+        a test needs — so both shapes are accepted.
+        """
+
+        result = self._runner(argv)
+        if isinstance(result, tuple):
+            return result
+        return result, ""
 
     def _units(self) -> list[_Unit]:
         """Units with journal entries, as ``journalctl --field`` reports them."""
 
-        output = self._runner(
+        output, self.unit_error = self._query(
             [journalctl_path() or "journalctl", "--no-pager", "--field=_SYSTEMD_UNIT"]
         )
         units: list[_Unit] = []
@@ -413,7 +446,7 @@ class JournaldProvider(LogSourceProvider):
         return sorted(units, key=lambda unit: unit.name)[:200]
 
     def _has_previous_boot(self) -> bool:
-        output = self._runner(
+        output, _error = self._query(
             [journalctl_path() or "journalctl", "--no-pager", "--list-boots"]
         )
         return len([line for line in output.splitlines() if line.strip()]) > 1
@@ -438,20 +471,30 @@ class JournaldProvider(LogSourceProvider):
         return JournalReader(path, max_lines=min(max_lines, self._max_lines), **kwargs)
 
 
-def _run(argv: list[str]) -> str:
-    """Run a short, bounded journalctl query. Never raises."""
+def _run(argv: list[str]) -> tuple[str, str]:
+    """Run a short, bounded journalctl query as ``(stdout, why it failed)``.
+
+    Never raises, but no longer swallows the reason either: a query that timed
+    out and one that returned nothing are different facts, and the difference
+    is exactly what an operator needs when the tree is emptier than expected.
+    """
 
     try:
         completed = subprocess.run(
             argv,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=QUERY_TIMEOUT,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return completed.stdout or ""
+    except subprocess.TimeoutExpired:
+        return "", f"journalctl timed out after {QUERY_TIMEOUT}s"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return "", f"journalctl could not be run: {exc}"
+    if completed.returncode != 0:
+        detail = (completed.stderr or "").strip().splitlines()
+        return "", f"journalctl exited {completed.returncode}: {detail[0] if detail else 'no output'}"
+    return completed.stdout or "", ""
 
 
 def register() -> list[LogSourceProvider]:

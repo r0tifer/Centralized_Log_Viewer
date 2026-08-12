@@ -764,21 +764,29 @@ class LogViewerApp(App[None]):
         roots = self._source_manager.all_sources()
         settings = self._discovery_settings()
 
-        # The walk touches the filesystem and can be slow on a large tree, so
-        # it runs in a thread rather than blocking the event loop.
+        # Both halves run in the thread. The walk touches the filesystem and
+        # can be slow on a large tree; a provider may *shell out*, which is
+        # slower still — enumerating units on a multi-gigabyte journal is
+        # seconds of work. Asking providers on the event loop froze the UI for
+        # exactly as long as they took, and when one hit its own timeout the
+        # tree quietly came back short. Neither is discovery's judgement to
+        # make: a provider that raises is still recorded and skipped.
         worker = self.run_worker(
-            lambda: discover(roots, settings), thread=True, name="discover", exit_on_error=False
+            lambda: (discover(roots, settings), self._plugins.discover_sources()),
+            thread=True,
+            name="discover",
+            exit_on_error=False,
         )
-        report = await worker.wait()
+        found = await worker.wait()
+        report, provider_sources = found if found else (None, [])
         if report is None:
             report = DiscoveryReport()
         self._report = report
-        # Providers are asked on the same pass, but never in the same thread:
-        # a provider may shell out, and a plugin's idea of "quick" is not
-        # something discovery should have to trust. It is guarded instead —
-        # one that raises is recorded and skipped, like a filter stage.
-        self._provider_sources = self._plugins.discover_sources()
+        self._provider_sources = provider_sources
         self._refresh_plugin_status()
+        # After the providers have run, so the drawer reports what they found
+        # rather than what they were about to look for.
+        self._sync_journald_status()
         await self._build_tree(report)
         if self._selected_source is None:
             self._show_discovery_summary(report)
@@ -2976,6 +2984,17 @@ class LogViewerApp(App[None]):
         from .plugins.sources.journald import JournaldProvider, availability
 
         available, reason = availability()
+        provider = next(
+            (p for p in self._plugins.sources if isinstance(p, JournaldProvider)), None
+        )
+        if provider is not None and self._config.enable_journald and available:
+            # What the provider actually found, rather than what it is allowed
+            # to look for. "Two sources and no units" is the shape of a failure
+            # and looked exactly like success from out here.
+            self.advanced_drawer.set_journald(
+                True, available=True, reason=provider.status
+            )
+            return
         if available and not any(
             isinstance(plugin, JournaldProvider) for plugin in self._plugins.sources
         ):

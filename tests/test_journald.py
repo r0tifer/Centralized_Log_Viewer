@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -561,5 +562,127 @@ def test_the_drawer_says_when_the_plugin_is_missing_from_the_build() -> None:
             status = drawer.query_one("#journald-status", Static).render().plain
             assert "not loaded" in status
             assert drawer.query_one("#drawer-journald", Switch).disabled is True
+
+    asyncio.run(scenario())
+
+
+def test_the_status_says_what_was_found_not_just_that_it_looked() -> None:
+    """"Two sources and no units" is a failure that looked like success."""
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(journald.shutil, "which", lambda _n: "/usr/bin/journalctl")
+        monkey.setattr(journald, "availability", lambda: (True, ""))
+        persist_setting(user_config_path(), "enable_journald", "true")
+
+        healthy = journald.JournaldProvider(
+            runner=lambda argv: (
+                "-1 a\n 0 b\n" if "--list-boots" in argv else "sshd.service\nnginx.service\n"
+            )
+        )
+        list(healthy.discover())
+        assert "2 unit(s)" in healthy.status
+
+        # journalctl ran and said nothing — a real answer, not a failure.
+        quiet = journald.JournaldProvider(runner=lambda argv: "")
+        list(quiet.discover())
+        assert "no units listed" in quiet.status
+        assert "journalctl reported none" in quiet.status
+
+        # journalctl could not be run — a different fact, and the actionable one.
+        broken = journald.JournaldProvider(
+            runner=lambda argv: ("", "journalctl timed out after 10s")
+        )
+        list(broken.discover())
+        assert "timed out" in broken.status
+    finally:
+        monkey.undo()
+
+
+def test_a_failing_journalctl_reports_why_rather_than_returning_empty() -> None:
+    assert _run_reports("/nonexistent/journalctl") != ""
+
+
+def _run_reports(binary: str) -> str:
+    _out, error = journald._run([binary, "--list-boots"])
+    return error
+
+
+def test_the_drawer_reports_what_the_provider_found() -> None:
+    """The provider knew all along; nothing displayed it."""
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            await pilot.pause()
+
+            provider = journald.JournaldProvider()
+            provider.status = "3 journal source(s), no units listed (journalctl timed out)"
+            app._plugins = PluginRegistry(sources=[provider])
+            app._config = replace(app._config, enable_journald=True)
+            monkey = pytest.MonkeyPatch()
+            monkey.setattr(
+                "clv.plugins.sources.journald.availability", lambda: (True, "")
+            )
+            try:
+                app._sync_journald_status()
+                await pilot.pause()
+                status = app.advanced_drawer.query_one(
+                    "#journald-status", Static
+                ).render().plain
+            finally:
+                monkey.undo()
+
+            assert "no units listed" in status
+            assert "timed out" in status
+
+    asyncio.run(scenario())
+
+
+def test_providers_are_asked_off_the_event_loop(tmp_path: Path) -> None:
+    """A provider shells out; on the UI thread that is a frozen app.
+
+    Enumerating units on a multi-gigabyte journal is seconds of work, and the
+    query has a timeout measured in tens of seconds. Discovery already runs in
+    a worker thread for the filesystem walk; this asserts the providers went
+    with it, because the symptom of getting that wrong is a UI that stops
+    responding and a tree that quietly comes back short.
+    """
+
+    import threading
+
+    root = tmp_path / "logs"
+    root.mkdir()
+    (root / "app.log").write_text("2026-08-12 10:00:00 - INFO - x\n", encoding="utf-8")
+
+    class Slow(LogSourceProvider):
+        name = "slow provider"
+
+        def __init__(self) -> None:
+            self.thread: str | None = None
+
+        def discover(self):
+            self.thread = threading.current_thread().name
+            return [ProviderSource(Path("slow:one"), "One")]
+
+        def open(self, path):
+            return iter(())
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(120, 30)) as pilot:
+            provider = Slow()
+            app._plugins = PluginRegistry(sources=[provider])
+            app._source_manager = SourceManager([root], [])
+            main = threading.current_thread().name
+
+            await app._rescan()
+            await pilot.pause()
+
+            assert provider.thread is not None, "the provider was never asked"
+            assert provider.thread != main, (
+                f"discover() ran on {provider.thread}, the event loop's thread"
+            )
+            assert len(app._provider_sources) == 1
 
     asyncio.run(scenario())
