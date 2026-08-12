@@ -78,7 +78,7 @@ distros.
 | Layer | Location | Owns | Must not |
 | --- | --- | --- | --- |
 | **App shell** | `clv/app.py` | Layout, routing, lifecycle, breakpoints | Parse, filter, read files, or define widget visuals |
-| **Services** | `clv/services/` | Parsing, filtering, discovery, reading, config, source management | Touch the UI or import Textual |
+| **Services** | `clv/services/` | Parsing, filtering, discovery, reading, buffering, config, source management | Touch the UI or import Textual |
 | **Widgets** | `clv/widgets/` | Self-contained UI + own `DEFAULT_CSS` | Depend on other widgets' internals or import `clv.app` |
 | **Plugins** | `clv/plugins/` | Extension interfaces + loader | Break interface contracts |
 | **State** | `clv/storage.py` | JSON session persistence (atomic), including `SavedView` records | Depend on the UI |
@@ -116,6 +116,14 @@ distros.
   between `SourceReader` (streams) and `DocumentReader` (container documents);
   both expose `path` / `prime()` / `poll()` and a `RELOAD_NOTICE` template.
 - `documents.py` — stdlib-only text extraction for container formats.
+- `session.py` — who owns the readers and the lines they produced. A
+  `SourceBuffer` is one reader plus its parser and its bounded deque; a
+  `SourceSession` is the ordered set of buffers the pane is showing. **A single
+  open log is a session of one**, which is the point: there is no separate
+  single-source path for a feature to be written against by accident. Marks and
+  watch answers key on `origin_of(entry)` rather than on "the open log", so two
+  identical lines from two logs stay two lines. The tail *clock* stays in the
+  app — `poll()` is called from the timer that already runs, never a second one.
 - `config.py` — settings resolution, validation, clamping.
 - `sources.py` — session source management and settings persistence.
 - `export.py` — the three built-in output formats (JSON Lines, CSV, plain text)
@@ -147,7 +155,9 @@ config.load_config ─→ SourceManager ─→ discovery.discover (thread)
                                               ↓
                                         DiscoveryReport ─→ tree
                                               ↓
-   reader.SourceReader.prime/poll ─→ parsing.LogParser.feed ─→ deque[LogEntry]
+   reader.prime/poll ─→ parsing.LogParser.feed ─→ session.SourceBuffer
+                                              ↓
+                            session.SourceSession (one buffer, or several)
                                               ↓
         plugins.apply_filters ─→ filtering.filter_entries ─→ LogView
                                                                ↓

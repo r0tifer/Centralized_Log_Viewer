@@ -70,7 +70,6 @@ from .services.parsing import (
     LEVEL_ERROR,
     LEVEL_WARN,
     LogEntry,
-    LogParser,
     level_matches,
 )
 from .services.query import (
@@ -78,7 +77,7 @@ from .services.query import (
     collect_field_names,
     entry_matches,
 )
-from .services.reader import AnyReader, open_reader
+from .services.session import SourceSession
 from .services.watch import (
     WatchIndex,
     WatchNotifier,
@@ -460,10 +459,10 @@ class LogViewerApp(App[None]):
 
         self._source_manager = SourceManager([], [])
         self._report: DiscoveryReport | None = None
-        self._selected_source: Optional[Path] = None
-        self._reader: AnyReader | None = None
-        self._parser = LogParser()
-        self._entries: deque[LogEntry] = deque(maxlen=self._config.max_buffer_lines)
+        #: Readers and buffers, owned by a UI-free service. A single open log is
+        #: a session of one, so nothing below has a single-source path of its
+        #: own to keep in step — see clv/services/session.py.
+        self._session = SourceSession(max_lines=self._config.max_buffer_lines)
         self._tail_timer: Timer | None = None
 
         self._show_lines = self._config.default_show_lines
@@ -511,6 +510,39 @@ class LogViewerApp(App[None]):
             max_rows=self._config.max_buffer_lines,
         )
         self.detail_pane = DetailPane(id="detail-pane")
+
+    # --- the session, and the three names the app knows it by ---------------
+
+    @property
+    def _selected_source(self) -> Optional[Path]:
+        """The log the pane is showing, or None.
+
+        A property over the session rather than an attribute of the shell, so
+        "which source" has exactly one answer and the merged case cannot grow a
+        second one behind its back. Settable because a caller with lines of its
+        own still has to be able to say where they came from.
+        """
+
+        return self._session.primary_path
+
+    @_selected_source.setter
+    def _selected_source(self, value: Optional[Path]) -> None:
+        self._session.set_primary_path(value)
+
+    @property
+    def _entries(self):
+        """Every buffered entry the filters will see."""
+
+        return self._session.entries
+
+    @_entries.setter
+    def _entries(self, value) -> None:
+        self._session.set_entries(value)
+
+    @property
+    def _reader(self):
+        buffer = self._session.primary
+        return buffer.reader if buffer is not None else None
 
     # --- composition --------------------------------------------------------
 
@@ -810,19 +842,14 @@ class LogViewerApp(App[None]):
             return False
 
         self._stop_tail()
-        self._parser.reset()
-        self._entries = deque(maxlen=self._config.max_buffer_lines)
-
-        reader = open_reader(resolved, max_lines=self._config.max_buffer_lines)
         try:
-            initial = reader.prime()
+            # Only commits on success, so a source that will not open does not
+            # also cost the one that was working.
+            self._session.open_single(resolved)
         except OSError as exc:
             self._notify(f"Failed to read {resolved}: {exc}", "error")
             return False
 
-        self._reader = reader
-        self._selected_source = resolved
-        self._entries.extend(self._parser.feed(initial.lines))
         self._show_lines = min(self._config.default_show_lines, self._config.max_buffer_lines)
 
         self._sync_field_names()
@@ -847,7 +874,7 @@ class LogViewerApp(App[None]):
         """
 
         self._stop_tail()
-        if self._reader is None:
+        if not self._session:
             return
         interval = 1 / max(1, self._config.refresh_hz)
         self._tail_timer = self.set_interval(interval, self._poll_tail)
@@ -858,17 +885,14 @@ class LogViewerApp(App[None]):
             self._tail_timer = None
 
     def _poll_tail(self) -> None:
-        if self._reader is None or self._is_shutting_down:
+        if not self._session or self._is_shutting_down:
             return
-        try:
-            result = self._reader.poll()
-        except OSError:
+        outcomes = self._session.poll()
+        if not outcomes:
             return
 
-        if result.rotated:
-            self._parser.reset()
-            self._entries.clear()
-            self._entries.extend(self._parser.feed(result.lines))
+        rotated = [outcome for outcome in outcomes if outcome.rotated]
+        if rotated:
             # A rotated file can be a different shape entirely, so the field
             # vocabulary is rebuilt rather than extended, and the watch index
             # starts again on what is effectively a new source.
@@ -877,23 +901,21 @@ class LogViewerApp(App[None]):
             self._watch_index.reset()
             self._sync_watch_rules()
             self._render_log(scroll_end=self.state.auto_scroll)
-            notice = self._reader.RELOAD_NOTICE.format(name=self._reader.path.name)
-            self._notify(notice, "warning")
+            for outcome in rotated:
+                self._notify(outcome.notice, "warning")
             return
 
-        if not result.lines:
+        new_entries = [entry for outcome in outcomes for entry in outcome.entries]
+        if not new_entries:
             return
 
-        new_entries = self._parser.feed(result.lines)
-        overflowing = len(self._entries) + len(new_entries) > (self._entries.maxlen or 0)
-        self._entries.extend(new_entries)
         self._sync_field_names(new_entries)
         self._sync_regex_validation()
         # Before the rows are written, so a watched line is highlighted the
         # moment it appears rather than on the render after it.
         self._poll_watch(new_entries)
 
-        if overflowing:
+        if any(outcome.overflowed for outcome in outcomes):
             # The ring buffer dropped old lines, so the visible window shifted:
             # a full redraw is the only correct option.
             self._render_log()
@@ -926,6 +948,16 @@ class LogViewerApp(App[None]):
 
     def _plugin_context(self) -> FilterContext:
         return FilterContext(spec=self._filter_spec(), source=self._selected_source)
+
+    def _origin(self, entry: LogEntry) -> Optional[Path]:
+        """Which source *entry* came from.
+
+        Marks and watch answers are keyed on this rather than on "the open
+        log", so that when a session holds more than one member two identical
+        lines from two different logs stay two different lines.
+        """
+
+        return self._session.origin_of(entry)
 
     def _visible_entries(self, entries: Iterable[LogEntry]):
         """Apply plugin stages, then the user's filters."""
@@ -1000,9 +1032,10 @@ class LogViewerApp(App[None]):
         unchanged, so this costs a re-strip only for rows that actually flipped.
         """
 
-        source = self._selected_source
         for index, entry in self.log_panel.entry_rows():
-            self.log_panel.set_row_marked(index, self._marks.contains(source, entry))
+            self.log_panel.set_row_marked(
+                index, self._marks.contains(self._origin(entry), entry)
+            )
 
     def _restore_cursor(self, entry: LogEntry | None, index: int) -> None:
         """Put the cursor back where it was, or as near as the new view allows.
@@ -1035,16 +1068,15 @@ class LogViewerApp(App[None]):
         # A tailed line can be one an operator marked earlier and that rotated
         # back in, so the gutter has to be set as it arrives — but only when
         # there are marks at all, keeping the common path a plain append.
-        source = self._selected_source
         marked = bool(self._marks)
         watching = self._watch_index.active
         for entry in result.entries:
             self.log_panel.write_entry(self._renderable_for(entry), entry)
-            if marked and self._marks.contains(source, entry):
+            if marked and self._marks.contains(self._origin(entry), entry):
                 self.log_panel.set_row_marked(len(self.log_panel.rows) - 1, True)
             # A lookup, not a match: _poll_watch already asked the rules about
             # this line before it reached the pane.
-            if watching and self._watch_index.watched(source, entry):
+            if watching and self._watch_index.watched(self._origin(entry), entry):
                 self.log_panel.set_row_watched(len(self.log_panel.rows) - 1, True)
 
     def _renderable_for(self, entry: LogEntry) -> RenderableType:
@@ -1439,7 +1471,7 @@ class LogViewerApp(App[None]):
         if entry is None:
             self._notify("Move the cursor to a line to mark it.", "warning")
             return
-        marked = self._marks.toggle(self._selected_source, entry)
+        marked = self._marks.toggle(self._origin(entry), entry)
         # Content-keyed, so identical lines share one mark: resync every row
         # rather than only the cursor's, or the copies would disagree.
         self._sync_marks()
@@ -1453,11 +1485,10 @@ class LogViewerApp(App[None]):
             self._notify("Open a log before jumping between marks.", "warning")
             return
 
-        source = self._selected_source
         marked = [
             index
             for index, entry in self.log_panel.entry_rows()
-            if self._marks.contains(source, entry)
+            if self._marks.contains(self._origin(entry), entry)
         ]
         if not marked:
             self._notify("No marked lines — press m to mark one.", "warning")
@@ -1531,9 +1562,10 @@ class LogViewerApp(App[None]):
         are enabled.
         """
 
-        source = self._selected_source
         for index, entry in self.log_panel.entry_rows():
-            self.log_panel.set_row_watched(index, self._watch_index.watched(source, entry))
+            self.log_panel.set_row_watched(
+                index, self._watch_index.watched(self._origin(entry), entry)
+            )
 
     def _set_watch_rules(self, rules: Iterable[WatchRule]) -> None:
         self._update_state(watch_rules=tuple(rules))
@@ -2047,6 +2079,9 @@ class LogViewerApp(App[None]):
         self._stop_tail()
         self._config = load_config()
         self._settings_path = get_config_file() or user_config_path()
+        # The cap can have changed under us, so the session adopts the new one
+        # before anything is read against it.
+        self._session.resize(self._config.max_buffer_lines)
         self._entries = deque(maxlen=self._config.max_buffer_lines)
         self._source_manager = SourceManager(*self._split_roots(self._config.log_dirs))
         for path in added:
@@ -2170,7 +2205,9 @@ class LogViewerApp(App[None]):
             return
 
         source = self._selected_source
-        marked = [entry for entry in entries if self._marks.contains(source, entry)]
+        marked = [
+            entry for entry in entries if self._marks.contains(self._origin(entry), entry)
+        ]
 
         dialog = ExportDialog(
             self._exporter_choices(),
@@ -2535,6 +2572,10 @@ class LogViewerApp(App[None]):
     async def on_unmount(self) -> None:
         self._is_shutting_down = True
         self._stop_tail()
+        # Readers may hold more than a file handle — a provider-backed source
+        # owns a subprocess — so shutdown releases them explicitly rather than
+        # leaving it to garbage collection.
+        self._session.close()
         if self._persist_state:
             # Persist as-is: the selected source is deliberately kept so the
             # next launch reopens it.
