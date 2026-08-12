@@ -129,6 +129,13 @@ distros.
   different line as lines were evicted. `MarkSet` is deliberately not
   serialisable — a digest is derived from log content, and session state holds
   paths and settings only.
+- `watch.py` — the patterns `W` manages. `WatchIndex` answers "which rules did
+  this line hit" **once per line**, keyed the way `marks.py` keys a bookmark, so
+  a re-render is a dict lookup rather than a rule sweep over every visible row.
+  `WatchNotifier` coalesces: first match immediately, everything else in the
+  window counted and reported together, because a rule matching every line is
+  what makes people switch a feature like this off. Both are driven from the
+  existing tail poll — no second clock.
 - `clipboard.py` — assembles and size-caps the payload `y` hands to
   `App.copy_to_clipboard`. OSC 52 has no continuation form, so an oversized
   payload is truncated at a line boundary and reported, never chunked and never
@@ -177,10 +184,11 @@ config.load_config ─→ SourceManager ─→ discovery.discover (thread)
 | `SegmentedButtons` | `ValueChanged` / `Reselected` | Segment activated / re-activated |
 | `FilterChip` | `Dismissed` | Revert the named filter |
 | `AdvancedFiltersDrawer` | `SettingsChanged` | Full before/after snapshot; `needs_rescan` says whether discovery must re-run |
-| `AdvancedFiltersDrawer` | `ViewToggleChanged` | Auto-scroll / structured / clipboard flipped from a drawer switch |
+| `AdvancedFiltersDrawer` | `ViewToggleChanged` | Auto-scroll / structured / clipboard / detail pane / watch rules flipped from a drawer switch |
 | `ExportDialog` | dismiss value | `ExportRequest(key, path, marked_only)`, or `None` when canceled |
 | `SaveViewDialog` | dismiss value | The name to save the current filters under, or `None` |
 | `ViewPickerDialog` | dismiss value | `ViewRequest(action, name, new_name)`, or `None` when closed. The dialog never edits state; the app acts and reopens it |
+| `WatchRulesDialog` | dismiss value | The edited rule set, or `None` when nothing changed — so a dialog that was only looked at costs no re-indexing |
 | `AdvancedFiltersDrawer` | `RescanRequested` / `Closed` | Explicit rescan / dismissal |
 
 ### Controls with two homes

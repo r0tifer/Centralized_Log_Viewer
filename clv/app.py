@@ -21,8 +21,9 @@ import json
 from collections import deque
 from dataclasses import replace
 from datetime import datetime
+from time import monotonic
 from pathlib import Path
-from typing import Iterable, Literal, Optional
+from typing import Iterable, Literal, Optional, Sequence
 from xml.dom import minidom
 
 from rich.console import Group, RenderableType
@@ -78,6 +79,14 @@ from .services.query import (
     entry_matches,
 )
 from .services.reader import AnyReader, open_reader
+from .services.watch import (
+    WatchIndex,
+    WatchNotifier,
+    WatchRule,
+    describe_rules,
+    notifying,
+    toggled,
+)
 from .storage import SavedView, SessionState, StateStore
 from .widgets.add_source_dialog import AddSourceDialog
 from .widgets.advanced_drawer import AdvancedFiltersDrawer, AdvancedSettings
@@ -90,6 +99,7 @@ from .widgets.help_overlay import HelpOverlay, HelpSection
 from .widgets.log_view import LogView
 from .widgets.query_bar import QueryBar
 from .widgets.view_dialogs import SaveViewDialog, ViewPickerDialog, ViewRequest
+from .widgets.watch_dialog import WatchRulesDialog
 
 #: What `n`/`N` step between when there is no query and no severity bucket to
 #: take the definition from. Stepping every entry would just duplicate the down
@@ -119,6 +129,9 @@ BREAKPOINT_NARROW = 130
 #: at exactly this width — so widening that row again fails the build until the
 #: number is re-measured.
 BREAKPOINT_MERGE = 148
+
+#: Watch rules shown as individual chips before they collapse into a count.
+MAX_WATCH_CHIPS = 3
 
 SOURCES_PANEL_MIN_WIDTH = 20
 SOURCES_PANEL_MAX_WIDTH = 120
@@ -183,6 +196,7 @@ BINDING_CATEGORIES: dict[str, str] = {
     "next_mark": "Navigation",
     "toggle_auto_scroll": "View",
     "toggle_structured": "View",
+    "watch_rules": "View",
     "export_view": "View",
     "copy_view": "View",
     "toggle_pane": "View",
@@ -415,6 +429,7 @@ class LogViewerApp(App[None]):
         Binding("M", "next_mark", "Jump to next mark", show=False),
         Binding("v", "open_views", "Saved views", show=False),
         Binding("V", "save_view", "Save current filters as a view", show=False),
+        Binding("W", "watch_rules", "Watch rules", show=False),
         Binding("ctrl+b", "toggle_pane", "Switch pane", show=True),
         Binding("[", "shrink_sources_panel", "Narrower", show=False),
         Binding("]", "expand_sources_panel", "Wider", show=False),
@@ -474,6 +489,12 @@ class LogViewerApp(App[None]):
         #: disk — see clv/services/marks.py for why that is a constraint rather
         #: than a gap.
         self._marks = MarkSet()
+        #: Which lines matched which watch rules, evaluated once per line so a
+        #: re-render is a lookup rather than a rule sweep.
+        self._watch_index = WatchIndex()
+        #: Coalesces watch notifications. Drained from the tail poll, so no
+        #: second timer exists to keep in step with the first.
+        self._watch_notifier = WatchNotifier(window=self._config.watch_rate_limit)
         #: Field names present in the buffer, offered as query completions.
         self._field_names: frozenset[str] = frozenset()
         #: Names a query term may use: the parser's normalised vocabulary plus
@@ -527,6 +548,7 @@ class LogViewerApp(App[None]):
         self._refresh_chips()
         self._sync_star_button()
         self._sync_detail_pane()
+        self._sync_watch_rules()
         # Filled at mount rather than only when the drawer opens, so the plugin
         # and exporter lines are correct the first time it is seen.
         self._refresh_plugin_status()
@@ -582,7 +604,18 @@ class LogViewerApp(App[None]):
             structured=self.state.pretty_rendering,
             clipboard=self.state.clipboard_osc52,
             detail_pane=self.state.detail_pane,
+            watch_rules=self._watching,
         )
+
+    @property
+    def _watching(self) -> bool:
+        """Whether any watch rule is live — what the drawer's switch shows.
+
+        Any rather than all: the switch answers "is anything being watched",
+        and flipping it off must be able to quieten a partly-enabled set.
+        """
+
+        return any(rule.enabled for rule in self.state.watch_rules)
 
     # --- responsiveness -----------------------------------------------------
 
@@ -794,6 +827,10 @@ class LogViewerApp(App[None]):
 
         self._sync_field_names()
         self._sync_regex_validation()
+        # Rules are recompiled against this source's vocabulary and the primed
+        # buffer is matched for highlighting — silently; see _sync_watch_rules.
+        self._watch_index.reset()
+        self._sync_watch_rules()
         self._render_log(scroll_end=True)
         self._start_tail()
         self._update_status()
@@ -833,9 +870,12 @@ class LogViewerApp(App[None]):
             self._entries.clear()
             self._entries.extend(self._parser.feed(result.lines))
             # A rotated file can be a different shape entirely, so the field
-            # vocabulary is rebuilt rather than extended.
+            # vocabulary is rebuilt rather than extended, and the watch index
+            # starts again on what is effectively a new source.
             self._field_names = frozenset()
             self._sync_field_names()
+            self._watch_index.reset()
+            self._sync_watch_rules()
             self._render_log(scroll_end=self.state.auto_scroll)
             notice = self._reader.RELOAD_NOTICE.format(name=self._reader.path.name)
             self._notify(notice, "warning")
@@ -849,6 +889,9 @@ class LogViewerApp(App[None]):
         self._entries.extend(new_entries)
         self._sync_field_names(new_entries)
         self._sync_regex_validation()
+        # Before the rows are written, so a watched line is highlighted the
+        # moment it appears rather than on the render after it.
+        self._poll_watch(new_entries)
 
         if overflowing:
             # The ring buffer dropped old lines, so the visible window shifted:
@@ -928,9 +971,11 @@ class LogViewerApp(App[None]):
             self._sync_detail_pane()
             return
 
-        # Drop marks whose lines the ring buffer has evicted, so the count in
-        # the status line stays honest as the source tails.
+        # Drop marks — and cached watch answers — whose lines the ring buffer
+        # has evicted, so the count in the status line stays honest as the
+        # source tails and the index cannot grow without bound.
         self._marks.prune(self._selected_source, self._entries)
+        self._watch_index.prune(self._selected_source, self._entries)
 
         for entry in result.entries[-self._show_lines :]:
             self.log_panel.write_entry(self._renderable_for(entry), entry)
@@ -938,6 +983,8 @@ class LogViewerApp(App[None]):
         # — and an empty set is the overwhelmingly common case.
         if self._marks:
             self._sync_marks()
+        if self._watch_index.active:
+            self._sync_watch_highlights()
 
         self._restore_cursor(previous_entry, previous_index)
         if scroll_end or self.state.auto_scroll:
@@ -990,10 +1037,15 @@ class LogViewerApp(App[None]):
         # there are marks at all, keeping the common path a plain append.
         source = self._selected_source
         marked = bool(self._marks)
+        watching = self._watch_index.active
         for entry in result.entries:
             self.log_panel.write_entry(self._renderable_for(entry), entry)
             if marked and self._marks.contains(source, entry):
                 self.log_panel.set_row_marked(len(self.log_panel.rows) - 1, True)
+            # A lookup, not a match: _poll_watch already asked the rules about
+            # this line before it reached the pane.
+            if watching and self._watch_index.watched(source, entry):
+                self.log_panel.set_row_watched(len(self.log_panel.rows) - 1, True)
 
     def _renderable_for(self, entry: LogEntry) -> RenderableType:
         if self.state.pretty_rendering:
@@ -1173,6 +1225,19 @@ class LogViewerApp(App[None]):
             chips.append(FilterChip("Inverted", key="invert"))
         if settings.include_globs:
             chips.append(FilterChip(f"Include: {settings.include_globs}", key="include"))
+
+        # Watch rules are not filters, but they are active state the operator
+        # should be able to see and switch off from one place. Past a handful
+        # they collapse into one chip: the bar is a single row, and a dozen
+        # named chips would push the filters out of sight at 80 columns.
+        enabled = [rule for rule in self.state.watch_rules if rule.enabled]
+        if len(enabled) > MAX_WATCH_CHIPS:
+            chips.append(FilterChip(f"Watching: {len(enabled)} rules", key="watch:*"))
+        else:
+            chips.extend(
+                FilterChip(f"Watch: {rule.name}", key=f"watch:{rule.name}")
+                for rule in enabled
+            )
 
         self.chip_bar.update_chips(chips)
 
@@ -1408,6 +1473,96 @@ class LogViewerApp(App[None]):
             self._notify(f"Wrapped to the first mark ({position} of {len(marked)}).")
         else:
             self._notify(f"Mark {position} of {len(marked)}.")
+
+    # --- watch rules --------------------------------------------------------
+
+    def action_watch_rules(self) -> None:
+        """Add, edit, enable, disable or delete the live-alert rules."""
+        self.run_worker(self._prompt_watch_rules(), group="dialogs", exit_on_error=False)
+
+    def _sync_watch_rules(self) -> None:
+        """Recompile the rules and re-read the buffer against them.
+
+        Lines already buffered are matched so they *look* watched — a rule that
+        highlighted nothing already on screen would read as broken — but they
+        raise no notification. Nobody asked to be told about lines that arrived
+        before the rule existed, and a source switch would otherwise open with
+        a burst of toasts about history.
+        """
+
+        self._watch_index.set_rules(self.state.watch_rules, self._known_fields)
+        self._watch_notifier.reset()
+        if self._watch_index.active and self._selected_source is not None:
+            self._watch_index.evaluate(self._selected_source, self._entries)
+        self._refresh_watch_status()
+
+    def _refresh_watch_status(self) -> None:
+        self.advanced_drawer.set_watch_status(describe_rules(self.state.watch_rules))
+
+    def _poll_watch(self, entries: Sequence[LogEntry]) -> None:
+        """Match newly arrived lines and say something, at most so often.
+
+        Driven from the tail poll rather than a timer of its own: there is
+        already a clock running at ``refresh_hz`` and a second one would only
+        create ways for the two to disagree.
+        """
+
+        if not self._watch_index.active:
+            return
+        for _entry, names in self._watch_index.evaluate(self._selected_source, entries):
+            self._watch_notifier.record(notifying(names, self.state.watch_rules))
+
+        messages = self._watch_notifier.due(monotonic())
+        for message in messages:
+            self._notify(message, "warning")
+        if messages and self._config.watch_bell:
+            # Opt-in only, and guarded: a terminal that cannot ring is not a
+            # reason to lose the notification that went with it.
+            try:
+                self.bell()
+            except Exception:  # noqa: BLE001 - terminal-dependent
+                pass
+
+    def _sync_watch_highlights(self) -> None:
+        """Set every visible row's highlight from the index.
+
+        A lookup per row, never a match: the answer was computed when the line
+        arrived. This is what keeps re-rendering independent of how many rules
+        are enabled.
+        """
+
+        source = self._selected_source
+        for index, entry in self.log_panel.entry_rows():
+            self.log_panel.set_row_watched(index, self._watch_index.watched(source, entry))
+
+    def _set_watch_rules(self, rules: Iterable[WatchRule]) -> None:
+        self._update_state(watch_rules=tuple(rules))
+        self._sync_watch_rules()
+        self._sync_view_toggles()
+        self._render_log()
+
+    def _set_watch_enabled(self, value: bool) -> None:
+        """The drawer's switch: all rules on, or all off."""
+
+        if not self.state.watch_rules:
+            self._notify("No watch rules yet — press W to add one.", "warning")
+            return
+        self._set_watch_rules(
+            replace(rule, enabled=value) for rule in self.state.watch_rules
+        )
+        self._notify("Watch rules on." if value else "Watch rules off.")
+
+    async def _prompt_watch_rules(self) -> None:
+        rules = await self.push_screen(
+            WatchRulesDialog(self.state.watch_rules, self._known_fields),
+            wait_for_dismiss=True,
+        )
+        if rules is None:
+            # Nothing changed: not worth re-indexing the buffer over a dialog
+            # that was only looked at.
+            return
+        self._set_watch_rules(rules)
+        self._notify(describe_rules(rules))
 
     # --- saved views --------------------------------------------------------
 
@@ -2200,6 +2355,8 @@ class LogViewerApp(App[None]):
             self._set_clipboard_enabled(message.value)
         elif message.field == "detail_pane":
             self._set_detail_pane(message.value)
+        elif message.field == "watch_rules":
+            self._set_watch_enabled(message.value)
         else:
             self._set_structured(message.value)
 
@@ -2284,6 +2441,7 @@ class LogViewerApp(App[None]):
             structured=self.state.pretty_rendering,
             clipboard=self.state.clipboard_osc52,
             detail_pane=self.state.detail_pane,
+            watch_rules=self._watching,
         )
 
     def _sync_detail_pane(self) -> None:
@@ -2317,6 +2475,16 @@ class LogViewerApp(App[None]):
     def _dismiss_chip(self, key: str) -> None:
         if key == "query":
             self.action_clear_query()
+            return
+        if key.startswith("watch:"):
+            # Dismissing a watch chip disables the rule rather than deleting
+            # it: a chip is a way to quieten something, not to throw it away.
+            name = key.split(":", 1)[1]
+            if name == "*":
+                self._set_watch_enabled(False)
+            else:
+                self._set_watch_rules(toggled(self.state.watch_rules, name, False))
+                self._notify(f"Watch rule '{name}' disabled.")
             return
         if key == "severity":
             self.query_bar.set_severity("all")

@@ -131,6 +131,8 @@ use.
 | `tree_width` | Starting width of the source tree, in columns. | `38` |
 | `csv_max_rows` / `csv_max_cols` | Structured payload preview limits. | `20 / 10` |
 | `clipboard_max_bytes` | Most log text one `y` clipboard copy may carry. Oversized copies are truncated at a line boundary and say so. | `65536` |
+| `watch_rate_limit` | Seconds a watch rule waits before notifying again; matches inside the window are counted and reported together. | `60` |
+| `watch_bell` | Ring the terminal bell when a watch rule notifies. | `false` |
 
 Invalid values fall back to safe defaults; the app never fails to start because
 of a malformed settings file. Most discovery options are also editable at
@@ -233,6 +235,42 @@ Views live in `session.json`, so they survive restarts. Like everything else
 there, a view records **settings and one path only** — never a log line, never
 what it matched.
 
+### Watch rules
+
+Tailing means waiting for something. A watch rule says what, so you can stop
+reading every line: `W` opens the manager, `a` adds a rule, `Enter` edits one,
+`space` enables or disables it, `d` twice deletes it.
+
+A rule is a name, a pattern in the same syntax the query box uses (so
+`tag:kernel oom-killer` works), and an action:
+
+| Action | Effect |
+| --- | --- |
+| Highlight only | Matching lines are drawn with a distinct background |
+| Notify only | A notification, nothing visual |
+| Highlight + notify | Both (the default) |
+
+The highlight is a **background**, deliberately: severity is carried in the
+text colour, so a watched INFO line reads as watched rather than as an error.
+
+**Notifications are rate limited.** The first match for a rule is reported at
+once; anything else inside the window is counted and reported together — *"Watch
+'oom-killer' matched 143 lines."* The window is `watch_rate_limit` in
+`settings.conf` (60 seconds by default), and a rule matching every line
+therefore costs one message a minute rather than one per line. Set
+`watch_bell = true` if you want the terminal bell as well; it is off by default.
+
+Opening a log highlights the lines already in the buffer that match, but says
+nothing about them — you asked to be told about what happens next, not about
+what happened before you asked. Enabled rules appear as chips beside the filter
+chips, and dismissing a chip disables that rule without deleting it. The
+Advanced drawer has a switch for the whole set and a count of what is live.
+
+Rules persist in `session.json`, the same as saved views: a pattern is
+something you typed, not something a log contained. Everything runs in-process
+for the life of the session — no daemon, no desktop notification service, no
+subprocess.
+
 ### Exporting
 
 `Ctrl+E` writes the entries the filters kept to a file. Three formats ship:
@@ -300,6 +338,7 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `g` | Go to a timestamp |
 | `m` / `M` | Mark the cursor line / jump to the next mark |
 | `v` / `V` | Open saved views / save the current filters as a view |
+| `W` | Manage watch rules (live highlights and alerts) |
 | `d` | Show / hide the event detail pane |
 | `w` | Follow new lines (auto-scroll) on/off |
 | `o` | Structured output on/off |

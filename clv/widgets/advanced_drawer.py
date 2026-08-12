@@ -141,7 +141,8 @@ class AdvancedFiltersDrawer(Static):
     /* Read-only list of what Ctrl+E can write, so the exporters are visible
        without opening the dialog. No top padding: it sits directly under the
        plugin line as a second detail of the same block. */
-    AdvancedFiltersDrawer #export-status {
+    AdvancedFiltersDrawer #export-status,
+    AdvancedFiltersDrawer #watch-status {
         color: $text-muted;
         height: auto;
     }
@@ -203,6 +204,7 @@ class AdvancedFiltersDrawer(Static):
         self._structured = False
         self._clipboard = True
         self._detail_pane = False
+        self._watch_rules = True
         self.add_class("-hidden")
 
     # --- composition --------------------------------------------------------
@@ -240,7 +242,14 @@ class AdvancedFiltersDrawer(Static):
                 with Vertical(classes="drawer-toggle"):
                     yield Label("Detail pane")
                     yield Switch(value=self._detail_pane, id="drawer-detail-pane")
-                yield Static("", classes="drawer-field")
+                # Takes the spacer's place rather than adding a row: this
+                # drawer scrolls at max-height 16, and a new row here is what
+                # pushes "Source discovery" below the fold. Single-home like
+                # its neighbours — `W` manages the rules, this switches the
+                # whole set on or off.
+                with Vertical(classes="drawer-toggle"):
+                    yield Label("Watch rules")
+                    yield Switch(value=self._watch_rules, id="drawer-watch-rules")
 
         yield Label("Source discovery", classes="drawer-heading")
         with Horizontal(classes="drawer-row"):
@@ -294,6 +303,7 @@ class AdvancedFiltersDrawer(Static):
 
         yield Static("", id="plugin-status")
         yield Static("", id="export-status")
+        yield Static("", id="watch-status")
 
         with Container(id="drawer-actions"):
             yield Button("Rescan sources", id="rescan-sources", variant="primary")
@@ -315,6 +325,13 @@ class AdvancedFiltersDrawer(Static):
         """Show what the export dialog offers. Read-only: `Ctrl+E` runs it."""
         try:
             self.query_one("#export-status", Static).update(text)
+        except NoMatches:
+            pass
+
+    def set_watch_status(self, text: str) -> None:
+        """Show how many watch rules are live. Read-only: `W` manages them."""
+        try:
+            self.query_one("#watch-status", Static).update(text)
         except NoMatches:
             pass
 
@@ -351,6 +368,7 @@ class AdvancedFiltersDrawer(Static):
         structured: bool,
         clipboard: bool | None = None,
         detail_pane: bool | None = None,
+        watch_rules: bool | None = None,
     ) -> None:
         """Mirror the app's view state onto this drawer's switches.
 
@@ -360,9 +378,9 @@ class AdvancedFiltersDrawer(Static):
         a flag cleared at the end of this method is already back to False by
         the time the handler runs.
 
-        ``clipboard`` and ``detail_pane`` are optional because neither switch
-        has a second copy in the query bar: they only need seeding, not
-        continuous mirroring.
+        ``clipboard``, ``detail_pane`` and ``watch_rules`` are optional because
+        none of those switches has a second copy in the query bar: they only
+        need seeding, not continuous mirroring.
         """
 
         self._auto_scroll = auto_scroll
@@ -371,6 +389,8 @@ class AdvancedFiltersDrawer(Static):
             self._clipboard = clipboard
         if detail_pane is not None:
             self._detail_pane = detail_pane
+        if watch_rules is not None:
+            self._watch_rules = watch_rules
         try:
             with self.prevent(Switch.Changed):
                 self.query_one("#drawer-auto-scroll", Switch).value = auto_scroll
@@ -379,6 +399,8 @@ class AdvancedFiltersDrawer(Static):
                     self.query_one("#drawer-clipboard", Switch).value = clipboard
                 if detail_pane is not None:
                     self.query_one("#drawer-detail-pane", Switch).value = detail_pane
+                if watch_rules is not None:
+                    self.query_one("#drawer-watch-rules", Switch).value = watch_rules
         except NoMatches:  # not composed yet
             pass
 
@@ -392,6 +414,7 @@ class AdvancedFiltersDrawer(Static):
             "drawer-structured": "structured",
             "drawer-clipboard": "clipboard",
             "drawer-detail-pane": "detail_pane",
+            "drawer-watch-rules": "watch_rules",
         }.get(switch_id)
         if view_field is not None:
             event.stop()

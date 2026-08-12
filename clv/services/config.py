@@ -35,6 +35,11 @@ _LIMITS: dict[str, tuple[int, int, int]] = {
     # ~74 kB passthrough limit with room for base64 expansion, so a copy that
     # fits the cap is a copy the terminal will actually accept.
     "clipboard_max_bytes": (65_536, 1_024, 1_000_000),
+    # Seconds a watch rule waits before it may notify again. The floor is not
+    # zero on purpose: a rule matching every tailed line would otherwise raise
+    # a toast per line, which is the behaviour that gets a feature like this
+    # switched off for good.
+    "watch_rate_limit": (60, 5, 3_600),
 }
 
 DEFAULT_SETTINGS_TEMPLATE = f"""[{CONFIG_SECTION}]
@@ -83,6 +88,13 @@ csv_max_cols = 10
 # Most log text one 'y' (OSC 52 clipboard copy) may carry. Oversized copies are
 # truncated at a line boundary and the notification says how much was dropped.
 clipboard_max_bytes = 65536
+
+# Watch rules (W). Seconds one rule waits before it may notify again; matches
+# inside the window are counted and reported together.
+watch_rate_limit = 60
+
+# Ring the terminal bell when a watch rule notifies. Off by default.
+watch_bell = false
 """
 
 
@@ -101,6 +113,10 @@ class LogConfig:
     csv_max_cols: int = _LIMITS["csv_max_cols"][0]
     tree_width: int = _LIMITS["tree_width"][0]
     clipboard_max_bytes: int = _LIMITS["clipboard_max_bytes"][0]
+    watch_rate_limit: int = _LIMITS["watch_rate_limit"][0]
+    #: Ring the terminal bell when a watch rule notifies. Off by default: a
+    #: bell is a thing an operator opts into, never a thing a log does to them.
+    watch_bell: bool = False
 
     def with_discovery(self, **changes) -> "LogConfig":
         """Return a copy with individual discovery settings replaced."""
@@ -304,6 +320,8 @@ def load_config(path: Optional[Path] = None) -> LogConfig:
         csv_max_cols=_read_int(section, "csv_max_cols"),
         tree_width=_read_int(section, "tree_width"),
         clipboard_max_bytes=_read_int(section, "clipboard_max_bytes"),
+        watch_rate_limit=_read_int(section, "watch_rate_limit"),
+        watch_bell=_read_bool(section, "watch_bell", False),
     )
 
     # default_show_lines must not exceed what the buffer can hold.

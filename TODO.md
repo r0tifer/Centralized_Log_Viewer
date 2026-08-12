@@ -682,6 +682,40 @@ switch. Active rules also surface as dismissable chips, reusing
 **README.** New "Watch rules" section; shortcuts row for `W`; `settings.conf`
 table rows for the bell and rate-limit window.
 
+**As shipped.** The interesting decisions are all about *what counts as an
+event*:
+
+- **Matching is cached per distinct line; occurrences are counted per
+  arrival.** `WatchIndex` keys its answers the way `marks.py` does — source
+  plus a digest of the raw text — so a re-render is a dict lookup and
+  `test_re_rendering_does_not_re_evaluate_the_rules` holds by construction.
+  But the cache answers "does this text match", not "how many times has this
+  happened": fifty identical `connection refused` lines are fifty events, and
+  an index that deduplicated them would have the notifier report one. So
+  `evaluate` returns a hit for every entry handed to it and only *matching*
+  work is deduplicated. Callers pass in what newly arrived; the silent pass
+  over a primed buffer ignores the return value.
+- **Lines already in the buffer are highlighted, never announced.** Opening a
+  source or adding a rule matches what is already there so the pane is honest
+  about it, and says nothing: nobody asked to be told about lines that arrived
+  before the rule existed, and a source switch would otherwise open with a
+  burst of toasts about history.
+- **The highlight is a background, not a gutter glyph.** The gutter is two
+  cells and already belongs to marks. Severity lives in the foreground colour,
+  so a background plus bold is what makes a watched INFO line read as watched
+  rather than as an error, and it survives a terminal with no colour at all.
+- **No new timer.** The notifier is driven from the tail poll that already runs
+  at `refresh_hz`; a clock of its own would only be a way for the two to
+  disagree. Time is injected, so the rate limiting is unit-tested without one.
+- **The enable-all switch took the spacer slot** in the drawer's "Output &
+  panes" row rather than getting a section of its own — the same `max-height:
+  16` constraint Item 5 recorded. Past three enabled rules the chips collapse
+  into one `Watching: N rules`, because the chip bar is a single row at 80
+  columns; dismissing any watch chip **disables** the rule rather than deleting
+  it.
+- **The dialog dismisses with `None` when nothing changed**, so opening it to
+  look costs no re-indexing of the buffer.
+
 ---
 
 # Phase 4 — The source layer

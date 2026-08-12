@@ -13,6 +13,8 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, ClassVar, Dict, Optional
 
+from .services.watch import WatchRule
+
 
 @dataclass(frozen=True)
 class SavedView:
@@ -132,6 +134,10 @@ class SessionState:
     #: Named filter bundles, sorted by name. Same argument as `starred`: an
     #: explicit choice, and settings only — see :class:`SavedView`.
     views: tuple[SavedView, ...] = ()
+    #: Watch rules. A pattern is something the operator typed, like a query, so
+    #: keeping it is recording their setup and not their reading — which is
+    #: exactly the line marks fall on the other side of.
+    watch_rules: tuple[WatchRule, ...] = ()
 
     #: Fields written to disk. Every field on this class — the previous build
     #: persisted only three and dropped every filter on exit.
@@ -160,6 +166,7 @@ class SessionState:
         "tree_width",
         "starred",
         "views",
+        "watch_rules",
     )
 
     @classmethod
@@ -186,13 +193,18 @@ class SessionState:
                 if not isinstance(value, (list, tuple)):
                     continue
                 value = tuple(item for item in value if isinstance(item, str))
-            if expected == "tuple[SavedView, ...]":
+            if expected in ("tuple[SavedView, ...]", "tuple[WatchRule, ...]"):
                 # Same rule one level down: a malformed record is dropped and
-                # the rest of the operator's views survive it.
+                # the rest of the operator's views (or rules) survive it.
                 if not isinstance(value, (list, tuple)):
                     continue
-                restored = (SavedView.from_dict(item) for item in value)
-                value = tuple(view for view in restored if view is not None)
+                build = (
+                    SavedView.from_dict
+                    if expected == "tuple[SavedView, ...]"
+                    else WatchRule.from_dict
+                )
+                restored = (build(item) for item in value)
+                value = tuple(record for record in restored if record is not None)
             known[name] = value
         return cls(**known)
 

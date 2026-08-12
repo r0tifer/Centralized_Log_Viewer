@@ -76,6 +76,9 @@ class _Row:
     renderable: RenderableType
     entry: Optional[LogEntry] = None
     marked: bool = False
+    #: Matched an enabled watch rule. Styling only — a watched row is an
+    #: ordinary row that is easier to find.
+    watched: bool = False
     strips: list[Strip] = field(default_factory=list)
     #: First line of this row within the flat line map. Recomputed by _relayout.
     start_line: int = 0
@@ -91,6 +94,7 @@ class LogView(ScrollView, can_focus=True):
     COMPONENT_CLASSES = {
         "log-view--cursor",
         "log-view--mark",
+        "log-view--watch",
     }
 
     DEFAULT_CSS = """
@@ -111,6 +115,16 @@ class LogView(ScrollView, can_focus=True):
 
     LogView > .log-view--mark {
         color: #facc15;
+        text-style: bold;
+    }
+
+    /* A watched line has to be distinguishable from a *severe* one, and
+       severity is carried in the foreground colour — so this is a background,
+       plus bold for a terminal showing no colour at all. Deliberately a
+       different hue from the cursor, which is a position rather than a
+       property of the line. */
+    LogView > .log-view--watch {
+        background: #4c1d95;
         text-style: bold;
     }
     """
@@ -315,17 +329,21 @@ class LogView(ScrollView, can_focus=True):
             return Strip.blank(width, self.rich_style)
 
         row_index, offset = self._line_map[index]
+        row = self._rows[row_index]
         is_cursor = row_index == self._cursor
-        key = (row_index, offset, scroll_x, width, is_cursor)
+        key = (row_index, offset, scroll_x, width, is_cursor, row.watched)
         cached = self._strip_cache.get(key)
         if cached is not None:
             return cached
 
-        strip = self._rows[row_index].strips[offset]
+        strip = row.strips[offset]
         strip = strip.crop_extend(scroll_x, scroll_x + width, self.rich_style)
+        # Both are *base* styles — per-segment severity colours still win on
+        # top, so neither erases the line's own meaning. Watch first, cursor
+        # second: where you are looking beats what you asked to be shown.
+        if row.watched:
+            strip = strip.apply_style(self.get_component_rich_style("log-view--watch"))
         if is_cursor:
-            # apply_style is a *base* style — per-segment severity colours still
-            # win on top of it, so the cursor tints the row without erasing it.
             strip = strip.apply_style(self.get_component_rich_style("log-view--cursor"))
         self._strip_cache[key] = strip
         return strip
@@ -495,6 +513,26 @@ class LogView(ScrollView, can_focus=True):
             row.strips = self._render_strips(row, index)
             self._strip_cache.clear()
             self._refresh_row(index)
+
+    def set_row_watched(self, index: int, watched: bool) -> None:
+        """Flip a row's watch highlight.
+
+        Cheaper than :meth:`set_row_marked`: the highlight is applied at paint
+        time from the row flag, so nothing has to be re-stripped — only the
+        cached strips for this row are dropped and the lines repainted.
+        """
+
+        if not (0 <= index < len(self._rows)):
+            return
+        row = self._rows[index]
+        if row.watched == watched:
+            return
+        row.watched = watched
+        self._strip_cache.clear()
+        self._refresh_row(index)
+
+    def is_row_watched(self, index: int) -> bool:
+        return 0 <= index < len(self._rows) and self._rows[index].watched
 
     # --- actions ------------------------------------------------------------
 
