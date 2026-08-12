@@ -246,7 +246,7 @@ or break a render.
 - Layout regressions are caught by asserting widget `region` bounds at a given
   terminal size rather than by eyeballing screenshots.
 
-Run: `python -m pytest` (362 tests).
+Run: `python -m pytest` (508 tests).
 
 ---
 

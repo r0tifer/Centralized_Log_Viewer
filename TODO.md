@@ -14,7 +14,7 @@ would mean reworking every feature built on top of them.
 | 0 — Foundations | 1, 2 | ✅ **Complete** (`094716c`) |
 | 1 — Close the dangling loops | 3, 4 | ✅ **Complete** (`48822ed`, `08edb3c`) |
 | 2 — The line cursor and what it unlocks | 5, 6, 7 | ✅ **Complete** (`63354f9`, `1c9fd27`, `20e4ffd`) |
-| 3 — Query and view power | 8, 9, 10 | Not started |
+| 3 — Query and view power | 8, 9, 10 | ✅ **Complete** (`b882cfb`, `3fbbf75`, `bd174af`) |
 | 4 — The source layer | 11, 12, 13 | Not started |
 | 5 — Analysis | 14, 15 | Not started |
 
@@ -78,9 +78,9 @@ counts against the same key budget and appears in the same help overlay.
 | `g` | Go to timestamp | 6 | hidden | ✅ |
 | `m` | Mark / unmark the cursor line | 7 | hidden | ✅ |
 | `M` | Jump to next mark | 7 | hidden | ✅ |
-| `v` | Open saved views | 9 | hidden | |
-| `V` | Save current filters as a view | 9 | hidden | |
-| `W` | Watch rules manager | 10 | hidden | |
+| `v` | Open saved views | 9 | hidden | ✅ |
+| `V` | Save current filters as a view | 9 | hidden | ✅ |
+| `W` | Watch rules manager | 10 | hidden | ✅ |
 | `x` | Toggle source into the merged set | 13 | hidden | |
 | `u` | Open the merged (unified) view | 13 | hidden | |
 | `b` | Toggle the severity timeline | 14 | hidden | |
@@ -491,9 +491,9 @@ The privacy constraint is enforced rather than only documented: `MarkSet` is
 
 ---
 
-# Phase 3 — Query and view power
+# Phase 3 — Query and view power ✅
 
-## 8. Field-aware query syntax
+## 8. Field-aware query syntax ✅
 
 **Goal.** The query is a regex over the whole raw line, which is excellent for
 "find this string" and useless for "show me sshd on web01 with a 5xx". With
@@ -570,7 +570,7 @@ so no import site changed.
 
 ---
 
-## 9. Saved views (Custom Views)
+## 9. Saved views (Custom Views) ✅
 
 **Goal.** `SessionState` persists exactly one filter set
 ([storage.py:19-64](clv/storage.py#L19-L64)). Event Viewer's headline feature is
@@ -640,7 +640,7 @@ with the notification saying which of the two happened.
 
 ---
 
-## 10. Watch rules and live alerts
+## 10. Watch rules and live alerts ✅
 
 **Goal.** Tailing means watching for something. A watch rule is a saved pattern
 that highlights matching lines as they arrive and raises a notification —

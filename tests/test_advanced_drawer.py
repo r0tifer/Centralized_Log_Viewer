@@ -6,11 +6,15 @@ import asyncio
 from pathlib import Path
 
 from textual.app import App, ComposeResult
-from textual.widgets import Input, Switch
+from textual.widgets import Input, Static, Switch
 
 from clv.app import LogViewerApp
 from clv.services.discovery import DiscoverySettings
 from clv.widgets.advanced_drawer import AdvancedFiltersDrawer, AdvancedSettings
+
+
+def _run(scenario) -> None:
+    asyncio.run(scenario())
 
 
 class _Harness(App[None]):
@@ -356,3 +360,38 @@ def test_section_headings_are_actually_painted() -> None:
                 )
 
     asyncio.run(scenario())
+
+
+def test_the_query_syntax_reminder_and_watch_switch_are_present() -> None:
+    """Both were added below "Source discovery", which must still paint.
+
+    That heading is the one an earlier drawer change pushed past `max-height:
+    16`, where it laid out correctly and painted nothing — so the guard here is
+    not "the new controls exist" but "they exist and cost the old ones nothing".
+    """
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.advanced_drawer.show()
+            await pilot.pause()
+            await pilot.pause()
+
+            drawer = app.advanced_drawer
+            for widget_id in ("#query-syntax", "#watch-status", "#drawer-watch-rules"):
+                region = drawer.query_one(widget_id).region
+                assert region.width > 0 and region.height > 0, widget_id
+
+            hint = drawer.query_one("#query-syntax", Static)
+            assert "field terms" in hint.render().plain
+
+            # Every heading still has rows to paint into. The syntax line went
+            # in *after* Search options and the watch switch replaced a spacer,
+            # so neither can have squeezed a heading to nothing — this is the
+            # assertion that would catch it if one did.
+            for label in drawer.query(".drawer-heading"):
+                assert label.region.height >= 2, str(label.render())
+
+    _run(scenario)
