@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from dataclasses import MISSING
 from datetime import datetime
 
 import pytest
 
+from clv.services.parsing import _EMPTY_FIELDS
 from clv.services.parsing import (
     LEVEL_CRITICAL,
     LEVEL_DEBUG,
@@ -275,6 +277,33 @@ def test_log_entry_is_constructible_without_fields() -> None:
 
     entry = LogEntry(raw="hello")
     assert entry.fields == {}
+
+
+def test_the_fields_default_is_legal_on_the_oldest_supported_python() -> None:
+    """`fields` must use a default_factory, or 3.11 cannot import the package.
+
+    Python 3.11 rejects a dataclass default whose *class* defines no
+    ``__hash__``, and ``mappingproxy`` was such a class: declaring this field
+    as ``field(default=_EMPTY_FIELDS)`` makes ``import clv`` raise ValueError
+    on 3.11 — the minimum this project supports, and the version the release
+    binaries are built with.
+
+    The rule cannot be asked of the running interpreter, which is the trap:
+    3.12 gave ``mappingproxy`` a ``__hash__`` and narrowed the check, so a
+    test that probes the rule passes on a modern interpreter no matter what
+    this field says. So the workaround is what gets asserted. Verified against
+    a real 3.11 rather than inferred from the docs.
+    """
+
+    spec = LogEntry.__dataclass_fields__["fields"]
+
+    assert spec.default is MISSING, (
+        "fields needs a default_factory; a plain default fails to import on 3.11"
+    )
+    # And the factory must still hand back the shared mapping, or the common
+    # case — a line with no fields, which is most of them — starts allocating.
+    assert spec.default_factory() is _EMPTY_FIELDS
+    assert LogEntry(raw="hello").fields == {}
 
 
 def test_fields_are_read_only_and_do_not_break_hashing() -> None:

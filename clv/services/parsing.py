@@ -181,7 +181,17 @@ class LogEntry:
     #: Structure recovered from the line, keyed by the normalised names in the
     #: module docstring. ``compare=False`` because this is derived from ``raw``
     #: and a mapping member would otherwise make ``LogEntry`` unhashable.
-    fields: Mapping[str, str] = field(default=_EMPTY_FIELDS, compare=False)
+    #:
+    #: A ``default_factory`` rather than a plain ``default``, and the shared
+    #: mapping is what it returns, so the common case still allocates nothing.
+    #: Python 3.11 -- the *minimum* this project supports, and what the release
+    #: binaries are built with -- rejects any dataclass default whose class is
+    #: unhashable, and ``mappingproxy`` is one. 3.12 narrowed that check to
+    #: list/dict/set, which is why a plain default looks fine on a newer
+    #: interpreter and fails to import on the oldest supported one.
+    fields: Mapping[str, str] = field(
+        default_factory=lambda: _EMPTY_FIELDS, compare=False
+    )
 
     @property
     def structured(self) -> bool:
