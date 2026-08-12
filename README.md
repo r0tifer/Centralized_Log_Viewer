@@ -177,10 +177,10 @@ it to the **merged set**; `u` opens the set as one timestamp-ordered stream:
 
 ```
 ⭐ Starred
-  ⭐ logs/auth.log       alpha.log   2026-08-11 10:00:00 INFO  request accepted
-⧉ Merged                beta.log    2026-08-11 10:00:01 INFO  upstream connect
-  ⧉ logs/alpha.log      alpha.log   2026-08-11 10:00:02 ERROR upstream timeout
-  ⧉ logs/beta.log       beta.log    2026-08-11 10:00:03 WARN  retrying
+  ⭐ logs/auth.log            alpha.log   2026-08-11 10:00:00 INFO  request accepted
+⧉ Merged (2 sources)   ←     beta.log    2026-08-11 10:00:01 INFO  upstream connect
+  ⧉ logs/alpha.log     click alpha.log   2026-08-11 10:00:02 ERROR upstream timeout
+  ⧉ logs/beta.log      to open beta.log  2026-08-11 10:00:03 WARN  retrying
 📂 /var/log
    ⧉📄 alpha.log
    ⧉📄 beta.log
@@ -189,7 +189,10 @@ it to the **merged set**; `u` opens the set as one timestamp-ordered stream:
 
 The set is repeated as a group below the starred logs, so it is one keystroke
 away however deep its members are buried; each member also carries a `⧉` where
-it sits in the folder tree. A source column names the origin of every row
+it sits in the folder tree. **Selecting the `⧉ Merged` row itself opens the
+merged view** — the same thing `u` does — which is how you get back into a set
+after a restart without remembering the shortcut. Selecting one member below it
+opens just that log, which is also sometimes what you want. A source column names the origin of every row
 (abbreviated as the terminal narrows), and the status line names the set.
 Adding or removing a source edits those rows in place — it never re-runs
 discovery, and it never collapses folders you had opened. **Every other feature works exactly as it does on a single log** — filters,

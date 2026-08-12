@@ -171,6 +171,25 @@ ICON_MERGED = "⧉"
 #: `u`, and the two are read in that order.
 MERGED_GROUP = f"{ICON_MERGED} Merged"
 
+
+class MergedSetNode:
+    """Marker carried by the tree row that opens the merged view.
+
+    The other groups are headings — selecting "Starred" means nothing, so they
+    carry no data and the selection handler ignores them. This one *is* an
+    action: it is the only way back into a merged set with the mouse, and after
+    a restart the set is the thing an operator is looking for rather than any
+    single member. Its children stay individually selectable, because opening
+    one member on its own is also a reasonable thing to want.
+    """
+
+    __slots__ = ()
+
+
+#: Singleton, so the handler and the tree lookups can both test identity —
+#: sturdier than matching on a label that carries a count.
+MERGED_VIEW = MergedSetNode()
+
 #: Groups that sit above the configured roots, in the order they are built.
 #: Used to place the merged group correctly when it appears mid-session,
 #: without rebuilding the tree around it.
@@ -814,7 +833,7 @@ class LogViewerApp(App[None]):
         # that has since rotated away should be visible enough to press `x` on
         # rather than silently absent.
         if self.state.merged:
-            group = tree.root.add(MERGED_GROUP, data=None, expand=True)
+            group = tree.root.add(self._merged_label(), data=MERGED_VIEW, expand=True)
             for path in self._merged_display_paths():
                 group.add_leaf(f"{ICON_MERGED} {_compact_path(path)}", data=path)
 
@@ -1050,6 +1069,16 @@ class LogViewerApp(App[None]):
     def _merged_paths(self) -> set[Path]:
         return {_resolve(Path(entry)) for entry in self.state.merged}
 
+    def _merged_label(self) -> str:
+        """The group's heading, which says what pressing it will open.
+
+        The count is the difference between a heading and a control: "Merged"
+        alone reads as a category, while "2 sources" says there is something
+        assembled here to open.
+        """
+
+        return f"{MERGED_GROUP} ({_plural(len(self.state.merged), 'source', 'sources')})"
+
     def _merged_display_paths(self) -> list[Path]:
         """The merged set in the order the group lists it."""
 
@@ -1080,7 +1109,10 @@ class LogViewerApp(App[None]):
                 # Mid-session, so it has to be placed rather than appended:
                 # below the other groups and above the configured roots.
                 group = tree.root.add(
-                    MERGED_GROUP, data=None, expand=True, before=self._group_count(tree)
+                    self._merged_label(),
+                    data=MERGED_VIEW,
+                    expand=True,
+                    before=self._group_count(tree),
                 )
             ordered = self._merged_display_paths()
             position = ordered.index(next(p for p in ordered if _resolve(p) == path))
@@ -1095,6 +1127,10 @@ class LogViewerApp(App[None]):
                 # An empty group is a row that explains nothing.
                 group.remove()
                 group = None
+
+        if group is not None:
+            # The count is part of what makes the row read as a control.
+            group.set_label(self._merged_label())
 
         # Every other node carrying this path — the file in its folder, and its
         # copy in the starred group — gains or loses the indicator.
@@ -1111,12 +1147,7 @@ class LogViewerApp(App[None]):
     @staticmethod
     def _merged_group(tree: LogTree) -> Optional[TreeNode[object]]:
         return next(
-            (
-                node
-                for node in tree.root.children
-                if node.data is None and node.label.plain == MERGED_GROUP
-            ),
-            None,
+            (node for node in tree.root.children if node.data is MERGED_VIEW), None
         )
 
     @staticmethod
@@ -2739,6 +2770,8 @@ class LogViewerApp(App[None]):
             self._select_rotated_set(data)
         elif isinstance(data, ProviderSource):
             self._select_provider_source(data)
+        elif data is MERGED_VIEW:
+            self.action_open_merged()
         elif isinstance(data, SavedView):
             self._apply_view(data)
             self._notify(f"Applied view '{data.name}'.")
