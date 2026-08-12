@@ -49,6 +49,7 @@ from typing import Iterator, Optional
 
 from rich.console import RenderableType
 from rich.segment import Segment
+from rich.style import Style
 from rich.text import Text
 from textual import events
 from textual.binding import Binding
@@ -193,7 +194,9 @@ class LogView(ScrollView, can_focus=True):
         self._layout_width = 0
         self._widest = 0
         self._cursor = -1
-        self._strip_cache: LRUCache[tuple[int, int, int, int, bool], Strip] = LRUCache(1024)
+        self._strip_cache: LRUCache[tuple[int, int, int, int, bool, bool, Style], Strip] = (
+            LRUCache(1024)
+        )
 
     # --- content ------------------------------------------------------------
 
@@ -312,7 +315,12 @@ class LogView(ScrollView, can_focus=True):
         ]
 
     def _gutter_strips(self, row: _Row, height: int) -> list[Strip]:
-        blank = Strip.blank(GUTTER_WIDTH, self.rich_style)
+        # No style, deliberately: a strip is built once and reused, so baking
+        # today's background into it means the gutter keeps the colours of
+        # whatever theme was active when the row was written. Left unstyled,
+        # it picks up the widget's background in `render_line` along with
+        # everything else, and follows a theme change with the rest of the pane.
+        blank = Strip.blank(GUTTER_WIDTH)
         if not row.marked:
             return [blank] * height
         # Only the first line carries the glyph: a wrapped line is the same
@@ -331,7 +339,13 @@ class LogView(ScrollView, can_focus=True):
         row_index, offset = self._line_map[index]
         row = self._rows[row_index]
         is_cursor = row_index == self._cursor
-        key = (row_index, offset, scroll_x, width, is_cursor, row.watched)
+        # The widget style is part of the key, not just something the cache is
+        # cleared on: a cached strip carries the background it was painted
+        # with, so switching theme has to miss rather than hand back a row
+        # coloured for the theme before it. `notify_style_update` still clears,
+        # but correctness must not depend on the order that arrives in.
+        base = self.rich_style
+        key = (row_index, offset, scroll_x, width, is_cursor, row.watched, base)
         cached = self._strip_cache.get(key)
         if cached is not None:
             return cached
@@ -345,6 +359,17 @@ class LogView(ScrollView, can_focus=True):
             strip = strip.apply_style(self.get_component_rich_style("log-view--watch"))
         if is_cursor:
             strip = strip.apply_style(self.get_component_rich_style("log-view--cursor"))
+        # The widget's own background, applied last and therefore *underneath*
+        # everything above — `apply_style` layers its argument beneath the
+        # styles already on a segment, so severity colours, the cursor and a
+        # watch highlight all still win.
+        #
+        # Without this the pane never paints its own background at all. Rich
+        # renders a Text with no background of its own, so those cells came out
+        # unstyled and the terminal's default showed through: invisible on a
+        # dark terminal, which is why it survived this long, and a white log
+        # pane on a light one no matter which Textual theme was selected.
+        strip = strip.apply_style(base)
         self._strip_cache[key] = strip
         return strip
 
