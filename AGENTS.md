@@ -90,11 +90,19 @@ distros.
   normalised across formats — `host` means the same thing whether it came from
   syslog or from an access log. Values are strings and are never coerced; a
   continuation inherits timestamp and level but never fields.
+- `query.py` — the grammar behind `host:web01 status>=500`: tokenising,
+  operators, and the rule that decides what is a field term at all. A token is
+  one only when its key is a name the parser normalises or a key the buffer
+  actually carries; everything else stays part of the regex, which is what
+  keeps `sshd:` searching for text. A query with no recognised term is passed
+  through byte-for-byte, so nothing anyone had saved changes meaning.
 - `filtering.py` — `FilterSpec` → `FilterResult` with per-reason hidden counts.
   Also owns time parsing: `parse_relative_window` / `parse_absolute_window` for
   the presets, `parse_moment` for the single point `g` jumps to, and
   `align_moments` so an aware JSON stamp and a naive syslog one can be ordered
-  rather than refused.
+  rather than refused. Field terms come from `query.py`; an entry that lacks a
+  field the query named is hidden into its own `hidden_missing_field` counter,
+  never merged with "did not match".
 - `discovery.py` — walks roots into a `DiscoveryReport`; pure and synchronous
   so callers can thread it. Every skip is attributed to exactly one of
   **`unsupported file type`** (CLV cannot display it), **`filtered out`** (the

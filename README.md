@@ -303,6 +303,48 @@ Understanding two rules explains everything the pane does:
    asked for** — and when they do, the empty pane says so, e.g. *"No matches —
    12 have no detected severity (nothing in this source declares a level)."*
 
+### Field queries
+
+The parser recovers more than a timestamp and a level from each line — a
+hostname, a program tag, an HTTP status, every key of a JSON payload — and the
+query box can ask about any of it:
+
+```
+tag:sshd host:web01 status>=500 timeout|refused
+└──────────── field terms ─────┘ └─── regex ──┘
+```
+
+Terms combine with **and**. Anything that is not a term is the regex it has
+always been, matched against the whole raw line.
+
+| Operator | Means | Example |
+| --- | --- | --- |
+| `key:value` | contains, smart-case (case-sensitive only if you type a capital) | `host:web` |
+| `key:` | the field is present at all | `pid:` |
+| `key=value` | exactly equal, case-sensitive | `host=web01` |
+| `key!=value` | not equal | `tag!=cron` |
+| `key>value` `key>=value` `key<value` `key<=value` | numeric when both sides are numbers, alphabetical otherwise | `status>=500` |
+
+Quote a value to keep spaces or colons inside it: `msg:"disk full"`.
+
+Which names work depends on the source. The parser's own vocabulary — `host`,
+`tag`, `pid`, `msgid`, `ident`, `user`, `request`, `status`, `size` — is always
+available, and every key a JSON line carries is added as soon as one is read.
+Start typing a name and the field list drops down under the input: `Tab` takes
+the first suggestion, `↓` steps into the list, `Esc` dismisses it. The Advanced
+drawer keeps a one-line reminder of the syntax under Search options.
+
+**Nothing you already search for changes.** A word that is not a known field
+name is text, so `sshd:` and `kernel: oom-killer` search for exactly what they
+always did, and so does a timestamp like `10:30:00`. The cost of that guarantee
+is that a mistyped field name (`hsot:web01`) is searched for as text rather
+than reported — which is why the completions exist.
+
+A line that has no such field is hidden and **counted**, like every other
+filter here: *"No matches — 214 carry no 'status' field (this source's format
+does not report it)."* If you are filtering a syslog with `status>=500`, that
+sentence is the answer.
+
 ### Navigating what you filtered to
 
 `n` and `N` move the line cursor forward and back through the lines worth

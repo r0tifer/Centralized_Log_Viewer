@@ -18,6 +18,13 @@ from textual.widgets import Button, Input, Label, Static, Switch
 
 from ..services.discovery import DiscoverySettings
 
+#: One-line reminder of the query grammar, shown under Search options. Kept
+#: short enough to survive 80 columns without wrapping into the plugin status.
+QUERY_SYNTAX_HINT = (
+    'Query: plain text is a regex · field terms: host:web01 · status>=500 · '
+    'tag!=cron · msg:"disk full"'
+)
+
 
 @dataclass(frozen=True)
 class AdvancedSettings:
@@ -116,6 +123,14 @@ class AdvancedFiltersDrawer(Static):
     }
 
     AdvancedFiltersDrawer Switch { height: 3; }
+
+    /* Wraps rather than truncates at 80 columns: the syntax is only useful
+       if all of it is readable. */
+    AdvancedFiltersDrawer #query-syntax {
+        color: $text-muted;
+        height: auto;
+        padding-top: 1;
+    }
 
     AdvancedFiltersDrawer #plugin-status {
         color: $text-muted;
@@ -271,6 +286,11 @@ class AdvancedFiltersDrawer(Static):
                 yield Label("Invert match")
                 yield Switch(value=self._settings.invert_match, id="invert-match")
             yield Static("", classes="drawer-field")
+
+        # One line, not a section: the drawer is capped at max-height 16 and a
+        # whole new heading here is what once pushed "Source discovery" below
+        # the fold, where it laid out and painted nothing.
+        yield Static(QUERY_SYNTAX_HINT, id="query-syntax")
 
         yield Static("", id="plugin-status")
         yield Static("", id="export-status")

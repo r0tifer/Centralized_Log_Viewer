@@ -9,6 +9,13 @@ Two rules drive the design, both reactions to the previous implementation:
    lacks (a severity, or a time window), and when that happens the count is
    reported back so the UI can explain the empty pane instead of just showing
    one.
+
+Since Item 8 the query may also carry **field terms** (``host:web01``,
+``status>=500``). The grammar lives in :mod:`clv.services.query`; this module
+splits the query once, applies the terms, and hands whatever is left to
+``compile_query`` exactly as the whole string used to be. Rule 2 extends to
+them: an entry that lacks a referenced field is hidden and counted in
+``hidden_missing_field``, never dropped without a reason.
 """
 
 from __future__ import annotations
@@ -19,10 +26,15 @@ from datetime import datetime, timedelta
 from typing import Optional, Sequence
 
 from .parsing import LogEntry, level_matches
-
-
-class QueryError(ValueError):
-    """Raised when a query string is not a usable regular expression."""
+from .query import (
+    MATCH_HIT,
+    MATCH_MISSING_FIELD,
+    FieldTerm,
+    QueryError,
+    entry_matches,
+    match_terms,
+    parse_query,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,14 +67,34 @@ class FilterSpec:
     #: uppercase character, matching the convention operators expect from
     #: ripgrep and friends.
     case_sensitive: Optional[bool] = None
-    #: When False, a plain-substring query is used instead of a regex.
+    #: When False, a plain-substring query is used instead of a regex. Field
+    #: terms are unaffected: they are never a regex, so there is nothing to
+    #: escape. Only the free-text remainder is taken literally.
     regex: bool = True
-    #: Invert the query match (show lines that do *not* match).
+    #: Invert the **free-text** match (show lines whose text does not match).
+    #: Field terms are always positive — `!=`, `<` and `>` are the per-term
+    #: negation, and there is no honest way to invert "this entry has no such
+    #: field": the entry would have to count as both hidden and shown.
     invert: bool = False
+    #: Field names that may appear as query terms: the parser's normalised
+    #: vocabulary plus whatever the buffer actually carries. Anything else in
+    #: the query stays free text, which is what keeps `sshd:` a regex. Passed
+    #: in rather than derived from the entries so the same spec always parses
+    #: the same way, whatever list it is applied to.
+    known_fields: frozenset[str] = frozenset()
 
     @property
     def active(self) -> bool:
         return bool(self.query) or self.severity != "all" or self.window.bounded
+
+    def parse(self):
+        """Split :attr:`query` into field terms and free text.
+
+        Raises:
+            QueryError: if a term is malformed.
+        """
+
+        return parse_query(self.query, self.known_fields)
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +110,11 @@ class FilterStats:
     hidden_missing_level: int = 0
     #: Subset of hidden_by_time whose timestamp was never detected.
     hidden_missing_timestamp: int = 0
+    #: Hidden because a field the query asked about is not on the entry at all.
+    #: Kept apart from hidden_by_query, which means "has the field, does not
+    #: match": one is a filter doing its job, the other is a question this
+    #: source cannot answer, and only the second needs explaining.
+    hidden_missing_field: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,12 +153,21 @@ def compile_query(
         raise QueryError(str(exc)) from exc
 
 
-def count_matches(entries: Sequence[LogEntry], pattern: Optional[re.Pattern[str]]) -> int:
-    """Count entries whose raw text matches *pattern* (all of them if None)."""
+def count_matches(
+    entries: Sequence[LogEntry],
+    pattern: Optional[re.Pattern[str]],
+    terms: Sequence[FieldTerm] = (),
+) -> int:
+    """Count entries matching *pattern* and every term in *terms*.
 
-    if pattern is None:
+    With neither, every entry counts. The term half goes through the same
+    predicate :func:`filter_entries` uses, so the hit counter in the query bar
+    cannot report a number the pane disagrees with.
+    """
+
+    if pattern is None and not terms:
         return len(entries)
-    return sum(1 for entry in entries if pattern.search(entry.raw))
+    return sum(1 for entry in entries if entry_matches(entry, terms, pattern))
 
 
 # --- time window construction ----------------------------------------------
@@ -237,8 +283,10 @@ def align_moments(left: datetime, right: datetime) -> tuple[datetime, datetime]:
 def filter_entries(entries: Sequence[LogEntry], spec: FilterSpec) -> FilterResult:
     """Apply *spec* to *entries*, reporting why anything was withheld."""
 
+    parsed = spec.parse()
+    terms = parsed.terms
     pattern = compile_query(
-        spec.query,
+        parsed.text,
         case_sensitive=spec.case_sensitive,
         regex=spec.regex,
     )
@@ -251,8 +299,21 @@ def filter_entries(entries: Sequence[LogEntry], spec: FilterSpec) -> FilterResul
     hidden_by_time = 0
     missing_level = 0
     missing_timestamp = 0
+    missing_field = 0
 
     for entry in entries:
+        # Terms first: an entry that cannot answer the question is a different
+        # kind of absent from one that answers it wrongly, and the counters
+        # have to keep them apart for describe_empty_result to be useful.
+        if terms:
+            outcome = match_terms(entry, terms)
+            if outcome == MATCH_MISSING_FIELD:
+                missing_field += 1
+                continue
+            if outcome != MATCH_HIT:
+                hidden_by_query += 1
+                continue
+
         if pattern is not None:
             hit = pattern.search(entry.raw) is not None
             if hit == spec.invert:
@@ -285,6 +346,7 @@ def filter_entries(entries: Sequence[LogEntry], spec: FilterSpec) -> FilterResul
         hidden_by_time=hidden_by_time,
         hidden_missing_level=missing_level,
         hidden_missing_timestamp=missing_timestamp,
+        hidden_missing_field=missing_field,
     )
     return FilterResult(entries=kept, stats=stats)
 
@@ -298,6 +360,11 @@ def describe_empty_result(stats: FilterStats, spec: FilterSpec) -> str:
     reasons: list[str] = []
     if stats.hidden_by_query:
         reasons.append(f"{stats.hidden_by_query} filtered out by the query")
+    if stats.hidden_missing_field:
+        reasons.append(
+            f"{stats.hidden_missing_field} carry no {_field_list(spec)} "
+            f"(this source's format does not report it)"
+        )
     if stats.hidden_by_severity:
         if stats.hidden_missing_level == stats.hidden_by_severity:
             reasons.append(
@@ -318,3 +385,22 @@ def describe_empty_result(stats: FilterStats, spec: FilterSpec) -> str:
     if not reasons:
         return "No log lines match the current filters."
     return "No matches — " + "; ".join(reasons) + "."
+
+
+def _field_list(spec: FilterSpec) -> str:
+    """Name the fields the query asked about, for the missing-field reason.
+
+    Re-parsed rather than carried on ``FilterStats``: the spec already knows
+    everything needed, and a stats object that held query fragments would be a
+    second place for the two to drift apart.
+    """
+
+    try:
+        keys = spec.parse().field_keys
+    except QueryError:  # pragma: no cover - the caller had a result to describe
+        keys = ()
+    if not keys:
+        return "field the query asked for"
+    if len(keys) == 1:
+        return f"'{keys[0]}' field"
+    return "'" + "', '".join(keys) + "' fields"

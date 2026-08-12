@@ -72,6 +72,11 @@ from .services.parsing import (
     LogParser,
     level_matches,
 )
+from .services.query import (
+    NORMALISED_FIELD_KEYS,
+    collect_field_names,
+    entry_matches,
+)
 from .services.reader import AnyReader, open_reader
 from .storage import SessionState, StateStore
 from .widgets.add_source_dialog import AddSourceDialog
@@ -453,6 +458,12 @@ class LogViewerApp(App[None]):
         #: disk — see clv/services/marks.py for why that is a constraint rather
         #: than a gap.
         self._marks = MarkSet()
+        #: Field names present in the buffer, offered as query completions.
+        self._field_names: frozenset[str] = frozenset()
+        #: Names a query term may use: the parser's normalised vocabulary plus
+        #: whatever this source turned out to carry. Anything else stays a
+        #: regex, which is what keeps `sshd:` searching for text.
+        self._known_fields: frozenset[str] = NORMALISED_FIELD_KEYS
 
         self.query_bar = QueryBar()
         self.chip_bar = FilterChips(id="chip-bar")
@@ -757,6 +768,7 @@ class LogViewerApp(App[None]):
         self._entries.extend(self._parser.feed(initial.lines))
         self._show_lines = min(self._config.default_show_lines, self._config.max_buffer_lines)
 
+        self._sync_field_names()
         self._sync_regex_validation()
         self._render_log(scroll_end=True)
         self._start_tail()
@@ -796,6 +808,10 @@ class LogViewerApp(App[None]):
             self._parser.reset()
             self._entries.clear()
             self._entries.extend(self._parser.feed(result.lines))
+            # A rotated file can be a different shape entirely, so the field
+            # vocabulary is rebuilt rather than extended.
+            self._field_names = frozenset()
+            self._sync_field_names()
             self._render_log(scroll_end=self.state.auto_scroll)
             notice = self._reader.RELOAD_NOTICE.format(name=self._reader.path.name)
             self._notify(notice, "warning")
@@ -807,6 +823,7 @@ class LogViewerApp(App[None]):
         new_entries = self._parser.feed(result.lines)
         overflowing = len(self._entries) + len(new_entries) > (self._entries.maxlen or 0)
         self._entries.extend(new_entries)
+        self._sync_field_names(new_entries)
         self._sync_regex_validation()
 
         if overflowing:
@@ -828,6 +845,7 @@ class LogViewerApp(App[None]):
             case_sensitive=True if settings.case_sensitive else None,
             regex=settings.use_regex,
             invert=settings.invert_match,
+            known_fields=self._known_fields,
         )
 
     def _time_window(self) -> TimeWindow:
@@ -1135,7 +1153,29 @@ class LogViewerApp(App[None]):
         self.chip_bar.update_chips(chips)
 
     def _sync_regex_validation(self) -> None:
-        self.query_bar.validate_entries(list(self._entries))
+        self.query_bar.validate_entries(list(self._entries), self._known_fields)
+
+    def _sync_field_names(self, arrived: Iterable[LogEntry] | None = None) -> None:
+        """Refresh the vocabulary field terms and completions are drawn from.
+
+        ``arrived`` is the incremental case: tailed lines can only *add* names,
+        so a poll unions instead of re-walking the buffer. The union is never
+        pruned as the ring buffer evicts lines, which means a name can outlive
+        the last entry carrying it — harmless, since a term naming a field no
+        entry has is hidden and counted like any other, and the alternative is
+        an O(buffer) rescan on every poll.
+        """
+
+        names = (
+            collect_field_names(self._entries)
+            if arrived is None
+            else self._field_names | collect_field_names(arrived)
+        )
+        if names == self._field_names:
+            return
+        self._field_names = names
+        self._known_fields = NORMALISED_FIELD_KEYS | names
+        self.query_bar.set_field_names(names)
 
     # --- state --------------------------------------------------------------
 
@@ -1217,14 +1257,19 @@ class LogViewerApp(App[None]):
 
         if spec.query:
             try:
+                parsed = spec.parse()
                 pattern = compile_query(
-                    spec.query, case_sensitive=spec.case_sensitive, regex=spec.regex
+                    parsed.text, case_sensitive=spec.case_sensitive, regex=spec.regex
                 )
             except QueryError:
                 return [], "match"
-            if pattern is not None:
+            # Terms without free text still define a match set, so this cannot
+            # key off the pattern alone the way it did before Item 8.
+            if pattern is not None or parsed.terms:
                 return [
-                    index for index, entry in rows if pattern.search(entry.raw)
+                    index
+                    for index, entry in rows
+                    if entry_matches(entry, parsed.terms, pattern)
                 ], "match"
 
         if spec.severity != "all":

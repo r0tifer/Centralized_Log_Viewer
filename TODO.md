@@ -543,6 +543,31 @@ a dropdown under the query input.
 an operator table and worked examples; a note that plain regex queries are
 unchanged.
 
+**As shipped.** Three things this item did not spell out, all forced by its own
+compatibility bar:
+
+- **A `key:value` token is a term only when the key is *known*** — one of the
+  names `parsing.py` normalises, or a key the buffer actually carries. Purely
+  syntactic recognition would have reinterpreted `sshd:` and `kernel:`, which
+  are among the most common things anyone greps a syslog for, and "an existing
+  saved query must behave identically" is the bar this item set for itself. The
+  cost is that a mistyped key is searched for as text rather than reported;
+  the completion dropdown exists to narrow that gap. Reinforced by the
+  stronger guarantee in `parse_query`: a query with no recognised term is
+  returned *unmodified*, so a plain regex never even reaches the rejoin step.
+- **`invert` applies to the free-text half only.** Field terms stay positive.
+  `!=`, `<` and `>` are the per-term negation, and inverting "this entry has no
+  such field" has no honest answer — the entry would have to count as both
+  hidden and shown.
+- **`key:` with no value tests that the field is present**, rather than being
+  the malformed term this item implies. It is useful (`pid:` finds everything
+  from a daemon), and the alternative was flashing "invalid query" at anyone
+  half-way through typing `host:web01`. A *comparison* with no value
+  (`status>=`) is still an error, which is what the malformed-term test uses.
+
+`QueryError` moved from `filtering.py` to the new `query.py` and is re-exported,
+so no import site changed.
+
 ---
 
 ## 9. Saved views (Custom Views)
