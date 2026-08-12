@@ -430,17 +430,34 @@ def _extract_plugins(module: Any) -> list[Any]:
 
 
 def _load_local(registry: PluginRegistry, clv_version: str) -> None:
-    """Import drop-in modules under clv/plugins/ (flat and in subpackages)."""
+    """Import drop-in modules under clv/plugins/ (flat and in subpackages).
+
+    Where each subpackage *lives* is asked of the import system rather than of
+    the filesystem. In a PyInstaller bundle the modules are inside the archive
+    and ``clv/plugins/sources/`` is not a directory on disk, so testing
+    ``is_dir()`` skipped every drop-in — silently, since finding no plugins is
+    not an error. That is the whole of why the shipped binary offered no
+    journal: not packaging, not the opt-in, just a filesystem check standing in
+    for a question only the loader can answer.
+    """
 
     package_dir = Path(__file__).resolve().parent
-    search: list[tuple[Path, str]] = [(package_dir, __name__)]
+    search: list[tuple[str, str]] = [(str(package_dir), __name__)]
     for sub in _LOCAL_SUBPACKAGES:
-        sub_dir = package_dir / sub
-        if sub_dir.is_dir():
-            search.append((sub_dir, f"{__name__}.{sub}"))
+        package_name = f"{__name__}.{sub}"
+        try:
+            subpackage = importlib.import_module(package_name)
+        except ImportError:
+            # A build that dropped the subpackage entirely. Not an error worth
+            # reporting: an absent drop-in folder is a valid state.
+            continue
+        except Exception as exc:  # noqa: BLE001 - a broken __init__ is on them
+            registry.errors.append(PluginError(package_name, f"import failed: {exc}"))
+            continue
+        search.extend((str(entry), package_name) for entry in getattr(subpackage, "__path__", ()))
 
     for directory, package_name in search:
-        for info in pkgutil.iter_modules([str(directory)]):
+        for info in pkgutil.iter_modules([directory]):
             if info.name.startswith("_") or info.name in _LOCAL_SUBPACKAGES:
                 continue
             module_name = f"{package_name}.{info.name}"

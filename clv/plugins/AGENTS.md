@@ -95,6 +95,15 @@ required a restart.
 Returning `None` (the default) means "use `open()`", so a provider written
 before this existed keeps working unchanged.
 
+**Discovery must not ask the filesystem where a package is.** Drop-ins are
+found by importing each subpackage and walking its own `__path__`. A frozen
+build (PyInstaller) has the modules inside an archive and no
+`clv/plugins/sources/` directory on disk, so a `Path.is_dir()` check skips
+every drop-in — and reports nothing, because loading no plugins is a valid
+state rather than an error. That combination cost the shipped binary its
+journal support entirely; see
+`test_drop_ins_are_found_without_the_folder_existing_on_disk`.
+
 **Subprocesses need consent.** A plugin must not run one because it was
 installed. The shipped `journald` provider is the pattern: a `settings.conf`
 opt-in, read fresh on every `discover()`, returning no sources at all until it

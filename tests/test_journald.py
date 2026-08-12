@@ -14,12 +14,15 @@ from pathlib import Path
 
 import pytest
 
+from textual.widgets import Static, Switch
+
 from clv.app import LogTree, LogViewerApp
 from clv.plugins import (
     IteratorReader,
     LogSourceProvider,
     PluginRegistry,
     ProviderSource,
+    load_plugins,
 )
 from clv.plugins.sources import journald
 from clv.services import SourceManager, persist_setting
@@ -510,5 +513,53 @@ def test_the_drawer_switch_writes_the_opt_in_back_to_settings() -> None:
             assert "enable_journald = false" in app._settings_path.read_text(
                 encoding="utf-8"
             )
+
+    asyncio.run(scenario())
+
+
+# --- the loader, where the shipped binary differs from a checkout -----------
+
+
+def test_drop_ins_are_found_without_the_folder_existing_on_disk(monkeypatch) -> None:
+    """A PyInstaller bundle has the modules but not the directories.
+
+    `_load_local` used to gate the subpackage search on `sub_dir.is_dir()`,
+    which is False inside a bundle even though the modules are present and
+    importable. Every drop-in was skipped, and silently — finding no plugins
+    is a valid state, so nothing was reported. The shipped binary therefore
+    offered no journal however the opt-in was set.
+
+    Where a subpackage lives is now asked of the import system, which is the
+    only thing that knows when the answer is "inside an archive". Simulated
+    here by making the filesystem deny the directory exists.
+    """
+
+    from pathlib import Path as RealPath
+
+    monkeypatch.setattr(RealPath, "is_dir", lambda self: False)
+
+    registry = load_plugins(include_entry_points=False)
+
+    assert any(isinstance(plugin, journald.JournaldProvider) for plugin in registry.sources), (
+        "no drop-in was loaded when the plugin folder was not a real directory"
+    )
+    assert not registry.errors
+
+
+def test_the_drawer_says_when_the_plugin_is_missing_from_the_build() -> None:
+    """A switch that writes an opt-in nothing reads is worse than a dead one."""
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            await pilot.pause()
+            app._plugins = PluginRegistry()  # a build that loaded no plugins
+            app._sync_journald_status()
+            await pilot.pause()
+
+            drawer = app.advanced_drawer
+            status = drawer.query_one("#journald-status", Static).render().plain
+            assert "not loaded" in status
+            assert drawer.query_one("#drawer-journald", Switch).disabled is True
 
     asyncio.run(scenario())

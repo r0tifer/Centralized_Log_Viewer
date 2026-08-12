@@ -2973,9 +2973,18 @@ class LogViewerApp(App[None]):
     def _sync_journald_status(self) -> None:
         """Show journal state in the drawer, including why it may be off."""
 
-        from .plugins.sources.journald import availability
+        from .plugins.sources.journald import JournaldProvider, availability
 
         available, reason = availability()
+        if available and not any(
+            isinstance(plugin, JournaldProvider) for plugin in self._plugins.sources
+        ):
+            # The switch would write an opt-in that nothing reads. Loading no
+            # plugins is not an error — it is a valid state — so nothing else
+            # would ever mention it, and a control that quietly does nothing is
+            # worse than one that is visibly unavailable.
+            available = False
+            reason = "the journald plugin is not loaded in this build"
         self.advanced_drawer.set_journald(
             self._config.enable_journald and available,
             available=available,
