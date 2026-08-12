@@ -41,8 +41,9 @@ desktop terminal and on a headless 80-column SSH session.
   and they are session-only, never written to disk.
 - 📤 **Get the view out.** `Ctrl+E` writes the filtered entries as JSON Lines,
   CSV or raw text — the whole filtered set, not just the lines on screen. `y`
-  copies what is on screen to your local clipboard through the terminal, so it
-  works over SSH and tmux where a mouse selection does not.
+  copies the selected line — or the whole visible view — to your local clipboard
+  through the terminal, so it works over SSH and tmux where a mouse selection
+  does not.
 - 🧩 **Plugins.** `LogSourceProvider`, `FilterStage` and `Exporter` interfaces,
   loaded from `clv/plugins/` or from installed packages via the `clv.plugins`
   entry point group. A broken plugin is reported, never fatal.
@@ -238,8 +239,11 @@ pane first.
 
 ### Copying to the clipboard
 
-`y` copies the lines currently on screen — filters and the visible-line window
-included — to your **local** clipboard using an OSC 52 escape sequence.
+`y` copies to your **local** clipboard using an OSC 52 escape sequence. It
+copies the **selected line** when the cursor is on one, and the lines currently
+on screen — filters and the visible-line window included — when it is not.
+Nothing is selected until you move the cursor, so `y` on a freshly opened log
+still copies the view.
 
 `y` and `Ctrl+L` solve the same problem from opposite ends and both are kept:
 
@@ -279,7 +283,7 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `[` / `]` | Narrow / widen the source tree |
 | `+` / `-` | Show more / fewer lines |
 | `Ctrl+E` | Export the filtered entries to a file |
-| `y` | Copy the visible lines to the clipboard (OSC 52) |
+| `y` | Copy the selected line, or the visible lines, to the clipboard (OSC 52) |
 | `Ctrl+L` | Copy mode (hides all chrome) |
 | `Ctrl+S` | Save added sources to `settings.conf` |
 | `Ctrl+R` | Reload configuration and rescan |

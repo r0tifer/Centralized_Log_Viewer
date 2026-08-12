@@ -100,7 +100,7 @@ class _Harness:
         return " | ".join(message for message, _ in self.notices)
 
 
-def test_y_copies_the_visible_lines(tmp_path: Path) -> None:
+def test_y_copies_the_visible_lines_when_no_line_is_selected(tmp_path: Path) -> None:
     async def scenario() -> None:
         app = LogViewerApp()
         async with app.run_test(size=(120, 30)) as pilot:
@@ -109,12 +109,65 @@ def test_y_copies_the_visible_lines(tmp_path: Path) -> None:
             app.set_focus(app.log_panel)
             await pilot.pause()
 
+            assert app.log_panel.cursor == -1, "nothing should be selected yet"
+
             await pilot.press("y")
             await pilot.pause()
 
             assert len(harness.copied) == 1
             assert harness.copied[0].splitlines()[-1].endswith("line 19")
             assert "Copied 20 lines" in harness.messages()
+
+    asyncio.run(scenario())
+
+
+def test_y_copies_the_cursor_line_once_one_is_selected(tmp_path: Path) -> None:
+    """Once a line can be pointed at, copying the whole pane is the surprise."""
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(120, 30)) as pilot:
+            app._select_source(_log_file(tmp_path, 20), announce=False)
+            harness = _Harness(app)
+            app.set_focus(app.log_panel)
+            await pilot.pause()
+
+            await pilot.press("home")
+            await pilot.press("down", "down", "down")
+            await pilot.pause()
+            selected = app.log_panel.cursor_entry
+            assert selected.raw.endswith("line 3")
+
+            await pilot.press("y")
+            await pilot.pause()
+
+            assert harness.copied == [selected.raw]
+            assert "Copied 1 line" in harness.messages()
+
+    asyncio.run(scenario())
+
+
+def test_copying_the_cursor_line_ignores_the_visible_line_window(tmp_path: Path) -> None:
+    """A selected line is copied because it was selected, not because it fits."""
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(120, 30)) as pilot:
+            app._select_source(_log_file(tmp_path, 20), announce=False)
+            harness = _Harness(app)
+            app.set_focus(app.log_panel)
+            await pilot.pause()
+
+            app._set_show_lines(app._config.min_show_lines)
+            await pilot.pause()
+            app.log_panel.move_cursor(0)
+            await pilot.pause()
+            selected = app.log_panel.cursor_entry
+
+            app.action_copy_view()
+            await pilot.pause()
+
+            assert harness.copied == [selected.raw]
 
     asyncio.run(scenario())
 

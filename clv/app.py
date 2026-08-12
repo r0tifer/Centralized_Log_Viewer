@@ -1524,12 +1524,16 @@ class LogViewerApp(App[None]):
         self._notify(f"Showing up to {self._show_lines} lines.")
 
     def action_copy_view(self) -> None:
-        """Put the visible lines on the local clipboard via OSC 52.
+        """Put the selection on the local clipboard via OSC 52.
 
         The counterpart to `Ctrl+L`, not a replacement for it: copy mode needs a
         local terminal selection, which is exactly what is unavailable over tmux
         or SSH, and this path needs a terminal that honours OSC 52. Whichever
         one an operator's setup supports, one of them works.
+
+        "Selection" means the cursor line when there is one, and the visible
+        view when there is not. Once a line can be pointed at, copying the whole
+        pane instead of the line under the cursor is the surprising answer.
         """
 
         if self._selected_source is None:
@@ -1543,19 +1547,20 @@ class LogViewerApp(App[None]):
             )
             return
 
-        try:
-            result = self._visible_entries(self._entries)
-        except QueryError as exc:
-            self._notify(f"Cannot copy while the query is invalid: {exc}", "error")
-            return
+        cursor_entry = self.log_panel.cursor_entry
+        if cursor_entry is not None:
+            lines = [cursor_entry.raw]
+        else:
+            try:
+                result = self._visible_entries(self._entries)
+            except QueryError as exc:
+                self._notify(f"Cannot copy while the query is invalid: {exc}", "error")
+                return
+            # The lines on screen, filter and window included — the same slice
+            # _render_log writes. Ctrl+E is the path for the whole filtered set.
+            lines = [entry.raw for entry in result.entries[-self._show_lines :]]
 
-        # The lines on screen, filter and window included — the same slice
-        # _render_log writes. Ctrl+E is the path for the whole filtered set.
-        visible = result.entries[-self._show_lines :]
-        payload = prepare_payload(
-            [entry.raw for entry in visible],
-            max_bytes=self._config.clipboard_max_bytes,
-        )
+        payload = prepare_payload(lines, max_bytes=self._config.clipboard_max_bytes)
         if payload.empty:
             self._notify(
                 payload.summary
