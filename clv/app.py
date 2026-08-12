@@ -78,7 +78,7 @@ from .services.query import (
     entry_matches,
 )
 from .services.reader import AnyReader, open_reader
-from .storage import SessionState, StateStore
+from .storage import SavedView, SessionState, StateStore
 from .widgets.add_source_dialog import AddSourceDialog
 from .widgets.advanced_drawer import AdvancedFiltersDrawer, AdvancedSettings
 from .widgets.custom_time_dialog import CustomTimeRangeDialog
@@ -89,6 +89,7 @@ from .widgets.goto_dialog import GotoDialog
 from .widgets.help_overlay import HelpOverlay, HelpSection
 from .widgets.log_view import LogView
 from .widgets.query_bar import QueryBar
+from .widgets.view_dialogs import SaveViewDialog, ViewPickerDialog, ViewRequest
 
 #: What `n`/`N` step between when there is no query and no severity bucket to
 #: take the definition from. Stepping every entry would just duplicate the down
@@ -129,6 +130,11 @@ ICON_FILE = "📄"
 #: starring never changes a row's width.
 ICON_STAR = "⭐"
 STARRED_GROUP = f"{ICON_STAR} Starred"
+#: Saved views sit above the starred group, in the same repeated-shortcuts
+#: spirit: both are things the operator chose to keep, and both would otherwise
+#: cost a walk down the hierarchy on every launch.
+ICON_VIEW = "📑"
+VIEWS_GROUP = f"{ICON_VIEW} Views"
 
 #: Help categories, in the order the overlay lists them. A category with no
 #: bindings is skipped, so a group can be declared before the item that fills
@@ -156,6 +162,8 @@ BINDING_CATEGORIES: dict[str, str] = {
     "cycle_time": "Search",
     "cycle_severity": "Search",
     "toggle_advanced": "Search",
+    "open_views": "Search",
+    "save_view": "Search",
     # LogView owns the cursor keys. They are bound on the widget rather than
     # the app so they cannot fight the source tree or a text input, and they
     # are folded into the overlay by build_help_sections rather than written
@@ -216,13 +224,19 @@ def build_help_sections(
     return [HelpSection(name, tuple(grouped[name])) for name in ordered]
 
 
-class LogTree(Tree[Path]):
+class LogTree(Tree[object]):
     """Source tree.
 
     A single tree holds every configured root. The previous build mounted one
     Tree per root inside a scrolling container, which required manual cursor
     hand-off between trees and manual scroll synchronisation against private
     node internals. One tree scrolls itself.
+
+    Typed on ``object`` rather than ``Path`` since Item 9: the saved-views group
+    hangs :class:`~clv.storage.SavedView` records off its nodes, and selection
+    dispatches on what the node carries. Everything that walks the tree for a
+    file already tests ``isinstance(data, Path)``, so a view node is invisible
+    to it.
     """
 
     COMPONENT_CLASSES = Tree.COMPONENT_CLASSES | {
@@ -399,6 +413,8 @@ class LogViewerApp(App[None]):
         Binding("g", "goto_timestamp", "Go to timestamp", show=False),
         Binding("m", "toggle_mark", "Mark / unmark this line", show=False),
         Binding("M", "next_mark", "Jump to next mark", show=False),
+        Binding("v", "open_views", "Saved views", show=False),
+        Binding("V", "save_view", "Save current filters as a view", show=False),
         Binding("ctrl+b", "toggle_pane", "Switch pane", show=True),
         Binding("[", "shrink_sources_panel", "Narrower", show=False),
         Binding("]", "expand_sources_panel", "Wider", show=False),
@@ -642,12 +658,20 @@ class LogViewerApp(App[None]):
         # first one left registered.
         await panel.remove_children()
 
-        if not report.files:
+        if not report.files and not self.state.views:
             await panel.mount(Static("No log sources found.", classes="empty-tree"))
             return
 
         tree: LogTree = LogTree("Sources", id="source-tree")
         await panel.mount(tree)
+
+        # Saved views first: they are filter bundles rather than files, they
+        # are few, and they are the fastest way back into a piece of work.
+        # Above the starred group because a view usually names a starred log.
+        if self.state.views:
+            group = tree.root.add(VIEWS_GROUP, data=None, expand=True)
+            for view in self.state.views:
+                group.add_leaf(f"{ICON_VIEW} {view.name}", data=view)
 
         # Starred logs are repeated in a group at the top. With the tree
         # collapsed by default, a favourite would otherwise cost a walk down
@@ -1385,6 +1409,214 @@ class LogViewerApp(App[None]):
         else:
             self._notify(f"Mark {position} of {len(marked)}.")
 
+    # --- saved views --------------------------------------------------------
+
+    def action_save_view(self) -> None:
+        """Name the filters that are active and keep them."""
+        self.run_worker(self._prompt_save_view(), group="dialogs", exit_on_error=False)
+
+    def action_open_views(self) -> None:
+        """Apply, rename or delete a saved view."""
+        self.run_worker(self._prompt_views(), group="dialogs", exit_on_error=False)
+
+    def _capture_view(self, name: str) -> SavedView:
+        """Everything the current filter state consists of, under *name*.
+
+        The open source is recorded by path so applying the view puts the
+        filters back where they mean something. Nothing about what those
+        filters *matched* is captured — see :class:`SavedView`.
+        """
+
+        settings = self.advanced_drawer.settings
+        return SavedView(
+            name=name,
+            query=self.state.query,
+            severity=self.state.severity,
+            time_window=self.state.time_window,
+            custom_start=self.state.custom_start,
+            custom_end=self.state.custom_end,
+            case_sensitive=settings.case_sensitive,
+            use_regex=settings.use_regex,
+            invert_match=settings.invert_match,
+            include_globs=settings.include_globs,
+            exclude_globs=settings.exclude_globs,
+            source=str(self._selected_source) if self._selected_source else "",
+        )
+
+    def _view_named(self, name: str) -> Optional[SavedView]:
+        return next((view for view in self.state.views if view.name == name), None)
+
+    async def _store_views(self, views: Iterable[SavedView]) -> None:
+        """Persist *views* sorted by name, and rebuild the tree group.
+
+        Rebuilt from the report already in hand rather than by re-walking the
+        filesystem, the same way starring does it.
+        """
+
+        self._update_state(views=tuple(sorted(views, key=lambda view: view.name.lower())))
+        if self._report is not None:
+            await self._build_tree(self._report)
+
+    def _default_view_name(self) -> str:
+        """A name worth pressing Enter on, derived from what is filtered."""
+
+        if self.state.query:
+            query = self.state.query
+            return query if len(query) <= 24 else query[:23] + "…"
+        parts = [
+            part
+            for part in (
+                self.state.severity if self.state.severity != "all" else "",
+                self.state.time_window if self.state.time_window not in {"", "all"} else "",
+                self._selected_source.name if self._selected_source else "",
+            )
+            if part
+        ]
+        return " ".join(parts) if parts else f"View {len(self.state.views) + 1}"
+
+    def _apply_view(self, view: SavedView) -> None:
+        """Put every filter the view records back, in a single re-render.
+
+        Field by field this would repaint the pane five times and fight the
+        cursor restore on each one, so the state is assembled first, the
+        controls are synced with their own messages suppressed, and exactly one
+        render happens at the end — either `_select_source`'s or this method's.
+        """
+
+        settings = self.advanced_drawer.settings
+        updated = replace(
+            settings,
+            include_globs=view.include_globs,
+            exclude_globs=view.exclude_globs,
+            case_sensitive=view.case_sensitive,
+            use_regex=view.use_regex,
+            invert_match=view.invert_match,
+        )
+        rescan = updated.affects_discovery(settings)
+        self.advanced_drawer.sync_settings(updated)
+
+        # prevent(), not a flag: assigning to the input posts Input.Changed
+        # asynchronously, and the app's handler would render a second time.
+        with self.prevent(Input.Changed):
+            self.query_bar.set_query_value(view.query)
+        self.query_bar.set_severity(view.severity)
+        if view.time_window == "range" and view.custom_start and view.custom_end:
+            self.query_bar.apply_custom_time_range(
+                view.custom_start, view.custom_end, emit=False
+            )
+        else:
+            self.query_bar.select_time(view.time_window)
+
+        self._update_state(
+            query=view.query,
+            severity=view.severity,
+            time_window=view.time_window,
+            custom_start=view.custom_start,
+            custom_end=view.custom_end,
+            case_sensitive=view.case_sensitive,
+            use_regex=view.use_regex,
+            invert_match=view.invert_match,
+            include_globs=view.include_globs,
+            exclude_globs=view.exclude_globs,
+        )
+
+        missing = ""
+        opened = False
+        if view.source:
+            source = Path(view.source)
+            if source.is_file():
+                # _select_source renders once; nothing below may render again.
+                opened = self._select_source(source, announce=False)
+                if opened:
+                    self._highlight_source(source, select=False)
+            else:
+                # The filters still describe something worth seeing, so they go
+                # on regardless. Refusing would make a rotated log a dead view.
+                missing = view.source
+
+        if not opened:
+            self._sync_regex_validation()
+            self._render_log()
+        if rescan:
+            self.run_worker(self._rescan(), group="discovery", exit_on_error=False)
+        if missing:
+            self._notify(
+                f"View '{view.name}' names a source that is no longer there: {missing}",
+                "warning",
+            )
+
+    async def _prompt_save_view(self) -> None:
+        dialog = SaveViewDialog(
+            default_name=self._default_view_name(),
+            summary=self._capture_view("preview").summary(),
+        )
+        name = await self.push_screen(dialog, wait_for_dismiss=True)
+        if name is None:
+            self._notify("Save view canceled.")
+            return
+
+        replaced = self._view_named(name) is not None
+        view = self._capture_view(name)
+        await self._store_views(
+            [existing for existing in self.state.views if existing.name != name] + [view]
+        )
+        self._notify(
+            f"Replaced view '{name}'." if replaced else f"Saved view '{name}'."
+        )
+
+    async def _prompt_views(self) -> None:
+        """Show the picker until the operator applies one or closes it.
+
+        Rename and delete reopen it: the list the modal is holding is stale the
+        moment either lands, and reopening is cheaper — in code and in
+        surprises — than teaching the dialog to edit its own copy.
+        """
+
+        while True:
+            if not self.state.views:
+                self._notify(
+                    "No saved views yet — press V to save the current filters.", "warning"
+                )
+                return
+
+            request = await self.push_screen(
+                ViewPickerDialog(self.state.views), wait_for_dismiss=True
+            )
+            if request is None:
+                return
+            if not await self._handle_view_request(request):
+                return
+
+    async def _handle_view_request(self, request: ViewRequest) -> bool:
+        """Act on the picker's answer. True when the picker should reopen."""
+
+        view = self._view_named(request.name)
+        if view is None:  # pragma: no cover - the list came from this state
+            return False
+
+        if request.action == "apply":
+            self._apply_view(view)
+            self._notify(f"Applied view '{view.name}'.")
+            return False
+        if request.action == "delete":
+            await self._store_views(
+                other for other in self.state.views if other.name != view.name
+            )
+            self._notify(f"Deleted view '{view.name}'.")
+            return True
+
+        renamed = replace(view, name=request.new_name)
+        await self._store_views(
+            [
+                other
+                for other in self.state.views
+                if other.name not in {view.name, request.new_name}
+            ]
+            + [renamed]
+        )
+        self._notify(f"Renamed '{view.name}' to '{renamed.name}'.")
+        return True
+
     def action_toggle_detail(self) -> None:
         """Show or hide the event detail pane."""
         self._set_detail_pane(not self.state.detail_pane)
@@ -1869,10 +2101,13 @@ class LogViewerApp(App[None]):
 
     # --- events -------------------------------------------------------------
 
-    def on_tree_node_selected(self, event: Tree.NodeSelected[Path]) -> None:
+    def on_tree_node_selected(self, event: Tree.NodeSelected[object]) -> None:
         data = event.node.data
         if isinstance(data, Path) and data.is_file():
             self._select_source(data)
+        elif isinstance(data, SavedView):
+            self._apply_view(data)
+            self._notify(f"Applied view '{data.name}'.")
 
     def on_tree_node_highlighted(self, _event: Tree.NodeHighlighted[Path]) -> None:
         # The star target follows the cursor while the tree has focus, so the
@@ -2090,13 +2325,15 @@ class LogViewerApp(App[None]):
             self.query_bar.select_time("all")
             self._update_state(time_window="all", custom_start="", custom_end="")
         elif key == "invert":
-            self.advanced_drawer._settings = replace(
-                self.advanced_drawer.settings, invert_match=False
+            # sync_settings, not a bare assignment: the drawer's switch has to
+            # follow the setting, or dismissing the chip leaves it showing on.
+            self.advanced_drawer.sync_settings(
+                replace(self.advanced_drawer.settings, invert_match=False)
             )
             self._update_state(invert_match=False)
         elif key == "include":
-            self.advanced_drawer._settings = replace(
-                self.advanced_drawer.settings, include_globs=""
+            self.advanced_drawer.sync_settings(
+                replace(self.advanced_drawer.settings, include_globs="")
             )
             self._update_state(include_globs="")
             self.run_worker(self._rescan(), group="discovery", exit_on_error=False)

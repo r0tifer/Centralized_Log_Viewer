@@ -11,7 +11,89 @@ import json
 import os
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, ClassVar, Dict
+from typing import Any, ClassVar, Dict, Optional
+
+
+@dataclass(frozen=True)
+class SavedView:
+    """A named bundle of filters, and the log they were built against.
+
+    Event Viewer calls these Custom Views. The shape is the one starred logs
+    already established: an explicit, named choice by the operator, recorded
+    because they asked for it — not a trace of what they happened to be doing.
+
+    What a view holds is **settings and one path**. Never a log line, never a
+    match count, never a result. ``source`` is the log the view was saved on so
+    that applying it puts you back where the filters make sense; if that path
+    has since gone, the filters are applied anyway and the miss is reported,
+    because a rotated-away file is not a reason to refuse.
+    """
+
+    name: str
+    query: str = ""
+    severity: str = "all"
+    time_window: str = "all"
+    custom_start: str = ""
+    custom_end: str = ""
+    case_sensitive: bool = False
+    use_regex: bool = True
+    invert_match: bool = False
+    include_globs: str = ""
+    exclude_globs: str = ""
+    #: Absolute path of the log this view was saved against. Empty means the
+    #: view is about filters alone and applying it leaves the source as it is.
+    source: str = ""
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> Optional["SavedView"]:
+        """Build a view from stored JSON, or ``None`` if it is not usable.
+
+        Returning None rather than raising is the point: one hand-edited record
+        must not cost the operator every other view, nor stop the app starting.
+        """
+
+        if not isinstance(raw, dict):
+            return None
+        name = raw.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return None
+
+        types = {field.name: field.type for field in fields(cls)}
+        values: Dict[str, Any] = {"name": name.strip()}
+        for key, expected in types.items():
+            if key == "name" or key not in raw:
+                continue
+            value = raw[key]
+            if expected == "bool" and not isinstance(value, bool):
+                continue
+            if expected == "str" and not isinstance(value, str):
+                continue
+            values[key] = value
+        return cls(**values)
+
+    def summary(self) -> str:
+        """One line describing what this view filters to, for the picker."""
+
+        parts: list[str] = []
+        if self.query:
+            parts.append(f"query {self.query}")
+        if self.severity != "all":
+            parts.append(self.severity)
+        if self.time_window == "range" and self.custom_start:
+            parts.append(f"{self.custom_start} → {self.custom_end}")
+        elif self.time_window not in {"", "all"}:
+            parts.append(self.time_window)
+        if self.invert_match:
+            parts.append("inverted")
+        if not self.use_regex:
+            parts.append("literal")
+        if self.case_sensitive:
+            parts.append("case-sensitive")
+        if self.include_globs:
+            parts.append(f"include {self.include_globs}")
+        if self.source:
+            parts.append(Path(self.source).name)
+        return " · ".join(parts) if parts else "no filters"
 
 
 @dataclass
@@ -47,6 +129,9 @@ class SessionState:
     #: source that merely happened to be open, these are chosen explicitly, so
     #: recording them is something the operator asked for.
     starred: tuple[str, ...] = ()
+    #: Named filter bundles, sorted by name. Same argument as `starred`: an
+    #: explicit choice, and settings only — see :class:`SavedView`.
+    views: tuple[SavedView, ...] = ()
 
     #: Fields written to disk. Every field on this class — the previous build
     #: persisted only three and dropped every filter on exit.
@@ -74,6 +159,7 @@ class SessionState:
         "invert_match",
         "tree_width",
         "starred",
+        "views",
     )
 
     @classmethod
@@ -100,6 +186,13 @@ class SessionState:
                 if not isinstance(value, (list, tuple)):
                     continue
                 value = tuple(item for item in value if isinstance(item, str))
+            if expected == "tuple[SavedView, ...]":
+                # Same rule one level down: a malformed record is dropped and
+                # the rest of the operator's views survive it.
+                if not isinstance(value, (list, tuple)):
+                    continue
+                restored = (SavedView.from_dict(item) for item in value)
+                value = tuple(view for view in restored if view is not None)
             known[name] = value
         return cls(**known)
 

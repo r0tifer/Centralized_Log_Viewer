@@ -321,6 +321,29 @@ class AdvancedFiltersDrawer(Static):
     def _emit(self, previous: AdvancedSettings) -> None:
         self.post_message(self.SettingsChanged(self._settings, previous))
 
+    def sync_settings(self, settings: AdvancedSettings) -> None:
+        """Adopt a settings snapshot and show it, without emitting.
+
+        For the times something other than this drawer decides a search or
+        discovery option — a saved view being applied, a chip being dismissed.
+        Without it the switches keep displaying the old answer while the filter
+        uses the new one. Suppression is ``prevent`` rather than a flag, for the
+        reason spelled out in :meth:`sync_view_toggles`.
+        """
+
+        self._settings = settings
+        try:
+            with self.prevent(Switch.Changed, Input.Changed):
+                self.query_one("#include-globs", Input).value = settings.include_globs
+                self.query_one("#exclude-globs", Input).value = settings.exclude_globs
+                self.query_one("#follow-symlinks", Switch).value = settings.follow_symlinks
+                self.query_one("#skip-binary", Switch).value = settings.skip_binary
+                self.query_one("#case-sensitive", Switch).value = settings.case_sensitive
+                self.query_one("#use-regex", Switch).value = settings.use_regex
+                self.query_one("#invert-match", Switch).value = settings.invert_match
+        except NoMatches:  # not composed yet
+            pass
+
     def sync_view_toggles(
         self,
         *,

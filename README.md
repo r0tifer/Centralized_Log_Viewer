@@ -210,6 +210,29 @@ way on purpose: the digest is derived from log content, and `session.json`
 records paths and settings, never anything about what a log contained. Closing
 CLV forgets them.
 
+### Saved views
+
+A filter set you had to think about is worth keeping. `V` names the one that is
+active; `v` opens the list of saved ones.
+
+```
+V  →  name it "5xx on web01"      (query, severity, time window, search
+                                   options, globs and the open log)
+v  →  Enter applies it            r renames · d deletes (twice) · Esc closes
+```
+
+Saved views also appear as a group at the top of the source tree, above the
+starred logs, so applying one is a single click or a couple of arrow keys.
+
+Applying a view puts everything back at once — one repaint, not one per field —
+and reopens the log it was saved against. If that log has since gone, the
+filters are applied anyway and a notification says which source was missing: a
+rotated-away file should not turn a view into a dead end.
+
+Views live in `session.json`, so they survive restarts. Like everything else
+there, a view records **settings and one path only** — never a log line, never
+what it matched.
+
 ### Exporting
 
 `Ctrl+E` writes the entries the filters kept to a file. Three formats ship:
@@ -276,6 +299,7 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `n` / `N` | Next / previous match (or warning-and-worse, with no query) |
 | `g` | Go to a timestamp |
 | `m` / `M` | Mark the cursor line / jump to the next mark |
+| `v` / `V` | Open saved views / save the current filters as a view |
 | `d` | Show / hide the event detail pane |
 | `w` | Follow new lines (auto-scroll) on/off |
 | `o` | Structured output on/off |

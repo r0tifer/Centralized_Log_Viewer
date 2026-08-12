@@ -614,6 +614,30 @@ full.
 `v` and `V`; a `session.json` note stating that views record filters, never log
 content.
 
+**As shipped.** Four things worth recording:
+
+- **The picker never edits state.** It dismisses with a
+  `ViewRequest(action, name, new_name)` and the app performs it, reopening the
+  picker after a rename or a delete. The list a modal is holding is stale the
+  instant either lands, and reopening costs one repaint against teaching the
+  dialog to maintain its own copy of the truth.
+- **`AdvancedFiltersDrawer.sync_settings` had to exist.** The drawer's switches
+  were only ever seeded at compose time, so a view that turned on
+  `case_sensitive` would have filtered correctly while the switch still read
+  off. It uses `prevent(Switch.Changed, Input.Changed)` for the reason
+  `sync_view_toggles` documents. `_dismiss_chip` now goes through it too — the
+  Invert chip had exactly this bug already.
+- **`LogTree` is `Tree[object]`, not `Tree[Path]`.** A view node carries a
+  `SavedView`, and selection dispatches on the type. Everything that walks the
+  tree for a file already tested `isinstance(data, Path)`, so nothing else
+  changed.
+- **The merged source set is not captured**, because Item 13 has not landed.
+  `SavedView` gains a field when it does; nothing else about the record needs
+  to move.
+
+Views are stored sorted by name and saving over an existing name replaces it,
+with the notification saying which of the two happened.
+
 ---
 
 ## 10. Watch rules and live alerts

@@ -81,7 +81,7 @@ distros.
 | **Services** | `clv/services/` | Parsing, filtering, discovery, reading, config, source management | Touch the UI or import Textual |
 | **Widgets** | `clv/widgets/` | Self-contained UI + own `DEFAULT_CSS` | Depend on other widgets' internals or import `clv.app` |
 | **Plugins** | `clv/plugins/` | Extension interfaces + loader | Break interface contracts |
-| **State** | `clv/storage.py` | JSON session persistence (atomic) | Depend on the UI |
+| **State** | `clv/storage.py` | JSON session persistence (atomic), including `SavedView` records | Depend on the UI |
 
 ### Services
 - `parsing.py` — multi-format line parsing, canonical severity vocabulary,
@@ -179,6 +179,8 @@ config.load_config ─→ SourceManager ─→ discovery.discover (thread)
 | `AdvancedFiltersDrawer` | `SettingsChanged` | Full before/after snapshot; `needs_rescan` says whether discovery must re-run |
 | `AdvancedFiltersDrawer` | `ViewToggleChanged` | Auto-scroll / structured / clipboard flipped from a drawer switch |
 | `ExportDialog` | dismiss value | `ExportRequest(key, path, marked_only)`, or `None` when canceled |
+| `SaveViewDialog` | dismiss value | The name to save the current filters under, or `None` |
+| `ViewPickerDialog` | dismiss value | `ViewRequest(action, name, new_name)`, or `None` when closed. The dialog never edits state; the app acts and reopens it |
 | `AdvancedFiltersDrawer` | `RescanRequested` / `Closed` | Explicit rescan / dismissal |
 
 ### Controls with two homes
