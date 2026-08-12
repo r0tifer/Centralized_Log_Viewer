@@ -342,6 +342,18 @@ class LogView(ScrollView, can_focus=True):
 
         return [row.entry for row in self._rows if row.entry is not None]
 
+    def entry_rows(self) -> list[tuple[int, LogEntry]]:
+        """Selectable rows as ``(row index, entry)``, in display order.
+
+        Row indexes rather than a bare list because callers that pick an entry
+        — jump to the next match, jump to a timestamp — have to hand an index
+        back to :meth:`move_cursor`, and message rows make the two differ.
+        """
+
+        return [
+            (index, row.entry) for index, row in enumerate(self._rows) if row.entry is not None
+        ]
+
     @property
     def text_lines(self) -> list[str]:
         """Rendered content as plain text, one item per screen line.

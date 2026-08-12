@@ -14,7 +14,7 @@ adapt the layout, and they are plain CSS selectors.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable, Optional
 
 from textual import events
@@ -59,6 +59,10 @@ class RegexStatus:
     valid: bool
     message: str = ""
     matches: Optional[int] = None
+    #: 1-based position of the cursor within the matches, when `n`/`N` have put
+    #: it on one. None means "we have a total but no position", which is the
+    #: state before the cursor has visited a match.
+    position: Optional[int] = None
 
 
 class LabeledField(Static):
@@ -360,6 +364,20 @@ class QueryBar(Container):
             return
         self.regex_status = RegexStatus(True, matches=count_matches(entries, pattern))
 
+    def set_match_position(self, position: Optional[int]) -> None:
+        """Show where the cursor sits within the hits, as `n`/`N` move it.
+
+        Only the position changes: recounting here would disagree with the
+        count the app just navigated over. Dropped whenever the count itself is
+        recomputed, because a position into a stale result set is worse than no
+        position at all.
+        """
+
+        status = self.regex_status
+        if status.matches is None or status.position == position:
+            return
+        self.regex_status = replace(status, position=position)
+
     def watch_regex_status(self, status: RegexStatus) -> None:
         try:
             query_input = self.query_one("#query-input", Input)
@@ -378,8 +396,10 @@ class QueryBar(Container):
         query_input.tooltip = None
         if status.matches is None:
             counter.update("")
-        else:
+        elif status.position is None:
             counter.update(f"{status.matches} hits")
+        else:
+            counter.update(f"{status.position} of {status.matches} hits")
 
     # --- severity -----------------------------------------------------------
 

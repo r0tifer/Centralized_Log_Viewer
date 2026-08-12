@@ -245,6 +245,8 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `↑` / `↓` | Move the line cursor |
 | `PgUp` / `PgDn` | Move the line cursor a screen at a time |
 | `Home` / `End` | First / last line (`End` also resumes following) |
+| `n` / `N` | Next / previous match (or warning-and-worse, with no query) |
+| `g` | Go to a timestamp |
 | `d` | Show / hide the event detail pane |
 | `w` | Follow new lines (auto-scroll) on/off |
 | `o` | Structured output on/off |
@@ -271,6 +273,24 @@ Understanding two rules explains everything the pane does:
 2. **Severity and time filters only hide lines that demonstrably lack what you
    asked for** — and when they do, the empty pane says so, e.g. *"No matches —
    12 have no detected severity (nothing in this source declares a level)."*
+
+### Navigating what you filtered to
+
+`n` and `N` move the line cursor forward and back through the lines worth
+stopping at, wrapping at either end with a notification rather than going quiet.
+What counts as "worth stopping at" depends on what is active:
+
+| Active | `n` steps between |
+| --- | --- |
+| A query | Its matches — and since the query *filters*, that is every visible line. What `n` adds here is the position: *"match 12 of 47"*, in the hit counter and the status bar. |
+| A severity bucket | Entries in that bucket. |
+| Neither | **WARN and above.** Stepping every entry would only duplicate the down arrow; warnings are included because they usually precede the failure. |
+
+`g` asks for a time and moves the cursor to the first entry **at or after** it.
+It takes an absolute timestamp (`2026-08-07 09:25:01`) or an offset from now
+(`-15m`, `-6h`, `-2d`; a bare `15m` means the past). Entries with no parsed
+timestamp cannot answer a question about time, so they are skipped — and the
+notification says how many, rather than quietly ignoring part of the source.
 
 ---
 

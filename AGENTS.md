@@ -91,6 +91,10 @@ distros.
   syslog or from an access log. Values are strings and are never coerced; a
   continuation inherits timestamp and level but never fields.
 - `filtering.py` — `FilterSpec` → `FilterResult` with per-reason hidden counts.
+  Also owns time parsing: `parse_relative_window` / `parse_absolute_window` for
+  the presets, `parse_moment` for the single point `g` jumps to, and
+  `align_moments` so an aware JSON stamp and a naive syslog one can be ordered
+  rather than refused.
 - `discovery.py` — walks roots into a `DiscoveryReport`; pure and synchronous
   so callers can thread it. Every skip is attributed to exactly one of
   **`unsupported file type`** (CLV cannot display it), **`filtered out`** (the
@@ -218,7 +222,7 @@ or break a render.
 - Layout regressions are caught by asserting widget `region` bounds at a given
   terminal size rather than by eyeballing screenshots.
 
-Run: `python -m pytest` (316 tests).
+Run: `python -m pytest` (343 tests).
 
 ---
 

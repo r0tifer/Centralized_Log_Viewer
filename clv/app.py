@@ -55,12 +55,22 @@ from .services.filtering import (
     FilterSpec,
     QueryError,
     TimeWindow,
+    align_moments,
+    compile_query,
     describe_empty_result,
     filter_entries,
     parse_absolute_window,
+    parse_moment,
     parse_relative_window,
 )
-from .services.parsing import LogEntry, LogParser
+from .services.parsing import (
+    LEVEL_CRITICAL,
+    LEVEL_ERROR,
+    LEVEL_WARN,
+    LogEntry,
+    LogParser,
+    level_matches,
+)
 from .services.reader import AnyReader, open_reader
 from .storage import SessionState, StateStore
 from .widgets.add_source_dialog import AddSourceDialog
@@ -69,9 +79,16 @@ from .widgets.custom_time_dialog import CustomTimeRangeDialog
 from .widgets.detail_pane import DetailPane
 from .widgets.export_dialog import ExportChoice, ExportDialog, ExportRequest
 from .widgets.filter_chip import FilterChip, FilterChips
+from .widgets.goto_dialog import GotoDialog
 from .widgets.help_overlay import HelpOverlay, HelpSection
 from .widgets.log_view import LogView
 from .widgets.query_bar import QueryBar
+
+#: What `n`/`N` step between when there is no query and no severity bucket to
+#: take the definition from. Stepping every entry would just duplicate the down
+#: arrow; WARN and above is what someone scanning a tail is looking for, and
+#: warnings are included because they are usually what precedes the failure.
+NOTABLE_LEVELS: frozenset[str] = frozenset({LEVEL_WARN, LEVEL_ERROR, LEVEL_CRITICAL})
 
 SEVERITY_COLORS: dict[str, str] = {
     "CRITICAL": "#fb7185",
@@ -145,6 +162,9 @@ BINDING_CATEGORIES: dict[str, str] = {
     "cursor_end": "Navigation",
     "select_cursor": "Navigation",
     "toggle_detail": "Navigation",
+    "next_match": "Navigation",
+    "previous_match": "Navigation",
+    "goto_timestamp": "Navigation",
     "toggle_auto_scroll": "View",
     "toggle_structured": "View",
     "export_view": "View",
@@ -366,6 +386,9 @@ class LogViewerApp(App[None]):
         Binding("w", "toggle_auto_scroll", "Follow", show=True),
         Binding("o", "toggle_structured", "Structured", show=False),
         Binding("d", "toggle_detail", "Detail pane", show=False),
+        Binding("n", "next_match", "Next match", show=False),
+        Binding("N", "previous_match", "Previous match", show=False),
+        Binding("g", "goto_timestamp", "Go to timestamp", show=False),
         Binding("ctrl+b", "toggle_pane", "Switch pane", show=True),
         Binding("[", "shrink_sources_panel", "Narrower", show=False),
         Binding("]", "expand_sources_panel", "Wider", show=False),
@@ -413,6 +436,14 @@ class LogViewerApp(App[None]):
         #: the status line can say *why* it is paused rather than just that it
         #: is. Cleared by anything that resumes following.
         self._follow_suspended_by_cursor = False
+        #: (position, total, label) from the last `n`/`N`, mirrored into the
+        #: status bar. The query bar has its own copy, but #match-count is
+        #: hidden at the compact breakpoint and this is not.
+        self._match_position: tuple[int, int, str] | None = None
+        #: Rows `n`/`N` step between, cached per render. Recomputing per cursor
+        #: move would re-run the query regex over every visible line on every
+        #: arrow keypress; the set only changes when the pane is rebuilt.
+        self._navigation_cache: tuple[list[int], str] | None = None
 
         self.query_bar = QueryBar()
         self.chip_bar = FilterChips(id="chip-bar")
@@ -816,6 +847,10 @@ class LogViewerApp(App[None]):
         # back to the top. Captured before the pane is cleared.
         previous_entry = self.log_panel.cursor_entry
         previous_index = self.log_panel.cursor
+        # The visible set is about to change, so both the navigation targets
+        # and any position into them are stale.
+        self._navigation_cache = None
+        self._match_position = None
         self.log_panel.clear()
 
         if self._selected_source is None:
@@ -1025,7 +1060,13 @@ class LogViewerApp(App[None]):
             follow = "paused — cursor moved, End resumes"
         else:
             follow = "paused"
-        status.update(f"{self._selected_source} · {detail} · {follow}")
+
+        parts = [str(self._selected_source), detail]
+        if self._match_position is not None:
+            position, total, label = self._match_position
+            parts.append(f"{label} {position} of {total}")
+        parts.append(follow)
+        status.update(" · ".join(parts))
 
     def _refresh_chips(self) -> None:
         if self._is_shutting_down or not self.chip_bar.is_attached:
@@ -1110,6 +1151,110 @@ class LogViewerApp(App[None]):
         self._notify(
             "Following new lines." if self.state.auto_scroll else "Auto-scroll paused."
         )
+
+    # --- match navigation ---------------------------------------------------
+
+    def _navigation_targets(self) -> tuple[list[int], str]:
+        """Rows `n`/`N` step between, and what to call one in a notification.
+
+        With a query active these are the query's matches. Because the query
+        *filters* rather than highlights, that is normally every line on
+        screen — the value `n` adds there is the "3 of 47" position readout and
+        the wrap notice, not a different destination. With `Invert match` on it
+        genuinely differs, and with no query at all it falls back to severity,
+        which is the case that earns the key.
+        """
+
+        if self._navigation_cache is not None:
+            return self._navigation_cache
+        targets = self._compute_navigation_targets()
+        self._navigation_cache = targets
+        return targets
+
+    def _compute_navigation_targets(self) -> tuple[list[int], str]:
+        spec = self._filter_spec()
+        rows = self.log_panel.entry_rows()
+
+        if spec.query:
+            try:
+                pattern = compile_query(
+                    spec.query, case_sensitive=spec.case_sensitive, regex=spec.regex
+                )
+            except QueryError:
+                return [], "match"
+            if pattern is not None:
+                return [
+                    index for index, entry in rows if pattern.search(entry.raw)
+                ], "match"
+
+        if spec.severity != "all":
+            return [
+                index for index, entry in rows if level_matches(entry.level, spec.severity)
+            ], f"{spec.severity} entry"
+
+        return [
+            index for index, entry in rows if entry.level in NOTABLE_LEVELS
+        ], "warning or worse"
+
+    def action_next_match(self) -> None:
+        self._step_match(1)
+
+    def action_previous_match(self) -> None:
+        self._step_match(-1)
+
+    def _step_match(self, direction: int) -> None:
+        if self._selected_source is None:
+            self._notify("Open a log before navigating matches.", "warning")
+            return
+
+        targets, label = self._navigation_targets()
+        if not targets:
+            self._notify(f"No {label} to jump to.", "warning")
+            self._sync_match_position()
+            return
+
+        cursor = self.log_panel.cursor
+        if direction > 0:
+            following = [index for index in targets if index > cursor]
+            target = following[0] if following else targets[0]
+            wrapped = not following
+        else:
+            preceding = [index for index in targets if index < cursor]
+            target = preceding[-1] if preceding else targets[-1]
+            wrapped = not preceding
+
+        self.log_panel.move_cursor(target)
+        self._sync_match_position()
+        self._update_status()
+        if wrapped:
+            # Say it rather than stopping dead at the end: silently refusing to
+            # move looks like a broken key.
+            position = targets.index(target) + 1
+            self._notify(
+                f"Wrapped to the {'first' if direction > 0 else 'last'} {label} "
+                f"({position} of {len(targets)})."
+            )
+
+    def _sync_match_position(self) -> None:
+        """Report where the cursor sits within the navigation targets.
+
+        Recomputed on every cursor move, not only on `n`/`N`, so arrowing onto
+        a match updates the counter instead of leaving a stale one on screen.
+        """
+
+        targets, label = self._navigation_targets()
+        cursor = self.log_panel.cursor
+        if cursor >= 0 and cursor in targets:
+            position = targets.index(cursor) + 1
+            self._match_position = (position, len(targets), label)
+        else:
+            self._match_position = None
+        self.query_bar.set_match_position(
+            None if self._match_position is None else self._match_position[0]
+        )
+
+    def action_goto_timestamp(self) -> None:
+        self.run_worker(self._prompt_goto(), group="dialogs", exit_on_error=False)
 
     def action_toggle_detail(self) -> None:
         """Show or hide the event detail pane."""
@@ -1418,6 +1563,51 @@ class LogViewerApp(App[None]):
         elif addition.path and self._source_manager.contains(addition.path):
             self._highlight_source(addition.path)
 
+    async def _prompt_goto(self) -> None:
+        """Move the cursor to the first entry at or after a moment in time."""
+
+        if self._selected_source is None:
+            self._notify("Open a log before jumping to a timestamp.", "warning")
+            return
+
+        typed = await self.push_screen(GotoDialog(), wait_for_dismiss=True)
+        if typed is None:
+            return
+
+        moment = parse_moment(typed)
+        if moment is None:
+            self._notify(
+                f"Could not read {typed!r} as a time. Try 2026-08-07 09:25:01 or -15m.",
+                "warning",
+            )
+            return
+
+        rows = self.log_panel.entry_rows()
+        # Entries with no timestamp cannot answer a question about time, so they
+        # are skipped — and counted, because a pane that quietly ignored half a
+        # source would be the same silent loss the severity filter is careful to
+        # avoid.
+        undated = sum(1 for _, entry in rows if entry.timestamp is None)
+
+        def at_or_after(entry: LogEntry) -> bool:
+            if entry.timestamp is None:
+                return False
+            stamp, target_moment = align_moments(entry.timestamp, moment)
+            return stamp >= target_moment
+
+        target = next((index for index, entry in rows if at_or_after(entry)), None)
+
+        skipped = f" ({undated} with no timestamp skipped)" if undated else ""
+        if target is None:
+            self._notify(
+                f"No entry at or after {moment:%Y-%m-%d %H:%M:%S}{skipped}.", "warning"
+            )
+            return
+
+        self.log_panel.move_cursor(target)
+        self._update_status()
+        self._notify(f"Moved to {moment:%Y-%m-%d %H:%M:%S} or later{skipped}.")
+
     def _exporter_choices(self) -> list[ExportChoice]:
         """Built-ins first, then whatever the plugin registry supplied.
 
@@ -1650,6 +1840,7 @@ class LogViewerApp(App[None]):
             self._notify("Following new lines.")
         if self.state.detail_pane:
             self.detail_pane.show(message.entry)
+        self._sync_match_position()
         self._update_status()
 
     def on_log_view_entry_selected(self, message: LogView.EntrySelected) -> None:
