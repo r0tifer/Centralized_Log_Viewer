@@ -175,6 +175,18 @@ distros.
   its bucket by arithmetic; when an arrival falls outside the grid `extend`
   says so and the caller rebuilds, rather than guessing. An entry with no
   timestamp is counted in `undated` and reported, never placed.
+- `clustering.py` — what `c` collapses. A line's *shape* is its message with the
+  volatile tokens normalised away, plus its level and its source — so a WARN and
+  an ERROR that read alike stay apart, and a merged view never folds two logs
+  together. Field *values* are deliberately not in the shape: a differing request
+  ID is exactly what must not split a cluster. Clustering is a **display
+  transform, never a filter** — `expand()` gives every line back, and the
+  guarantee is per cluster (its own members, in order, byte-identical) rather
+  than over the whole list, because gathering a run into one row is the feature.
+  `ClusterStream` is one code path for both the full render and the tail, so
+  "incremental" has no second implementation to drift from. `normalise` is
+  memoised: clustering re-runs on every keystroke in the query box, and shaping
+  a full buffer costs ~115 ms cold against ~6 ms warm.
 - `clipboard.py` — assembles and size-caps the payload `y` hands to
   `App.copy_to_clipboard`. OSC 52 has no continuation form, so an oversized
   payload is truncated at a line boundary and reported, never chunked and never
@@ -224,11 +236,12 @@ config.load_config ─→ SourceManager ─→ discovery.discover (thread)
 | `LogView` | `EntrySelected` | `Enter` on a line — open the detail pane on it |
 | `TimelineBar` | `BucketSelected` | `Enter` (or a click) on a bucket — narrow the time window to it |
 | `TimelineBar` | `WidthChanged` | The bar has room for a different number of buckets than it holds |
+| `LogView` | `ClusterToggled` | `Enter` on a collapsed (or opened) repeat group — the app owns which are open |
 | `SegmentedButtons` | `ValueChanged` / `Reselected` | Segment activated / re-activated |
 | `FilterChip` | `Dismissed` | Revert the named filter |
 | `AdvancedFiltersDrawer` | `SettingsChanged` | Full before/after snapshot; `needs_rescan` says whether discovery must re-run |
 | `AdvancedFiltersDrawer` | `ViewToggleChanged` | Auto-scroll / structured / clipboard / detail pane / watch rules flipped from a drawer switch |
-| `ExportDialog` | dismiss value | `ExportRequest(key, path, marked_only)`, or `None` when canceled |
+| `ExportDialog` | dismiss value | `ExportRequest(key, path, marked_only, clustered)`, or `None` when canceled |
 | `SaveViewDialog` | dismiss value | The name to save the current filters under, or `None` |
 | `ViewPickerDialog` | dismiss value | `ViewRequest(action, name, new_name)`, or `None` when closed. The dialog never edits state; the app acts and reopens it |
 | `WatchRulesDialog` | dismiss value | The edited rule set, or `None` when nothing changed — so a dialog that was only looked at costs no re-indexing |

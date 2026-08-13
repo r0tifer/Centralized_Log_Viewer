@@ -49,6 +49,10 @@ desktop terminal and on a headless 80-column SSH session.
   `M` steps between the marks, and `Ctrl+E` can export just those. Marks are
   keyed by content rather than position, so they survive filtering and tailing —
   and they are session-only, never written to disk.
+- 🧹 **Collapse the noise.** `c` folds repeated lines into one `×147` row by
+  normalising the volatile tokens — IDs, IPs, durations, paths — out of them.
+  Nothing is hidden: `Enter` expands a cluster in place and every line inside
+  is still selectable, markable and exportable.
 - 📤 **Get the view out.** `Ctrl+E` writes the filtered entries as JSON Lines,
   CSV or raw text — the whole filtered set, not just the lines on screen. `y`
   copies the selected line — or the whole visible view — to your local clipboard
@@ -154,6 +158,7 @@ use.
 | `clipboard_max_bytes` | Most log text one `y` clipboard copy may carry. Oversized copies are truncated at a line boundary and say so. | `65536` |
 | `watch_rate_limit` | Seconds a watch rule waits before notifying again; matches inside the window are counted and reported together. | `60` |
 | `watch_bell` | Ring the terminal bell when a watch rule notifies. | `false` |
+| `cluster_lookback` | How far back, in entries, `c` may reach to fold a repeated line into a cluster. A bound, not a taste: it keeps one cluster from spanning a session. | `200` |
 | `enable_journald` | Offer the systemd journal as a source. Off by default: reading it runs `journalctl`, and CLV spawns no subprocess unasked. The drawer's switch writes this line for you. | `false` |
 
 Invalid values fall back to safe defaults; the app never fails to start because
@@ -429,6 +434,47 @@ way on purpose: the digest is derived from log content, and `session.json`
 records paths and settings, never anything about what a log contained. Closing
 CLV forgets them.
 
+### Noise reduction
+
+`c` collapses repeated lines into one row with a count:
+
+```
+  2026-08-07 09:25:01 - ERROR - connection refused for 10.0.0.5:5432 after 1.25s
+  2026-08-07 09:25:01 - ERROR - connection refused for 10.0.0.6:5433 after 0.90s
+  2026-08-07 09:25:02 - ERROR - connection refused for 10.0.0.7:5433 after 2.10s
+  … 144 more like it …
+  2026-08-07 09:27:14 - WARN  - disk almost full
+
+  ▸ ×147 09:25:01→09:27:09  2026-08-07 09:25:01 - ERROR - connection refused …
+  2026-08-07 09:27:14 - WARN  - disk almost full
+```
+
+Two lines collapse together when they look the same once the volatile tokens
+are normalised away — quoted strings, timestamps, UUIDs, IPv6 and IPv4
+addresses (with ports), hex, paths, floats and integers, applied in that order.
+So `request 8821 took 12ms` and `request 8822 took 47ms` are one event, and the
+line that is genuinely different stays on its own. Severity is part of the
+match: a WARN and an ERROR that read alike stay apart, as do identical lines
+from two different logs in a merged view.
+
+**Collapsing never hides a line.** It is a display transform, not a filter.
+`Enter` on a cluster row expands it in place and gives back exactly the lines
+that went into it, byte-identical and in order; every one of them is then
+selectable, markable and exportable like any other. `Enter` again closes it.
+Marking a *collapsed* cluster is refused with a note asking you to expand it
+first — one keystroke should not mark a hundred and forty-seven lines behind a
+single gutter dot.
+
+The row shows the count, the span from first to last, and the cluster's
+severity in its colour. `Ctrl+E` gains a **Clustered** option that writes one
+row per group with `cluster.count`, `cluster.first` and `cluster.last` as
+fields; expanded output remains the default.
+
+Clusters only form within `cluster_lookback` entries (200 by default, see
+[Configuration](#configuration)), so one cluster cannot quietly span a whole
+session and swallow an event from an hour ago. Whether clustering is on is
+remembered between runs; which clusters you had open is not.
+
 ### Saved views
 
 A filter set you had to think about is worth keeping. `V` names the one that is
@@ -561,6 +607,7 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `W` | Manage watch rules (live highlights and alerts) |
 | `d` | Show / hide the event detail pane |
 | `b` | Show / hide the severity timeline (then `←` `→` `Enter` to filter to a bucket) |
+| `c` | Collapse / expand repeated lines (then `Enter` on a cluster row) |
 | `w` | Follow new lines (auto-scroll) on/off |
 | `o` | Structured output on/off |
 | `Ctrl+B` | Switch between tree and log pane (compact widths) |

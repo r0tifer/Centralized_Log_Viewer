@@ -1191,6 +1191,48 @@ in M clusters".
 shortcuts row for `c`; an explicit statement that clustering never hides a line
 and that every clustered line stays selectable and exportable.
 
+**As shipped.** The no-loss requirement is the one this item stands on, and it
+is also the one whose wording did not survive contact:
+
+- **"Expanding a cluster yields exactly the original lines, in order" is a
+  guarantee *per cluster*, not over the pane.** A cluster gathers its members at
+  the position of its first one, so a run with something else interleaved comes
+  back grouped rather than interleaved — which is what collapsing a run *means*,
+  and is the case the feature exists for. Within a cluster the order and the
+  bytes are exactly what was read; nothing is dropped and nothing invented.
+  `expand()`'s docstring says so, and
+  `test_expanding_a_cluster_gives_back_every_original_line` asserts both halves
+  rather than the stronger claim this item made.
+- **The lookback is measured in *entries* and from the cluster's last member.**
+  A steady drip of the same line keeps one cluster alive, which is the shape
+  real noise has; a gap wider than `cluster_lookback` starts a new one. New
+  setting, default 200, clamped like every other.
+- **`m` on a *collapsed* cluster is refused rather than obeyed.** One keystroke
+  marking a hundred and forty-seven lines behind one gutter dot is not what the
+  key means, so it asks for the cluster to be expanded first. Expanded, every
+  member marks exactly as it always did.
+- **The shape carries the level and the source, but never a field value.** A
+  differing request ID is the thing that must not split a cluster; a WARN that
+  reads like an ERROR, and one log's line that reads like another's in a merged
+  view, are things that must not join one.
+- **`normalise` is memoised, and that is not an optimisation but the feature
+  working at all.** Clustering runs on the filtered set, which is rebuilt on
+  every keystroke in the query box: 115 ms per five thousand lines, per
+  character, is unusable. Cached, a re-render is ~6 ms. Measured numbers are in
+  the commit message, and both the cold and warm ceilings have tests.
+- **A cluster row is never a structured panel.** With `o` on, an ordinary row
+  still renders its JSON payload; a bordered panel per repeat group is the noise
+  this item removes.
+
+Two smaller notes. `LogView` gained a third row kind, and a cluster row carries
+**both** its cluster and the group's first entry — so the detail pane, the mark
+gutter, `n`/`N` and the watch highlight all keep working with no branch of their
+own, and only `Enter` differs. And a tailed line that joins an *open* cluster
+costs a redraw rather than an in-place update, because inserting a row into the
+middle of the pane is the one thing that widget deliberately cannot do.
+
+---
+
 # Deliberately out of scope
 
 Recorded so these do not have to be re-argued each time they are proposed.

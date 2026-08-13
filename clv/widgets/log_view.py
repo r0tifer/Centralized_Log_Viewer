@@ -26,13 +26,20 @@ lines: raw lines wrap, and in structured mode an entry renders as a whole
 bordered panel. A cursor counting screen rows would land in the middle of one
 event and call it another.
 
-Two kinds of row
-----------------
+Three kinds of row
+------------------
 
 `write_entry` adds a row backed by a `LogEntry`; the cursor can land on it.
 `write` adds a bare renderable — the discovery summary, "No log entries", an
 invalid-query message, the `describe_empty_result` explanation — which is
 skipped by the cursor because there is nothing there to inspect.
+
+`write_cluster` adds a row backed by a *group* of entries (Item 15). It carries
+its cluster **and** that cluster's first entry, so it is selectable and every
+consumer that reads `row.entry` — the detail pane, marks, watch highlights,
+`n`/`N` — keeps working without learning what a cluster is. `Enter` is the one
+thing that differs: on a cluster row it posts `ClusterToggled` rather than
+`EntrySelected`, because expanding the group is what an operator means there.
 
 The gutter
 ----------
@@ -76,6 +83,10 @@ class _Row:
 
     renderable: RenderableType
     entry: Optional[LogEntry] = None
+    #: The group this row stands for, when it is a collapsed or expanded
+    #: cluster. Held opaquely: this widget stores it and hands it back on
+    #: `Enter`, and knows nothing about how one is formed.
+    cluster: Optional[object] = None
     marked: bool = False
     #: Matched an enabled watch rule. Styling only — a watched row is an
     #: ordinary row that is easier to find.
@@ -173,6 +184,24 @@ class LogView(ScrollView, can_focus=True):
         def control(self) -> "LogView":
             return self.log_view
 
+    class ClusterToggled(Message):
+        """Enter on a cluster row — expand it in place, or collapse it again.
+
+        The widget does not do it itself: which clusters are open is app state
+        that has to survive a re-render, and the rows are rebuilt from the
+        filtered set rather than edited in the pane.
+        """
+
+        def __init__(self, log_view: "LogView", index: int, cluster: object) -> None:
+            super().__init__()
+            self.log_view = log_view
+            self.index = index
+            self.cluster = cluster
+
+        @property
+        def control(self) -> "LogView":
+            return self.log_view
+
     def __init__(
         self,
         *,
@@ -214,6 +243,48 @@ class LogView(ScrollView, can_focus=True):
         """
 
         return self._add_row(_Row(renderable, entry))
+
+    def write_cluster(
+        self, renderable: RenderableType, cluster: object, entry: LogEntry
+    ) -> "LogView":
+        """Add a row standing for a group of entries.
+
+        *entry* is the cluster's representative and is stored as the row's
+        entry, so the detail pane, the mark gutter and `n`/`N` all keep working
+        on a clustered pane without a branch of their own.
+        """
+
+        return self._add_row(_Row(renderable, entry, cluster))
+
+    def update_row(
+        self, index: int, renderable: RenderableType, cluster: object | None = None
+    ) -> None:
+        """Replace what a row draws, in place.
+
+        For a cluster whose count rose on this poll: the row is already on
+        screen and only its text changed. Re-strips that one row, and pays for
+        a relayout only when the new renderable is a different *height* — which
+        it is not, for a count going from ×9 to ×10.
+
+        *cluster* is how a plain entry row becomes a cluster row when its second
+        member arrives: the row was written before there was a group to attach.
+        """
+
+        if not (0 <= index < len(self._rows)):
+            return
+        row = self._rows[index]
+        row.renderable = renderable
+        if cluster is not None:
+            row.cluster = cluster
+        if not self._layout_width:
+            return
+        previous = len(row.strips)
+        row.strips = self._render_strips(row, index)
+        self._strip_cache.clear()
+        if len(row.strips) != previous:
+            self._relayout()
+            return
+        self._refresh_row(index)
 
     def clear(self) -> "LogView":
         self._rows.clear()
@@ -446,6 +517,14 @@ class LogView(ScrollView, can_focus=True):
         return None
 
     @property
+    def cursor_cluster(self) -> object | None:
+        """The group under the cursor, when the cursor is on a cluster row."""
+
+        if 0 <= self._cursor < len(self._rows):
+            return self._rows[self._cursor].cluster
+        return None
+
+    @property
     def cursor_at_end(self) -> bool:
         """True when nothing is selected, or the last entry is."""
 
@@ -556,6 +635,17 @@ class LogView(ScrollView, can_focus=True):
         self._strip_cache.clear()
         self._refresh_row(index)
 
+    def row_holds(self, index: int, cluster: object) -> bool:
+        """Whether row *index* is still the row standing for *cluster*.
+
+        Row indexes are not stable: :meth:`_trim` drops a batch off the front
+        when the cap is exceeded and everything below it moves up. A caller
+        holding an index from an earlier render has to ask before writing
+        through it, or it rewrites whatever line is there now.
+        """
+
+        return 0 <= index < len(self._rows) and self._rows[index].cluster is cluster
+
     def is_row_watched(self, index: int) -> bool:
         return 0 <= index < len(self._rows) and self._rows[index].watched
 
@@ -619,9 +709,16 @@ class LogView(ScrollView, can_focus=True):
             self.scroll_end(animate=False)
 
     def action_select_cursor(self) -> None:
-        entry = self.cursor_entry
-        if entry is not None:
-            self.post_message(self.EntrySelected(self, self._cursor, entry))
+        if not (0 <= self._cursor < len(self._rows)):
+            return
+        row = self._rows[self._cursor]
+        if row.cluster is not None:
+            # A cluster row expands; a normal row opens detail. One key, two
+            # meanings, decided by what the cursor is on rather than by a mode.
+            self.post_message(self.ClusterToggled(self, self._cursor, row.cluster))
+            return
+        if row.entry is not None:
+            self.post_message(self.EntrySelected(self, self._cursor, row.entry))
 
     # --- mouse --------------------------------------------------------------
 

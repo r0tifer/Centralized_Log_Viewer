@@ -61,6 +61,10 @@ class ExportRequest:
     #: Write only the lines the operator marked. The dialog does not know what
     #: a mark is; it reports the choice and the app narrows the entry list.
     marked_only: bool = False
+    #: Write one row per repeat cluster instead of one per line. Same division
+    #: of labour: the dialog reports the choice, the app decides what a cluster
+    #: is and hands the exporter ordinary entries either way.
+    clustered: bool = False
 
 
 class ExportDialog(ModalScreen[ExportRequest | None]):
@@ -112,6 +116,18 @@ class ExportDialog(ModalScreen[ExportRequest | None]):
         background: transparent;
     }
 
+    /* The same, and deliberately with no top margin: it is a second option of
+       the same kind, and at 80x24 this dialog has no rows to spare — adding a
+       default-styled checkbox here cost three of them and pushed the buttons
+       off screen, which is what `test_the_export_dialog_fits_eighty_columns`
+       exists to catch. */
+    #export-clustered {
+        height: 1;
+        border: none;
+        padding: 0;
+        background: transparent;
+    }
+
     #export-path {
         border: tall $surface 25%;
         background: $surface 8%;
@@ -146,7 +162,9 @@ class ExportDialog(ModalScreen[ExportRequest | None]):
     }
     """
 
-    HINT = "Enter a destination path. Relative paths resolve from the working directory."
+    # One line at 80 columns: the dialog is exactly as tall as it can be, so a
+    # hint that wraps costs a row the buttons need.
+    HINT = "Enter a destination path. Relative paths resolve from the cwd."
     PLUGIN_HINT = "This exporter chooses its own destination."
 
     def __init__(
@@ -156,6 +174,7 @@ class ExportDialog(ModalScreen[ExportRequest | None]):
         entry_count: int,
         default_name: str = "clv-export",
         marked_count: int = 0,
+        cluster_count: int = 0,
     ) -> None:
         super().__init__()
         self._choices = list(choices)
@@ -163,6 +182,10 @@ class ExportDialog(ModalScreen[ExportRequest | None]):
         #: How many of those entries are marked. Zero disables the checkbox
         #: with a caption, rather than offering a filter that writes nothing.
         self._marked_count = marked_count
+        #: How many repeat clusters the view currently holds. Zero disables the
+        #: checkbox: offering "clustered" output for a view with no clusters in
+        #: it would write exactly the same file under a different name.
+        self._cluster_count = cluster_count
         # The stem the app derived from the source; the extension follows the
         # highlighted format.
         self._default_name = default_name
@@ -186,6 +209,12 @@ class ExportDialog(ModalScreen[ExportRequest | None]):
                 value=False,
                 id="export-marked-only",
                 disabled=self._marked_count == 0,
+            )
+            yield Checkbox(
+                self._clustered_label(),
+                value=False,
+                id="export-clustered",
+                disabled=self._cluster_count == 0,
             )
             yield Input(
                 value=self._filename_for(self._choice_at(0)),
@@ -212,6 +241,20 @@ class ExportDialog(ModalScreen[ExportRequest | None]):
         if self._marked_count == 1:
             return "Marked lines only (1 line)"
         return f"Marked lines only ({self._marked_count} lines)"
+
+    def _clustered_label(self) -> str:
+        if self._cluster_count == 0:
+            return "Clustered (no repeats collapsed — press c in the log pane)"
+        if self._cluster_count == 1:
+            return "Clustered (1 group, one row each)"
+        return f"Clustered ({self._cluster_count} groups, one row each)"
+
+    @property
+    def clustered(self) -> bool:
+        try:
+            return bool(self.query_one("#export-clustered", Checkbox).value)
+        except NoMatches:  # not composed yet
+            return False
 
     @property
     def marked_only(self) -> bool:
@@ -317,7 +360,7 @@ class ExportDialog(ModalScreen[ExportRequest | None]):
             return
 
         if not choice.needs_path:
-            self.dismiss(ExportRequest(choice.key, None, self.marked_only))
+            self.dismiss(ExportRequest(choice.key, None, self.marked_only, self.clustered))
             return
 
         text = self.query_one("#export-path", Input).value.strip()
@@ -336,4 +379,4 @@ class ExportDialog(ModalScreen[ExportRequest | None]):
             self._warn(f"{path.name} exists — press Export again to overwrite.")
             return
 
-        self.dismiss(ExportRequest(choice.key, path, self.marked_only))
+        self.dismiss(ExportRequest(choice.key, path, self.marked_only, self.clustered))

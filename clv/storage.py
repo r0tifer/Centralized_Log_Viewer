@@ -134,6 +134,10 @@ class SessionState:
     #: pane: which panes are open is a preference, what was in them is not —
     #: the *selected bucket* is therefore not persisted either.
     timeline: bool = False
+    #: Whether repeated lines are collapsed into clusters. A reading
+    #: preference; *which* clusters were expanded is not persisted, for the
+    #: reason marks are not — a cluster key is derived from log content.
+    clustering: bool = False
     # Advanced drawer state
     include_globs: str = ""
     exclude_globs: str = ""
@@ -180,6 +184,7 @@ class SessionState:
         "clipboard_osc52",
         "detail_pane",
         "timeline",
+        "clustering",
         "include_globs",
         "exclude_globs",
         "follow_symlinks",

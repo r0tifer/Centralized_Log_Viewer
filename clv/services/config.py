@@ -40,6 +40,11 @@ _LIMITS: dict[str, tuple[int, int, int]] = {
     # a toast per line, which is the behaviour that gets a feature like this
     # switched off for good.
     "watch_rate_limit": (60, 5, 3_600),
+    # Entries of lookback for repeat clustering (`c`). A line joins a cluster
+    # only when that cluster's last member is within this many entries, which
+    # is what stops one cluster spanning a whole session and swallowing an
+    # event from an hour ago.
+    "cluster_lookback": (200, 2, 100_000),
 }
 
 DEFAULT_SETTINGS_TEMPLATE = f"""[{CONFIG_SECTION}]
@@ -100,6 +105,11 @@ watch_rate_limit = 60
 # Ring the terminal bell when a watch rule notifies. Off by default.
 watch_bell = false
 
+# Repeat clustering (c). How many entries back a cluster may reach to absorb a
+# line that looks like it. Higher collapses more; lower keeps repeats that are
+# far apart as separate events.
+cluster_lookback = 200
+
 # Read the systemd journal (per unit and per boot) as a source. Off by default:
 # reading it means running journalctl, and CLV does not spawn a subprocess
 # without being asked. The Advanced drawer's "Journal (systemd)" switch turns
@@ -124,6 +134,7 @@ class LogConfig:
     tree_width: int = _LIMITS["tree_width"][0]
     clipboard_max_bytes: int = _LIMITS["clipboard_max_bytes"][0]
     watch_rate_limit: int = _LIMITS["watch_rate_limit"][0]
+    cluster_lookback: int = _LIMITS["cluster_lookback"][0]
     #: Ring the terminal bell when a watch rule notifies. Off by default: a
     #: bell is a thing an operator opts into, never a thing a log does to them.
     watch_bell: bool = False
@@ -336,6 +347,7 @@ def load_config(path: Optional[Path] = None) -> LogConfig:
         tree_width=_read_int(section, "tree_width"),
         clipboard_max_bytes=_read_int(section, "clipboard_max_bytes"),
         watch_rate_limit=_read_int(section, "watch_rate_limit"),
+        cluster_lookback=_read_int(section, "cluster_lookback"),
         watch_bell=_read_bool(section, "watch_bell", False),
         enable_journald=_read_bool(section, "enable_journald", False),
     )

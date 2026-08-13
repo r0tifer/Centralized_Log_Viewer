@@ -53,6 +53,14 @@ from .plugins import (
 )
 from .services import SourceManager, persist_log_sources, persist_setting
 from .services.clipboard import prepare_payload
+from .services.clustering import (
+    COUNT_PREFIX,
+    Cluster,
+    ClusterStream,
+    cluster_entries,
+    describe as describe_clusters,
+    summarise,
+)
 from .services.config import LogConfig, get_config_file, load_config, user_config_path
 from .services.discovery import DiscoveredFile, DiscoveryReport, discover
 from .services.export import (
@@ -272,6 +280,7 @@ BINDING_CATEGORIES: dict[str, str] = {
     "toggle_auto_scroll": "View",
     "toggle_structured": "View",
     "toggle_timeline": "View",
+    "toggle_clustering": "View",
     "watch_rules": "View",
     "export_view": "View",
     "copy_view": "View",
@@ -541,6 +550,7 @@ class LogViewerApp(App[None]):
         Binding("o", "toggle_structured", "Structured", show=False),
         Binding("d", "toggle_detail", "Detail pane", show=False),
         Binding("b", "toggle_timeline", "Severity timeline", show=False),
+        Binding("c", "toggle_clustering", "Collapse repeated lines", show=False),
         Binding("n", "next_match", "Next match", show=False),
         Binding("N", "previous_match", "Previous match", show=False),
         Binding("g", "goto_timestamp", "Go to timestamp", show=False),
@@ -641,6 +651,18 @@ class LogViewerApp(App[None]):
         #: The histogram the bar is showing, kept so a tail poll can fold new
         #: lines into it instead of rebuilding it from the whole buffer.
         self._timeline: Timeline = EMPTY_TIMELINE
+        #: Clustering of the currently rendered set, or None when `c` is off.
+        #: Kept so a tailed line joins the run it belongs to rather than
+        #: re-clustering the buffer on every poll.
+        self._clusters: ClusterStream | None = None
+        #: Which clusters the operator opened, keyed by content the way marks
+        #: are: the buffer is a bounded deque, so anything positional starts
+        #: pointing at a different cluster as lines are evicted. Session-only
+        #: and never persisted — a cluster key is derived from log content.
+        self._expanded_clusters: set[str] = set()
+        #: Stream row index -> row index in the pane, so a cluster that grew on
+        #: this poll can be redrawn without rebuilding the pane.
+        self._cluster_rows: dict[int, int] = {}
 
     # --- the session, and the three names the app knows it by ---------------
 
@@ -776,6 +798,7 @@ class LogViewerApp(App[None]):
             detail_pane=self.state.detail_pane,
             watch_rules=self._watching,
             timeline=self.state.timeline,
+            clustering=self.state.clustering,
         )
 
     @property
@@ -1534,8 +1557,7 @@ class LogViewerApp(App[None]):
         # lines than it matched.
         self._rebuild_timeline(result.entries)
 
-        for entry in result.entries[-self._show_lines :]:
-            self.log_panel.write_entry(self._renderable_for(entry), entry)
+        self._write_rows(result.entries)
         # Rows are created unmarked, so with an empty set there is nothing to do
         # — and an empty set is the overwhelmingly common case.
         if self._marks:
@@ -1547,6 +1569,117 @@ class LogViewerApp(App[None]):
         if scroll_end or self.state.auto_scroll:
             self.log_panel.scroll_end(animate=False)
         self._update_status()
+
+    # --- repeat clustering --------------------------------------------------
+
+    def _write_rows(self, entries: Sequence[LogEntry]) -> None:
+        """Fill the pane from *entries*, collapsing repeats when `c` is on.
+
+        Without clustering this is the loop it has always been. With it, the
+        rows are what the pane shows and the `_show_lines` window applies to
+        *those*: collapsing is worth doing precisely because it buys history on
+        screen, and slicing before it would give that back.
+        """
+
+        if not self.state.clustering:
+            self._clusters = None
+            self._cluster_rows = {}
+            for entry in entries[-self._show_lines :]:
+                self.log_panel.write_entry(self._renderable_for(entry), entry)
+            return
+
+        stream = cluster_entries(entries, lookback=self._config.cluster_lookback)
+        self._clusters = stream
+        self._cluster_rows = {}
+        # Keys that no longer exist are dropped rather than kept forever: the
+        # lines behind them have been filtered away or evicted, and an expansion
+        # set that only grew would be a slow leak keyed on log content.
+        live_keys = {row.key() for row in stream.rows if isinstance(row, Cluster)}
+        self._expanded_clusters &= live_keys
+
+        plan: list[tuple[int, Optional[Cluster], LogEntry]] = []
+        for index, row in enumerate(stream.rows):
+            if isinstance(row, Cluster):
+                plan.append((index, row, row.representative))
+                if row.key() in self._expanded_clusters:
+                    # The members follow their header, which is what "expanded
+                    # in place" means: the lines stay where they were read.
+                    plan.extend((-1, None, member) for member in row.entries)
+            else:
+                plan.append((index, None, row))
+
+        for stream_index, cluster, entry in plan[-self._show_lines :]:
+            if cluster is None:
+                self.log_panel.write_entry(self._renderable_for(entry), entry)
+            else:
+                self.log_panel.write_cluster(
+                    self._cluster_renderable(cluster), cluster, entry
+                )
+            if stream_index >= 0:
+                self._cluster_rows[stream_index] = len(self.log_panel.rows) - 1
+
+    def _cluster_renderable(self, cluster: Cluster) -> RenderableType:
+        """A collapsed (or opened) group, as one line.
+
+        Deliberately never a structured panel, even with `o` on: a bordered
+        payload per repeat group is the noise this feature exists to remove.
+        """
+
+        expanded = cluster.key() in self._expanded_clusters
+        marker = "▾" if expanded else "▸"
+        prefix = f"{marker} {COUNT_PREFIX}{cluster.count} "
+        text = Text(prefix, style="bold #7aa3d1")
+        if self._breakpoint != "-compact":
+            # The span is what makes a count actionable — "147 of these, over
+            # four seconds" is a different event from "147, over an hour". It
+            # gives way first, because at 80 columns the line itself matters
+            # more.
+            span = self._cluster_span(cluster)
+            if span:
+                text.append(f"{span} ", style="#7aa3d1")
+        body = self._colorize(cluster.representative)
+        if self._session.is_merged:
+            body = self._with_source_column(body, cluster.representative)
+        return text.append_text(body)
+
+    @staticmethod
+    def _cluster_span(cluster: Cluster) -> str:
+        first, last = cluster.first, cluster.last
+        if first is None or last is None:
+            return ""
+        if first == last:
+            return f"{first:%H:%M:%S}"
+        return f"{first:%H:%M:%S}→{last:%H:%M:%S}"
+
+    def action_toggle_clustering(self) -> None:
+        self._set_clustering(not self.state.clustering)
+
+    def _set_clustering(self, value: bool) -> None:
+        self._update_state(clustering=value)
+        if not value:
+            # Nothing is remembered across an off/on: what was expanded refers
+            # to clusters that no longer exist.
+            self._expanded_clusters.clear()
+        self._sync_view_toggles()
+        self._render_log()
+        if value and self._clusters is not None:
+            summary = describe_clusters(self._clusters)
+            self._notify(f"Collapsed repeats — {summary}." if summary else "No repeats to collapse.")
+
+    def on_log_view_cluster_toggled(self, message: LogView.ClusterToggled) -> None:
+        """Enter on a cluster row opens it, or closes it again."""
+
+        cluster = message.cluster
+        if not isinstance(cluster, Cluster):  # pragma: no cover - defensive
+            return
+        key = cluster.key()
+        if key in self._expanded_clusters:
+            self._expanded_clusters.discard(key)
+        else:
+            self._expanded_clusters.add(key)
+        # A rebuild rather than an edit: the rows come from the filtered set,
+        # and _restore_cursor puts the cursor back on the row that was toggled.
+        self._render_log()
 
     def _sync_marks(self) -> None:
         """Set every visible row's gutter from the mark set.
@@ -1599,6 +1732,10 @@ class LogViewerApp(App[None]):
         marked = bool(self._marks)
         watching = self._watch_index.active
         for entry in result.entries:
+            if self._append_clustered(entry):
+                # Joined a group already on screen: the row was redrawn with a
+                # higher count and there is no new row to decorate.
+                continue
             self.log_panel.write_entry(self._renderable_for(entry), entry)
             if marked and self._marks.contains(self._origin(entry), entry):
                 self.log_panel.set_row_marked(len(self.log_panel.rows) - 1, True)
@@ -1606,6 +1743,49 @@ class LogViewerApp(App[None]):
             # this line before it reached the pane.
             if watching and self._watch_index.watched(self._origin(entry), entry):
                 self.log_panel.set_row_watched(len(self.log_panel.rows) - 1, True)
+
+    def _append_clustered(self, entry: LogEntry) -> bool:
+        """Fold one tailed *entry* into the clustering, if it is on.
+
+        Returns True when the entry was absorbed by a row already on screen, so
+        the caller writes nothing. The stream is the same object a full render
+        builds, fed one entry at a time — there is no second clustering
+        implementation for the tail path to disagree with.
+        """
+
+        stream = self._clusters
+        if not self.state.clustering or stream is None:
+            return False
+
+        growth = stream.add(entry)
+        if growth.appended:
+            # A shape nobody has seen lately: an ordinary row, remembered in
+            # case the next line makes it a cluster.
+            self.log_panel.write_entry(self._renderable_for(entry), entry)
+            self._cluster_rows[growth.index] = len(self.log_panel.rows) - 1
+            return True
+
+        row_index = self._cluster_rows.get(growth.index)
+        cluster = growth.row
+        if row_index is None or not isinstance(cluster, Cluster):
+            # The row scrolled out of the `_show_lines` window, so there is
+            # nothing on screen to update. A redraw is the honest answer.
+            self._render_log()
+            return True
+        if cluster.key() in self._expanded_clusters:
+            # An open cluster gains a *member row*, which means inserting a row
+            # mid-pane — the one thing this widget deliberately cannot do. Rare
+            # enough (a cluster has to be open) to pay a redraw for.
+            self._render_log()
+            return True
+        if not self.log_panel.row_holds(row_index, cluster):
+            # The pane hit its row cap and dropped a batch off the front, so
+            # every index below it moved. Updating by a stale index would
+            # rewrite some unrelated line, which is worse than a redraw.
+            self._render_log()
+            return True
+        self.log_panel.update_row(row_index, self._cluster_renderable(cluster), cluster)
+        return True
 
     # --- the severity timeline ----------------------------------------------
 
@@ -1918,6 +2098,10 @@ class LogViewerApp(App[None]):
             # One source made of several files: which one the cursor is in is
             # not deducible from anything else on screen.
             parts.append(f"in {member}")
+        if self.state.clustering and self._clusters is not None:
+            # Says what collapsing bought, and — when it bought nothing — that
+            # it is on and found no repeats, rather than looking switched off.
+            parts.append(describe_clusters(self._clusters) or "no repeats collapsed")
         marks = self._marks.count_for(*self._origins())
         if marks:
             parts.append(f"{marks} marked")
@@ -2181,6 +2365,16 @@ class LogViewerApp(App[None]):
         entry = self.log_panel.cursor_entry
         if entry is None:
             self._notify("Move the cursor to a line to mark it.", "warning")
+            return
+        cluster = self.log_panel.cursor_cluster
+        if isinstance(cluster, Cluster) and cluster.key() not in self._expanded_clusters:
+            # A mark is a line. Marking 147 of them from one keystroke — and
+            # drawing one gutter dot for all of them — is not what `m` means,
+            # so the cluster has to be opened first.
+            self._notify(
+                f"Expand this cluster (Enter) to mark one of its {cluster.count} lines.",
+                "warning",
+            )
             return
         marked = self._marks.toggle(self._origin(entry), entry)
         # Content-keyed, so identical lines share one mark: resync every row
@@ -2962,6 +3156,7 @@ class LogViewerApp(App[None]):
                 Path(self._merged_name()) if self._session.is_merged else source
             ),
             marked_count=len(marked),
+            cluster_count=self._clusters.clustered if self._clusters is not None else 0,
         )
         request = await self.push_screen(dialog, wait_for_dismiss=True)
         if request is None:
@@ -2973,7 +3168,26 @@ class LogViewerApp(App[None]):
                 self._notify("Nothing marked to export.", "warning")
                 return
             entries = marked
+        if request.clustered:
+            # Expanded output is the default, and clustered output is derived
+            # from it rather than from a second pass: every cluster becomes one
+            # ordinary entry, so the exporters never learn what a cluster is.
+            entries = self._clustered_entries(entries)
         self._run_export(request, entries)
+
+    def _clustered_entries(self, entries: list[LogEntry]) -> list[LogEntry]:
+        """One entry per repeat group, for a clustered export.
+
+        Re-clustered from whatever the export is actually writing rather than
+        read off the pane: "marked lines only" narrows the set first, and a
+        count taken from the pane would then be a count of lines that are not
+        in the file.
+        """
+
+        stream = cluster_entries(entries, lookback=self._config.cluster_lookback)
+        return [
+            summarise(row) if isinstance(row, Cluster) else row for row in stream.rows
+        ]
 
     def _run_export(self, request: ExportRequest, entries: list[LogEntry]) -> None:
         if request.key.startswith("builtin:"):
@@ -3168,6 +3382,8 @@ class LogViewerApp(App[None]):
             self._set_watch_enabled(message.value)
         elif message.field == "timeline":
             self._set_timeline(message.value)
+        elif message.field == "clustering":
+            self._set_clustering(message.value)
         elif message.field == "journald":
             self._set_journald(message.value)
         else:
@@ -3314,6 +3530,7 @@ class LogViewerApp(App[None]):
             detail_pane=self.state.detail_pane,
             watch_rules=self._watching,
             timeline=self.state.timeline,
+            clustering=self.state.clustering,
         )
 
     def _sync_detail_pane(self) -> None:
