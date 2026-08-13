@@ -944,9 +944,37 @@ def test_a_merged_member_that_vanished_is_still_listed(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
-def test_selecting_the_merged_row_opens_the_merged_view(tmp_path: Path) -> None:
-    """The only way back into a set with the mouse, and the obvious one after
-    a restart — `u` is a keybinding nobody has to know to be able to click."""
+def _find_marker(app) -> tuple[int, int]:
+    """Screen position of the row's action marker, found by its metadata.
+
+    Located rather than computed: the cell's offset inside the tree depends on
+    the widget's border, padding and guide width, and a test that hardcodes
+    those is testing arithmetic instead of behaviour.
+    """
+
+    from clv.app import ACTION_META
+
+    screen = app.screen
+    for y in range(screen.size.height):
+        for x in range(screen.size.width):
+            if screen.get_style_at(x, y).meta.get(ACTION_META):
+                return x, y
+    raise AssertionError("no action marker painted anywhere on screen")
+
+
+async def _click_at(pilot, position: tuple[int, int]) -> None:
+    await pilot.click(offset=position)
+    await pilot.pause()
+    await pilot.pause()
+
+
+def test_the_marker_opens_the_merged_view_without_collapsing_it(tmp_path: Path) -> None:
+    """One row, two jobs, and a click has to be able to tell which it meant.
+
+    Opening the set used to be the whole row's behaviour, so it collapsed the
+    list of members at the same moment it opened them — the answer to "what is
+    in here" disappearing exactly when you asked for it.
+    """
 
     alpha, beta = _sources(tmp_path)
 
@@ -962,10 +990,9 @@ def test_selecting_the_merged_row_opens_the_merged_view(tmp_path: Path) -> None:
 
             tree = app.query_one("#source-tree", LogTree)
             row = _merged_row(tree)
-            assert row is not None
+            assert row is not None and row.is_expanded
 
-            tree.select_node(row)
-            await pilot.pause()
+            await _click_at(pilot, _find_marker(app))  # the ⧉ marker
 
             assert app._session.is_merged is True
             assert [entry.message for entry in app._entries] == [
@@ -974,6 +1001,39 @@ def test_selecting_the_merged_row_opens_the_merged_view(tmp_path: Path) -> None:
                 "alpha two",
                 "beta two",
             ]
+            assert row.is_expanded, "opening the view collapsed the group"
+
+    asyncio.run(scenario())
+
+
+def test_clicking_the_name_expands_and_collapses_without_opening(tmp_path: Path) -> None:
+    """The rest of the row is an ordinary group heading, and behaves like one."""
+
+    alpha, beta = _sources(tmp_path)
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            app._source_manager = SourceManager([alpha.parent], [])
+            app._update_state(merged=(str(alpha), str(beta)))
+            await app._rescan()
+            await pilot.pause()
+
+            from clv.app import LogTree
+
+            tree = app.query_one("#source-tree", LogTree)
+            row = _merged_row(tree)
+            assert row.is_expanded
+
+            marker_x, marker_y = _find_marker(app)
+            name = (marker_x + 5, marker_y)  # a few cells along, in "Merged"
+            await _click_at(pilot, name)
+
+            assert row.is_expanded is False, "the name did not collapse the group"
+            assert app._session.is_merged is False, "the name opened the view"
+
+            await _click_at(pilot, name)
+            assert row.is_expanded is True
 
     asyncio.run(scenario())
 
@@ -1038,8 +1098,7 @@ def test_the_merged_set_is_reachable_after_a_restart(tmp_path: Path) -> None:
             assert row is not None, "the merged set did not survive the restart"
             assert str(row.label) == "⧉ Merged (2 sources)"
 
-            tree.select_node(row)
-            await pilot.pause()
+            await _click_at(pilot, _find_marker(app))
             assert app._session.is_merged is True
 
     asyncio.run(first_run())

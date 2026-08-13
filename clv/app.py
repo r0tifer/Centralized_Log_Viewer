@@ -28,13 +28,16 @@ from xml.dom import minidom
 
 from rich.console import Group, RenderableType
 from rich.panel import Panel
+from rich.style import Style
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
 from textual.css.query import NoMatches
+from textual.message import Message
 from textual.reactive import reactive
 from textual.timer import Timer
 from textual.widgets import Button, Footer, Input, Label, Static, Switch, Tree
@@ -190,6 +193,14 @@ class MergedSetNode:
 #: sturdier than matching on a label that carries a count.
 MERGED_VIEW = MergedSetNode()
 
+#: Marks the one cell of a row that *acts* rather than selects. Carried as
+#: segment metadata on the label, which is the same mechanism Tree uses to tell
+#: its own expand chevron from the rest of the line.
+ACTION_META = "clv-action"
+
+#: How that cell is painted, so it reads as a control rather than decoration.
+ACTION_STYLE = Style(color="#95c8f5", bold=True)
+
 #: Groups that sit above the configured roots, in the order they are built.
 #: Used to place the merged group correctly when it appears mid-session,
 #: without rebuilding the tree around it.
@@ -333,11 +344,47 @@ class LogTree(Tree[object]):
     LogTree > .tree--label { color: #eef3ff; }
     """
 
+    class OpenRequested(Message):
+        """The action marker on a row was clicked."""
+
+        def __init__(self, node: TreeNode[object]) -> None:
+            super().__init__()
+            self.node = node
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.show_guides = True
         self.guide_depth = 3
         self.show_root = False
+
+    async def _on_click(self, event: events.Click) -> None:
+        """Let one cell of a row mean "act" while the rest means "select".
+
+        A group row has two jobs — expand its contents, and open what it
+        stands for — and answering both to the same click meant opening the
+        merged view while collapsing the list under it. Splitting them needs a
+        click target narrower than a row, which `Tree` does not offer: it
+        dispatches from segment metadata (that is how the expand chevron is
+        told apart), so a marker carrying metadata of its own is the same
+        mechanism rather than a new one.
+
+        Textual dispatches `_on_click` to every class in the MRO, most-derived
+        first, and stops at the first handler to call `prevent_default()`.
+        That, not `stop()`, is what keeps `Tree` from also selecting the row
+        and toggling it: `stop()` only ends the bubble to parent widgets, so
+        the base class ran anyway and the view opened as the group shut.
+        Anything without the marker falls through untouched, which is how the
+        rest of the row keeps behaving like the group heading it is.
+        """
+
+        if not event.style.meta.get(ACTION_META):
+            return
+        event.prevent_default()
+        event.stop()
+        line = event.style.meta.get("line")
+        node = self.get_node_at_line(line) if line is not None else None
+        if node is not None:
+            self.post_message(self.OpenRequested(node))
 
 
 class LogViewerApp(App[None]):
@@ -1077,15 +1124,25 @@ class LogViewerApp(App[None]):
     def _merged_paths(self) -> set[Path]:
         return {_resolve(Path(entry)) for entry in self.state.merged}
 
-    def _merged_label(self) -> str:
-        """The group's heading, which says what pressing it will open.
+    def _merged_label(self) -> Text:
+        """The group's heading: a marker that opens, and a name that expands.
+
+        The leading glyph carries the action metadata and is painted to look
+        like a control; the rest of the row is an ordinary group heading. One
+        row, two jobs, and a click can tell which one it meant — which it could
+        not when the whole row did both and opening the view collapsed the list
+        of what was in it.
 
         The count is the difference between a heading and a control: "Merged"
         alone reads as a category, while "2 sources" says there is something
         assembled here to open.
         """
 
-        return f"{MERGED_GROUP} ({_plural(len(self.state.merged), 'source', 'sources')})"
+        count = _plural(len(self.state.merged), "source", "sources")
+        return Text.assemble(
+            (ICON_MERGED, Style.from_meta({ACTION_META: True}) + ACTION_STYLE),
+            f" Merged ({count})",
+        )
 
     def _merged_display_paths(self) -> list[Path]:
         """The merged set in the order the group lists it."""
@@ -2779,11 +2836,15 @@ class LogViewerApp(App[None]):
             self._select_rotated_set(data)
         elif isinstance(data, ProviderSource):
             self._select_provider_source(data)
-        elif data is MERGED_VIEW:
-            self.action_open_merged()
         elif isinstance(data, SavedView):
             self._apply_view(data)
             self._notify(f"Applied view '{data.name}'.")
+
+    def on_log_tree_open_requested(self, message: LogTree.OpenRequested) -> None:
+        """A row's action marker was clicked: open what the row stands for."""
+
+        if message.node.data is MERGED_VIEW:
+            self.action_open_merged()
 
     def on_tree_node_highlighted(self, _event: Tree.NodeHighlighted[Path]) -> None:
         # The star target follows the cursor while the tree has focus, so the
