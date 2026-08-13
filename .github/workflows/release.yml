@@ -181,14 +181,31 @@ jobs:
           # container and the floor silently climbs to whatever the runner
           # ships, which is how a release stops installing on RHEL. Verified
           # locally against a real AlmaLinux 8 build, which reports 2.28.
-          MAX_GLIBC="$(find "dist/${BIN_NAME}" -type f \( -name '*.so*' -o -name "${BIN_NAME}" \) -print0 \
-            | xargs -0 -r objdump -T 2>/dev/null \
-            | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+          MAX_GLIBC="$(
+            # Not every file matching *.so* is an ELF object: AlmaLinux ships
+            # FIPS checksums (.libcrypto.so.1.1.hmac) beside the libraries.
+            # objdump exits 1 on those, xargs turns any such exit into 123, and
+            # pipefail would fail the step over a file that was never going to
+            # be inspected. grep exits 1 on no matches too. This subshell opts
+            # out of that strictness; the emptiness check below is what
+            # actually decides whether the scan found anything.
+            set +o pipefail
+            find "dist/${BIN_NAME}" -type f \( -name '*.so*' -o -name "${BIN_NAME}" \) -print0 \
+              | xargs -0 -r objdump -T 2>/dev/null \
+              | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+          )"
           echo "highest glibc requirement in the bundle: ${MAX_GLIBC:-none}"
+          if [[ -z "${MAX_GLIBC}" ]]; then
+            # A PyInstaller bundle always links glibc, so finding no reference
+            # to it means nothing was scanned — a moved path, an empty dist —
+            # and passing silently would make this guard decorative.
+            echo "::error::no glibc references under dist/${BIN_NAME}; did the build produce a bundle?" >&2
+            exit 1
+          fi
           ALLOWED="GLIBC_2.28"
           HIGHEST="$(printf '%s\n%s\n' "${MAX_GLIBC#GLIBC_}" "${ALLOWED#GLIBC_}" | sort -V | tail -1)"
           if [[ "${HIGHEST}" != "${ALLOWED#GLIBC_}" ]]; then
-            echo "::error::bundle needs ${MAX_GLIBC}, above the ${ALLOWED} floor — was it built outside manylinux?" >&2
+            echo "::error::bundle needs ${MAX_GLIBC}, above the ${ALLOWED} floor — was it built outside the AlmaLinux 8 container?" >&2
             exit 1
           fi
 
