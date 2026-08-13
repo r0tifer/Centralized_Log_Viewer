@@ -16,7 +16,7 @@ would mean reworking every feature built on top of them.
 | 2 — The line cursor and what it unlocks | 5, 6, 7 | ✅ **Complete** (`63354f9`, `1c9fd27`, `20e4ffd`) |
 | 3 — Query and view power | 8, 9, 10 | ✅ **Complete** (`b882cfb`, `3fbbf75`, `bd174af`) |
 | 4 — The source layer | 11, 12, 13 | ✅ **Complete** (`24647af`, `eb25ed7`, `ec03023`) |
-| 5 — Analysis | 14, 15 | Not started |
+| 5 — Analysis | 14, 15 | ✅ **Complete** (`c8639ba`, `5ed505e`) |
 
 Completed items are kept in full rather than deleted: the "production ready
 when" lists are what the tests were written against, and the reasoning behind
@@ -64,7 +64,10 @@ pane navigation stays available as a later option.
 
 Shipped rows are marked ✅. Cursor movement lives on `LogView.BINDINGS` rather
 than the app — see Item 5's **As shipped** — but is listed here because it
-counts against the same key budget and appears in the same help overlay.
+counts against the same key budget and appears in the same help overlay. The
+timeline's bucket keys are on `TimelineBar.BINDINGS` for the same reason, and
+reuse the cursor keys deliberately: they are the same gesture aimed at whatever
+has focus.
 
 | Key | Action | Item | Footer | |
 | --- | --- | --- | --- | --- |
@@ -83,8 +86,9 @@ counts against the same key budget and appears in the same help overlay.
 | `W` | Watch rules manager | 10 | hidden | ✅ |
 | `x` | Toggle source into the merged set | 13 | hidden | ✅ |
 | `u` | Open the merged (unified) view | 13 | hidden | ✅ |
-| `b` | Toggle the severity timeline | 14 | hidden | |
-| `c` | Toggle repeat clustering | 15 | hidden | |
+| `b` | Toggle the severity timeline | 14 | hidden | ✅ |
+| `←` `→` `Home` `End` `Enter` | Select a timeline bucket, filter to it | 14 | hidden | ✅ |
+| `c` | Toggle repeat clustering | 15 | hidden | ✅ |
 
 No collisions with the existing bindings (`/`, `Esc`, `a`, `*`, `t`, `s`, `f`,
 `w`, `o`, `Ctrl+B`, `[`, `]`, `+`, `-`, `Ctrl+L`, `Ctrl+S`, `Ctrl+R`, `q`).
@@ -1053,11 +1057,11 @@ set, because its filters were written against all of it.
 
 ---
 
-# Phase 5 — Analysis
+# Phase 5 — Analysis ✅
 
 Both items are what push CLV past the tool it is imitating.
 
-## 14. Severity timeline
+## 14. Severity timeline ✅
 
 **Goal.** Event Viewer's "Summary of Administrative Events", except live and
 one keystroke from the logs. A single-row sparkline of event volume by severity
@@ -1138,7 +1142,7 @@ pane colours lines with, and a widget may not import `clv.app`.
 
 ---
 
-## 15. Repeat clustering / noise collapse
+## 15. Repeat clustering / noise collapse ✅
 
 **Goal.** The single highest-leverage readability feature, and one nothing in
 Event Viewer does. Normalise volatile tokens (numbers, UUIDs, IPs, hex, paths)
