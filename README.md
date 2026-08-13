@@ -105,8 +105,7 @@ Both install the PyInstaller tree under `/opt/centralized-log-viewer` with a
 `centralized-log-viewer-linux-<arch>.tar.gz` tarball also ships with every
 release as a universal fallback.
 
-The binaries are built inside `manylinux_2_28`, so they need **glibc 2.28 or
-newer** — RHEL/Rocky/Alma 8+, Debian 11+, Ubuntu 20.04+, and anything more
+The binaries are built on AlmaLinux 8, so they need **glibc 2.28 or newer** — RHEL/Rocky/Alma 8+, Debian 11+, Ubuntu 20.04+, and anything more
 recent. The build fails rather than ships if that floor creeps upward. Nothing
 is bundled that a system tool will be made to load: CLV strips its own library
 path before running `journalctl`, so a bundle built on one distribution cannot
