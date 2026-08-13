@@ -168,6 +168,13 @@ distros.
   window counted and reported together, because a rule matching every line is
   what makes people switch a feature like this off. Both are driven from the
   existing tail poll — no second clock.
+- `timeline.py` — event volume over time, bucketed to whatever width the bar
+  has. The bucket count *is* the width, so a resize is a different histogram
+  rather than a reflow. Buckets are a fixed grid (an origin and a step) rather
+  than ranges recomputed from the data, which is what lets a tailed line find
+  its bucket by arithmetic; when an arrival falls outside the grid `extend`
+  says so and the caller rebuilds, rather than guessing. An entry with no
+  timestamp is counted in `undated` and reported, never placed.
 - `clipboard.py` — assembles and size-caps the payload `y` hands to
   `App.copy_to_clipboard`. OSC 52 has no continuation form, so an oversized
   payload is truncated at a line boundary and reported, never chunked and never
@@ -215,6 +222,8 @@ config.load_config ─→ SourceManager ─→ discovery.discover (thread)
 | `QueryBar` | `CustomRangeRequested` | Open the custom range dialog |
 | `LogView` | `CursorMoved` | The line cursor moved; carries whether it is on the last entry |
 | `LogView` | `EntrySelected` | `Enter` on a line — open the detail pane on it |
+| `TimelineBar` | `BucketSelected` | `Enter` (or a click) on a bucket — narrow the time window to it |
+| `TimelineBar` | `WidthChanged` | The bar has room for a different number of buckets than it holds |
 | `SegmentedButtons` | `ValueChanged` / `Reselected` | Segment activated / re-activated |
 | `FilterChip` | `Dismissed` | Revert the named filter |
 | `AdvancedFiltersDrawer` | `SettingsChanged` | Full before/after snapshot; `needs_rescan` says whether discovery must re-run |

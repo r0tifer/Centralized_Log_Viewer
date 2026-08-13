@@ -1097,6 +1097,45 @@ mirroring `b`, using the established two-homes pattern.
 **README.** New "Timeline" subsection with an ASCII example; shortcuts row for
 `b`.
 
+**As shipped.** Four departures, all of them consequences of the bar being a
+control rather than a picture:
+
+- **The widget is two rows, not one.** The bar is one row — volume is the
+  *height* of the block glyph, so a spike reads on a monochrome terminal — and
+  beneath it is a caption naming the selected bucket. Without it the selection
+  is invisible, which makes a control nobody can aim; the status bar, the only
+  other candidate, is already full at 80 columns. The caption is also where a
+  source with no timestamps explains itself, in `describe_empty_result`'s
+  voice, which is what keeps the bar row from being an empty rectangle.
+- **The switch went into "Output & panes", not the View section.** Item 5
+  recorded that `#view-toggles` is `display: none` above 148 columns, so a
+  single-home control placed there vanishes on a wide terminal; Item 10
+  recorded that a *new row* in the drawer pushes "Source discovery" past
+  `max-height: 16`, where it lays out and paints nothing. A fourth toggle in
+  the existing row is the one placement that avoids both, and
+  `test_the_drawer_still_paints_source_discovery_with_the_new_switch` is the
+  guard.
+- **The bucket count is the width, so a resize is a rebuild.** `TimelineBar`
+  cannot rebuild it — bucketing is a service and the entries belong to the app
+  — so it posts `WidthChanged` and the app re-buckets. That message is also
+  what corrects the *first* histogram: the bar is hidden until `b`, and a
+  hidden widget has no width to bucket against.
+- **"Recomputed incrementally on tail" is a fixed grid plus a fallback.**
+  `Timeline.extend` folds arrivals into the existing origin/step by arithmetic,
+  and returns `None` when one lands outside the grid — at which point the app
+  rebuilds. With buckets minutes wide and a 2 Hz poll, the rebuild is paid
+  about once per bucket rather than twice a second, and
+  `test_extending_matches_a_full_rebuild` is the correctness guard on the
+  cheap branch.
+
+Two smaller notes. Selecting a bucket goes through the *custom range* the query
+bar and `SessionState` already have rather than through a filter of its own, so
+it shows up as an ordinary Time chip and is dismissed like one — and the bar
+then re-buckets over the narrower window, which makes a second `Enter` a
+drill-down. And `SEVERITY_COLORS` moved from `app.py` to
+`clv/widgets/severity.py`: the bar colours buckets with the palette the log
+pane colours lines with, and a widget may not import `clv.app`.
+
 ---
 
 ## 15. Repeat clustering / noise collapse
@@ -1151,8 +1190,6 @@ in M clusters".
 **README.** New "Noise reduction" section with a before/after example;
 shortcuts row for `c`; an explicit statement that clustering never hides a line
 and that every clustered line stays selectable and exportable.
-
----
 
 # Deliberately out of scope
 

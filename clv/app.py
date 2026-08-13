@@ -89,6 +89,8 @@ from .services.query import (
 )
 from .services.rotation import RotatedSet, describe_set, group_rotated
 from .services.session import ORIGIN_FIELD, SourceSession
+from .services.timeline import Timeline, build_timeline
+from .services.timeline import EMPTY as EMPTY_TIMELINE
 from .services.watch import (
     WatchIndex,
     WatchNotifier,
@@ -108,6 +110,8 @@ from .widgets.goto_dialog import GotoDialog
 from .widgets.help_overlay import HelpOverlay, HelpSection
 from .widgets.log_view import LogView
 from .widgets.query_bar import QueryBar
+from .widgets.severity import SEVERITY_COLORS
+from .widgets.timeline import TimelineBar
 from .widgets.view_dialogs import SaveViewDialog, ViewPickerDialog, ViewRequest
 from .widgets.watch_dialog import WatchRulesDialog
 
@@ -117,15 +121,11 @@ from .widgets.watch_dialog import WatchRulesDialog
 #: warnings are included because they are usually what precedes the failure.
 NOTABLE_LEVELS: frozenset[str] = frozenset({LEVEL_WARN, LEVEL_ERROR, LEVEL_CRITICAL})
 
-SEVERITY_COLORS: dict[str, str] = {
-    "CRITICAL": "#fb7185",
-    "ERROR": "#f87171",
-    "WARN": "#facc15",
-    "NOTICE": "#38bdf8",
-    "INFO": "#22c55e",
-    "DEBUG": "#a855f7",
-    "TRACE": "#94a3b8",
-}
+#: ``SEVERITY_COLORS`` is imported from `clv/widgets/severity.py` rather than
+#: defined here: the timeline colours its buckets with the same palette the log
+#: pane colours its lines with, and a widget may not import `clv.app`. The name
+#: is still reachable as `clv.app.SEVERITY_COLORS`, which is where everything
+#: that already used it looks.
 
 STRUCTURED_PAYLOAD_MAX_CHARS = 8_192
 
@@ -261,8 +261,17 @@ BINDING_CATEGORIES: dict[str, str] = {
     "goto_timestamp": "Navigation",
     "toggle_mark": "Navigation",
     "next_mark": "Navigation",
+    # TimelineBar owns the bucket keys, bound on the widget for the reason
+    # LogView's cursor keys are: they only mean anything while the bar has
+    # focus. Folded into the overlay by build_help_sections, like those.
+    "bucket_left": "Navigation",
+    "bucket_right": "Navigation",
+    "bucket_home": "Navigation",
+    "bucket_end": "Navigation",
+    "apply_bucket": "Navigation",
     "toggle_auto_scroll": "View",
     "toggle_structured": "View",
+    "toggle_timeline": "View",
     "watch_rules": "View",
     "export_view": "View",
     "copy_view": "View",
@@ -494,6 +503,7 @@ class LogViewerApp(App[None]):
     LogViewerApp.-copy-mode #advanced-drawer,
     LogViewerApp.-copy-mode #sources-panel,
     LogViewerApp.-copy-mode #status-bar,
+    LogViewerApp.-copy-mode TimelineBar,
     LogViewerApp.-copy-mode DetailPane,
     LogViewerApp.-copy-mode Footer,
     LogViewerApp.-copy-mode .panel-title {
@@ -530,6 +540,7 @@ class LogViewerApp(App[None]):
         Binding("w", "toggle_auto_scroll", "Follow", show=True),
         Binding("o", "toggle_structured", "Structured", show=False),
         Binding("d", "toggle_detail", "Detail pane", show=False),
+        Binding("b", "toggle_timeline", "Severity timeline", show=False),
         Binding("n", "next_match", "Next match", show=False),
         Binding("N", "previous_match", "Previous match", show=False),
         Binding("g", "goto_timestamp", "Go to timestamp", show=False),
@@ -626,6 +637,10 @@ class LogViewerApp(App[None]):
             max_rows=self._config.max_buffer_lines,
         )
         self.detail_pane = DetailPane(id="detail-pane")
+        self.timeline_bar = TimelineBar(id="timeline-bar")
+        #: The histogram the bar is showing, kept so a tail poll can fold new
+        #: lines into it instead of rebuilding it from the whole buffer.
+        self._timeline: Timeline = EMPTY_TIMELINE
 
     # --- the session, and the three names the app knows it by ---------------
 
@@ -672,6 +687,10 @@ class LogViewerApp(App[None]):
                 yield Vertical(id="tree-panel")
             with Vertical(id="viewer-panel"):
                 yield Label("Log Output", classes="panel-title")
+                # Above #log-area rather than inside it: that container turns
+                # horizontal at -wide so the detail pane can sit beside the log,
+                # and a bar placed in it would become a third column.
+                yield self.timeline_bar
                 with Container(id="log-area"):
                     yield self.log_panel
                     yield self.detail_pane
@@ -696,6 +715,7 @@ class LogViewerApp(App[None]):
         self._refresh_chips()
         self._sync_star_button()
         self._sync_detail_pane()
+        self._sync_timeline()
         self._sync_watch_rules()
         # Filled at mount rather than only when the drawer opens, so the plugin
         # and exporter lines are correct the first time it is seen.
@@ -755,6 +775,7 @@ class LogViewerApp(App[None]):
             clipboard=self.state.clipboard_osc52,
             detail_pane=self.state.detail_pane,
             watch_rules=self._watching,
+            timeline=self.state.timeline,
         )
 
     @property
@@ -1472,11 +1493,13 @@ class LogViewerApp(App[None]):
         if self._selected_source is None:
             if self._report is not None:
                 self._show_discovery_summary(self._report)
+            self._clear_timeline()
             self._sync_detail_pane()
             return
 
         if not self._entries:
             self.log_panel.write(Text("No log entries in the selected source.", style="dim"))
+            self._clear_timeline()
             self._sync_detail_pane()
             return
 
@@ -1484,12 +1507,14 @@ class LogViewerApp(App[None]):
             result = self._visible_entries(self._entries)
         except QueryError as exc:
             self.log_panel.write(Text(f"Invalid query: {exc}", style="bold #f87171"))
+            self._clear_timeline()
             self._sync_detail_pane()
             return
 
         if not result.entries:
             message = describe_empty_result(result.stats, self._filter_spec())
             self.log_panel.write(Text(message, style="dim"))
+            self._clear_timeline()
             self._sync_detail_pane()
             return
 
@@ -1502,6 +1527,12 @@ class LogViewerApp(App[None]):
         live = {mark_key(self._origin(entry), entry) for entry in self._entries}
         self._marks.retain(live, sources=self._origins())
         self._watch_index.retain(live)
+
+        # Built from the filtered set and *not* from the `_show_lines` window:
+        # the histogram answers "when did the thing I am looking at happen",
+        # and the answer must not change because the pane is showing fewer
+        # lines than it matched.
+        self._rebuild_timeline(result.entries)
 
         for entry in result.entries[-self._show_lines :]:
             self.log_panel.write_entry(self._renderable_for(entry), entry)
@@ -1562,6 +1593,9 @@ class LogViewerApp(App[None]):
         # A tailed line can be one an operator marked earlier and that rotated
         # back in, so the gutter has to be set as it arrives — but only when
         # there are marks at all, keeping the common path a plain append.
+        # Folded into the existing grid rather than rebuilt from the buffer:
+        # this is the tail path, and it must cost what arrived.
+        self._extend_timeline(result.entries)
         marked = bool(self._marks)
         watching = self._watch_index.active
         for entry in result.entries:
@@ -1572,6 +1606,137 @@ class LogViewerApp(App[None]):
             # this line before it reached the pane.
             if watching and self._watch_index.watched(self._origin(entry), entry):
                 self.log_panel.set_row_watched(len(self.log_panel.rows) - 1, True)
+
+    # --- the severity timeline ----------------------------------------------
+
+    def _rebuild_timeline(self, entries: Sequence[LogEntry]) -> None:
+        """Bucket *entries* into the bar, at whatever width it has.
+
+        Skipped entirely while the bar is hidden: an operator who never presses
+        `b` should not pay for a histogram nobody is looking at, and the bar is
+        rebuilt the moment it is shown.
+        """
+
+        if not self.state.timeline:
+            self._timeline = EMPTY_TIMELINE
+            return
+        self._timeline = build_timeline(entries, width=self._timeline_width())
+        # is_running, not is_mounted: rendering is unit-tested without a screen,
+        # and a widget refresh needs one. Same guard _update_status uses.
+        if self.is_running:
+            self.timeline_bar.set_timeline(self._timeline)
+
+    def _timeline_width(self) -> int:
+        """How many buckets the bar has room for.
+
+        The widget's own width once it is laid out; before that — the first
+        render happens before the first resize — the terminal's, which is the
+        same number minus the panels beside it and is corrected on the next
+        render anyway.
+        """
+
+        width = self.timeline_bar.size.width or self.timeline_bar.container_size.width
+        return max(1, width or self.size.width or 80)
+
+    def _clear_timeline(self) -> None:
+        self._timeline = EMPTY_TIMELINE
+        if self.state.timeline and self.is_running:
+            self.timeline_bar.clear()
+
+    def _extend_timeline(self, entries: Sequence[LogEntry]) -> None:
+        """Fold tailed lines into the existing grid, or rebuild when they miss.
+
+        The incremental half of Item 14. At two polls a second against buckets
+        minutes wide, almost everything lands in the grid; a rebuild costs one
+        pass over the filtered set and happens about once per bucket.
+        """
+
+        if not self.state.timeline:
+            return
+        extended = self._timeline.extend(entries)
+        if extended is None:
+            try:
+                result = self._visible_entries(self._entries)
+            except QueryError:
+                return
+            self._rebuild_timeline(result.entries)
+            return
+        self._timeline = extended
+        if self.is_running:
+            self.timeline_bar.set_timeline(extended)
+
+    def action_toggle_timeline(self) -> None:
+        value = not self.state.timeline
+        self._set_timeline(value)
+        if value:
+            # Only from the key. The drawer switch and a restored session both
+            # go through _set_timeline without this: flipping a switch must not
+            # yank focus out of the drawer, and a session that reopens with the
+            # bar showing should still start on whatever normally has focus.
+            self.timeline_bar.focus()
+
+    def _set_timeline(self, value: bool) -> None:
+        self._update_state(timeline=value)
+        self._sync_view_toggles()
+        self._sync_timeline()
+
+    def _sync_timeline(self) -> None:
+        """Show or hide the bar, and fill it when it appears."""
+
+        if self._is_shutting_down or not self.is_running:
+            return
+        visible = self.state.timeline
+        self.timeline_bar.set_class(visible, "-visible")
+        if not visible:
+            self.timeline_bar.clear()
+            self._timeline = EMPTY_TIMELINE
+            return
+        # Rebuilt rather than restored: it was not being maintained while it
+        # was hidden, which is the point of hiding it.
+        try:
+            result = self._visible_entries(self._entries)
+        except QueryError:
+            self._clear_timeline()
+            return
+        self._rebuild_timeline(result.entries)
+
+    def on_timeline_bar_width_changed(self, message: TimelineBar.WidthChanged) -> None:
+        """Re-bucket to the width the bar actually got.
+
+        The bucket count is the width, so this is a rebuild rather than a
+        reflow. It is also what corrects the first histogram after `b`: the bar
+        is hidden until then, and a hidden widget has no width to bucket to.
+        """
+
+        if not self.state.timeline or self._is_shutting_down:
+            return
+        try:
+            result = self._visible_entries(self._entries)
+        except QueryError:
+            return
+        self._rebuild_timeline(result.entries)
+
+    def on_timeline_bar_bucket_selected(self, message: TimelineBar.BucketSelected) -> None:
+        """A bucket became the time window.
+
+        Routed through the *custom range* the query bar and the state already
+        have rather than through a filter of its own, so the selection shows up
+        as an ordinary Time chip and is dismissed the same way. The bar then
+        re-buckets over the narrower window, which is the drill-down the
+        histogram exists for.
+        """
+
+        window = message.window
+        if window.start is None or window.end is None:  # pragma: no cover - always bounded
+            return
+        start = window.start.isoformat(sep=" ", timespec="seconds")
+        end = window.end.isoformat(sep=" ", timespec="seconds")
+        self._update_state(time_window="range", custom_start=start, custom_end=end)
+        with self.prevent(Input.Changed):
+            self.query_bar.apply_custom_time_range(start, end, emit=False)
+        self._refresh_chips()
+        self._render_log()
+        self._notify(f"Time window set to {start} → {end}.")
 
     def _renderable_for(self, entry: LogEntry) -> RenderableType:
         if self.state.pretty_rendering:
@@ -2496,7 +2661,7 @@ class LogViewerApp(App[None]):
         # have to be handed in explicitly — still generated from Binding
         # objects, so a key added there can no more go missing from the overlay
         # than one added here.
-        bindings = list(self.BINDINGS) + list(LogView.BINDINGS)
+        bindings = list(self.BINDINGS) + list(LogView.BINDINGS) + list(TimelineBar.BINDINGS)
         self.push_screen(HelpOverlay(build_help_sections(bindings)))
 
     def action_toggle_advanced(self) -> None:
@@ -3001,6 +3166,8 @@ class LogViewerApp(App[None]):
             self._set_detail_pane(message.value)
         elif message.field == "watch_rules":
             self._set_watch_enabled(message.value)
+        elif message.field == "timeline":
+            self._set_timeline(message.value)
         elif message.field == "journald":
             self._set_journald(message.value)
         else:
@@ -3146,6 +3313,7 @@ class LogViewerApp(App[None]):
             clipboard=self.state.clipboard_osc52,
             detail_pane=self.state.detail_pane,
             watch_rules=self._watching,
+            timeline=self.state.timeline,
         )
 
     def _sync_detail_pane(self) -> None:

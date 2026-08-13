@@ -28,6 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Optional, Sequence
 
+from .filtering import sortable_moment
 from .parsing import LogEntry, LogParser
 from .reader import AnyReader, TailRead, open_reader
 
@@ -47,19 +48,12 @@ ReaderFactory = Callable[..., AnyReader]
 ORIGIN_FIELD = "source"
 
 
-def _sortable(moment: datetime, *, naive: bool) -> datetime:
-    """One comparable form for a timestamp, for ordering a whole set.
-
-    ``filtering._comparable`` answers this pairwise; a k-way merge needs a
-    single key, so the decision is made once for the set. When any member is
-    naive the offsets are dropped — the same rule, applied in bulk — and when
-    every member is aware they are kept, which orders two time zones correctly
-    rather than pretending both are local.
-    """
-
-    if naive and moment.tzinfo is not None:
-        return moment.replace(tzinfo=None)
-    return moment
+#: One comparable form for a timestamp, for ordering a whole set. Defined in
+#: `filtering` alongside the pairwise rule it is the bulk form of, and aliased
+#: here because this module was where it was first needed — the timeline needs
+#: exactly the same decision, and two copies of it would be two places for the
+#: merge and the histogram to disagree about a mixed-timezone source.
+_sortable = sortable_moment
 
 
 def tag_origins(

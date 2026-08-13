@@ -117,6 +117,22 @@ SEVERITY_BUCKETS: dict[str, frozenset[str]] = {
     "error": frozenset({LEVEL_ERROR, LEVEL_CRITICAL}),
 }
 
+#: The canonical levels from least to most severe. The buckets above say what
+#: a filter *accepts*; this says what "worse" means, which is a different
+#: question and the one anything summarising a group of lines has to answer —
+#: the timeline colouring a bucket, a cluster row reporting its highest level.
+LEVEL_ORDER: tuple[str, ...] = (
+    LEVEL_TRACE,
+    LEVEL_DEBUG,
+    LEVEL_INFO,
+    LEVEL_NOTICE,
+    LEVEL_WARN,
+    LEVEL_ERROR,
+    LEVEL_CRITICAL,
+)
+
+_LEVEL_RANK: dict[str, int] = {name: rank for rank, name in enumerate(LEVEL_ORDER)}
+
 #: Syslog numeric priorities (RFC 5424 severity part) to canonical levels.
 _SYSLOG_SEVERITY: dict[int, str] = {
     0: LEVEL_CRITICAL,
@@ -145,6 +161,30 @@ def normalize_level(raw: object) -> Optional[str]:
     if text.isdigit():
         return _SYSLOG_SEVERITY.get(int(text))
     return _LEVEL_ALIASES.get(text)
+
+
+def level_rank(level: Optional[str]) -> int:
+    """How severe *level* is, as a sortable number. Unknown and None rank -1.
+
+    Below TRACE rather than above it, so a group of lines that never declared a
+    level is not reported as more severe than one that did.
+    """
+
+    if level is None:
+        return -1
+    return _LEVEL_RANK.get(level, -1)
+
+
+def highest_level(levels: Iterable[Optional[str]]) -> Optional[str]:
+    """The most severe level in *levels*, or None when none was detected."""
+
+    best: Optional[str] = None
+    best_rank = -1
+    for level in levels:
+        rank = level_rank(level)
+        if rank > best_rank:
+            best, best_rank = level, rank
+    return best
 
 
 def level_matches(level: Optional[str], bucket: str) -> bool:

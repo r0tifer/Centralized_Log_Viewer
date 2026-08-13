@@ -40,6 +40,11 @@ desktop terminal and on a headless 80-column SSH session.
 - 📐 **Responsive layout.** Breakpoints at 90 and 130 columns reflow the
   controls; every control stays on screen and keyboard-reachable down to 80
   columns.
+- 📊 **See when it started.** `b` draws a one-row histogram of the filtered set
+  above the log, coloured by the worst severity in each bucket. It is a control
+  rather than a picture: `←`/`→` and `Enter` narrow the time window to the spike
+  you are pointing at, which is an ordinary custom range you can dismiss like
+  any other filter.
 - 🔖 **Mark the lines that matter.** `m` bookmarks the line under the cursor,
   `M` steps between the marks, and `Ctrl+E` can export just those. Marks are
   keyed by content rather than position, so they survive filtering and tailing —
@@ -374,6 +379,36 @@ the view out from under the line you just pointed at. The status bar says so —
 *"paused — cursor moved, End resumes"* — and `End` or `w` starts following
 again.
 
+### The severity timeline
+
+`b` opens a one-row histogram above the log: event volume over the time your
+filtered lines cover, each column coloured by the **worst** severity in it.
+
+```
+▁▁▂▁▁▃▂▁▁▁█▆▃▁▁▁▂▁▁·······▁▂▁▁▁▂▁▁▃▁▁▁▂▁▁▁▁▂▁▁▁▁▁▁▂▁▁▃▂▁▁▁▁▁
+2026-08-07 09:14:20–09:14:30 · 61 events · ERROR
+```
+
+Volume is the height of the block, not the colour, so the shape of a spike
+reads on a monochrome terminal. A column where nothing happened is a `·` rather
+than a gap, so the axis does not look like it stopped.
+
+It is a **control, not a picture**. `←`/`→` move the selection, `Home`/`End`
+jump to either end, and `Enter` narrows the time window to the selected bucket
+— which is an ordinary custom range, so it appears as a `Time:` chip and is
+dismissed like any other filter. Clicking a column does both at once. The bar
+then re-buckets over the narrower window, so pressing `Enter` again drills in
+further.
+
+The histogram is built from the **filtered** set, so it answers "when did the
+thing I am looking at happen" rather than "when did anything happen". It is
+built from the buffer only — no second read of the file — and while it is
+hidden it is not maintained at all. A source whose lines carry no timestamp
+says so in the caption instead of drawing an empty rectangle.
+
+Whether the bar is open is remembered between runs, along with a **Timeline**
+switch in the Advanced drawer. Which bucket you had selected is not.
+
 ### Marking lines
 
 `m` marks the line under the cursor and `M` steps between the marks, wrapping
@@ -525,6 +560,7 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `v` / `V` | Open saved views / save the current filters as a view |
 | `W` | Manage watch rules (live highlights and alerts) |
 | `d` | Show / hide the event detail pane |
+| `b` | Show / hide the severity timeline (then `←` `→` `Enter` to filter to a bucket) |
 | `w` | Follow new lines (auto-scroll) on/off |
 | `o` | Structured output on/off |
 | `Ctrl+B` | Switch between tree and log pane (compact widths) |

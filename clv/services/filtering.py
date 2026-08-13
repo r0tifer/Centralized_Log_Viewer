@@ -268,6 +268,22 @@ def _comparable(moment: datetime, reference: Optional[datetime]) -> datetime:
     return moment
 
 
+def sortable_moment(moment: datetime, *, naive: bool) -> datetime:
+    """One comparable form for a timestamp, for ordering or bucketing a *set*.
+
+    :func:`align_moments` answers this pairwise, which is all a comparison
+    needs. A k-way merge and a timeline both need a single key across every
+    entry at once, so the decision is made once for the set: when any member is
+    naive the offsets are dropped — the same rule, applied in bulk — and when
+    every member is aware they are kept, which orders two time zones correctly
+    rather than pretending both are local.
+    """
+
+    if naive and moment.tzinfo is not None:
+        return moment.replace(tzinfo=None)
+    return moment
+
+
 def align_moments(left: datetime, right: datetime) -> tuple[datetime, datetime]:
     """Make two timestamps comparable, whatever their tz-awareness.
 

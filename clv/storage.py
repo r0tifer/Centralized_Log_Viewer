@@ -130,6 +130,10 @@ class SessionState:
     #: survives a restart; the *selected line* does not, because that would
     #: record which log content someone was reading.
     detail_pane: bool = False
+    #: Whether the severity timeline is shown. Same argument as the detail
+    #: pane: which panes are open is a preference, what was in them is not —
+    #: the *selected bucket* is therefore not persisted either.
+    timeline: bool = False
     # Advanced drawer state
     include_globs: str = ""
     exclude_globs: str = ""
@@ -175,6 +179,7 @@ class SessionState:
         "pretty_rendering",
         "clipboard_osc52",
         "detail_pane",
+        "timeline",
         "include_globs",
         "exclude_globs",
         "follow_symlinks",

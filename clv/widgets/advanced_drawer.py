@@ -213,6 +213,7 @@ class AdvancedFiltersDrawer(Static):
         self._clipboard = True
         self._detail_pane = False
         self._watch_rules = True
+        self._timeline = False
         self._journald = False
         self.add_class("-hidden")
 
@@ -259,6 +260,14 @@ class AdvancedFiltersDrawer(Static):
                 with Vertical(classes="drawer-toggle"):
                     yield Label("Watch rules")
                     yield Switch(value=self._watch_rules, id="drawer-watch-rules")
+                # Item 14 asked for the View section above. It joins this row
+                # instead, for the two reasons already recorded here:
+                # #view-toggles vanishes above 148 columns and this switch has
+                # no query-bar copy, and a *new* row is what pushes "Source
+                # discovery" past max-height 16.
+                with Vertical(classes="drawer-toggle"):
+                    yield Label("Timeline")
+                    yield Switch(value=self._timeline, id="drawer-timeline")
 
         yield Label("Source discovery", classes="drawer-heading")
         with Horizontal(classes="drawer-row"):
@@ -414,6 +423,7 @@ class AdvancedFiltersDrawer(Static):
         clipboard: bool | None = None,
         detail_pane: bool | None = None,
         watch_rules: bool | None = None,
+        timeline: bool | None = None,
     ) -> None:
         """Mirror the app's view state onto this drawer's switches.
 
@@ -436,6 +446,8 @@ class AdvancedFiltersDrawer(Static):
             self._detail_pane = detail_pane
         if watch_rules is not None:
             self._watch_rules = watch_rules
+        if timeline is not None:
+            self._timeline = timeline
         try:
             with self.prevent(Switch.Changed):
                 self.query_one("#drawer-auto-scroll", Switch).value = auto_scroll
@@ -446,6 +458,8 @@ class AdvancedFiltersDrawer(Static):
                     self.query_one("#drawer-detail-pane", Switch).value = detail_pane
                 if watch_rules is not None:
                     self.query_one("#drawer-watch-rules", Switch).value = watch_rules
+                if timeline is not None:
+                    self.query_one("#drawer-timeline", Switch).value = timeline
         except NoMatches:  # not composed yet
             pass
 
@@ -460,6 +474,7 @@ class AdvancedFiltersDrawer(Static):
             "drawer-clipboard": "clipboard",
             "drawer-detail-pane": "detail_pane",
             "drawer-watch-rules": "watch_rules",
+            "drawer-timeline": "timeline",
             # A view toggle in mechanism only: the app owns it, acts on it, and
             # syncs it back. What it actually does is grant consent to run a
             # subprocess, which is why it is the app's decision and not this
