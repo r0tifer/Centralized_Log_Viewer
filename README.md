@@ -195,12 +195,20 @@ it to the **merged set**; `u` opens the set as one timestamp-ordered stream:
 
 The set is repeated as a group below the starred logs, so it is one keystroke
 away however deep its members are buried; each member also carries a `⧉` where
-it sits in the folder tree. The row itself does two things, split so a click
-can say which one it meant: **clicking the `⧉` marker opens the merged view** —
-the same thing `u` does, and how you get back into a set after a restart
-without remembering the shortcut — while clicking the name expands and
-collapses the list of members, like any other group. Selecting one member below
-it opens just that log, which is also sometimes what you want. A source column names the origin of every row
+it sits in the folder tree. The row carries its verbs as separate click
+targets, so a click can say which one it meant:
+
+| On the `⧉ Merged` row | | Keyboard |
+| --- | --- | --- |
+| `⧉` | Open the set as one stream | `u` |
+| `✎` | Save the set under a name | `V` |
+| `✕` | Empty the set, to start another | `X` |
+| the name | Expand / collapse its members | `Enter` |
+
+Selecting one member below it opens just that log, which is also sometimes what
+you want. Every group in the tree — Views, Providers, Starred, Merged — arrives
+collapsed, because a shortcut that unfolds itself pushes the rest of the tree
+off screen. A source column names the origin of every row
 (abbreviated as the terminal narrows), and the status line names the set.
 Adding or removing a source edits those rows in place — it never re-runs
 discovery, and it never collapses folders you had opened. **Every other feature works exactly as it does on a single log** — filters,
@@ -227,9 +235,11 @@ Some specifics worth knowing:
 - A member that disappears from disk is reported and the rest keep going.
 - The set persists in `session.json` and can be captured in a saved view.
 
-**Naming a set.** A merged set is not limited to one: with the set open, `V`
-saves it as a named view, and `v` (or the **Views** group at the top of the
-tree) switches between them. So `web tier` and `db tier` can be two different
+**Naming a set.** A merged set is not limited to one: `✎` on the row (or `V`)
+saves it as a named view, `✕` empties the working set so you can build the
+next one, and `v` (or the **Views** group at the top of the tree) switches
+between them. Renaming and deleting a saved set live in that picker — `r` and
+`d`. Clearing the working set never touches what you saved. So `web tier` and `db tier` can be two different
 groups of logs, each one keystroke away, and applying one moves the merged
 group in the tree to match.
 
@@ -505,6 +515,7 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `*` | Star / unstar the log under the cursor |
 | `x` | Add / remove the log under the cursor from the merged set |
 | `u` | Open the merged set as one timestamp-ordered stream |
+| `X` | Empty the merged set |
 | `↑` / `↓` | Move the line cursor |
 | `PgUp` / `PgDn` | Move the line cursor a screen at a time |
 | `Home` / `End` | First / last line (`End` also resumes following) |

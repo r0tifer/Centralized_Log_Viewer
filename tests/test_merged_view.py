@@ -810,7 +810,7 @@ def test_the_merged_group_appears_below_starred_and_above_the_roots(
             group = _merged_row(tree)
             assert [Path(str(child.data)).name for child in group.children] == ["alpha.log"]
             # The count is what makes the row read as something to open.
-            assert str(group.label) == "⧉ Merged (1 source)"
+            assert str(group.label).startswith("⧉ Merged (1 source)")
 
     asyncio.run(scenario())
 
@@ -839,7 +839,7 @@ def test_the_group_grows_shrinks_and_disappears_with_the_set(tmp_path: Path) -> 
                 "alpha.log",
                 "beta.log",
             ]
-            assert str(group.label) == "⧉ Merged (2 sources)"
+            assert str(group.label).startswith("⧉ Merged (2 sources)")
 
             for path in (alpha, beta):
                 app._highlight_source(path, select=False)
@@ -990,7 +990,9 @@ def test_the_marker_opens_the_merged_view_without_collapsing_it(tmp_path: Path) 
 
             tree = app.query_one("#source-tree", LogTree)
             row = _merged_row(tree)
-            assert row is not None and row.is_expanded
+            assert row is not None
+            row.expand()          # groups arrive collapsed; open it to watch
+            await pilot.pause()   # whether opening the view shuts it again
 
             await _click_at(pilot, _find_marker(app))  # the ⧉ marker
 
@@ -1023,6 +1025,8 @@ def test_clicking_the_name_expands_and_collapses_without_opening(tmp_path: Path)
 
             tree = app.query_one("#source-tree", LogTree)
             row = _merged_row(tree)
+            row.expand()
+            await pilot.pause()
             assert row.is_expanded
 
             marker_x, marker_y = _find_marker(app)
@@ -1096,7 +1100,7 @@ def test_the_merged_set_is_reachable_after_a_restart(tmp_path: Path) -> None:
             tree = app.query_one("#source-tree", LogTree)
             row = _merged_row(tree)
             assert row is not None, "the merged set did not survive the restart"
-            assert str(row.label) == "⧉ Merged (2 sources)"
+            assert str(row.label).startswith("⧉ Merged (2 sources)")
 
             await _click_at(pilot, _find_marker(app))
             assert app._session.is_merged is True
@@ -1160,6 +1164,144 @@ def test_applying_a_view_moves_the_merged_group_to_its_set(tmp_path: Path) -> No
                 assert app._session.is_merged is True
                 assert set(listed()) == names, f"group lists {listed()} for '{view.name}'"
                 assert marked() == names, f"indicators say {marked()} for '{view.name}'"
-                assert str(_merged_row(tree).label) == "⧉ Merged (2 sources)"
+                assert str(_merged_row(tree).label).startswith("⧉ Merged (2 sources)")
+
+    asyncio.run(scenario())
+
+
+# --- the verbs on the row ---------------------------------------------------
+
+
+def _find_action(app, action: str) -> tuple[int, int]:
+    """Screen position of a specific action marker, found by its metadata."""
+
+    from clv.app import ACTION_META
+
+    screen = app.screen
+    for y in range(screen.size.height):
+        for x in range(screen.size.width):
+            if screen.get_style_at(x, y).meta.get(ACTION_META) == action:
+                return x, y
+    raise AssertionError(f"no {action!r} marker painted anywhere on screen")
+
+
+def test_the_row_offers_open_name_and_clear(tmp_path: Path) -> None:
+    """All three verbs are on the row, and each is its own click target."""
+
+    alpha, beta = _sources(tmp_path)
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            app._source_manager = SourceManager([alpha.parent], [])
+            app._update_state(merged=(str(alpha), str(beta)))
+            await app._rescan()
+            await pilot.pause()
+
+            positions = {name: _find_action(app, name) for name in ("open", "save", "clear")}
+            # Three distinct cells on the same row.
+            assert len({positions[name] for name in positions}) == 3
+            assert len({y for _x, y in positions.values()}) == 1
+
+    asyncio.run(scenario())
+
+
+def test_the_clear_marker_empties_the_set(tmp_path: Path) -> None:
+    """The verb that was missing: building a second set meant unpicking the first."""
+
+    alpha, beta = _sources(tmp_path)
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            app._source_manager = SourceManager([alpha.parent], [])
+            app._update_state(merged=(str(alpha), str(beta)))
+            await app._rescan()
+            await pilot.pause()
+
+            await _click_at(pilot, _find_action(app, "clear"))
+
+            from clv.app import LogTree
+
+            tree = app.query_one("#source-tree", LogTree)
+            assert app.state.merged == ()
+            assert _merged_row(tree) is None
+            # The indicators go with it.
+            assert not [
+                node
+                for node in _walk(tree.root)
+                if isinstance(node.data, Path) and str(node.label).startswith("⧉")
+            ]
+
+    asyncio.run(scenario())
+
+
+def test_clearing_leaves_saved_views_alone(tmp_path: Path) -> None:
+    """A saved view recorded the set; emptying the working set is not a delete."""
+
+    alpha, beta = _sources(tmp_path)
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            app._source_manager = SourceManager([alpha.parent], [])
+            app._update_state(merged=(str(alpha), str(beta)))
+            app.action_open_merged()
+            await pilot.pause()
+            await app._store_views([app._capture_view("web tier")])
+            await pilot.pause()
+
+            app.action_clear_merged()
+            await pilot.pause()
+
+            assert app.state.merged == ()
+            saved = next(view for view in app.state.views if view.name == "web tier")
+            assert len(saved.merged) == 2
+
+            # And it can be brought back.
+            app._apply_view(saved)
+            await pilot.pause()
+            assert app._session.is_merged is True
+
+    asyncio.run(scenario())
+
+
+def test_clearing_an_empty_set_says_so_rather_than_pretending(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            await pilot.pause()
+            app.action_clear_merged()
+            await pilot.pause()
+
+            assert app.state.merged == ()
+
+    asyncio.run(scenario())
+
+
+def test_every_verb_has_a_keyboard_path(tmp_path: Path) -> None:
+    """Mouse is supported, never required — including for the new marker."""
+
+    from clv.app import LogViewerApp as App
+
+    actions = {binding.action for binding in App.BINDINGS}
+
+    assert {"open_merged", "toggle_merge", "clear_merged", "save_view"} <= actions
+
+
+def test_a_saved_merged_view_is_named_for_the_set(tmp_path: Path) -> None:
+    """Not for whichever member happens to sort first in it."""
+
+    alpha, beta = _sources(tmp_path)
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            app._source_manager = SourceManager([alpha.parent], [])
+            app._update_state(merged=(str(alpha), str(beta)))
+            app.action_open_merged()
+            await pilot.pause()
+
+            assert "alpha.log+beta.log" in app._default_view_name()
 
     asyncio.run(scenario())

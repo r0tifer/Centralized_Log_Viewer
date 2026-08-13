@@ -193,10 +193,15 @@ class MergedSetNode:
 #: sturdier than matching on a label that carries a count.
 MERGED_VIEW = MergedSetNode()
 
-#: Marks the one cell of a row that *acts* rather than selects. Carried as
-#: segment metadata on the label, which is the same mechanism Tree uses to tell
-#: its own expand chevron from the rest of the line.
+#: Marks a cell of a row that *acts* rather than selects, and says which act.
+#: Carried as segment metadata on the label, which is the same mechanism Tree
+#: uses to tell its own expand chevron from the rest of the line.
 ACTION_META = "clv-action"
+
+#: The verbs a merged row offers, as glyphs narrow enough that three of them
+#: still fit beside the name in a tree panel at its minimum width.
+ICON_NAME_SET = "✎"
+ICON_CLEAR_SET = "✕"
 
 #: How that cell is painted, so it reads as a control rather than decoration.
 ACTION_STYLE = Style(color="#95c8f5", bold=True)
@@ -271,6 +276,7 @@ BINDING_CATEGORIES: dict[str, str] = {
     "toggle_star": "Sources",
     "toggle_merge": "Sources",
     "open_merged": "Sources",
+    "clear_merged": "Sources",
     "reload_sources": "Sources",
     "save_session": "Session",
     "quit_app": "Session",
@@ -344,12 +350,13 @@ class LogTree(Tree[object]):
     LogTree > .tree--label { color: #eef3ff; }
     """
 
-    class OpenRequested(Message):
-        """The action marker on a row was clicked."""
+    class ActionRequested(Message):
+        """An action marker on a row was clicked, and which one."""
 
-        def __init__(self, node: TreeNode[object]) -> None:
+        def __init__(self, node: TreeNode[object], action: str) -> None:
             super().__init__()
             self.node = node
+            self.action = action
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -377,14 +384,15 @@ class LogTree(Tree[object]):
         rest of the row keeps behaving like the group heading it is.
         """
 
-        if not event.style.meta.get(ACTION_META):
+        action = event.style.meta.get(ACTION_META)
+        if not action:
             return
         event.prevent_default()
         event.stop()
         line = event.style.meta.get("line")
         node = self.get_node_at_line(line) if line is not None else None
         if node is not None:
-            self.post_message(self.OpenRequested(node))
+            self.post_message(self.ActionRequested(node, action))
 
 
 class LogViewerApp(App[None]):
@@ -532,6 +540,7 @@ class LogViewerApp(App[None]):
         Binding("W", "watch_rules", "Watch rules", show=False),
         Binding("x", "toggle_merge", "Add / remove from the merged set", show=False),
         Binding("u", "open_merged", "Open the merged view", show=False),
+        Binding("X", "clear_merged", "Empty the merged set", show=False),
         Binding("ctrl+b", "toggle_pane", "Switch pane", show=True),
         Binding("[", "shrink_sources_panel", "Narrower", show=False),
         Binding("]", "expand_sources_panel", "Wider", show=False),
@@ -853,11 +862,18 @@ class LogViewerApp(App[None]):
         tree: LogTree = LogTree("Sources", id="source-tree")
         await panel.mount(tree)
 
+        # Every group starts collapsed, like the configured roots below them.
+        # These are shortcuts to things buried deeper in the tree, and a
+        # shortcut that arrives already unfolded is not a shortcut: a hundred
+        # journal units expanded on launch pushes the actual roots off screen,
+        # which is the opposite of what a group at the top is for. One
+        # keystroke opens the one you want.
+        #
         # Saved views first: they are filter bundles rather than files, they
         # are few, and they are the fastest way back into a piece of work.
         # Above the starred group because a view usually names a starred log.
         if self.state.views:
-            group = tree.root.add(VIEWS_GROUP, data=None, expand=True)
+            group = tree.root.add(VIEWS_GROUP, data=None, expand=False)
             for view in self.state.views:
                 group.add_leaf(f"{ICON_VIEW} {view.name}", data=view)
 
@@ -865,7 +881,7 @@ class LogViewerApp(App[None]):
         # below this point in the tree can hold one — a folder hierarchy is
         # exactly what they do not have.
         if self._provider_sources:
-            group = tree.root.add(PROVIDERS_GROUP, data=None, expand=True)
+            group = tree.root.add(PROVIDERS_GROUP, data=None, expand=False)
             for source in self._provider_sources:
                 group.add_leaf(f"{ICON_PROVIDER} {source.name}", data=source)
 
@@ -878,7 +894,7 @@ class LogViewerApp(App[None]):
             key=lambda p: str(p).lower(),
         )
         if present:
-            group = tree.root.add(STARRED_GROUP, data=None, expand=True)
+            group = tree.root.add(STARRED_GROUP, data=None, expand=False)
             for path in present:
                 group.add_leaf(f"{ICON_STAR} {_compact_path(path)}", data=path)
 
@@ -888,7 +904,7 @@ class LogViewerApp(App[None]):
         # that has since rotated away should be visible enough to press `x` on
         # rather than silently absent.
         if self.state.merged:
-            group = tree.root.add(self._merged_label(), data=MERGED_VIEW, expand=True)
+            group = tree.root.add(self._merged_label(), data=MERGED_VIEW, expand=False)
             for path in self._merged_display_paths():
                 group.add_leaf(f"{ICON_MERGED} {_compact_path(path)}", data=path)
 
@@ -1120,6 +1136,26 @@ class LogViewerApp(App[None]):
         )
         self._notify(f"Merged {len(opened)} sources.{detail}")
 
+    def action_clear_merged(self) -> None:
+        """Empty the merged set, so the next one starts from nothing.
+
+        The verb that was missing: naming a set has always been possible
+        through saved views, but building a *second* one meant pressing `x`
+        off every member of the first. What is already saved is untouched —
+        this empties the working set, not the views that recorded it.
+        """
+
+        if not self.state.merged:
+            self._notify("The merged set is already empty.", "warning")
+            return
+        count = len(self.state.merged)
+        self._update_state(merged=())
+        self._sync_merged_tree()
+        self._notify(
+            f"Cleared {_plural(count, 'source', 'sources')} from the merged set. "
+            "Saved views that name a set are unaffected."
+        )
+
     @property
     def _merged_paths(self) -> set[Path]:
         return {_resolve(Path(entry)) for entry in self.state.merged}
@@ -1138,10 +1174,16 @@ class LogViewerApp(App[None]):
         assembled here to open.
         """
 
+        def marker(glyph: str, action: str) -> tuple[str, Style]:
+            return glyph, Style.from_meta({ACTION_META: action}) + ACTION_STYLE
+
         count = _plural(len(self.state.merged), "source", "sources")
         return Text.assemble(
-            (ICON_MERGED, Style.from_meta({ACTION_META: True}) + ACTION_STYLE),
-            f" Merged ({count})",
+            marker(ICON_MERGED, "open"),
+            f" Merged ({count})  ",
+            marker(ICON_NAME_SET, "save"),
+            " ",
+            marker(ICON_CLEAR_SET, "clear"),
         )
 
     def _merged_display_paths(self) -> list[Path]:
@@ -1179,6 +1221,10 @@ class LogViewerApp(App[None]):
             if group is None:
                 # Appearing mid-session, so it has to be placed rather than
                 # appended: below the other groups, above the configured roots.
+                #
+                # Open, unlike the ones built at startup: this one appeared
+                # because the operator just pressed `x`, and seeing the source
+                # land in it is the confirmation that the keystroke worked.
                 group = tree.root.add(
                     self._merged_label(),
                     data=MERGED_VIEW,
@@ -2176,7 +2222,9 @@ class LogViewerApp(App[None]):
             for part in (
                 self.state.severity if self.state.severity != "all" else "",
                 self.state.time_window if self.state.time_window not in {"", "all"} else "",
-                self._selected_source.name if self._selected_source else "",
+                self._merged_name()
+                if self._session.is_merged
+                else (self._selected_source.name if self._selected_source else ""),
             )
             if part
         ]
@@ -2840,11 +2888,17 @@ class LogViewerApp(App[None]):
             self._apply_view(data)
             self._notify(f"Applied view '{data.name}'.")
 
-    def on_log_tree_open_requested(self, message: LogTree.OpenRequested) -> None:
-        """A row's action marker was clicked: open what the row stands for."""
+    def on_log_tree_action_requested(self, message: LogTree.ActionRequested) -> None:
+        """A marker on a row was clicked. The row says what it stands for."""
 
-        if message.node.data is MERGED_VIEW:
+        if message.node.data is not MERGED_VIEW:
+            return
+        if message.action == "open":
             self.action_open_merged()
+        elif message.action == "save":
+            self.action_save_view()
+        elif message.action == "clear":
+            self.action_clear_merged()
 
     def on_tree_node_highlighted(self, _event: Tree.NodeHighlighted[Path]) -> None:
         # The star target follows the cursor while the tree has focus, so the

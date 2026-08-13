@@ -456,7 +456,10 @@ def test_starred_logs_get_a_group_at_the_top_of_the_tree(tmp_path: Path) -> None
             tree = app.query_one("#source-tree", LogTree)
             group = _starred_group(tree)
             assert group is not None, "no Starred group"
-            assert group.is_expanded
+            # Collapsed on arrival, like the roots below it: a group at the top
+            # is a shortcut to something buried, and one that unfolds itself
+            # pushes the rest of the tree off screen.
+            assert group.is_expanded is False
             assert [n.data for n in group.children] == [target]
             # It is the first thing in the tree, above the configured roots.
             assert tree.root.children[0] is group
@@ -733,5 +736,51 @@ def test_star_binding_survives_footer_truncation_at_eighty_columns() -> None:
         async with app.run_test(size=(160, 32)) as pilot:
             await pilot.pause()
             assert app.query_bar.query_one("#toggle-star", Button) is not None
+
+    asyncio.run(scenario())
+
+
+def test_every_group_arrives_collapsed(tmp_path: Path) -> None:
+    """A shortcut that unfolds itself is not a shortcut.
+
+    These groups exist so something buried is one keystroke away. Expanded on
+    launch they do the opposite: a hundred journal units, or a long list of
+    saved views, pushes the configured roots off the bottom of the pane.
+    """
+
+    from clv.plugins import LogSourceProvider, PluginRegistry, ProviderSource
+    from clv.services import SourceManager
+
+    root = _nested_tree(tmp_path)
+    target = root / "alpha" / "a.log"
+
+    class Fake(LogSourceProvider):
+        name = "fake"
+
+        def discover(self):
+            return [ProviderSource(Path("fake:one"), "One")]
+
+        def open(self, path):
+            return iter(())
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(120, 30)) as pilot:
+            app._plugins = PluginRegistry(sources=[Fake()])
+            app._source_manager = SourceManager([root], [])
+            app._update_state(
+                starred=(str(target.resolve()),), merged=(str(target),)
+            )
+            await app._rescan()
+            await pilot.pause()
+
+            tree = app.query_one("#source-tree", LogTree)
+            groups = [node for node in tree.root.children if not isinstance(node.data, Path)]
+            assert len(groups) >= 3, [str(n.label) for n in tree.root.children]
+            for node in groups:
+                assert node.is_expanded is False, f"{node.label} arrived expanded"
+
+            # And the roots below them are still reachable without scrolling.
+            assert any(isinstance(node.data, Path) for node in tree.root.children)
 
     asyncio.run(scenario())
