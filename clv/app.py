@@ -2047,6 +2047,16 @@ class LogViewerApp(App[None]):
             self.log_panel.write(Text(""))
             for error in self._plugins.errors:
                 self.log_panel.write(Text(f"Plugin problem — {error}", style="#facc15"))
+            # The collection deduplicates and caps itself, so this can no longer
+            # bury the discovery summary the operator opened CLV to read — but
+            # it must still say what it is not showing.
+            if self._plugins.errors.overflow_note:
+                self.log_panel.write(
+                    Text(
+                        f"Plugin problems — {self._plugins.errors.overflow_note}",
+                        style="#facc15",
+                    )
+                )
 
     # --- status and chips ---------------------------------------------------
 

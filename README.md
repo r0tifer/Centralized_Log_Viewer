@@ -768,6 +768,6 @@ your `session.json` would be a path that does not exist.
 ```bash
 python -m pip install -e .
 python -m pip install pytest
-python -m pytest            # 290 tests
+python -m pytest            # 791 tests
 python -m textual run clv/app.py --dev
 ```

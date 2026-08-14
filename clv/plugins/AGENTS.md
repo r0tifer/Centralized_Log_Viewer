@@ -297,20 +297,52 @@ The app dynamically discovers plugins using:
 2. **Entry points** — installed distributions advertising the `clv.plugins`
    entry point group.
 
-Each plugin should register itself by defining an `__all__` list or `register()` function.
+### How a module says what it exports
 
-Example:
+Three strategies, tried in order. The first that produces anything wins.
 
-```python
-__all__ = ["MySource"]
-```
+1. **`register()`** — returns one plugin, or any iterable of them (a list, a
+   tuple, a set, or a generator).
 
-or
+   ```python
+   def register():
+       return MySource()
+   ```
 
-```python
-def register():
-    return MySource()
-```
+   Returning `None` or an empty list is a *deliberate* decline — it is how a
+   plugin says "not on this machine", the way the shipped `journald` provider
+   would if its tool were missing. It is never reported as a problem.
+
+2. **`__all__`** — a list of plugin class or instance names.
+
+   ```python
+   __all__ = ["MySource"]
+   ```
+
+3. **A namespace scan.** If the module defines neither of the above, CLV looks
+   for concrete `Plugin` subclasses **that module itself defined**. A class
+   imported from elsewhere is not collected, and neither is a subclass that has
+   not implemented its interface method — that one would otherwise be
+   instantiated into a confusing `TypeError`.
+
+A module that defines no plugin and says nothing about why is **reported**:
+`defines no plugin — add register() or __all__`. Writing the class and
+forgetting the boilerplate is the most likely first mistake, and it used to
+produce zero plugins, zero errors and no clue.
+
+### What an entry point may point at
+
+Four legal target shapes, all handled:
+
+| Target | Example |
+| --- | --- |
+| A module | `mypkg.plugin` — its `register()` / `__all__` / namespace is read |
+| A plugin class | `mypkg:MyFilter` — CLV instantiates it |
+| A zero-argument factory | `mypkg:make_plugin` — called once |
+| A plugin instance | `mypkg:INSTANCE` |
+
+A callable that requires arguments is reported as such rather than rejected with
+a message about interfaces.
 
 ---
 
@@ -349,20 +381,56 @@ choosing what to install.
 
 - Follow **semantic versioning** for each plugin.
 - Set `requires_clv` on the plugin class to declare compatibility, e.g.
-  `requires_clv = ">=2.0,<3.0"`. Comma-separated comparators (`>=`, `<=`, `>`,
-  `<`, `==`, `!=`) are supported and checked against `clv.__version__`.
-  Omitting it means "any version".
+  `requires_clv = ">=2.0,<3.0"`. Omitting it means "any version".
 - A plugin failing its constraint is skipped and reported in
   `PluginRegistry.errors`, which the Advanced drawer surfaces.
 
+### The constraint grammar
+
+A PEP 440 subset, hand-rolled — `packaging` is not a dependency and will not
+become one. Comma-separated pieces are ANDed and whitespace is ignored.
+
+| Form | Meaning |
+| --- | --- |
+| `>=` `<=` `>` `<` `==` `!=` | ordered comparison; a bare version means `==` |
+| `==2.6.*`, `!=2.6.*` | release-prefix match |
+| `~=2.6` | compatible release — `>=2.6, ==2.*` |
+| `~=2.6.1` | `>=2.6.1, ==2.6.*` |
+| `^2.0.0` | Poetry's caret, a documented alias — `>=2.0.0,<3.0.0` |
+
+Versions may carry a prerelease (`a`/`b`/`rc`, with `alpha`/`beta`/`pre`
+normalised), `.postN` and `.devN`. They order as
+`1.0.dev1 < 1.0a1 < 1.0b1 < 1.0rc1 < 1.0 < 1.0.post1` — so `2.6.0rc1` is
+correctly **older** than `2.6.0`, which the previous comparator got backwards by
+stripping the letters and reading it as `2.6.1`.
+
+**One deliberate divergence from PEP 440: prereleases are always considered.**
+Strict PEP 440 excludes a prerelease from a range that does not name one, which
+would make `requires_clv = ">=2.6"` unsatisfied on a running `2.7.0rc1` and
+silently disable every installed plugin on any release-candidate build.
+
+An **unparseable** constraint — `~~2.6`, `>=abc`, a bare `~=2` — is reported
+against your plugin by name. It is never a silent "unsatisfied": a typo and a
+genuine incompatibility must not look the same from the outside.
+
 ## Failure Handling
 
-Loading never raises. An import error, an unsatisfied `requires_clv`, a class
-that cannot be instantiated, an object that implements no interface, or a
-`FilterStage` that throws mid-render is recorded in `PluginRegistry.errors` and
-skipped — a stage that raises is disabled for that pass while the remaining
-stages keep running. A third-party plugin must never prevent CLV from starting
-or break a render.
+Loading never raises. An import error, an unreadable or unsatisfied
+`requires_clv`, a class that cannot be instantiated, an object that implements
+no interface, a module that exports nothing, or a `FilterStage` that throws
+mid-render is recorded in `PluginRegistry.errors` and skipped. A third-party
+plugin must never prevent CLV from starting or break a render.
+
+**A plugin disabled at runtime stays disabled for the session.** A `FilterStage`
+that raises is taken out of service and its failure recorded **once**; the
+remaining stages keep running and the pane keeps rendering. It is not retried on
+the next render — doing that cost one identical error per render pass, and a
+plugin that raised on one entry will raise on the next.
+
+`PluginRegistry.errors` deduplicates identical `(origin, message)` pairs into a
+single entry with a count, and caps the number of distinct problems it stores,
+reporting how many it dropped. A broken plugin can no longer bury the discovery
+summary in the log panel.
 
 ---
 

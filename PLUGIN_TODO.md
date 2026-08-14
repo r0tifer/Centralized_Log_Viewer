@@ -26,7 +26,7 @@ ecosystem, it is three hooks and a directory.
 | --- | --- | --- |
 | **Stage A — Foundations** | | |
 | 0 — Doctrine | Withdraw the sandbox claim; reverse three stated non-goals | ✅ Done |
-| 1 — Loader correctness | The six defects, before anyone depends on them | ⬜ Not started |
+| 1 — Loader correctness | The six defects, before anyone depends on them | ✅ Done |
 | 2 — The contract | `clv/api.py`, `PLUGIN_API_VERSION`, the entry wire form | ⬜ Not started |
 | **Stage B — Reach** | | |
 | 3 — Installation | `~/.config/clv/plugins/`, `CLV_PLUGIN_PATH`, the enable-list | ⬜ Not started |
@@ -393,7 +393,36 @@ disabled at runtime stays disabled for the session.
 **Gate.** Every defect in the investigation has a failing-before/passing-after
 test. The shipped journald plugin loads and opens a source unchanged — this
 phase touches the loader, and the one real plugin in the tree is the regression
-check. Suite green on 3.11 and 3.14.
+check. Suite green on 3.11 and 3.14: 791 passed on both.
+
+**As shipped.** Two decisions worth recording, neither a change of scope.
+
+*`disable()` marks; it never removes.* [app.py:3113](clv/app.py#L3113) builds the
+export dialog's choices keyed `plugin:<index>` and
+[app.py:3236](clv/app.py#L3236) resolves them back by *position* in
+`registry.exporters`. Removing a disabled plugin from that list would silently
+re-target an in-flight export, so `sources`, `filters` and `exporters` stay
+append-only-at-load and every use site skips what is disabled. Phase 4's
+management UI and Phase 6's budget both inherit that constraint.
+
+*Only `apply_filters` calls `disable()` yet.* That is the defect this phase
+exists to fix — a per-render loop that re-reported the same failure every pass.
+Providers and exporters are operator-initiated one-shots, and disabling an
+exporter for the session because one export hit a permission error would be a
+worse bug than the one being fixed, with no way back until Phase 4's re-enable
+control. `is_disabled` is honoured everywhere from day one, so later phases add
+callers rather than plumbing.
+
+*The prerelease rule diverges from PEP 440 on purpose.* Strict PEP 440 excludes
+prereleases from a range that does not name one, which would make
+`requires_clv = ">=2.6"` unsatisfied on a running `2.7.0rc1` and disable every
+installed plugin on any release-candidate build. CLV compares in plain order.
+Documented in `clv/plugins/AGENTS.md` and pinned by a test.
+
+**Also swept here.** The CI matrix gains `3.14` — Requirement 8 names 3.11 and
+3.14 and nothing enforced the latter. The stale test counts in
+[AGENTS.md:330](AGENTS.md#L330) (620) and [README.md:768](README.md#L768) (290)
+are corrected to 791; Phase 16 still owns the test that keeps them honest.
 
 **Commit.** `fix(plugins): loader correctness before the door opens`
 

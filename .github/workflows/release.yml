@@ -24,7 +24,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.11', '3.13']
+        # 3.11 is the floor the release binaries are built against and 3.14 is
+        # the ceiling the project targets; both are stated requirements and
+        # neither was enforced here until now. 3.13 stays because it is what
+        # most contributors have locally. A dataclass default that worked on a
+        # newer interpreter has already failed to import on 3.11 once.
+        python-version: ['3.11', '3.13', '3.14']
     steps:
       - uses: actions/checkout@v4
 
