@@ -64,7 +64,10 @@ desktop terminal and on a headless 80-column SSH session.
   do on a single file. Local only — remote aggregation stays a non-goal.
 - 🧩 **Plugins.** `LogSourceProvider`, `FilterStage` and `Exporter` interfaces,
   loaded from `clv/plugins/` or from installed packages via the `clv.plugins`
-  entry point group. A broken plugin is reported, never fatal.
+  entry point group. A broken plugin is reported, never fatal. A plugin is
+  **trusted code** — it runs with your privileges, in CLV's process, and can
+  read every log CLV can open; install one the way you would install any other
+  program. `clv/plugins/AGENTS.md` has the trust model in full.
 - ⭐ **Starred logs.** Press `*` on any log to star it. Starred logs are
   repeated in a group at the top of the tree, so a favourite buried several
   folders deep is one keystroke away. Star exactly one and CLV opens it on

@@ -345,7 +345,11 @@ Run: `python -m pytest` (620 tests).
 
 - Network collection, multi-node aggregation, remote tailing.
 - Heavy parsing DSLs or schema-aware pipelines.
-- Background daemons or privileged operations.
+- Background daemons or privileged operations. The opt-in plugin isolation host
+  planned in [PLUGIN_TODO.md](PLUGIN_TODO.md) Phase 13 is neither: it lives and
+  dies with the viewer, runs at the operator's own privilege and never above it,
+  and exists so a plugin that hangs can be *killed*. It is not a sandbox, and
+  `clv/plugins/AGENTS.md`'s trust model says so in those words.
 
 ---
 

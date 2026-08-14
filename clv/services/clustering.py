@@ -33,7 +33,18 @@ so a later numeric rule cannot chew them up:
 1. quoted strings  2. timestamps  3. UUIDs  4. IPv6  5. IPv4 (and `:port`)
 6. hex (``0x…`` and long bare runs)  7. paths  8. floats  9. integers
 
-Not configurable, and there is no rules DSL: that is a stated non-goal.
+Not configurable from ``settings.conf``, and there is no rules DSL for the
+operator: that is a stated non-goal and it stands.
+
+**Reversed 2026-08-14, narrowly.** ``PLUGIN_TODO.md`` Phase 10 adds a
+``ClusterRule`` plugin interface, so the rule list above stops being closed.
+Recorded here rather than quietly outgrown, because the original objection was
+right and survives intact: it was to *the operator* hand-writing regex rules in
+a config file, where a typo is a silently mis-clustered pane and there is no
+review, no test and no way to tell a bad rule from a bad log. A plugin author
+writing Python against a reviewed interface is a different party making a
+different promise. The rules stay unconfigurable from ``settings.conf``, and
+nothing here becomes a text format.
 
 The lookback
 ------------

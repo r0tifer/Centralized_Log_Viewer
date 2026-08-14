@@ -25,7 +25,7 @@ ecosystem, it is three hooks and a directory.
 | Phase | Scope | State |
 | --- | --- | --- |
 | **Stage A — Foundations** | | |
-| 0 — Doctrine | Withdraw the sandbox claim; reverse three stated non-goals | ⬜ Not started |
+| 0 — Doctrine | Withdraw the sandbox claim; reverse three stated non-goals | ✅ Done |
 | 1 — Loader correctness | The six defects, before anyone depends on them | ⬜ Not started |
 | 2 — The contract | `clv/api.py`, `PLUGIN_API_VERSION`, the entry wire form | ⬜ Not started |
 | **Stage B — Reach** | | |
@@ -290,7 +290,8 @@ not appear in `clv/plugins/AGENTS.md`, so the claim cannot come back by
 accident during a later edit — including during Phase 13, which is when it
 would be most tempting.
 
-**Gate.** `python -m pytest` reports 718 passed on 3.11 and 3.14. A reader of
+**Gate.** `python -m pytest` reports 722 passed on 3.11 and 3.14 (717 before
+this phase, plus the five in `tests/test_plugin_docs.py`). A reader of
 `clv/plugins/AGENTS.md` alone can correctly answer "what can a plugin I install
 do to me?" and can find, for each reversed non-goal, what changed and why.
 

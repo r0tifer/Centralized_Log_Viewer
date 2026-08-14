@@ -1246,6 +1246,15 @@ Recorded so these do not have to be re-argued each time they are proposed.
   and the README should say so directly.
 - **A query DSL with boolean operators, parentheses and precedence.** Item 8
   stops deliberately at `key:value` terms with implicit AND.
+
+  **Partially reversed 2026-08-14** — see [PLUGIN_TODO.md](PLUGIN_TODO.md)
+  Phase 8. The entry is rewritten rather than deleted, per the rule at the head
+  of this file. What changed: a plugin may now contribute a `QueryOperator` (a
+  new comparison token) and a `ComputedField` (a queryable field derived rather
+  than parsed). What did **not** change, and stays out of scope: `OR`,
+  parentheses, and precedence. Those three are the DSL; operators and computed
+  fields are vocabulary. The grammar remains implicit-AND and flat, and
+  `query.py`'s module docstring records the same boundary at the point of use.
 - **Schema-aware pipelines and log-format definition files.** The parser
   auto-detects; that is the product.
 - **Background daemons and privileged operations.** Item 10's watch rules run
