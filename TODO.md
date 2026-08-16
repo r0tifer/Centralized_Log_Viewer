@@ -23,6 +23,14 @@ when" lists are what the tests were written against, and the reasoning behind
 each constraint is worth more as a record than as a checkbox. Where what
 shipped differs from what was planned, the item says so under **As shipped**.
 
+**Successor plans.** The five phases above are done; work continues in two files
+that carry their own status tables:
+
+| Plan | Scope | State |
+| --- | --- | --- |
+| [PLUGIN_TODO.md](PLUGIN_TODO.md) | The plugin system — interfaces, loader, distribution, isolation | In progress |
+| [SSH_TODO.md](SSH_TODO.md) | Remote sources over SSH. Reverses a non-goal recorded below | In progress |
+
 ---
 
 ## Constraints that apply to every item
@@ -45,8 +53,11 @@ has to relitigate them.
   itself through `describe_empty_result`.
 - **Bounded work.** No feature may introduce a whole-file read of a stream
   source, or unbounded memory growth beyond `max_buffer_lines`.
-- **Local only.** No network, no telemetry. Log content never lands in a cache
-  or temp file; session state stores paths and settings only.
+- **No telemetry, no exfiltration, no privilege escalation.** Network access is
+  limited to hosts the operator names, over SSH, with their own credentials, on
+  an explicit action — see [SSH_TODO.md](SSH_TODO.md). Log content never lands
+  in a cache or temp file, local or remote; session state stores source
+  identifiers and settings only.
 - **Every action has a keyboard path.** Mouse is supported, never required.
 
 ### Footer and keybinding policy
@@ -1014,6 +1025,11 @@ paragraph stating that merging is local-only and that remote aggregation
 remains out of scope, so the non-goal does not have to be relitigated in every
 issue.
 
+> The local-only paragraph is **superseded as of 2026-08-16** — see
+> [SSH_TODO.md](SSH_TODO.md) Phase 6, which merges across hosts, and Phase 8,
+> which rewrites that README paragraph. The requirement is left as written
+> because it is what the shipped tests were built against.
+
 **As shipped.** The acceptance bar — "no feature becomes single-source-only" —
 was met by making the *session* the unit rather than by adding a merged branch
 to each feature, which is why the extraction landed first as its own commit.
@@ -1244,6 +1260,18 @@ Recorded so these do not have to be re-argued each time they are proposed.
 - **Remote collection, multi-node aggregation, remote tailing.** A documented
   non-goal. Item 13 (local merge) is what most requests for this actually want,
   and the README should say so directly.
+
+  **Reversed 2026-08-16** — see [SSH_TODO.md](SSH_TODO.md). The entry is
+  rewritten rather than deleted, per the rule at the head of this file. The
+  objection was to CLV becoming collection infrastructure: an agent to install,
+  a daemon to run, a spool to manage, a privilege to hold. That objection stands
+  and every part of it stays out of scope. What did not survive is the
+  assumption underneath it — that reading a folder on another machine requires
+  any of those things. It requires an `ssh` the operator already has. The
+  narrowed refusal is on-demand reads versus infrastructure, not local versus
+  remote. Also wrong in the original entry: local merge is *not* what most
+  requests wanted. Comparing one path across five web servers is the request,
+  and shipping the logs to one host first is a workaround, not an answer.
 - **A query DSL with boolean operators, parentheses and precedence.** Item 8
   stops deliberately at `key:value` terms with implicit AND.
 

@@ -458,8 +458,14 @@ summary in the log panel.
 
 Still non-goals:
 
-- Network aggregation or remote log collection.  
-- Kernel-level or privileged operations.  
+- Collection infrastructure: unattended collection, an agent or daemon on a
+  remote host, store-and-forward pipelines, or spooling. A source plugin may
+  read a remote log on demand over a connection the operator already has; it may
+  not install anything, leave anything running, or cache content to disk.  
+- Kernel-level or privileged operations. No `sudo`, `doas` or `pkexec`, at
+  either end of a connection, not behind a setting.  
+- Credentials of any kind — no password field, no key generation, no agent
+  management, and never a disabled host key check.  
 - Background daemons or telemetry. A plugin may not run unattended, and CLV
   reports nothing anywhere. The opt-in subprocess host planned in
   [PLUGIN_TODO.md](../../PLUGIN_TODO.md) Phase 13 is not a daemon: it lives and
@@ -486,6 +492,14 @@ the rule stated at the head of [TODO.md](../../TODO.md).
   stands and **no index is planned**. What is planned is a user plugin
   directory, an explicit enable-list, and manifests a `clv plugin install` can
   verify from a path, a tarball or a URL that anyone may host.
+- **"Network aggregation or remote log collection."** *Reversed 2026-08-16* by
+  [SSH_TODO.md](../../SSH_TODO.md). The objection was to CLV becoming collection
+  infrastructure, and it stands — it is the first bullet above. What changed is
+  that reading a folder on a host the operator can already `ssh` into needs none
+  of that. A source plugin may now open a network connection, under the same
+  consent rule every subprocess already lives under: a `settings.conf` opt-in,
+  read fresh on every `discover()`, offering nothing at all until it is true.
+  A *network* subprocess raises that bar rather than lowering it.
 
 ---
 

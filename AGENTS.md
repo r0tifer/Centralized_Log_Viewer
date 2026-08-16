@@ -24,6 +24,15 @@ valid source. Filtering by name is the user's decision (`include_globs` /
 **readability** reasons (binary content, compressed archives), never for
 naming reasons.
 
+**Anywhere includes another machine.** A root may live on a host the operator
+names in `settings.conf`, read over SSH with their own credentials — see
+[SSH_TODO.md](SSH_TODO.md). A remote folder is a root like any other: discovered
+recursively, listed under the same folder hierarchy, starrable, mergeable. It is
+not a second-class source type, and a source is therefore a `SourceRef` rather
+than a `pathlib.Path` — see the identity rule in [clv/AGENTS.md](clv/AGENTS.md).
+What remains refused is stated under Non-Goals, and the line is on-demand reads
+versus collection infrastructure, not local versus remote.
+
 "Readable text" is judged on **characters, not bytes**. UTF-16 encodes ASCII
 with a NUL beside every character, so a byte-level NUL test rejects the
 Windows and PowerShell exports operators most often point CLV at. Encoding is
@@ -65,6 +74,21 @@ therefore be said out loud. They keep the **last** lines, unlike a document —
 this is a log, and its newest content is at the end. A rotated set spends one
 shared budget newest-member-first, so older members are often never opened at
 all, and only the live member is ever polled.
+
+**Distance does not relax any of this**, and adds two clauses of its own.
+
+*Round trips are a bounded resource too.* Discovering a remote root is **one**
+command, not one per file. A per-file round trip is what makes reading 400
+remote files unusable, and it is the specific cost an `sshfs` mount pays. The
+budget is asserted by a test that counts commands, not by review.
+
+*No remote IO on the event loop — ever.* `poll()` runs on a `set_interval`
+timer at `refresh_hz` and must never perform a round trip; a remote source is
+followed by a persistent process whose stdout is drained non-blocking, the way
+`JournalReader._drain` already does. Everything one-shot — opening a source,
+connecting, probing — runs in a worker thread, as discovery already does. A
+frozen UI is the failure mode this clause exists to prevent, and the obvious
+implementation of every remote operation is the blocking one.
 
 ### 4) Nothing off-screen, ever
 Layout must scale cleanly from 80 columns up. Every control stays on screen and
@@ -334,7 +358,16 @@ Run: `python -m pytest` (791 tests).
 ## Security & Privacy
 
 - Read only what the operator configured or explicitly selected.
-- Local only: no network, no telemetry, no exfiltration.
+- **No telemetry and no exfiltration**, absolutely. Network access is limited to
+  hosts the operator names, over SSH, using their own credentials, initiated
+  only by an explicit action, and never with elevated privilege. CLV reports
+  nothing anywhere, to anyone, ever — that part is not narrowed and will not be.
+- **No privilege escalation, anywhere.** No `sudo`, `doas` or `pkexec`, local or
+  remote, not behind a setting. An unreadable file is reported, with the group
+  or ACL that would fix it; it is never read by becoming someone else.
+- **No credentials.** No password field in the config schema, in any dialog, in
+  `SessionState`, or in memory. A connection that needs interactive input fails
+  as unreachable. Host key verification is never disabled, not even for testing.
 - Treat log contents as sensitive; never copy them into caches or temp files.
   Session state stores paths and filter settings, never log content — which
   is why marks (`services/marks.py`) live for the session only.
@@ -343,13 +376,36 @@ Run: `python -m pytest` (791 tests).
 
 ## Non-Goals (for now)
 
-- Network collection, multi-node aggregation, remote tailing.
+- **Collection infrastructure.** Unattended collection, agents or daemons on a
+  remote host, store-and-forward pipelines and spooling, and privileged
+  operations anywhere. CLV reads on demand, over a connection the operator
+  already has, and installs nothing and leaves nothing running at either end.
+- Transports other than SSH — no syslog receiver, no HTTP log API, no
+  cloud-provider log service. Each of those is a different product.
+- Writing to a remote host, or to any source. Read-only, always.
+- Credential management: no password storage, no key generation, no agent
+  management. CLV uses the SSH setup the operator already has.
 - Heavy parsing DSLs or schema-aware pipelines.
 - Background daemons or privileged operations. The opt-in plugin isolation host
   planned in [PLUGIN_TODO.md](PLUGIN_TODO.md) Phase 13 is neither: it lives and
   dies with the viewer, runs at the operator's own privilege and never above it,
   and exists so a plugin that hangs can be *killed*. It is not a sandbox, and
   `clv/plugins/AGENTS.md`'s trust model says so in those words.
+
+### Reversed
+
+Kept rather than deleted, so the argument survives rather than being erased —
+the rule stated at the head of [TODO.md](TODO.md).
+
+- **"Network collection, multi-node aggregation, remote tailing."** *Reversed
+  2026-08-16* by [SSH_TODO.md](SSH_TODO.md). The objection was to CLV becoming
+  collection infrastructure — an agent to install, a daemon to run, a spool to
+  manage, a privilege to hold — and that objection stands unchanged; it is the
+  first bullet above. What changed is that none of it is required to read a
+  folder on a machine the operator can already `ssh` into. A viewer called
+  *Centralized* Log Viewer that can only read the machine it runs on has
+  centralised nothing. The narrowed refusal is on-demand reads versus
+  infrastructure, not local versus remote.
 
 ---
 
@@ -361,4 +417,11 @@ Run: `python -m pytest` (791 tests).
   `DetailPane` beside/below it renders whatever that cursor is on.
 - **Keep it fast**: bounded reads, incremental renders, threaded discovery.
 - **Keep it honest**: never drop a line silently; explain every empty pane.
+  - An **unreachable source is reported, never rendered as an empty one**. A
+    pane that goes quiet because a link dropped is indistinguishable from a log
+    that stopped, and the two are not the same fact.
+  - An **ordering across machines is only as trustworthy as their clocks, and
+    says so**. Merging was local-only, so there was one clock and one timezone;
+    across hosts both assumptions fail silently and the operator reads causation
+    out of a wrong interleaving.
 - **Keep it consistent**: identical keyboard and mouse paths everywhere.

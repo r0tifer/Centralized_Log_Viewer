@@ -94,7 +94,11 @@ Before adding or changing a module:
 
 ## Non-Goals (for `clv/` package)
 
-- Network log aggregation or remote tailing.  
+- Collection infrastructure: unattended collection, remote agents or daemons,
+  store-and-forward pipelines, or privileged operations anywhere. Reading a
+  remote root on demand over the operator's own SSH is **in** scope as of
+  2026-08-16 — see [SSH_TODO.md](../SSH_TODO.md); becoming the thing that
+  gathers logs for you is not, and that is the line.  
 - Background daemons or system services.  
 - Heavy GUI frameworks or external windowing systems.  
 - Any code that violates the “fast, lightweight, terminal-native” ethos.

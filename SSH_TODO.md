@@ -13,7 +13,7 @@ filesystem assumption that had already spread further.
 
 | Phase | Scope | State |
 | --- | --- | --- |
-| 0 — Doctrine | Reverse the non-goal in the internal contracts | ⬜ Not started |
+| 0 — Doctrine | Reverse the non-goal in the internal contracts | ✅ **Complete** |
 | 1 — Source identity | `SourceRef`, and the end of bare `Path(entry)` | ⬜ Not started |
 | 2 — Filesystem seam | Injectable backend, off the event loop | ⬜ Not started |
 | 3 — Configuration | `[ssh:<name>]` sections, `enable_ssh` | ⬜ Not started |
@@ -255,9 +255,14 @@ Spans every phase, so it is stated once.
 
 ## Phase 0 — Doctrine
 
-Remote sources are currently a documented non-goal in four places. Every phase
-after this one contradicts a shipped document until this lands, so it goes
-first.
+Remote sources are currently a documented non-goal in **six** places — this
+phase originally named four, and the survey found two more saying the same
+thing. Every phase after this one contradicts a shipped document until this
+lands, so it goes first.
+
+> **Line references below are as of 2.6.1 (`662df42`), before this phase
+> landed.** Kept as written so the diff can be checked against them; they are
+> a record, not a map of the current file.
 
 **Scope.** The *internal* contracts only. The README is a promise to users and
 is not touched until Phase 8, when the feature actually works — advertising it
@@ -281,8 +286,20 @@ earlier is how a doc becomes a lie.
 - `AGENTS.md` "Keep it honest" gains two lines that later phases depend on: *an
   unreachable source is reported, never rendered as an empty one*, and *an
   ordering across machines is only as trustworthy as their clocks, and says so.*
-- [clv/plugins/AGENTS.md:312](clv/plugins/AGENTS.md#L312) — "Network
-  aggregation or remote log collection" narrowed the same way.
+  (It is a single bullet inside `## Quick Reference`, not a section — the two
+  lines become sub-bullets under it.)
+- [clv/plugins/AGENTS.md:461](clv/plugins/AGENTS.md#L461) — "Network
+  aggregation or remote log collection" narrowed the same way, plus a third
+  entry in that file's existing `### Reversed` list. (This phase originally
+  cited line 312; 312 is about `register()` returning `None`.)
+- **[clv/AGENTS.md:97](clv/AGENTS.md#L97)** — "Network log aggregation or remote
+  tailing", a fourth copy of the non-goal this phase originally missed. Narrowed
+  identically. Without it the gate below does not hold: a reader of the `clv/`
+  contract would still be told remote is refused.
+- **[TODO.md:48-49](TODO.md#L48-L49)** — "**Local only.** No network, no
+  telemetry", a second declaration this phase originally missed. It sits under
+  *Constraints that apply to every item*, which states it derives from
+  `AGENTS.md`, so it must move with the Security & Privacy bullet above.
 - [TODO.md:1244](TODO.md#L1244) — the *Deliberately out of scope* entry is
   **not deleted**. It is rewritten to record that the decision was reversed, on
   what date, and why, with a pointer to this file. That section exists so
@@ -294,9 +311,11 @@ earlier is how a doc becomes a lie.
 
 **Testing.** None beyond the suite staying green — no code changes.
 
-**Gate.** No source file modified. `python -m pytest` reports 621 passed on
-3.11 and 3.14. A reader of `AGENTS.md` alone can tell that remote sources are
-now in scope and what kind of remote access is still refused.
+**Gate.** No source file modified. `python -m pytest` reports **791** passed on
+3.11 and 3.14 — the count `AGENTS.md`'s Testing section already carries; the
+621 this file was written against predates it. A reader of `AGENTS.md` alone can
+tell that remote sources are now in scope and what kind of remote access is
+still refused.
 
 **Commit.** `docs: bring remote sources into scope`
 
@@ -307,12 +326,39 @@ now in scope and what kind of remote access is still refused.
 The systemic risk, and the reason a plugin alone cannot deliver the goal.
 
 State persists sources as **strings** and reconstructs them with a bare
-`Path(entry)` in at least eight places: [app.py:1032](clv/app.py#L1032),
-[1155](clv/app.py#L1155), [1205](clv/app.py#L1205),
-[1237](clv/app.py#L1237), [1321](clv/app.py#L1321),
-[2650](clv/app.py#L2650), [2837](clv/app.py#L2837), plus
-`config.parse_log_dirs` and `sources.normalize_path`. Every one of those turns
-a remote identifier into a wrong local path on restore, silently.
+`Path(entry)` in **twelve** places — this phase originally named eight, and the
+survey found four more of the same shape. All line numbers are as of 2.6.1
+(`662df42`); three of the eight originally listed had drifted.
+
+*Originally named:* [app.py:1032](clv/app.py#L1032) (starred),
+[1155](clv/app.py#L1155), [1205](clv/app.py#L1205), [1237](clv/app.py#L1237),
+[1321](clv/app.py#L1321) (merged), [2660](clv/app.py#L2660) (`SavedView.source`,
+was cited as 2650), [2847](clv/app.py#L2847) (starred at launch, was cited as
+2837).
+
+*Found by the survey:* [storage.py:109](clv/storage.py#L109)
+(`SavedView.summary`), [session.py:534](clv/services/session.py#L534)
+(`origin_of`), [app.py:1487](clv/app.py#L1487) (`ORIGIN_FIELD` values taken off
+the entry stream), and [app.py:3166](clv/app.py#L3166) —
+`Path(self._merged_name())`, a *label* wrapped in a `Path` purely to reach
+`export.default_stem`, and the last `Path(<non-path>)` in `app.py`. It is in
+scope because leaving it forces the guard test below to carry a whitelist, and
+a whitelist is how a guard rots.
+
+Plus `config.parse_log_dirs` and `sources.normalize_path` — but see the note
+below: those two are **not** the same operation as the twelve.
+
+Every one of the twelve turns a remote identifier into a wrong local path on
+restore, silently.
+
+**Restore and user input are two boundaries, not one.** The twelve sites read a
+string CLV itself wrote, which is already canonical: they must not expand `~`,
+prepend the working directory, or resolve. `parse_log_dirs` and
+`SourceManager.add` read a string a person typed and must do all three.
+Collapsing them is the only way this phase can move behaviour, so `refs.py`
+ships `parse_ref`/`format_ref` for the first and `normalize_ref` for the second.
+That split is also what makes `parse_ref("journal:unit/sshd.service")` safe:
+`parse_ref` contains no operation that could damage a scheme ref.
 
 **The scheme is constrained by this, and the constraint is already verified.**
 `Path("ssh://web01/var/log")` collapses to `ssh:/web01/var/log`, reports
@@ -339,8 +385,13 @@ inventing a plausible local path.
   once. The ref string is what disambiguates them.
 - Every string→source reconstruction site routes through `parse_ref`. Every
   source→string persistence site routes through `format_ref`.
-- `_resolve` ([app.py:3653](clv/app.py#L3653)) becomes ref-aware: identity for
-  a local path stays `path.resolve()`; a remote ref resolves to itself.
+- `_resolve` ([app.py:3663](clv/app.py#L3663), cited above as 3653) becomes
+  ref-aware and moves into `refs.py` as `identity`: a local path stays
+  `path.resolve()`; a remote ref resolves to itself. It has **two** definitions
+  today, not one — `sources._marker`
+  ([sources.py:27-34](clv/services/sources.py#L27-L34)) is the same idea
+  returning a `str`. Unifying them as `identity` and `ref_key` is the more
+  valuable half of this bullet.
 - No remote implementation exists yet. This phase ships one implementation of
   the protocol: `pathlib.Path`.
 
@@ -360,9 +411,9 @@ Services. `clv/AGENTS.md` gains the identity rule: *a source is a `SourceRef`;
 - Grep-style guard test asserting no bare `Path(` reconstruction remains in the
   persistence paths, so the seam cannot quietly rot back.
 
-**Gate.** All 621 existing tests pass **with no assertion edited**. Any test
-that needed changing means behaviour moved, which this phase forbids. Both
-Python versions.
+**Gate.** All **791** existing tests pass **with no assertion edited** — prove
+it with `git diff -- tests/` showing additions only. Any test that needed
+changing means behaviour moved, which this phase forbids. Both Python versions.
 
 **Commit.** `refactor: introduce SourceRef and route source identity through it`
 
@@ -745,7 +796,8 @@ which is genuinely new behaviour and is the largest single item in this phase.
   carry `node`.
 
 **Documentation changes.** `README.md`'s "Merging is local only" section
-([README.md:262](README.md#L262)) is rewritten — the user-facing promise Phase
+([README.md:265-268](README.md#L265-L268), plus the Feature Highlights bullet at
+[README.md:64](README.md#L64)) is rewritten — the user-facing promise Phase
 0 deliberately left alone, changed now because the capability exists.
 
 **Testing** (extend `tests/test_sources.py`, `test_merged_view.py`,
