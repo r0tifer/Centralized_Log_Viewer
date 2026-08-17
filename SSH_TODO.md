@@ -505,6 +505,20 @@ after, no regression beyond noise. Both Python versions.
   is enforced at the schema, where it cannot be forgotten.
 - **A malformed section degrades to being skipped and reported, never to a
   startup failure** — the rule the whole of `config.py` already follows.
+- **Carried over from Phase 1: a relative `log_dirs` entry shadowed by a
+  registered scheme.** A directory named `journal:archive` or `ssh:backups`,
+  named relatively, is read as an identifier by `refs.scheme_of` and so comes
+  back from `normalize_ref` **unpinned** — the one entry in `log_dirs` that is
+  not absolutised, and therefore the one that silently means a different place
+  depending on where CLV was launched from. It is not unreachable; it works,
+  until someone starts the viewer from elsewhere, which is why it is worse than
+  a refusal. Phase 1 documented it and pinned it with
+  `test_a_scheme_shadowed_relative_dir_is_left_unpinned` rather than fixing it,
+  because reporting it is a behaviour change and that phase had none. This is
+  the phase that builds the validation channel, so the fix lands here: refuse
+  the entry and say *"`journal:archive` reads as a journald identifier; if you
+  meant a directory, give its absolute path."* Invert that test rather than
+  deleting it.
 - Validation with actionable messages: a section with no `host`, an
   unreadable `identity_file`, a port outside 1–65535, an empty `log_dirs`.
   Reported through the same channel as plugin errors.
@@ -545,6 +559,9 @@ no password option and no `sudo` option, and why.
 - Every malformed shape: missing `host`, bad port, absent identity file,
   duplicate section name, empty `log_dirs`. Each is skipped, reported, and
   never raises.
+- A relative `log_dirs` entry shadowed by a registered scheme is refused with
+  the absolute-path instruction, and an absolute one with the same name still
+  works. Inverts Phase 1's `test_a_scheme_shadowed_relative_dir_is_left_unpinned`.
 - `enable_ssh` defaults false; hosts parse but stay inert when it is false.
 - **No password key is accepted.** A `password =` line is ignored and reported
   as unsupported, with a test asserting the value never reaches `RemoteHost`.

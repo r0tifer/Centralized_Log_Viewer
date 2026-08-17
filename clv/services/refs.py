@@ -188,10 +188,20 @@ def scheme_of(ref: "SourceRef | str") -> str | None:
     or ``logs:2026`` would be mistaken for an identifier and never absolutised.
 
     What is left ambiguous, stated rather than hidden: a **relative** local path
-    whose first component begins ``journal:`` or ``ssh:`` reads as a scheme and
-    cannot be pointed at. ``./journal:all`` does not disambiguate it —
-    ``Path`` normalises the ``./`` away before this ever sees it — so the
-    escape is to name it absolutely, which every path CLV stores already is.
+    whose first component begins ``journal:`` or ``ssh:`` reads as a scheme.
+    ``./journal:all`` does not disambiguate it — ``Path`` normalises the ``./``
+    away before this ever sees it — and the escape is to name it absolutely,
+    which every path CLV stores already is.
+
+    Such a path is not unreachable: ``Path`` operations on it still resolve
+    against the working directory, so it opens and reads. What it loses is
+    **absolutisation**. It is the one ``log_dirs`` entry
+    :func:`normalize_ref` hands back unpinned, so unlike every other relative
+    entry it is re-interpreted against whatever directory CLV is launched from
+    — it works, until someone starts the viewer somewhere else. That is worse
+    than a clean refusal, and the refusal is owed: see ``SSH_TODO.md`` Phase 3,
+    which builds the validation channel this needs. It is not fixed here
+    because reporting it is a behaviour change and this phase has none.
     """
 
     match = _SCHEME_RE.match(ref if isinstance(ref, str) else str(ref))

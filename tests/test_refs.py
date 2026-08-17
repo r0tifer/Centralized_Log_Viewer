@@ -291,12 +291,11 @@ def test_a_colon_in_a_filename_is_still_a_local_path(
 def test_a_relative_path_shadowed_by_a_scheme_is_reachable_absolutely(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The documented ambiguity, pinned so it stays the one it is.
+    """The escape hatch, pinned: an absolute name, not ``./``.
 
-    A relative path whose first component begins ``journal:`` reads as a scheme.
-    ``./journal:all`` does **not** disambiguate it — ``Path`` normalises the
-    ``./`` away before ``refs`` ever sees it — so the escape is an absolute
-    name, which every path CLV stores already is.
+    ``Path`` normalises ``./`` away before ``refs`` ever sees it, so
+    ``./journal:all`` is not a disambiguation. An absolute name is, and every
+    path CLV stores is already absolute.
     """
 
     monkeypatch.chdir(tmp_path)
@@ -305,6 +304,39 @@ def test_a_relative_path_shadowed_by_a_scheme_is_reachable_absolutely(
     absolute = tmp_path / "journal:all"
     assert normalize_ref(str(absolute)) == absolute
     assert refs.is_local(absolute)
+
+
+def test_a_scheme_shadowed_relative_dir_is_left_unpinned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The known defect, pinned as a defect so the fix has something to flip.
+
+    A relative directory whose name begins ``journal:`` is *not* unreachable —
+    it opens and reads, because ``Path`` still resolves it against the working
+    directory. What it loses is absolutisation: it is the one ``log_dirs``
+    entry that comes back unpinned, and so means a different place depending on
+    where CLV was started, while every sibling entry is fixed at parse time.
+
+    That is worse than a refusal, because it works right up until someone
+    launches from elsewhere. ``SSH_TODO.md`` Phase 3 owes the actionable
+    message; this test records the behaviour that message will replace, and is
+    expected to be inverted then rather than deleted.
+    """
+
+    from clv.services.config import parse_log_dirs
+
+    (tmp_path / "journal:archive").mkdir()
+    (tmp_path / "ordinary").mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    here = [format_ref(ref) for ref in parse_log_dirs("journal:archive, ordinary")]
+    assert here == ["journal:archive", str(tmp_path / "ordinary")]
+
+    # The sibling entry is pinned by cwd; the shadowed one floats with it.
+    monkeypatch.chdir(tmp_path.parent)
+    elsewhere = [format_ref(ref) for ref in parse_log_dirs("journal:archive, ordinary")]
+    assert elsewhere[0] == here[0], "the shadowed entry is unpinned, so it did not move"
+    assert elsewhere[1] != here[1], "an ordinary relative entry is pinned at parse time"
 
 
 def test_the_journald_scheme_is_registered() -> None:
@@ -641,13 +673,51 @@ def _functions() -> list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef, list
     found = []
     for source in sorted(PACKAGE.rglob("*.py")):
         text = source.read_text(encoding="utf-8")
-        tree = ast.parse(text, filename=str(source))
-        body = text.splitlines()
         relative = source.relative_to(REPO_ROOT).as_posix()
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                found.append((relative, node, body))
+        found.extend(_functions_in(text, relative))
     return found
+
+
+def _functions_in(
+    text: str, relative: str
+) -> list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef, list[str]]]:
+    tree = ast.parse(text, filename=relative)
+    body = text.splitlines()
+    return [
+        (relative, node, body)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+
+def _bare_path_offenders(text: str, relative: str) -> set[str]:
+    """Every ``Path(...)`` inside a function that reads persisted state.
+
+    Split out of the test below so that the detector itself can be tested. A
+    guard whose own breakage is invisible is not a guard: empty
+    ``_PERSISTED_READS``, a broken ``_dotted``, or a changed call-name match
+    would each make this return nothing forever, and the suite would stay green
+    while the seam rotted.
+    """
+
+    offenders: set[str] = set()
+    for _, func, body in _functions_in(text, relative):
+        if not _reads_persisted_state(func):
+            continue
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Call):
+                continue
+            target = node.func
+            name = (
+                target.id
+                if isinstance(target, ast.Name)
+                else target.attr
+                if isinstance(target, ast.Attribute)
+                else None
+            )
+            if name == "Path":
+                offenders.add(f"{relative}:{node.lineno}: {body[node.lineno - 1].strip()}")
+    return offenders
 
 
 def test_no_bare_path_reconstructs_persisted_state() -> None:
@@ -666,22 +736,9 @@ def test_no_bare_path_reconstructs_persisted_state() -> None:
     """
 
     offenders: set[str] = set()
-    for relative, func, body in _functions():
-        if not _reads_persisted_state(func):
-            continue
-        for node in ast.walk(func):
-            if not isinstance(node, ast.Call):
-                continue
-            target = node.func
-            name = (
-                target.id
-                if isinstance(target, ast.Name)
-                else target.attr
-                if isinstance(target, ast.Attribute)
-                else None
-            )
-            if name == "Path":
-                offenders.add(f"{relative}:{node.lineno}: {body[node.lineno - 1].strip()}")
+    for source in sorted(PACKAGE.rglob("*.py")):
+        relative = source.relative_to(REPO_ROOT).as_posix()
+        offenders |= _bare_path_offenders(source.read_text(encoding="utf-8"), relative)
 
     assert not offenders, (
         "These functions read persisted source state and rebuild it with Path(). "
@@ -718,3 +775,81 @@ def test_every_persistence_boundary_names_its_ref_helper() -> None:
         if helper not in seen[(path, name)]
     )
     assert not wrong, "\n  ".join(["Persistence boundaries reaching past refs:", *wrong])
+
+
+# --- and the guard that the guard still works -----------------------------
+#
+# Both tests above assert an *empty* result, which is what a broken detector
+# also returns. These feed it code that must be caught, so the day
+# `_PERSISTED_READS` is emptied or `_dotted` stops walking an attribute chain,
+# something fails immediately instead of never.
+
+_ROTTED = '''
+from pathlib import Path
+
+class App:
+    def _starred_paths(self):
+        return {Path(entry) for entry in self.state.starred}
+'''
+
+_ROTTED_ACROSS_LINES = '''
+from pathlib import Path
+
+ORIGIN_FIELD = "source"
+
+class Session:
+    def origin_of(self, entry):
+        tagged = entry.fields.get(ORIGIN_FIELD)
+        # several
+        # lines
+        # later
+        if tagged:
+            return Path(tagged)
+        return None
+'''
+
+_INNOCENT = '''
+from pathlib import Path
+
+def user_config_path():
+    """Path(...) in a docstring must not count, nor must a real config path."""
+    # ...and neither must Path( in a comment
+    return Path.home() / ".config" / "clv" / "settings.conf"
+
+def _walk(root):
+    return [Path(entry) for entry in root.iterdir()]
+'''
+
+
+@pytest.mark.parametrize(
+    ("label", "source"),
+    [("same line", _ROTTED), ("read and rebuild lines apart", _ROTTED_ACROSS_LINES)],
+)
+def test_the_bare_path_guard_catches_a_rotted_seam(label: str, source: str) -> None:
+    """The detector must fail on code that reintroduces the bug.
+
+    The second case is why this is an AST walk and not a grep: the
+    ``ORIGIN_FIELD`` read that makes the function a boundary is five lines above
+    the ``Path(tagged)`` that breaks it, so no single line looks wrong.
+    """
+
+    found = _bare_path_offenders(source, "rotted.py")
+    assert found, f"the guard stopped catching a rotted seam ({label})"
+    assert any("Path(" in entry for entry in found)
+
+
+def test_the_bare_path_guard_ignores_paths_outside_the_boundary() -> None:
+    """And it must stay quiet on the two dozen legitimate ``Path(...)`` calls.
+
+    A guard that fires on the config file or an ``iterdir`` result gets a
+    whitelist bolted on within a week, and a whitelist is how a guard rots.
+    """
+
+    assert _bare_path_offenders(_INNOCENT, "innocent.py") == set()
+
+
+def test_the_boundary_map_is_not_silently_empty() -> None:
+    """``_BOUNDARY_FUNCTIONS`` emptied would make its test pass vacuously."""
+
+    assert len(_BOUNDARY_FUNCTIONS) >= 15
+    assert _PERSISTED_READS and _PERSISTED_NAMES
