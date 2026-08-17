@@ -13,6 +13,7 @@ It supplements the **root AGENTS.md** by explaining how each internal component 
 | **app.py** | Application shell and orchestrator | - Owns main layout and lifecycle. <br> - Handles global keybindings, routing, and message coordination. <br> - Should not define widget visuals or logic directly. |
 | **storage.py** | State persistence and config IO | - Reads/writes JSON state files. <br> - Provides safe defaults when config is invalid. <br> - Must remain headless (no UI dependencies). <br> - `from_dict` dispatches on the **text** of a field's annotation; changing one silently drops the field on load. |
 | **services/refs.py** | Source identity | - Defines `SourceRef`, the surface CLV requires of a source. <br> - `parse_ref` / `format_ref` are the persistence boundary; `normalize_ref` is the user-input one. See the identity rule below. <br> - Owns `identity` / `ref_key`, the one canonical form. |
+| **services/backend.py** | Source IO, and what it costs | - Defines `SourceBackend`; `LocalBackend` is the only implementation and its behaviour is what `os` did before. <br> - Every method is marked `@cheap` or `@blocking`; `cheap_only()` makes a blocking call from `poll()` raise. See the seam rule below. <br> - `identity` is opaque and may be `None`; `walk` is lazy and yields files only. |
 | **widgets/query_bar.py** | Query, time, severity, and action controls | - Emits `ActionTriggered`, `TimeWindowChanged`, and `SeverityChanged` messages. <br> - No logic beyond UI validation. |
 | **widgets/segmented.py** | Generic segmented control | - Self-contained visual component. <br> - Should be reusable across other widgets. |
 | **widgets/advanced_drawer.py** | Advanced filters and secondary options | - Optional drawer for extended filtering and plugin-provided UI. <br> - Should expose show/hide events to `app.py`. |
@@ -88,6 +89,39 @@ They must change together with the prose claim in `plugins/__init__.py`'s
 isolation makes that docstring false; widening them structurally (an
 `isinstance` against the protocol) is what would let a `journal:` source into
 someone's `session.json`, which is the thing that docstring exists to prevent.
+
+---
+
+## The filesystem seam
+
+**IO against a source goes through a `SourceBackend`. `os` and `pathlib` are
+`LocalBackend`'s business and nobody else's.** `refs.py` says what a source is;
+`services/backend.py` says who reads it. Nothing else in `clv/services/` may
+call `os.walk`, `os.access`, `os.scandir` or `path.open("rb")` — a guard test in
+`tests/test_backend.py` fails if one comes back, because such a call works
+perfectly on local files and silently reads *this* machine when handed a remote
+ref.
+
+**Costs are declared, not assumed.** This is the part that is a type rather than
+a convention:
+
+| Mark | Means | Where it may be called |
+|---|---|---|
+| `@cheap` | A `stat`-sized operation | Anywhere, including `poll()` |
+| `@blocking` | May be a network round trip | A worker thread only |
+
+`stat` and `identity` are **guaranteed cheap on every backend** — a backend that
+cannot honour that is a reason to change the reader, and `blocking_methods`
+refuses to build capabilities for one that tries. `BackendCapabilities.blocking`
+is derived from the marks, so it cannot drift from the code, and an unmarked
+method is refused outright. `SourceBuffer.poll` runs inside `cheap_only()`, so a
+blocking call there raises `BlockingCallError` rather than freezing the UI at
+`refresh_hz`. That exception is deliberately **not** caught: it is a design
+error, not a source that went away.
+
+When adding a method to the protocol: mark it, add it to `PROTOCOL_METHODS`, and
+put it in `GUARANTEED_CHEAP` only if every conceivable backend can answer it
+without a round trip.
 
 ---
 

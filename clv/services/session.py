@@ -28,6 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Optional, Sequence
 
+from .backend import cheap_only
 from .filtering import sortable_moment
 from .parsing import LogEntry, LogParser
 from .reader import AnyReader, TailRead, open_reader
@@ -166,13 +167,28 @@ class SourceBuffer:
         return entries
 
     def poll(self) -> PollOutcome:
-        """Read whatever arrived since the last poll."""
+        """Read whatever arrived since the last poll.
+
+        The single funnel every reader's ``poll()`` passes through, which is why
+        the cheap-only guard is entered here rather than in each reader. Inside
+        it a backend method declared blocking raises instead of stalling: this
+        runs on a ``set_interval`` timer at ``refresh_hz``, per member of the
+        set, and a round trip here is a frozen UI twice a second.
+
+        :class:`~clv.services.backend.BlockingCallError` is deliberately **not**
+        caught. It is a design error rather than a source that went away — a
+        reader whose poll needs a blocking read (re-priming a changed archive,
+        say) cannot be driven from here at all, and must follow the source with
+        something drained non-blocking instead. Swallowing it would hide that
+        until the UI froze.
+        """
 
         reader = self.reader
         if reader is None:
             return PollOutcome(self)
         try:
-            result = reader.poll()
+            with cheap_only():
+                result = reader.poll()
         except OSError:
             # A source that vanished mid-session is not an error worth taking
             # the pane down for; the next poll finds it again or it stays quiet.

@@ -5,6 +5,14 @@ multi-gigabyte application logs. Nothing here ever loads a whole file: the
 initial read seeks backwards from the end and stops as soon as it has the
 lines the viewer will actually show, and tailing reads only the bytes appended
 since the last poll.
+
+Every byte read here comes through a
+:class:`~clv.services.backend.SourceBackend`, and the split in that protocol is
+what makes tailing safe: :meth:`~clv.services.backend.SourceBackend.stat` is
+cheap on every backend, so :meth:`SourceReader.poll` can ask "did this grow?"
+from the event loop, while :meth:`~clv.services.backend.SourceBackend.open` may
+block and is only reached once there is something to read. A backend's handle
+must be **seekable** — the backwards read below is the reason.
 """
 
 from __future__ import annotations
@@ -15,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .backend import LOCAL, SourceBackend
 from .documents import DocumentFormat, document_format_for, extract_document
 
 #: Backwards read granularity. Large enough that a few hundred lines usually
@@ -83,11 +92,11 @@ def detect_encoding(prefix: bytes) -> TextEncoding:
     return UTF8
 
 
-def detect_file_encoding(path: Path) -> TextEncoding:
+def detect_file_encoding(path: Path, *, backend: SourceBackend = LOCAL) -> TextEncoding:
     """Read just enough of *path* to identify its encoding."""
 
     try:
-        with path.open("rb") as handle:
+        with backend.open(path, "rb") as handle:
             return detect_encoding(handle.read(4))
     except OSError:
         return UTF8
@@ -111,7 +120,9 @@ class TailRead:
     origins: tuple[Path, ...] | None = None
 
 
-def looks_binary(path: Path, *, sniff: int = _SNIFF_SIZE) -> bool:
+def looks_binary(
+    path: Path, *, sniff: int = _SNIFF_SIZE, backend: SourceBackend = LOCAL
+) -> bool:
     """Heuristic text/binary test: a NUL byte in the first block means binary.
 
     This is the same rule git uses. It keeps journals, archives and databases
@@ -126,7 +137,7 @@ def looks_binary(path: Path, *, sniff: int = _SNIFF_SIZE) -> bool:
     """
 
     try:
-        with path.open("rb") as handle:
+        with backend.open(path, "rb") as handle:
             block = handle.read(sniff)
     except OSError:
         return False
@@ -148,25 +159,27 @@ def read_last_lines(
     *,
     max_bytes: int = DEFAULT_MAX_READ_BYTES,
     encoding: str | TextEncoding | None = None,
+    backend: SourceBackend = LOCAL,
 ) -> TailRead:
     """Read up to *max_lines* lines from the end of *path*.
 
     Reads backwards in chunks and stops as soon as enough newlines are in hand,
-    so cost is proportional to what is displayed rather than to file size.
+    so cost is proportional to what is displayed rather than to file size. The
+    handle *backend* returns must therefore be seekable.
 
     *encoding* defaults to sniffing the file's byte-order mark, falling back to
     UTF-8. Pass a codec name to override that.
     """
 
-    text_encoding = _coerce_encoding(encoding) or detect_file_encoding(path)
+    text_encoding = _coerce_encoding(encoding) or detect_file_encoding(
+        path, backend=backend
+    )
 
     if max_lines <= 0:
-        try:
-            return TailRead(lines=[], offset=path.stat().st_size)
-        except OSError:
-            return TailRead(lines=[], offset=0)
+        info = backend.stat(path)
+        return TailRead(lines=[], offset=info.size if info else 0)
 
-    with path.open("rb") as handle:
+    with backend.open(path, "rb") as handle:
         handle.seek(0, os.SEEK_END)
         size = handle.tell()
         if size == 0:
@@ -243,10 +256,14 @@ class SourceReader:
         max_lines: int,
         encoding: str | TextEncoding | None = None,
         max_bytes: int = DEFAULT_MAX_READ_BYTES,
+        backend: SourceBackend = LOCAL,
     ) -> None:
         self.path = path
         self._max_lines = max_lines
-        self._encoding = _coerce_encoding(encoding) or detect_file_encoding(path)
+        self._backend = backend
+        self._encoding = _coerce_encoding(encoding) or detect_file_encoding(
+            path, backend=backend
+        )
         self._max_bytes = max_bytes
         self._offset = 0
         self._remainder = ""
@@ -254,30 +271,33 @@ class SourceReader:
         #: it is written. Decoding them alone would emit U+FFFD for a character
         #: that arrives intact a fraction of a second later.
         self._byte_remainder = b""
-        self._identity: Optional[tuple[int, int]] = None
+        self._identity: object | None = None
 
     @property
     def offset(self) -> int:
         return self._offset
 
-    def _stat_identity(self) -> Optional[tuple[int, int]]:
-        try:
-            info = self.path.stat()
-        except OSError:
-            return None
-        return (info.st_dev, info.st_ino)
+    def _stat_identity(self) -> object | None:
+        """The backend's opaque "is this still the same file" comparable.
+
+        ``None`` from a backend that has no stable answer — see
+        :meth:`poll` for what that costs.
+        """
+
+        return self._backend.identity(self.path)
 
     def prime(self) -> TailRead:
         """Perform the initial bounded read and arm the tail position."""
 
         # A rotated-in file may be a different encoding than the one it
         # replaced, so re-sniff rather than trust the previous read.
-        self._encoding = detect_file_encoding(self.path)
+        self._encoding = detect_file_encoding(self.path, backend=self._backend)
         result = read_last_lines(
             self.path,
             self._max_lines,
             max_bytes=self._max_bytes,
             encoding=self._encoding,
+            backend=self._backend,
         )
         self._offset = result.offset
         self._remainder = ""
@@ -290,15 +310,32 @@ class SourceReader:
 
         On rotation or truncation the reader re-primes from the new file, so a
         rotated log keeps streaming instead of going silent.
+
+        **One** ``stat`` per poll, and it is the backend's cheap one: size,
+        mtime and identity arrive together because at 2 Hz per merged source a
+        second call would be a second round trip.
+
+        **When the backend has no stable identity** — ``capabilities
+        .stable_identity`` false, which an SFTP-style backend and a non-GNU
+        remote both are — rotation is *not* inferred from ``(size, mtime)``.
+        That comparison changes on every ordinary append, so using it would
+        report a reload twice a second on a live log. What survives instead is
+        the shrink test below: a file replaced by a **smaller** one is still
+        caught, and one replaced by a same-size file is not. The degradation is
+        conservative and silent by design, and it is why
+        ``stable_identity`` is reported rather than assumed.
         """
 
-        try:
-            info = self.path.stat()
-        except OSError:
+        info = self._backend.stat(self.path)
+        if info is None:
             return TailRead(lines=[], offset=self._offset)
 
-        identity = (info.st_dev, info.st_ino)
-        if self._identity is not None and identity != self._identity:
+        identity = info.identity
+        if (
+            identity is not None
+            and self._identity is not None
+            and identity != self._identity
+        ):
             # The name now points at a different file: rotation.
             result = self.prime()
             return TailRead(
@@ -308,7 +345,7 @@ class SourceReader:
                 rotated=True,
             )
 
-        size = info.st_size
+        size = info.size
         if size < self._offset:
             # Truncated in place; restart from the beginning of the new content.
             self._offset = min(self._encoding.bom_size, size)
@@ -329,7 +366,7 @@ class SourceReader:
 
     def _read_from(self, start: int, size: int) -> TailRead:
         try:
-            with self.path.open("rb") as handle:
+            with self._backend.open(self.path, "rb") as handle:
                 handle.seek(start)
                 # Never ingest more than one bounded read's worth in a single
                 # poll; a burst of writes must not stall the UI.
@@ -382,10 +419,12 @@ class DocumentReader:
         *,
         max_lines: int,
         document_format: DocumentFormat | None = None,
+        backend: SourceBackend = LOCAL,
     ) -> None:
         self.path = path
         self.document_format = document_format or document_format_for(path)
         self._max_lines = max_lines
+        self._backend = backend
         self._offset = 0
         self._stamp: Optional[tuple[int, int]] = None
 
@@ -394,11 +433,10 @@ class DocumentReader:
         return self._offset
 
     def _current_stamp(self) -> Optional[tuple[int, int]]:
-        try:
-            info = self.path.stat()
-        except OSError:
+        info = self._backend.stat(self.path)
+        if info is None:
             return None
-        return (info.st_mtime_ns, info.st_size)
+        return (info.mtime_ns, info.size)
 
     def prime(self) -> TailRead:
         """Extract the document and arm change detection."""
@@ -407,7 +445,7 @@ class DocumentReader:
         # extraction then still looks newer than what we hold, and the next
         # poll picks it up instead of trusting a half-written extraction.
         stamp = self._current_stamp()
-        text = extract_document(self.path, self._max_lines)
+        text = extract_document(self.path, self._max_lines, backend=self._backend)
         self._stamp = stamp
         self._offset = stamp[1] if stamp else 0
         return TailRead(lines=text.lines, offset=self._offset, truncated=text.truncated)
@@ -442,21 +480,30 @@ class DocumentReader:
 AnyReader = SourceReader | DocumentReader
 
 
-def open_reader(path: Path, *, max_lines: int, **kwargs) -> AnyReader:
+def open_reader(
+    path: Path, *, max_lines: int, backend: SourceBackend = LOCAL, **kwargs
+) -> AnyReader:
     """Build the right reader for *path*.
 
     Container documents get :class:`DocumentReader`, compressed members get a
     :class:`~clv.services.compressed.CompressedReader`; everything else is a
-    stream of text lines and gets :class:`SourceReader`.
+    stream of text lines and gets :class:`SourceReader`. Whichever it is, it
+    reads through *backend* — the choice is made on the name, which costs no IO
+    and so needs no backend to decide.
     """
 
     document_format = document_format_for(path)
     if document_format is not None:
-        return DocumentReader(path, max_lines=max_lines, document_format=document_format)
+        return DocumentReader(
+            path,
+            max_lines=max_lines,
+            document_format=document_format,
+            backend=backend,
+        )
     # Imported here rather than at module scope: compressed.py needs this
     # module's BOM detection, so the dependency has to run one way only.
     from .compressed import CompressedReader, is_compressed
 
     if is_compressed(path):
-        return CompressedReader(path, max_lines=max_lines)
-    return SourceReader(path, max_lines=max_lines, **kwargs)
+        return CompressedReader(path, max_lines=max_lines, backend=backend)
+    return SourceReader(path, max_lines=max_lines, backend=backend, **kwargs)

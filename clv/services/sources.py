@@ -5,13 +5,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Literal, Sequence
 
+from .backend import LOCAL, LOCAL_ACCESS_HINT, BackendResolver, SourceBackend
 from .refs import SourceRef, identity, normalize_ref, ref_key
 
 
-ACCESS_HINT = (
-    "Re-launch Centralized Log Viewer with elevated permissions (for example `sudo`) "
-    "to include this source."
-)
+#: What to tell an operator whose local read was refused.
+#:
+#: Now **the local backend's** answer rather than the only one:
+#: :func:`check_access` takes its hint from ``backend.capabilities``, because
+#: "re-launch with sudo" is not merely unhelpful for a file on another machine
+#: — it recommends the one thing CLV refuses to do anywhere. Kept as a name
+#: here because it is part of this module's public surface.
+ACCESS_HINT = LOCAL_ACCESS_HINT
 
 
 @dataclass
@@ -45,30 +50,42 @@ def normalize_path(raw: str | SourceRef) -> SourceRef:
     return normalize_ref(raw)
 
 
-def check_access(path: Path) -> tuple[bool, str | None]:
-    """Verify CLV can read from *path* before incorporating it."""
+def check_access(
+    path: Path, *, backend: SourceBackend = LOCAL
+) -> tuple[bool, str | None]:
+    """Verify CLV can read from *path* before incorporating it.
 
-    try:
-        exists = path.exists()
-    except PermissionError:
-        return False, f"Permission denied while checking '{path}'. {ACCESS_HINT}"
+    The hint appended to every refusal comes from
+    ``backend.capabilities.access_hint``, not from this module: what to do
+    about an unreadable file is a property of where the file lives.
 
-    if not exists:
+    The directory case tests listing for real rather than trusting the
+    permission bits, which is deliberate — an ACL or an SELinux label can
+    refuse a listing that ``access`` says is fine. That is why
+    ``SourceBackend.list_dir`` exists and *raises*, where ``walk`` skips.
+    """
+
+    hint = backend.capabilities.access_hint
+    kind = backend.kind(path)
+
+    if kind == "denied":
+        return False, f"Permission denied while checking '{path}'. {hint}"
+
+    if kind == "missing":
         return False, f"Path '{path}' does not exist."
 
-    if path.is_file():
-        if not os.access(path, os.R_OK):
-            return False, f"Read access required for file '{path}'. {ACCESS_HINT}"
+    if kind == "file":
+        if not backend.access(path, os.R_OK):
+            return False, f"Read access required for file '{path}'. {hint}"
         return True, None
 
-    if path.is_dir():
-        if not os.access(path, os.R_OK | os.X_OK):
-            return False, f"List access required for directory '{path}'. {ACCESS_HINT}"
+    if kind == "dir":
+        if not backend.access(path, os.R_OK | os.X_OK):
+            return False, f"List access required for directory '{path}'. {hint}"
         try:
-            with os.scandir(path) as iterator:
-                next(iterator, None)
+            next(iter(backend.list_dir(path)), None)
         except PermissionError:
-            return False, f"Permission denied while listing '{path}'. {ACCESS_HINT}"
+            return False, f"Permission denied while listing '{path}'. {hint}"
         except FileNotFoundError:
             return False, f"Directory '{path}' is not accessible."
         return True, None
@@ -83,11 +100,17 @@ class SourceManager:
         self,
         directories: Iterable[Path],
         files: Iterable[Path],
+        *,
+        backends: BackendResolver = LOCAL,
     ) -> None:
         self._directories = self._prepare(directories)
         self._files = self._prepare(files)
         self._markers = {_marker(path) for path in self._directories + self._files}
         self._added: set[Path] = set()
+        #: A resolver rather than a backend: an ad-hoc source may name another
+        #: machine, and the one being added is not necessarily on the same one
+        #: as the last.
+        self._backends = backends
 
     @staticmethod
     def _prepare(items: Iterable[Path]) -> list[Path]:
@@ -125,6 +148,7 @@ class SourceManager:
             return SourceAddition(success=False, messages=[])
 
         path = normalize_path(cleaned)
+        backend = self._backends.for_ref(path)
         marker = _marker(path)
         if marker in self._markers:
             return SourceAddition(
@@ -135,7 +159,7 @@ class SourceManager:
                 ],
             )
 
-        allowed, reason = check_access(path)
+        allowed, reason = check_access(path, backend=backend)
         if not allowed:
             return SourceAddition(
                 success=False,
@@ -144,11 +168,12 @@ class SourceManager:
             )
 
         resolved = identity(path)
+        kind = backend.kind(resolved)
 
-        if resolved.is_dir():
+        if kind == "dir":
             self._directories.append(resolved)
             self._directories.sort(key=lambda p: str(p).lower())
-        elif resolved.is_file():
+        elif kind == "file":
             self._files.append(resolved)
             self._files.sort(key=lambda p: str(p).lower())
         else:
@@ -162,7 +187,7 @@ class SourceManager:
         self._added.add(resolved)
 
         messages = [SourceMessage(f"Added {resolved} to the current session.", "info")]
-        if resolved.is_file() and resolved.suffix.lower() != ".log":
+        if kind == "file" and resolved.suffix.lower() != ".log":
             messages.insert(
                 0,
                 SourceMessage(

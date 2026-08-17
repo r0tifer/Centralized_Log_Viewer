@@ -12,6 +12,8 @@ from __future__ import annotations
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from clv.services.discovery import DiscoverySettings, discover
 from clv.services.documents import DocumentError, extract_document
 from clv.services.reader import (
@@ -327,3 +329,46 @@ def test_document_reader_survives_a_document_caught_mid_save(tmp_path: Path) -> 
 
     assert result.lines == []
     assert result.rotated is False
+
+
+# --- reading from a handle rather than a path -------------------------------
+
+
+def test_extract_ods_from_reads_an_open_handle(tmp_path: Path) -> None:
+    """The shape a remote backend hands over. ``zipfile`` needs it seekable,
+    which is why ``SourceBackend.open`` promises seekability rather than
+    leaving it to be discovered by a stack trace from inside the stdlib."""
+
+    from io import BytesIO
+
+    from clv.services.documents import extract_ods_from
+
+    path = _ods(tmp_path / "hosts.ods", _row("Host") + _row("web01"))
+    handle = BytesIO(path.read_bytes())
+
+    text = extract_ods_from(handle, max_lines=10, name="hosts.ods")
+
+    assert "Host" in "\n".join(text.lines)
+    assert "web01" in "\n".join(text.lines)
+
+
+def test_extract_ods_from_names_the_document_in_its_error() -> None:
+    from io import BytesIO
+
+    from clv.services.documents import DocumentError, extract_ods_from
+
+    with pytest.raises(DocumentError) as caught:
+        extract_ods_from(BytesIO(b"not a zip"), max_lines=10, name="hosts.ods")
+
+    assert "hosts.ods" in str(caught.value)
+
+
+def test_a_document_extracts_through_an_injected_backend(tmp_path: Path) -> None:
+    from clv.services.backend import LOCAL
+    from clv.services.documents import extract_document
+
+    path = _ods(tmp_path / "hosts.ods", _row("Host"))
+
+    assert extract_document(path, 10).lines == extract_document(
+        path, 10, backend=LOCAL
+    ).lines

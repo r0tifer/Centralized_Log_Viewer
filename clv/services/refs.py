@@ -5,6 +5,10 @@ this module, the only one — but it is no longer the assumed one. Remote source
 over SSH are in scope (see ``SSH_TODO.md``), and the reason a plugin alone could
 not deliver them is that eight years of code said *a source is a path*.
 
+This module answers *what a source is*. :mod:`clv.services.backend` answers
+*who reads it*, and owns every filesystem call that used to be made against a
+ref directly.
+
 Two boundaries live here, and keeping them apart is the whole point.
 
 ``parse_ref`` / ``format_ref`` are the **persistence boundary**. They are exact
@@ -120,10 +124,16 @@ class SourceRef(Protocol):
     def __eq__(self, other: object) -> bool: ...
 
     # --- IO -------------------------------------------------------------------
-    # Phase 2 moves these behind a ``SourceBackend`` with a declared blocking
-    # contract. Until it does, they are here because discovery and reading call
-    # them directly, and a protocol that omitted them would be a lie about what
-    # CLV requires today.
+    # Phase 2 moved these behind :mod:`clv.services.backend`. They stay listed
+    # because ``LocalBackend`` is implemented *in terms of them* — it calls
+    # ``ref.stat()``, ``ref.open()``, ``ref.is_dir()`` — so they remain part of
+    # what a **local** ref must provide, and removing them would make that
+    # dependency undeclared rather than absent.
+    #
+    # What changed is who may call them: nothing outside ``backend.py`` does,
+    # and a guard test in ``tests/test_backend.py`` keeps it that way. A remote
+    # ref is not expected to implement them at all; its backend answers instead,
+    # which is the whole point of the seam.
     def exists(self) -> bool: ...
 
     def is_file(self) -> bool: ...

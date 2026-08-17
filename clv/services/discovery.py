@@ -16,9 +16,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from .backend import LOCAL, BackendResolver, SourceBackend
 from .compressed import is_compressed, probe
 from .documents import document_format_for
 from .reader import looks_binary
+from .refs import SourceRef
 
 #: Skipped unless the user opts in. These are readable files that are not
 #: usefully viewable as text: archives and binary journals. Rotated plain-text
@@ -104,14 +106,14 @@ def _split_globs(raw: str) -> tuple[str, ...]:
 
 @dataclass(frozen=True, slots=True)
 class DiscoveredFile:
-    path: Path
+    path: SourceRef
     #: The configured root this file was found under (a directory, or the file
     #: itself when the operator named a single file).
-    root: Path
+    root: SourceRef
     size: int
 
     @property
-    def relative(self) -> Path:
+    def relative(self) -> SourceRef:
         try:
             return self.path.relative_to(self.root)
         except ValueError:
@@ -138,20 +140,20 @@ class DiscoveryReport:
     """What discovery found, and what it declined to list."""
 
     files: list[DiscoveredFile] = field(default_factory=list)
-    roots: list[Path] = field(default_factory=list)
-    directories: set[Path] = field(default_factory=set)
+    roots: list[SourceRef] = field(default_factory=list)
+    directories: set[SourceRef] = field(default_factory=set)
     #: Content CLV cannot show as text: a binary, an archive, a PDF.
     skipped_unsupported: int = 0
     #: Hidden by the operator's own include_globs / exclude_globs.
     skipped_filtered: int = 0
     #: Present and of a supported type, but the read failed.
     skipped_unreadable: int = 0
-    unreadable_roots: list[Path] = field(default_factory=list)
+    unreadable_roots: list[SourceRef] = field(default_factory=list)
     #: Named sources that were skipped, with the reason. A file the operator
     #: typed out by hand deserves to be named back at them rather than folded
     #: into a count -- otherwise adding a PDF as a source looks like CLV did
     #: nothing at all.
-    skipped_sources: list[tuple[Path, str]] = field(default_factory=list)
+    skipped_sources: list[tuple[SourceRef, str]] = field(default_factory=list)
     #: True when max_files stopped the walk early.
     truncated: bool = False
 
@@ -192,7 +194,7 @@ class DiscoveryReport:
         return lines
 
 
-def matched_glob(path: Path, root: Path, globs: Sequence[str]) -> str | None:
+def matched_glob(path: SourceRef, root: SourceRef, globs: Sequence[str]) -> str | None:
     """The first of *globs* matching *path*, by name and by root-relative path.
 
     Returns the pattern rather than a bool because *which* glob matched decides
@@ -218,18 +220,19 @@ def matched_glob(path: Path, root: Path, globs: Sequence[str]) -> str | None:
     return None
 
 
-def matches_any(path: Path, root: Path, globs: Sequence[str]) -> bool:
+def matches_any(path: SourceRef, root: SourceRef, globs: Sequence[str]) -> bool:
     """Test *path* against *globs* by name and by root-relative path."""
 
     return matched_glob(path, root, globs) is not None
 
 
 def skip_reason(
-    path: Path,
-    root: Path,
+    path: SourceRef,
+    root: SourceRef,
     settings: DiscoverySettings,
     *,
     named: bool = False,
+    backend: SourceBackend = LOCAL,
 ) -> str | None:
     """Why *path* would not be listed, or None if it is a valid source.
 
@@ -262,7 +265,7 @@ def skip_reason(
         and not matches_any(path, root, settings.include_globs)
     ):
         return FILTERED
-    if not os.access(path, os.R_OK):
+    if not backend.access(path, os.R_OK):
         return UNREADABLE
     if is_compressed(path):
         # The binary sniff would reject every one of these for looking like
@@ -270,8 +273,12 @@ def skip_reason(
         # whether the archive opens at all. A corrupt one is `unreadable` --
         # CLV supports the format, this particular file is damaged -- which is
         # a different answer from `unsupported` and the actionable one.
-        return None if probe(path) else UNREADABLE
-    if settings.skip_binary and not _is_document(path) and looks_binary(path):
+        return None if probe(path, backend=backend) else UNREADABLE
+    if (
+        settings.skip_binary
+        and not _is_document(path)
+        and looks_binary(path, backend=backend)
+    ):
         return UNSUPPORTED
     return None
 
@@ -285,15 +292,21 @@ def _count_skip(report: DiscoveryReport, reason: str) -> None:
         report.skipped_unreadable += 1
 
 
-def _accepts(path: Path, root: Path, settings: DiscoverySettings, report: DiscoveryReport) -> bool:
-    reason = skip_reason(path, root, settings)
+def _accepts(
+    path: SourceRef,
+    root: SourceRef,
+    settings: DiscoverySettings,
+    report: DiscoveryReport,
+    backend: SourceBackend,
+) -> bool:
+    reason = skip_reason(path, root, settings, backend=backend)
     if reason is None:
         return True
     _count_skip(report, reason)
     return False
 
 
-def _is_document(path: Path) -> bool:
+def _is_document(path: SourceRef) -> bool:
     """True for container formats whose text CLV can extract.
 
     The binary test asks "can this be shown as text", and for these the answer
@@ -306,77 +319,75 @@ def _is_document(path: Path) -> bool:
 
 
 def _walk_directory(
-    root: Path,
+    root: SourceRef,
     settings: DiscoverySettings,
     report: DiscoveryReport,
-    seen_dirs: set[tuple[int, int]],
+    seen_dirs: set[object],
+    backend: SourceBackend,
 ) -> None:
-    for current, subdirs, filenames in os.walk(
-        root, followlinks=settings.follow_symlinks, onerror=lambda _err: None
+    """Fold one root's files into *report*.
+
+    The traversal itself — the symlink-cycle guard, the ordering, the
+    swallowing of a directory that will not list — belongs to the backend now.
+    What stays here is the part that is discovery's judgement rather than the
+    filesystem's: the ``max_files`` ceiling, and which skips are counted where.
+
+    *seen_dirs* is shared across every root in one pass, which is why it is
+    threaded through rather than owned by the walk: two configured roots that
+    overlap must not walk the shared subtree twice.
+    """
+
+    for entry in backend.walk(
+        root, follow_symlinks=settings.follow_symlinks, seen=seen_dirs
     ):
-        current_path = Path(current)
-
-        if settings.follow_symlinks:
-            # Guard against symlink cycles walking forever.
-            try:
-                info = current_path.stat()
-            except OSError:
-                subdirs.clear()
-                continue
-            identity = (info.st_dev, info.st_ino)
-            if identity in seen_dirs:
-                subdirs.clear()
-                continue
-            seen_dirs.add(identity)
-
-        subdirs.sort(key=str.lower)
-        for filename in sorted(filenames, key=str.lower):
-            if report.file_count >= settings.max_files:
-                report.truncated = True
-                return
-            candidate = current_path / filename
-            try:
-                if not candidate.is_file():
-                    continue
-                if not _accepts(candidate, root, settings, report):
-                    continue
-                size = candidate.stat().st_size
-            except OSError:
-                report.skipped_unreadable += 1
-                continue
-            report.files.append(DiscoveredFile(path=candidate, root=root, size=size))
-            report.directories.add(current_path)
+        if report.file_count >= settings.max_files:
+            report.truncated = True
+            return
+        if entry.unreadable:
+            report.skipped_unreadable += 1
+            continue
+        candidate = entry.ref
+        if not _accepts(candidate, root, settings, report, backend):
+            continue
+        report.files.append(
+            DiscoveredFile(path=candidate, root=root, size=entry.size)
+        )
+        report.directories.add(candidate.parent)
 
 
 def discover(
-    roots: Iterable[Path],
+    roots: Iterable[SourceRef],
     settings: DiscoverySettings | None = None,
+    *,
+    backends: BackendResolver = LOCAL,
 ) -> DiscoveryReport:
     """Walk *roots* (directories and/or individual files) into a report.
 
     Pure and synchronous by design so callers can run it in a worker thread;
     it performs no UI work and holds no application state.
+
+    *backends* is a resolver rather than a single backend because *roots* is a
+    mixed list: one entry may be a folder on this machine and the next a folder
+    on another, and no single backend can answer for both.
     """
 
     settings = settings or DiscoverySettings()
     report = DiscoveryReport()
-    seen_dirs: set[tuple[int, int]] = set()
+    seen_dirs: set[object] = set()
 
     for root in roots:
         report.roots.append(root)
-        try:
-            is_dir = root.is_dir()
-            is_file = root.is_file()
-        except OSError:
-            report.unreadable_roots.append(root)
-            continue
+        backend = backends.for_ref(root)
+        # One call, not an exists/is_file/is_dir triple: remotely that triple
+        # is three round trips to answer one question.
+        kind = backend.kind(root)
 
-        if is_dir:
-            if not os.access(root, os.R_OK | os.X_OK):
+        if kind == "dir":
+            if not backend.access(root, os.R_OK | os.X_OK):
                 report.unreadable_roots.append(root)
                 continue
-            _walk_directory(root, settings, report, seen_dirs)
-        elif is_file:
+            _walk_directory(root, settings, report, seen_dirs, backend)
+        elif kind == "file":
             # A directly named file bypasses the operator's own globs: they
             # already said they want this one. Type-based exclusions still
             # apply, and a skip is named back at them rather than folded into
@@ -385,19 +396,21 @@ def discover(
             if report.file_count >= settings.max_files:
                 report.truncated = True
                 continue
-            try:
-                reason = skip_reason(root, root, settings, named=True)
-                if reason is not None:
-                    _count_skip(report, reason)
-                    report.skipped_sources.append((root, reason))
-                    continue
-                size = root.stat().st_size
-            except OSError:
+            reason = skip_reason(root, root, settings, named=True, backend=backend)
+            if reason is not None:
+                _count_skip(report, reason)
+                report.skipped_sources.append((root, reason))
+                continue
+            info = backend.stat(root)
+            if info is None:
                 report.unreadable_roots.append(root)
                 continue
-            report.files.append(DiscoveredFile(path=root, root=root, size=size))
+            report.files.append(DiscoveredFile(path=root, root=root, size=info.size))
             report.directories.add(root.parent)
         else:
+            # `missing`, `denied`, and anything that is neither file nor
+            # directory. Three facts, one report line -- as before: what the
+            # operator can act on is that this root produced nothing.
             report.unreadable_roots.append(root)
 
     report.files.sort(key=lambda item: str(item.path).lower())

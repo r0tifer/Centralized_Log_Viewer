@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from .backend import LOCAL, SourceBackend
 from .compressed import is_compressed, read_compressed_tail, strip_compression_suffix
 from .reader import AnyReader, TailRead, open_reader, read_last_lines
 
@@ -171,6 +172,7 @@ class RotatedSetReader:
         rotated_set: RotatedSet,
         *,
         max_lines: int,
+        backend: SourceBackend = LOCAL,
         **kwargs,
     ) -> None:
         self.rotated_set = rotated_set
@@ -178,7 +180,13 @@ class RotatedSetReader:
         #: member) keeps naming a real file.
         self.path = rotated_set.head
         self._max_lines = max_lines
-        self._live: AnyReader = open_reader(rotated_set.head, max_lines=max_lines, **kwargs)
+        #: Every member of a set lives wherever the set does, so one backend
+        #: answers for all of them -- unlike a merged view, which is the case
+        #: that needs a resolver.
+        self._backend = backend
+        self._live: AnyReader = open_reader(
+            rotated_set.head, max_lines=max_lines, backend=backend, **kwargs
+        )
         #: How many members the last prime actually opened, and how many it
         #: could have. Opening a set is the one path that is not instant, so it
         #: has to be able to say what it did.
@@ -241,9 +249,9 @@ class RotatedSetReader:
 
         try:
             if is_compressed(path):
-                text = read_compressed_tail(path, budget)
+                text = read_compressed_tail(path, budget, backend=self._backend)
                 return text.lines, text.truncated
-            result = read_last_lines(path, budget)
+            result = read_last_lines(path, budget, backend=self._backend)
             return result.lines, result.truncated
         except OSError:
             # One damaged member must not cost the rest of the history. The

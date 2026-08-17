@@ -550,3 +550,82 @@ def test_a_set_tails_its_live_member(tmp_path: Path) -> None:
             assert [entry.raw for entry in app._entries][-1] == "head 3"
 
     asyncio.run(scenario())
+
+
+# --- reading from a handle rather than a path -------------------------------
+#
+# The split that makes a *remote* .gz readable: `decompress_tail` never learns
+# where its bytes came from. Half of /var/log is rotated and compressed, so a
+# transport that could not read one would have met a fraction of the goal.
+
+
+def test_decompress_tail_reads_from_any_binary_handle(tmp_path: Path) -> None:
+    """A BytesIO is the shape a remote backend hands over."""
+
+    from io import BytesIO
+
+    from clv.services.compressed import GZIP, decompress_tail
+
+    payload = BytesIO()
+    with gzip.GzipFile(fileobj=payload, mode="wb") as handle:
+        handle.write(b"alpha\nbravo\ncharlie\n")
+
+    text = decompress_tail(BytesIO(payload.getvalue()), GZIP, max_lines=2)
+
+    assert text.lines == ["bravo", "charlie"]
+    assert text.truncated is True
+
+
+def test_decompress_tail_names_the_member_in_its_error() -> None:
+    """The handle carries no name, so one is passed. A damaged archive still
+    has to say *which* archive it was."""
+
+    from io import BytesIO
+
+    from clv.services.compressed import GZIP, CompressedError, decompress_tail
+
+    with pytest.raises(CompressedError) as caught:
+        decompress_tail(BytesIO(b"not gzip at all"), GZIP, max_lines=10, name="syslog.2.gz")
+
+    assert "syslog.2.gz" in str(caught.value)
+
+
+def test_a_compressed_member_reads_through_an_injected_backend(tmp_path: Path) -> None:
+    """Same bytes, same lines, whoever opened the file."""
+
+    from clv.services.backend import LOCAL
+    from clv.services.compressed import read_compressed_tail
+
+    member = tmp_path / "app.log.1.gz"
+    with gzip.open(member, "wb") as handle:
+        handle.write(b"alpha\nbravo\n")
+
+    assert read_compressed_tail(member, 10).lines == ["alpha", "bravo"]
+    assert read_compressed_tail(member, 10, backend=LOCAL).lines == ["alpha", "bravo"]
+
+
+def test_probe_goes_through_the_backend(tmp_path: Path) -> None:
+    """Discovery's cheap "does this archive open at all" test, which on a
+    remote root must not become a second round trip per file."""
+
+    from clv.services.backend import LOCAL
+    from clv.services.compressed import probe
+
+    good = tmp_path / "good.gz"
+    with gzip.open(good, "wb") as handle:
+        handle.write(b"alpha\n")
+    bad = tmp_path / "bad.gz"
+    bad.write_bytes(b"definitely not gzip")
+
+    opened: list[Path] = []
+
+    class Counting:
+        capabilities = LOCAL.capabilities
+
+        def open(self, ref, mode="rb"):
+            opened.append(ref)
+            return ref.open(mode)
+
+    assert probe(good, backend=Counting()) is True
+    assert probe(bad, backend=Counting()) is False
+    assert opened == [good, bad], "one open per candidate, and only one"

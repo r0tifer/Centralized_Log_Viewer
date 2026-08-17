@@ -52,6 +52,7 @@ from .plugins import (
     load_plugins,
 )
 from .services import SourceManager, persist_log_sources, persist_setting
+from .services.backend import LOCAL
 from .services.clipboard import prepare_payload
 from .services.clustering import (
     COUNT_PREFIX,
@@ -873,7 +874,13 @@ class LogViewerApp(App[None]):
         # tree quietly came back short. Neither is discovery's judgement to
         # make: a provider that raises is still recorded and skipped.
         worker = self.run_worker(
-            lambda: (discover(roots, settings), self._plugins.discover_sources()),
+            # `backends=LOCAL` is passed rather than left to the default, so the
+            # seam is visible at the call site that owns the walk. Phase 3 of
+            # SSH_TODO.md is where this stops being a constant.
+            lambda: (
+                discover(roots, settings, backends=LOCAL),
+                self._plugins.discover_sources(),
+            ),
             thread=True,
             name="discover",
             exit_on_error=False,

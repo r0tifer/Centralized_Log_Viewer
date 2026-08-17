@@ -324,3 +324,131 @@ def test_a_named_document_is_still_listed(tmp_path: Path) -> None:
 
     assert [item.path for item in report.files] == [target]
     assert report.skipped_sources == []
+
+
+# --- discovery and reading through an injected backend ----------------------
+#
+# The seam is only worth having if the *same* walk produces the *same* report
+# whoever performed it. These pass a backend explicitly rather than relying on
+# the default, which is what Phase 4 will do with a remote one.
+
+
+def test_discovery_through_an_explicit_backend_matches_the_default(tmp_path: Path) -> None:
+    from clv.services.backend import LOCAL
+
+    for relative in ("a.log", "nested/b.log", "nested/deep/c.txt"):
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("alpha\n", encoding="utf-8")
+
+    default = discover([tmp_path])
+    injected = discover([tmp_path], backends=LOCAL)
+
+    assert [str(f.path) for f in default.files] == [str(f.path) for f in injected.files]
+    assert default.directories == injected.directories
+    assert default.skipped_total == injected.skipped_total
+
+
+def test_the_resolver_is_asked_once_per_root(tmp_path: Path) -> None:
+    """A resolver, not a backend, because in Phase 4 `roots` is a mixed list:
+    one entry may be a folder here and the next a folder on another machine."""
+
+    from clv.services.backend import LOCAL
+
+    first = tmp_path / "one"
+    second = tmp_path / "two"
+    for root in (first, second):
+        root.mkdir()
+        (root / "a.log").write_text("alpha\n", encoding="utf-8")
+
+    asked: list[Path] = []
+
+    class Recording:
+        def for_ref(self, ref):
+            asked.append(ref)
+            return LOCAL
+
+    report = discover([first, second], backends=Recording())
+
+    assert asked == [first, second]
+    assert report.file_count == 2
+
+
+def test_the_walk_stops_at_max_files_instead_of_measuring_the_rest(tmp_path: Path) -> None:
+    """`max_files` has to bound *work*, not just output.
+
+    The old walk checked the ceiling before touching each candidate; the seam
+    keeps that only if `backend.walk` stays lazy. A backend that materialised
+    its result would still return five files here and would still pass the
+    existing truncation test — while having stat'd two thousand.
+    """
+
+    from clv.services.backend import LOCAL, WalkEntry
+
+    root = tmp_path / "many"
+    root.mkdir()
+    for index in range(50):
+        (root / f"file{index:02d}.log").write_text("x\n", encoding="utf-8")
+
+    produced = 0
+
+    class Counting:
+        capabilities = LOCAL.capabilities
+
+        def walk(self, ref, *, follow_symlinks=False, seen=None):
+            nonlocal produced
+            for entry in LOCAL.walk(ref, follow_symlinks=follow_symlinks, seen=seen):
+                produced += 1
+                yield entry
+
+        def for_ref(self, ref):
+            return self
+
+        def __getattr__(self, name):
+            return getattr(LOCAL, name)
+
+    report = discover([root], DiscoverySettings(max_files=5), backends=Counting())
+
+    assert report.file_count == 5
+    assert report.truncated is True
+    assert produced <= 6, f"the walk measured {produced} files to report 5"
+
+
+def test_reading_goes_through_the_backend_it_was_given(tmp_path: Path) -> None:
+    """Every byte, including the encoding sniff — a remote source that sniffed
+    the *local* filesystem would read the wrong machine and never say so."""
+
+    from clv.services.backend import LOCAL
+
+    log = tmp_path / "a.log"
+    log.write_text("alpha\nbravo\n", encoding="utf-8")
+
+    opened: list[Path] = []
+
+    class Recording:
+        capabilities = LOCAL.capabilities
+
+        def open(self, ref, mode="rb"):
+            opened.append(ref)
+            return ref.open(mode)
+
+        def stat(self, ref):
+            return LOCAL.stat(ref)
+
+        def identity(self, ref):
+            return LOCAL.identity(ref)
+
+    result = read_last_lines(log, 10, backend=Recording())
+
+    assert result.lines == ["alpha", "bravo"]
+    assert opened, "read_last_lines opened the file behind the backend's back"
+    assert all(path == log for path in opened)
+
+
+def test_looks_binary_goes_through_the_backend(tmp_path: Path) -> None:
+    from clv.services.backend import LOCAL
+
+    binary = tmp_path / "b.bin"
+    binary.write_bytes(b"hello\x00world")
+
+    assert looks_binary(binary, backend=LOCAL) is True

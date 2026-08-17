@@ -90,6 +90,16 @@ connecting, probing — runs in a worker thread, as discovery already does. A
 frozen UI is the failure mode this clause exists to prevent, and the obvious
 implementation of every remote operation is the blocking one.
 
+**A third exception, and it is a seam rather than a format.** Every read of a
+source goes through a `SourceBackend` (`services/backend.py`). A backend may
+not silently substitute an unbounded read for a bounded one, nor a blocking
+call for a cheap one: it **declares** its costs with `@cheap` / `@blocking`,
+`BackendCapabilities.blocking` is derived from those marks rather than written
+by hand, and `SourceBuffer.poll` runs inside `cheap_only()` so a declared-
+blocking call raises `BlockingCallError` instead of stalling the timer.
+`stat` and `identity` are cheap on every backend — that is what lets tailing ask
+"did this grow?" from the event loop — and everything else belongs in a worker.
+
 ### 4) Nothing off-screen, ever
 Layout must scale cleanly from 80 columns up. Every control stays on screen and
 keyboard-reachable at every supported width. Horizontal groups are built from
@@ -112,7 +122,7 @@ distros.
 | Layer | Location | Owns | Must not |
 | --- | --- | --- | --- |
 | **App shell** | `clv/app.py` | Layout, routing, lifecycle, breakpoints | Parse, filter, read files, or define widget visuals |
-| **Services** | `clv/services/` | Source identity (`refs.py`), parsing, filtering, discovery, reading, buffering, config, source management | Touch the UI or import Textual |
+| **Services** | `clv/services/` | Source identity (`refs.py`), source IO (`backend.py`), parsing, filtering, discovery, reading, buffering, config, source management | Touch the UI or import Textual, or reach past `backend.py` to `os` |
 | **Widgets** | `clv/widgets/` | Self-contained UI + own `DEFAULT_CSS` | Depend on other widgets' internals or import `clv.app` |
 | **Plugins** | `clv/plugins/` | Extension interfaces + loader | Break interface contracts |
 | **State** | `clv/storage.py` | JSON session persistence (atomic), including `SavedView` records | Depend on the UI |
@@ -155,6 +165,18 @@ distros.
   `journal:all` into `$CWD/journal:all` on the next launch. Also owns
   `identity` / `ref_key` — one canonical form, replacing the two copies that
   used to live in `app.py` and `sources.py`.
+- `backend.py` — where a source's bytes come from, and **what asking costs**.
+  `refs.py` answered what a source is; this answers who reads it. `walk`,
+  `list_dir`, `kind`, `access`, `open`, `stat`, `identity` — `LocalBackend` is
+  the only implementation and its behaviour is what discovery and reading did
+  before. The part that is not a refactor is the blocking contract: every method
+  is marked `@cheap` or `@blocking`, the marks are what
+  `BackendCapabilities.blocking` is derived from, and `cheap_only()` turns a
+  blocking call on the event loop into an exception rather than a freeze. Two
+  members carry reasoning worth knowing: `identity` is an **opaque** comparable
+  whose `None` means "this backend has no stable answer" (rotation then degrades
+  to shrink-only, and says so), and `walk` yields files only, lazily, so
+  `max_files` bounds work rather than merely output.
 - `reader.py` — BOM-based encoding detection, bounded backwards reads,
   incremental tailing, rotation and truncation recovery. `open_reader()` picks
   between `SourceReader` (streams) and `DocumentReader` (container documents);
