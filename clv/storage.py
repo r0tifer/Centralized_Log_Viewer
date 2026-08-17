@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, ClassVar, Dict, Optional
 
+from .services.refs import parse_ref
 from .services.watch import WatchRule
 
 
@@ -56,6 +57,11 @@ class SavedView:
 
         Returning None rather than raising is the point: one hand-edited record
         must not cost the operator every other view, nor stop the app starting.
+
+        Like :meth:`SessionState.from_dict`, this dispatches on the *text* of a
+        field's annotation, so those strings may not change without a migration.
+        Two separately-coded copies of the same rule, and no schema version
+        between them — worth knowing before touching either.
         """
 
         if not isinstance(raw, dict):
@@ -106,7 +112,7 @@ class SavedView:
         if self.merged:
             parts.append(f"{len(self.merged)} merged sources")
         elif self.source:
-            parts.append(Path(self.source).name)
+            parts.append(parse_ref(self.source).name)
         return " · ".join(parts) if parts else "no filters"
 
 
@@ -202,7 +208,19 @@ class SessionState:
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "SessionState":
-        """Build state from stored JSON, ignoring unknown or mistyped values."""
+        """Build state from stored JSON, ignoring unknown or mistyped values.
+
+        **The annotation strings below are load-bearing.** This dispatches on
+        the *text* of a field's type, so renaming ``tuple[str, ...]`` to
+        anything else — including a more accurate type — makes no branch match,
+        the raw JSON value is assigned through unvalidated, and every tuple
+        comparison downstream quietly fails. There is no schema version to
+        detect it. A field's annotation may not change without a migration.
+
+        This is why sources persist as strings even though a source is a
+        ``SourceRef``: ``refs.format_ref`` writes them and ``refs.parse_ref``
+        reads them back at the boundary, and the on-disk type never moves.
+        """
 
         types = {field.name: field.type for field in fields(cls)}
         known: Dict[str, Any] = {}

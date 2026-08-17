@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Literal, Sequence
 
+from .refs import SourceRef, identity, normalize_ref, ref_key
+
 
 ACCESS_HINT = (
     "Re-launch Centralized Log Viewer with elevated permissions (for example `sudo`) "
@@ -25,29 +27,22 @@ class SourceAddition:
     messages: list[SourceMessage] = field(default_factory=list)
 
 
-def _marker(path: Path) -> str:
-    """Return a normalized string key for *path* suitable for deduping."""
-
-    try:
-        return str(path.resolve())
-    except OSError:
-        return str(path)
+#: Dedupe key for a source. Was a local ``_marker``; ``refs.ref_key`` is the
+#: same function with the scheme guard added, and unifying it with ``app``'s
+#: identical ``_resolve`` is half the point of ``refs``.
+_marker = ref_key
 
 
-def normalize_path(raw: str | Path) -> Path:
-    """Expand and absolutize a user supplied path without failing on missing targets."""
+def normalize_path(raw: str | SourceRef) -> SourceRef:
+    """Expand and absolutize a user supplied path without failing on missing targets.
 
-    if isinstance(raw, Path):
-        path = raw
-    else:
-        path = Path(str(raw))
-    path = path.expanduser()
-    try:
-        if path.is_absolute():
-            return path.resolve(strict=False)
-        return (Path.cwd() / path).resolve(strict=False)
-    except OSError:
-        return path
+    This is the **user-input** boundary — what a person typed into
+    ``settings.conf`` or the add-source dialog. A string CLV itself persisted is
+    already canonical and must go through ``refs.parse_ref`` instead: expanding
+    one is what turns ``journal:all`` into ``$CWD/journal:all``.
+    """
+
+    return normalize_ref(raw)
 
 
 def check_access(path: Path) -> tuple[bool, str | None]:
@@ -148,10 +143,7 @@ class SourceManager:
                 messages=[SourceMessage(reason or f"Permission denied for '{path}'.", "error")],
             )
 
-        try:
-            resolved = path.resolve()
-        except OSError:
-            resolved = path
+        resolved = identity(path)
 
         if resolved.is_dir():
             self._directories.append(resolved)

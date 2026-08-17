@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Sequence, TextIO
 
 from .parsing import LogEntry
+from .refs import SourceRef
 
 #: Signature every writer shares: consume entries, write them to an open text
 #: handle. Bounded by the caller's list — no writer reads a file or a stream.
@@ -161,16 +162,26 @@ def write_atomically(path: Path, entries: Sequence[LogEntry], writer: Writer) ->
     return len(entries)
 
 
-def default_stem(source: Path | None, *, now: datetime | None = None) -> str:
+def default_stem(
+    source: "SourceRef | str | None", *, now: datetime | None = None
+) -> str:
     """``syslog-20260811-142530`` — enough to tell two exports of one log apart.
 
     The extension is the caller's business: the export dialog appends whichever
     one the highlighted format uses. A dotted name like ``access.log.1`` keeps
     its identity, so the origin of an export stays readable from its name.
+
+    A plain ``str`` is accepted because a merged set has a *label* rather than a
+    source — ``"app+2-more"``. The caller used to wrap that label in a ``Path``
+    purely to get a string back out of ``.name``, which made a name look like a
+    location and left the last ``Path(<not a path>)`` in the app shell.
     """
 
     moment = now or datetime.now()
-    stem = source.name.replace(os.sep, "_") if source is not None else "clv-export"
+    if source is None:
+        stem = "clv-export"
+    else:
+        stem = (source if isinstance(source, str) else source.name).replace(os.sep, "_")
     return f"{stem}-{moment:%Y%m%d-%H%M%S}"
 
 

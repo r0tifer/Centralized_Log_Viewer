@@ -95,6 +95,7 @@ from .services.query import (
     collect_field_names,
     entry_matches,
 )
+from .services.refs import SourceRef, format_ref, identity, parse_ref, ref_key
 from .services.rotation import RotatedSet, describe_set, group_rotated
 from .services.session import ORIGIN_FIELD, SourceSession
 from .services.timeline import Timeline, build_timeline
@@ -934,7 +935,7 @@ class LogViewerApp(App[None]):
         # the hierarchy on every launch.
         starred = self._starred_paths()
         present = sorted(
-            (item.path for item in report.files if _resolve(item.path) in starred),
+            (item.path for item in report.files if identity(item.path) in starred),
             key=lambda p: str(p).lower(),
         )
         if present:
@@ -1029,13 +1030,13 @@ class LogViewerApp(App[None]):
             parent.add_leaf(self._leaf_label(path, path.name), data=path)
 
     def _starred_paths(self) -> set[Path]:
-        return {_resolve(Path(entry)) for entry in self.state.starred}
+        return {identity(parse_ref(entry)) for entry in self.state.starred}
 
     def _leaf_label(self, path: Path, text: str) -> str:
-        icon = ICON_STAR if _resolve(path) in self._starred_paths() else ICON_FILE
+        icon = ICON_STAR if identity(path) in self._starred_paths() else ICON_FILE
         # Merge membership prefixes rather than replaces: a starred log can be
         # merged too, and the star already owns the icon slot.
-        merged = ICON_MERGED if _resolve(path) in self._merged_paths else ""
+        merged = ICON_MERGED if identity(path) in self._merged_paths else ""
         return f"{merged}{icon} {text}"
 
     def _highlight_source(self, path: Path, *, select: bool = True) -> None:
@@ -1050,7 +1051,7 @@ class LogViewerApp(App[None]):
             tree = self.query_one("#source-tree", LogTree)
         except NoMatches:
             return
-        target = _resolve(path)
+        target = identity(path)
         node = _find_node(tree.root, target)
         if node is None:
             return
@@ -1081,7 +1082,7 @@ class LogViewerApp(App[None]):
     # --- source selection and tailing --------------------------------------
 
     def _select_source(self, path: Path, *, announce: bool = True) -> bool:
-        resolved = _resolve(path)
+        resolved = identity(path)
         if not resolved.is_file():
             if announce:
                 self._notify(f"{resolved} is not a readable file.", "error")
@@ -1131,14 +1132,17 @@ class LogViewerApp(App[None]):
             self._notify("Move to a log in the tree to merge it.", "warning")
             return
 
-        resolved = _resolve(target)
+        stored = ref_key(target)
         current = list(self.state.merged)
-        if str(resolved) in current:
-            current.remove(str(resolved))
+        if stored in current:
+            current.remove(stored)
             action = "Removed from"
         else:
-            current.append(str(resolved))
+            current.append(stored)
             action = "Added to"
+        # Sorted as strings, not as refs: the persisted order is lexicographic
+        # over the stored form, which is stable across a mixed local and remote
+        # set. `SourceRef` deliberately declares no ordering of its own.
         self._update_state(merged=tuple(sorted(current)))
         # Edited in place rather than rebuilt. Membership says nothing about
         # what is on disk, so a rescan would be a filesystem walk per keystroke
@@ -1152,7 +1156,10 @@ class LogViewerApp(App[None]):
     def action_open_merged(self) -> None:
         """Open every source in the merged set as one timestamp-ordered stream."""
 
-        paths = [Path(entry) for entry in self.state.merged]
+        # parse_ref, not identity: the stored form is what the set was built
+        # from, and resolving here would open a symlink's target instead of the
+        # member the operator chose.
+        paths = [parse_ref(entry) for entry in self.state.merged]
         if not paths:
             self._notify("No sources merged yet — press x on a log to add one.", "warning")
             return
@@ -1202,7 +1209,7 @@ class LogViewerApp(App[None]):
 
     @property
     def _merged_paths(self) -> set[Path]:
-        return {_resolve(Path(entry)) for entry in self.state.merged}
+        return {identity(parse_ref(entry)) for entry in self.state.merged}
 
     def _merged_label(self) -> Text:
         """The group's heading: a marker that opens, and a name that expands.
@@ -1234,7 +1241,7 @@ class LogViewerApp(App[None]):
         """The merged set in the order the group lists it."""
 
         return sorted(
-            (Path(entry) for entry in self.state.merged),
+            (parse_ref(entry) for entry in self.state.merged),
             key=lambda path: (path.name.lower(), str(path).lower()),
         )
 
@@ -1294,7 +1301,7 @@ class LogViewerApp(App[None]):
             plain = node.label.plain
             if plain.startswith(ICON_MERGED):
                 plain = plain[len(ICON_MERGED) :]
-            member = _resolve(node.data) in merged
+            member = identity(node.data) in merged
             node.set_label(f"{ICON_MERGED}{plain}" if member else plain)
 
     @staticmethod
@@ -1318,7 +1325,7 @@ class LogViewerApp(App[None]):
     def _merged_name(self) -> str:
         """What to call the merged set — in the status line and in an export."""
 
-        names = [Path(entry).name for entry in self.state.merged]
+        names = [parse_ref(entry).name for entry in self.state.merged]
         if len(names) <= 2:
             return "+".join(names) or "merged"
         return f"{names[0]}+{len(names) - 1}-more"
@@ -1479,12 +1486,17 @@ class LogViewerApp(App[None]):
         than assuming the answer is `_selected_source`.
         """
 
-        sources: list[Optional[Path]] = [buffer.path for buffer in self._session.buffers]
+        sources: list[Optional[SourceRef]] = [
+            buffer.path for buffer in self._session.buffers
+        ]
         if self._session.is_merged or any(
             entry.fields.get(ORIGIN_FIELD) for entry in self._entries
         ):
+            # An ORIGIN_FIELD value is format_ref output that has been living on
+            # an entry, so it comes back the same way anything else persisted
+            # does — and for two hosts it is what keeps their marks apart.
             sources += [
-                Path(value)
+                parse_ref(value)
                 for value in {
                     entry.fields.get(ORIGIN_FIELD)
                     for entry in self._entries
@@ -2559,7 +2571,10 @@ class LogViewerApp(App[None]):
             invert_match=settings.invert_match,
             include_globs=settings.include_globs,
             exclude_globs=settings.exclude_globs,
-            source=str(self._selected_source) if self._selected_source else "",
+            # format_ref, not ref_key: a view records the source as it was
+            # selected, and resolving it here would silently rewrite a view
+            # saved on a symlink to name its target instead.
+            source=format_ref(self._selected_source) if self._selected_source else "",
             # Item 9 left this out because there was no merged set to capture.
             # Recorded only when a merge is actually open, so a view saved on
             # one log does not quietly carry someone else's set around.
@@ -2657,7 +2672,7 @@ class LogViewerApp(App[None]):
             self.action_open_merged()
             opened = True
         elif view.source:
-            source = Path(view.source)
+            source = parse_ref(view.source)
             if source.is_file():
                 # _select_source renders once; nothing below may render again.
                 opened = self._select_source(source, announce=False)
@@ -2801,7 +2816,7 @@ class LogViewerApp(App[None]):
         if self._is_shutting_down or not self.is_mounted:
             return
         target = self._star_target()
-        starred = None if target is None else str(_resolve(target)) in self.state.starred
+        starred = None if target is None else ref_key(target) in self.state.starred
         self.query_bar.set_star_state(starred)
 
     async def action_toggle_star(self) -> None:
@@ -2812,7 +2827,7 @@ class LogViewerApp(App[None]):
             self._notify("Open a log, or move the tree cursor to one, to star it.", "warning")
             return
 
-        key = str(_resolve(data))
+        key = ref_key(data)
         starred = set(self.state.starred)
         if key in starred:
             starred.discard(key)
@@ -2843,12 +2858,12 @@ class LogViewerApp(App[None]):
         if report is None or not self.state.starred:
             return
 
-        discovered = {_resolve(item.path) for item in report.files}
-        starred = [Path(entry) for entry in self.state.starred]
-        present = [path for path in starred if _resolve(path) in discovered]
+        discovered = {identity(item.path) for item in report.files}
+        starred = [parse_ref(entry) for entry in self.state.starred]
+        present = [path for path in starred if identity(path) in discovered]
 
         for path in starred:
-            if _resolve(path) not in discovered:
+            if identity(path) not in discovered:
                 self._notify(f"Starred log is not available: {path}", "warning")
 
         if len(present) == 1:
@@ -3161,9 +3176,10 @@ class LogViewerApp(App[None]):
             entry_count=len(entries),
             # A merged export is named for the set, not for whichever member
             # happens to be first — "auth.log-20260812" would be a lie about
-            # what is in the file.
+            # what is in the file. The set name is a label rather than a
+            # location, and goes through as one.
             default_name=default_stem(
-                Path(self._merged_name()) if self._session.is_merged else source
+                self._merged_name() if self._session.is_merged else source
             ),
             marked_count=len(marked),
             cluster_count=self._clusters.clustered if self._clusters is not None else 0,
@@ -3660,13 +3676,6 @@ def _compact_path(path: Path) -> str:
     return f"{parent}/{path.name}" if parent else path.name
 
 
-def _resolve(path: Path) -> Path:
-    try:
-        return path.resolve()
-    except OSError:
-        return path
-
-
 def _walk_nodes(node: TreeNode[object]) -> Iterator[TreeNode[object]]:
     """Every node under *node*, itself included."""
 
@@ -3676,7 +3685,7 @@ def _walk_nodes(node: TreeNode[object]) -> Iterator[TreeNode[object]]:
 
 
 def _find_node(node: TreeNode[Path], target: Path) -> Optional[TreeNode[Path]]:
-    if isinstance(node.data, Path) and _resolve(node.data) == target:
+    if isinstance(node.data, Path) and identity(node.data) == target:
         return node
     for child in node.children:
         found = _find_node(child, target)

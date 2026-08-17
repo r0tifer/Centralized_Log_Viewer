@@ -39,6 +39,7 @@ from typing import Any, Iterable, Iterator, Optional
 from ...services.config import load_config
 from ...services.parsing import normalize_level
 from ...services.reader import TailRead
+from ...services.refs import split_scheme
 from .. import LogSourceProvider, ProviderSource
 
 #: The identifier scheme. Not a real path, and deliberately not one: nothing on
@@ -255,8 +256,11 @@ class JournalReader:
             f"--lines={self._max_lines}",
             "--follow",
         ]
-        selector = str(self.path)[len(SCHEME) :] if str(self.path).startswith(SCHEME) else ""
-        kind, _, value = selector.partition("/")
+        # Through refs rather than a local slice, so the knowledge that
+        # `journal:` is an identifier and not a path lives in one place. It is
+        # also what stops `normalize_ref` absolutising one of these.
+        scheme, selector = split_scheme(self.path)
+        kind, _, value = (selector if scheme == "journal" else "").partition("/")
         if kind == "unit" and value:
             argv.append(f"--unit={value}")
         elif kind == "boot" and value:

@@ -1,3 +1,15 @@
+from .refs import (
+    KNOWN_SCHEMES,
+    SourceRef,
+    format_ref,
+    identity,
+    is_local,
+    normalize_ref,
+    parse_ref,
+    ref_key,
+    scheme_of,
+    split_scheme,
+)
 from .sources import (
     ACCESS_HINT,
     SourceAddition,
@@ -9,9 +21,19 @@ from .sources import (
 
 __all__ = [
     "ACCESS_HINT",
+    "KNOWN_SCHEMES",
     "SourceAddition",
     "SourceManager",
     "SourceMessage",
+    "SourceRef",
+    "format_ref",
+    "identity",
+    "is_local",
+    "normalize_ref",
+    "parse_ref",
     "persist_log_sources",
     "persist_setting",
+    "ref_key",
+    "scheme_of",
+    "split_scheme",
 ]

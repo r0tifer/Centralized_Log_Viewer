@@ -31,6 +31,7 @@ from typing import Callable, Iterable, Iterator, Optional, Sequence
 from .filtering import sortable_moment
 from .parsing import LogEntry, LogParser
 from .reader import AnyReader, TailRead, open_reader
+from .refs import format_ref, parse_ref
 
 #: Builds the reader for a path. Injectable so a provider-backed source (a
 #: journal unit, say) can supply its own without this module learning about it.
@@ -69,8 +70,12 @@ def tag_origins(
 
     tagged: list[LogEntry] = []
     for entry, origin in zip(entries, origins):
+        # format_ref, so the value here is the same string the source persists
+        # under. For two hosts that is what keeps `source:/var/log/syslog` from
+        # matching both of them at once — the ref string is host-qualified, and
+        # that is a correctness requirement rather than presentation.
         tagged.append(
-            replace(entry, fields={**entry.fields, ORIGIN_FIELD: str(origin)})
+            replace(entry, fields={**entry.fields, ORIGIN_FIELD: format_ref(origin)})
         )
     return tagged
 
@@ -531,7 +536,7 @@ class SourceSession:
 
         tagged = entry.fields.get(ORIGIN_FIELD)
         if tagged:
-            return Path(tagged)
+            return parse_ref(tagged)
         if len(self._buffers) == 1:
             return self._buffers[0].path
         return None

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 from .discovery import DEFAULT_EXCLUDE_GLOBS, DEFAULT_MAX_FILES, DiscoverySettings
+from .refs import SourceRef, format_ref, normalize_ref
 
 CONFIG_SECTION = "log_viewer"
 
@@ -282,31 +283,35 @@ def _read_globs(section, option: str, default: tuple[str, ...]) -> tuple[str, ..
     return parts
 
 
-def parse_log_dirs(raw: str) -> list[Path]:
-    """Turn the comma-separated ``log_dirs`` value into absolute paths.
+def parse_log_dirs(raw: str) -> list[SourceRef]:
+    """Turn the comma-separated ``log_dirs`` value into absolute source refs.
 
     Relative entries are resolved against the working directory rather than
-    discarded, so ``log_dirs = ./logs`` behaves the way it reads.
+    discarded, so ``log_dirs = ./logs`` behaves the way it reads. This is the
+    **user-input** boundary — ``normalize_ref`` expands and absolutises what a
+    person typed, and leaves an identifier such as ``journal:all`` alone rather
+    than inventing ``$CWD/journal:all`` for it.
+
+    Splitting on ``,`` is why a ref string may not contain one. A local filename
+    with a comma in it is already mangled here, and has been since this function
+    was written; that is not made worse, and not fixed, by refs.
     """
 
-    entries: list[Path] = []
+    entries: list[SourceRef] = []
     seen: set[str] = set()
     for piece in raw.split(","):
+        # Stripping stays here rather than moving into normalize_ref: a
+        # trailing space is a legal filename component, so it may be tidied
+        # away from a config line and never from a ref.
         text = piece.strip().strip('"').strip("'")
         if not text:
             continue
-        path = Path(text).expanduser()
-        if not path.is_absolute():
-            path = Path.cwd() / path
-        try:
-            path = path.resolve(strict=False)
-        except OSError:
-            pass
-        key = str(path)
+        ref = normalize_ref(text)
+        key = format_ref(ref)
         if key in seen:
             continue
         seen.add(key)
-        entries.append(path)
+        entries.append(ref)
     return entries
 
 

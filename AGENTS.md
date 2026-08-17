@@ -112,7 +112,7 @@ distros.
 | Layer | Location | Owns | Must not |
 | --- | --- | --- | --- |
 | **App shell** | `clv/app.py` | Layout, routing, lifecycle, breakpoints | Parse, filter, read files, or define widget visuals |
-| **Services** | `clv/services/` | Parsing, filtering, discovery, reading, buffering, config, source management | Touch the UI or import Textual |
+| **Services** | `clv/services/` | Source identity (`refs.py`), parsing, filtering, discovery, reading, buffering, config, source management | Touch the UI or import Textual |
 | **Widgets** | `clv/widgets/` | Self-contained UI + own `DEFAULT_CSS` | Depend on other widgets' internals or import `clv.app` |
 | **Plugins** | `clv/plugins/` | Extension interfaces + loader | Break interface contracts |
 | **State** | `clv/storage.py` | JSON session persistence (atomic), including `SavedView` records | Depend on the UI |
@@ -145,6 +145,16 @@ distros.
   back into one "excluded" count is what made the number unactionable. A
   *named* source that is skipped is also listed by path — a file the operator
   typed out must never disappear into a tally.
+- `refs.py` — what a source *is*. `SourceRef` is the surface CLV requires of
+  one, counted from every source-facing call rather than guessed; `Path` is one
+  implementation and no longer the assumed one. Two boundaries live here and
+  are kept apart deliberately: `parse_ref` / `format_ref` are exact inverses
+  that never touch the filesystem, expand `~` or consult the working directory,
+  and are what a *persisted* source goes through; `normalize_ref` expands and
+  absolutises what a *person typed*. Collapsing them is what turns
+  `journal:all` into `$CWD/journal:all` on the next launch. Also owns
+  `identity` / `ref_key` — one canonical form, replacing the two copies that
+  used to live in `app.py` and `sources.py`.
 - `reader.py` — BOM-based encoding detection, bounded backwards reads,
   incremental tailing, rotation and truncation recovery. `open_reader()` picks
   between `SourceReader` (streams) and `DocumentReader` (container documents);
@@ -351,7 +361,7 @@ installed" — the trade Item 12 asked for.
 - Layout regressions are caught by asserting widget `region` bounds at a given
   terminal size rather than by eyeballing screenshots.
 
-Run: `python -m pytest` (791 tests).
+Run: `python -m pytest` (853 tests).
 
 ---
 

@@ -11,7 +11,8 @@ It supplements the **root AGENTS.md** by explaining how each internal component 
 | Module | Responsibility | Key Notes |
 |--------|----------------|-----------|
 | **app.py** | Application shell and orchestrator | - Owns main layout and lifecycle. <br> - Handles global keybindings, routing, and message coordination. <br> - Should not define widget visuals or logic directly. |
-| **storage.py** | State persistence and config IO | - Reads/writes JSON state files. <br> - Provides safe defaults when config is invalid. <br> - Must remain headless (no UI dependencies). |
+| **storage.py** | State persistence and config IO | - Reads/writes JSON state files. <br> - Provides safe defaults when config is invalid. <br> - Must remain headless (no UI dependencies). <br> - `from_dict` dispatches on the **text** of a field's annotation; changing one silently drops the field on load. |
+| **services/refs.py** | Source identity | - Defines `SourceRef`, the surface CLV requires of a source. <br> - `parse_ref` / `format_ref` are the persistence boundary; `normalize_ref` is the user-input one. See the identity rule below. <br> - Owns `identity` / `ref_key`, the one canonical form. |
 | **widgets/query_bar.py** | Query, time, severity, and action controls | - Emits `ActionTriggered`, `TimeWindowChanged`, and `SeverityChanged` messages. <br> - No logic beyond UI validation. |
 | **widgets/segmented.py** | Generic segmented control | - Self-contained visual component. <br> - Should be reusable across other widgets. |
 | **widgets/advanced_drawer.py** | Advanced filters and secondary options | - Optional drawer for extended filtering and plugin-provided UI. <br> - Should expose show/hide events to `app.py`. |
@@ -46,6 +47,47 @@ When adding new message types:
 1. Define them inside the emitting widget.
 2. Document their purpose and payload.
 3. Handle them in `app.py` using `on_message(...)`.
+
+---
+
+## Source identity
+
+**A source is a `SourceRef`. `Path` is one implementation and no longer the
+assumed one.** The surface is declared in `services/refs.py`, derived by
+counting every source-facing call rather than by guessing, and a source may not
+be assumed to have a member the protocol does not list.
+
+Two boundaries, and keeping them apart is the whole rule:
+
+| Boundary | Functions | Rule |
+|---|---|---|
+| **Persistence** — a string CLV itself wrote | `parse_ref` / `format_ref` | Exact inverses. Never expand `~`, never prepend the working directory, never resolve. The stored form is already canonical. |
+| **User input** — a string a person typed | `normalize_ref` | Expands and absolutises, exactly as the old `normalize_path` did, and leaves a registered scheme alone. |
+
+Comparison is a third thing again: `identity` (a ref) and `ref_key` (its string
+form) are what star and merge membership are decided by. `format_ref` does
+**not** resolve — a view saved on a symlink records the symlink.
+
+`str(ref)` is load-bearing in three places at once: it is what lands in
+`session.json`, the value of `ORIGIN_FIELD` on every merged entry (so it is
+what the operator types after `source:`), and half of a `marks.mark_key`. It
+may contain neither `,` nor NUL. Two hosts with the same path must produce two
+strings, or one saved query matches both machines.
+
+Two guard tests in `tests/test_refs.py` hold this: one fails if a `Path(...)`
+reappears in a function that reads persisted state, the other if a boundary
+function stops naming its helper. The seam is one call wide and rots back in
+one line, which is why it is tested rather than documented alone.
+
+**What Phase 6 of `SSH_TODO.md` still owes.** Five sites narrow a source with
+`isinstance(data, Path)` — `app.py`'s `_sync_merged_tree`, `_star_target`,
+`on_tree_node_selected` and `_find_node`, plus `rotation.RotatedSet.__contains__`
+— and they are correct today only because `Path` is the sole implementation.
+They must change together with the prose claim in `plugins/__init__.py`'s
+`ProviderSource` docstring, which cites them by name. Changing them in
+isolation makes that docstring false; widening them structurally (an
+`isinstance` against the protocol) is what would let a `journal:` source into
+someone's `session.json`, which is the thing that docstring exists to prevent.
 
 ---
 
