@@ -306,37 +306,49 @@ def test_a_relative_path_shadowed_by_a_scheme_is_reachable_absolutely(
     assert refs.is_local(absolute)
 
 
-def test_a_scheme_shadowed_relative_dir_is_left_unpinned(
+def test_a_scheme_shadowed_relative_dir_is_refused_rather_than_left_unpinned(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The known defect, pinned as a defect so the fix has something to flip.
+    """The Phase 1 defect, inverted by Phase 3 — the same scenario, the fix.
 
-    A relative directory whose name begins ``journal:`` is *not* unreachable —
-    it opens and reads, because ``Path`` still resolves it against the working
-    directory. What it loses is absolutisation: it is the one ``log_dirs``
-    entry that comes back unpinned, and so means a different place depending on
-    where CLV was started, while every sibling entry is fixed at parse time.
+    This test previously pinned the defect: a relative directory named
+    ``journal:archive`` was *not* unreachable — ``Path`` still resolved it
+    against the working directory — but it was the one ``log_dirs`` entry that
+    came back **unpinned**, and so meant a different place depending on where
+    CLV was launched from, while every sibling was fixed at parse time. Worse
+    than a refusal, because it worked right up until someone started the viewer
+    somewhere else.
 
-    That is worse than a refusal, because it works right up until someone
-    launches from elsewhere. ``SSH_TODO.md`` Phase 3 owes the actionable
-    message; this test records the behaviour that message will replace, and is
-    expected to be inverted then rather than deleted.
+    ``refs`` still behaves the same way, and deliberately: refusing is a
+    *reporting* decision, and ``normalize_ref`` has no channel to report on.
+    ``config.parse_log_dirs`` has one as of Phase 3, so the refusal lives there
+    — which is why what changed below is the config call, not ``normalize_ref``.
+
+    The escape is unchanged and is the message's advice: name it absolutely.
     """
 
-    from clv.services.config import parse_log_dirs
+    from clv.services.config import ConfigIssue, parse_log_dirs
 
     (tmp_path / "journal:archive").mkdir()
     (tmp_path / "ordinary").mkdir()
     monkeypatch.chdir(tmp_path)
 
-    here = [format_ref(ref) for ref in parse_log_dirs("journal:archive, ordinary")]
-    assert here == ["journal:archive", str(tmp_path / "ordinary")]
+    # Unchanged: the ref layer still hands a scheme ref back untouched, because
+    # damaging one is the thing it exists to prevent.
+    assert format_ref(normalize_ref("journal:archive")) == "journal:archive"
 
-    # The sibling entry is pinned by cwd; the shadowed one floats with it.
+    issues: list[ConfigIssue] = []
+    here = [format_ref(ref) for ref in parse_log_dirs("journal:archive, ordinary", issues)]
+
+    assert here == [str(tmp_path / "ordinary")], "the shadowed entry is refused"
+    assert len(issues) == 1
+    assert "absolute path" in issues[0].message
+
+    # The sibling is still pinned at parse time, which is the property the
+    # shadowed entry lacked and the reason it had to go.
     monkeypatch.chdir(tmp_path.parent)
-    elsewhere = [format_ref(ref) for ref in parse_log_dirs("journal:archive, ordinary")]
-    assert elsewhere[0] == here[0], "the shadowed entry is unpinned, so it did not move"
-    assert elsewhere[1] != here[1], "an ordinary relative entry is pinned at parse time"
+    elsewhere = [format_ref(ref) for ref in parse_log_dirs("ordinary")]
+    assert elsewhere != here
 
 
 def test_the_journald_scheme_is_registered() -> None:

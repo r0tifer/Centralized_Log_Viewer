@@ -16,7 +16,7 @@ filesystem assumption that had already spread further.
 | 0 — Doctrine | Reverse the non-goal in the internal contracts | ✅ **Complete** (`aba1b94`) |
 | 1 — Source identity | `SourceRef`, and the end of bare `Path(entry)` | ✅ **Complete** (`9c546c4`) |
 | 2 — Filesystem seam | Injectable backend, off the event loop | ✅ **Complete** (`c3b21a0`) |
-| 3 — Configuration | `[ssh:<name>]` sections, `enable_ssh` | ⬜ Not started |
+| 3 — Configuration | `[ssh:<name>]` sections, `enable_ssh` | ✅ **Complete** |
 | 4 — Transport & plugin | First readable remote log | ⬜ Not started |
 | 5 — Reachability | A host that goes away says so | ⬜ Not started |
 | 6 — Parity | Star, merge, rotation, hierarchy, time, session | ⬜ Not started |
@@ -617,6 +617,73 @@ no password option and no `sudo` option, and why.
 build with the SSH plugin absent entirely. Both Python versions.
 
 **Commit.** `feat(config): remote host sections and the enable_ssh switch`
+
+### As built
+
+Recorded where the phase departed from the plan above, so Phase 4 builds against
+what exists rather than what was proposed.
+
+- **`config.py` gained a validation channel, and that is the phase's real
+  substance.** It had none: every `OSError` and `configparser.Error` was
+  swallowed and defaults returned, silently. `ConfigIssue(origin, message,
+  severity)` lands in `LogConfig.issues`, and `app.py`'s
+  `_show_discovery_summary` prints it beside the plugin errors in the same
+  colour. It is a **separate type from `PluginError`**, deliberately: services
+  may not import plugins, and sharing the class would invert that layering for
+  two attributes. The shape and `__str__` match so the operator sees one format.
+- **An absent `host` falls back to the section name**, where the plan made it a
+  validation error. `[ssh:web01]` means the machine `web01`, which is exactly
+  how a `~/.ssh/config` `Host` alias already reads — and inheriting that file
+  wholesale is this plan's own transport decision. `host` is the override for
+  when CLV's name for a machine is not the address to reach it at. The
+  "section with no `host`" validation case is therefore replaced by "section
+  with an empty name (`[ssh:]`)".
+- **Two severities, not one.** Missing name, impossible port and no usable
+  `log_dirs` *skip* the host — it cannot function. An unreadable `identity_file`
+  *warns and keeps* it, because ssh-agent commonly already holds the key and
+  refusing there would lose a working machine to a stale line. Requirement 7
+  argues against strictness here more strongly than it argues for it.
+- **A duplicate section no longer costs the whole file.** Strict `configparser`
+  raised, `load_config` swallowed it, and one repeated `[ssh:web01]` silently
+  discarded every setting the operator had written, `log_dirs` included. The
+  strict read still comes first, so a well-formed file is unaffected; a
+  `DuplicateSectionError` triggers a non-strict re-read (last wins) and names
+  the duplicate. Two sections whose names differ only in whitespace resolve to
+  one host and report the collision.
+- **`port` does not go through `_read_int`**, which clamps. Clamping 70000 to
+  65535 would connect somewhere the operator never named, so a port outside
+  1–65535 is reported and the host skipped. `max_files` and `max_buffer_lines`
+  *are* clamped, because those are budgets rather than destinations.
+- **Per-host budgets are parsed and resolved, not yet enforced.** `RemoteHost`
+  carries them and `discovery_settings()` / `buffer_lines()` resolve them
+  against the global values in one tested place. Per-host truncation reporting
+  in `DiscoveryReport` belongs to **Phase 4**, where remote discovery exists to
+  be budgeted; this phase is parse-and-expose, so there is nothing yet to cut.
+- **`RemoteHost.log_dirs` is `tuple[str, ...]`, not refs.** These are paths on
+  another machine, and `normalize_ref` would resolve them against this one's
+  working directory — the exact corruption Phase 1 exists to prevent. Validated
+  only for absoluteness: `/var/log` and `~/logs` are accepted, a bare relative
+  entry is refused as ambiguous. Phase 4 turns them into remote refs once a host
+  and a backend exist to qualify them with.
+- **The refused-key list is wider than two.** `password`, `passphrase` and
+  `password_file` all get the ssh-agent answer; `sudo`, `use_sudo`, `doas`,
+  `pkexec` and `become` all get the group/ACL answer. The key is dropped, the
+  *host is kept*, and the test walks `dataclasses.fields(RemoteHost)`
+  reflectively rather than naming fields — so a field added later cannot quietly
+  become the place a refused value lands.
+- **Phase 1's debt is paid in `config.parse_log_dirs`, not in `refs`.** Every
+  entry that reads as a registered scheme is refused with the absolute-path
+  instruction plus a per-scheme sentence saying where that kind of source really
+  comes from. Refusing *all* of them rather than only those shadowing a real
+  directory is what keeps it a rule instead of a heuristic — and it cannot fight
+  CLV's own writes, because `sources.check_access` rejects a scheme ref as
+  missing, so `persist_log_sources` can never put one there.
+  `test_a_scheme_shadowed_relative_dir_is_left_unpinned` was inverted and
+  renamed rather than deleted.
+- **976 + 30 = 1006 passed, 1 skipped** on 3.11 and 3.14. No existing assertion
+  edited except that one named inversion — `git diff -- tests/` removes exactly
+  two other lines, a module docstring and an import, both replaced by longer
+  versions of themselves.
 
 ---
 

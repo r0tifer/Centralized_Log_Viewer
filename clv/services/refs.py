@@ -205,13 +205,17 @@ def scheme_of(ref: "SourceRef | str") -> str | None:
 
     Such a path is not unreachable: ``Path`` operations on it still resolve
     against the working directory, so it opens and reads. What it loses is
-    **absolutisation**. It is the one ``log_dirs`` entry
-    :func:`normalize_ref` hands back unpinned, so unlike every other relative
-    entry it is re-interpreted against whatever directory CLV is launched from
-    — it works, until someone starts the viewer somewhere else. That is worse
-    than a clean refusal, and the refusal is owed: see ``SSH_TODO.md`` Phase 3,
-    which builds the validation channel this needs. It is not fixed here
-    because reporting it is a behaviour change and this phase has none.
+    **absolutisation**. It is the one entry :func:`normalize_ref` hands back
+    unpinned, so unlike every other relative one it is re-interpreted against
+    whatever directory CLV is launched from — it works, until someone starts the
+    viewer somewhere else.
+
+    **That refusal now exists, and it is not here.** ``config.parse_log_dirs``
+    refuses such an entry and says to name it absolutely, because refusing is a
+    *reporting* decision and this module has nowhere to report to: it is called
+    from the persistence path as well as the input one, and a function that
+    raised or dropped would break the round trip. The validation channel is
+    ``config.ConfigIssue``, and the config layer is where it is spent.
     """
 
     match = _SCHEME_RE.match(ref if isinstance(ref, str) else str(ref))

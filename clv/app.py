@@ -2076,6 +2076,16 @@ class LogViewerApp(App[None]):
                         style="#facc15",
                     )
                 )
+        # Same channel and the same colour as a plugin problem, because it is
+        # the same kind of fact: something the operator wrote that CLV could not
+        # honour. A host section skipped in silence is a machine that vanishes
+        # from the tree with no explanation, which is the one outcome a remote
+        # feature may not produce.
+        if self._config.issues:
+            self.log_panel.write(Text(""))
+            for issue in self._config.issues:
+                label = "Config warning" if issue.severity == "warning" else "Config problem"
+                self.log_panel.write(Text(f"{label} — {issue}", style="#facc15"))
 
     # --- status and chips ---------------------------------------------------
 

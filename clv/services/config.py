@@ -3,6 +3,21 @@
 Extracted from ``app.py`` so configuration can be tested and reused without a
 running UI. Every value is validated and clamped: a malformed settings file
 degrades to defaults rather than preventing startup.
+
+**Two sections, one rule.** ``[log_viewer]`` holds the session's settings;
+``[ssh:<name>]`` holds one remote host each. Neither may prevent startup — a
+section CLV cannot make sense of is skipped and *reported*, never raised.
+
+Reporting is what this module gained for remote hosts, and it is not cosmetic.
+A per-host schema without it loses a machine to a typo in silence, which is the
+one outcome ``SSH_TODO.md`` Requirement 7 forbids outright. Problems land in
+:attr:`LogConfig.issues` and ``app.py`` prints them beside the plugin errors.
+:class:`ConfigIssue` deliberately mirrors ``plugins.PluginError``'s shape rather
+than being it: ``clv/services/`` may not import ``clv/plugins/``.
+
+**Nothing here touches the network.** This module parses and exposes host
+records; connecting to one is the SSH source's business, and does not happen
+until ``enable_ssh`` is true.
 """
 
 from __future__ import annotations
@@ -13,12 +28,24 @@ import shutil
 import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from .discovery import DEFAULT_EXCLUDE_GLOBS, DEFAULT_MAX_FILES, DiscoverySettings
-from .refs import SourceRef, format_ref, normalize_ref
+from .refs import SourceRef, format_ref, normalize_ref, scheme_of
 
 CONFIG_SECTION = "log_viewer"
+
+#: One remote host per section: ``[ssh:web01]``. The suffix is the host's name
+#: within CLV — what the tree shows, what ``node:`` matches, and the fallback
+#: for ``host`` when the operator does not give one.
+SSH_SECTION_PREFIX = "ssh:"
+
+#: The port range a TCP port can actually occupy. Out of it is a typo, and a
+#: typo is reported rather than clamped: clamping 70000 to 65535 would connect
+#: somewhere the operator did not name.
+_PORT_RANGE = (1, 65535)
+
+_DEFAULT_SSH_PORT = 22
 
 # Bounds keep a typo in settings.conf from producing a pathological UI.
 _LIMITS: dict[str, tuple[int, int, int]] = {
@@ -116,7 +143,158 @@ cluster_lookback = 200
 # without being asked. The Advanced drawer's "Journal (systemd)" switch turns
 # this on and writes it back here.
 enable_journald = false
+
+# Read log folders on other machines over SSH. Off by default, and for a
+# stronger version of the reason above: a remote source spawns ssh, and a
+# network subprocess needs asking for more than a local one does. With this
+# false nothing connects and nothing is spawned, however many hosts are
+# configured below.
+enable_ssh = false
+
+# One section per remote machine. The name after "ssh:" is CLV's name for it -
+# what the tree shows and what `node:` matches in a query.
+#
+# Authentication is ssh-agent and key files only, so CLV inherits your existing
+# ~/.ssh/config wholesale: aliases, ProxyJump, per-host keys, known_hosts.
+# There is no password option, and there never will be - CLV does not store or
+# transmit a credential. There is no sudo option either: CLV reads as the
+# configured user and never escalates privilege. If a log is unreadable, add
+# the user to its group (adm, systemd-journal) or set an ACL on the path.
+#
+# [ssh:web01]
+# host = web01.internal      # optional; defaults to the name above
+# user = ops
+# port = 22
+# identity_file = ~/.ssh/id_ed25519
+# log_dirs = /var/log, /srv/app/logs
+# include_globs = *.log, syslog*
+# max_files = 2000
+# correct_clock_skew = false
+# enabled = true
 """
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigIssue:
+    """Something in the settings file CLV could not honour, and what to do.
+
+    The shape is ``plugins.PluginError``'s on purpose — same ``(origin,
+    message)`` pair, same ``__str__`` — so ``app.py`` can print both into the
+    log panel without the operator learning two formats. It is a *separate
+    type* because ``clv/services/`` may not import ``clv/plugins/``; sharing the
+    class would invert the layering for the sake of two attributes.
+
+    ``severity`` is the difference between *this host is gone* and *this host
+    will probably still work*. An unreadable ``identity_file`` is a warning
+    because ssh-agent may already hold the key; a port of 70000 is an error
+    because there is nothing to connect to.
+    """
+
+    #: ``"[ssh:web01]"`` or ``"log_dirs"`` — what the operator should look at.
+    origin: str
+    message: str
+    severity: Literal["warning", "error"] = "error"
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return f"{self.origin}: {self.message}"
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteHost:
+    """One ``[ssh:<name>]`` section, parsed and validated.
+
+    Inert on its own. Holding one of these has spawned nothing and connected
+    nowhere: ``enable_ssh`` plus :attr:`enabled` is what a transport checks
+    before it may.
+
+    **There is no password field and no sudo field**, and their absence is
+    load-bearing rather than an oversight. ``SSH_TODO.md`` Requirements 9 and 11
+    are enforced here, at the schema, where they cannot be forgotten later —
+    :data:`_REFUSED_HOST_KEYS` makes writing one a reported error instead of a
+    silently ignored line.
+
+    :attr:`log_dirs` stays a tuple of **strings**, not refs. These are paths on
+    another machine, and ``normalize_ref`` would resolve them against *this*
+    one's working directory — the exact corruption the ref boundary exists to
+    prevent. They become refs once there is a host and a backend to qualify
+    them with.
+    """
+
+    #: The section suffix: ``[ssh:web01]`` is ``"web01"``. CLV's name for the
+    #: machine, and the fallback for :attr:`host`.
+    name: str
+    #: The address or ``~/.ssh/config`` alias to connect to.
+    host: str
+    user: Optional[str] = None
+    port: int = _DEFAULT_SSH_PORT
+    identity_file: Optional[Path] = None
+    log_dirs: tuple[str, ...] = ()
+    enabled: bool = True
+    #: Apply the measured clock offset to this host's timestamps. Off by
+    #: default: skew is always *reported*, and only corrected on request.
+    correct_clock_skew: bool = False
+
+    # --- per-host overrides --------------------------------------------------
+    # ``None`` means "inherit the global value". An empty tuple does not: for a
+    # glob list it means "explicitly no filtering", which is a real choice an
+    # operator can make and must not collapse into absence.
+    include_globs: Optional[tuple[str, ...]] = None
+    exclude_globs: Optional[tuple[str, ...]] = None
+    max_files: Optional[int] = None
+    max_buffer_lines: Optional[int] = None
+
+    def discovery_settings(self, base: DiscoverySettings) -> DiscoverySettings:
+        """*base*, with this host's overrides applied.
+
+        Resolution lives here rather than at each call site so "per-host
+        settings fall back to the global ones" is one tested function instead of
+        a rule every future caller has to remember.
+        """
+
+        changes: dict[str, object] = {}
+        if self.include_globs is not None:
+            changes["include_globs"] = self.include_globs
+        if self.exclude_globs is not None:
+            changes["exclude_globs"] = self.exclude_globs
+        if self.max_files is not None:
+            changes["max_files"] = self.max_files
+        return replace(base, **changes) if changes else base
+
+    def buffer_lines(self, base: int) -> int:
+        """Lines to hold per source from this host.
+
+        Its own knob because five merged remote sources pull five times the
+        history across the link on open, and a slow connection needs a pressure
+        valve the global default cannot provide.
+        """
+
+        return base if self.max_buffer_lines is None else self.max_buffer_lines
+
+
+#: Options CLV refuses to have in its schema at all, and what to do instead.
+#:
+#: Ignoring these silently would be the worse failure: an operator who wrote
+#: ``password = hunter2`` and saw it work would reasonably believe CLV stores
+#: it. The value is never read, never stored on a :class:`RemoteHost`, and the
+#: line is reported as unsupported.
+_CREDENTIAL_ANSWER = (
+    "CLV never stores or transmits a credential. Load your key into ssh-agent, "
+    "or point identity_file at a key with no passphrase."
+)
+_PRIVILEGE_ANSWER = (
+    "CLV never escalates privilege, locally or remotely. Add the SSH user to "
+    "the log group (adm, systemd-journal) or set an ACL on the path."
+)
+_REFUSED_HOST_KEYS: dict[str, str] = {
+    "password": _CREDENTIAL_ANSWER,
+    "passphrase": _CREDENTIAL_ANSWER,
+    "password_file": _CREDENTIAL_ANSWER,
+    "sudo": _PRIVILEGE_ANSWER,
+    "use_sudo": _PRIVILEGE_ANSWER,
+    "doas": _PRIVILEGE_ANSWER,
+    "pkexec": _PRIVILEGE_ANSWER,
+    "become": _PRIVILEGE_ANSWER,
+}
 
 
 @dataclass
@@ -143,10 +321,30 @@ class LogConfig:
     #: running `journalctl`, and a plugin may not spawn a subprocess without
     #: consent — which is the argument for the journal being a plugin at all.
     enable_journald: bool = False
+    #: Read log folders on remote hosts over SSH. Off by default, and the same
+    #: argument as `enable_journald` only more so: reading a remote source means
+    #: spawning `ssh`, and a *network* subprocess raises the consent bar rather
+    #: than lowering it. With this false nothing connects and nothing spawns,
+    #: however many hosts are configured.
+    enable_ssh: bool = False
+    #: Every `[ssh:<name>]` section that parsed, in file order.
+    #:
+    #: Populated regardless of :attr:`enable_ssh`. Parsing is inert, and a
+    #: mistake in a host section should be reported the launch it is *made*,
+    #: not held back until the launch the switch is flipped.
+    hosts: tuple[RemoteHost, ...] = ()
+    #: Everything in the settings file CLV could not honour. Never a reason to
+    #: fail startup; always a reason to say something.
+    issues: tuple[ConfigIssue, ...] = ()
 
     def with_discovery(self, **changes) -> "LogConfig":
         """Return a copy with individual discovery settings replaced."""
         return replace(self, discovery=replace(self.discovery, **changes))
+
+    def host(self, name: str) -> Optional[RemoteHost]:
+        """The configured host called *name*, or ``None``."""
+
+        return next((entry for entry in self.hosts if entry.name == name), None)
 
 
 def get_xdg_config_home() -> Path:
@@ -273,17 +471,56 @@ def _read_bool(section, option: str, default: bool) -> bool:
     return default if value is None else bool(value)
 
 
-def _read_globs(section, option: str, default: tuple[str, ...]) -> tuple[str, ...]:
+def _read_globs(section, option: str, default):
     raw = section.get(option, fallback=None)
     if raw is None:
         return default
     parts = tuple(piece.strip() for piece in raw.split(",") if piece.strip())
     # An explicitly empty value means "no filtering", which is meaningful for
-    # include_globs and must not silently fall back to the default.
+    # include_globs and must not silently fall back to the default. For a host
+    # section that distinction is also inherit-vs-override: the default passed
+    # in is `None`, and only an absent option can return it.
     return parts
 
 
-def parse_log_dirs(raw: str) -> list[SourceRef]:
+def _split_list(raw: str) -> list[str]:
+    """The comma-separated shape ``log_dirs`` uses, stripped of quotes.
+
+    Stripping stays out of the ref layer: a trailing space is a legal filename
+    component, so it may be tidied away from a config *line* and never from a
+    ref.
+    """
+
+    return [
+        text
+        for text in (piece.strip().strip('"').strip("'") for piece in raw.split(","))
+        if text
+    ]
+
+
+#: What to tell an operator whose ``log_dirs`` entry read as an identifier:
+#: what it was taken for, and where that kind of source actually comes from.
+#:
+#: One entry per scheme because the two have different answers — the journal is
+#: offered by its own source, a remote root belongs to a host section — and a
+#: generic "that is a scheme" would leave the operator to guess which.
+_SCHEME_ANSWERS: dict[str, tuple[str, str]] = {
+    "journal": (
+        "a journald identifier",
+        "The journal is offered by the journald source when enable_journald is "
+        "true, not by log_dirs.",
+    ),
+    "ssh": (
+        "a remote source identifier",
+        "Remote roots belong to a host's own log_dirs, inside an [ssh:<name>] "
+        "section.",
+    ),
+}
+
+
+def parse_log_dirs(
+    raw: str, issues: Optional[list[ConfigIssue]] = None
+) -> list[SourceRef]:
     """Turn the comma-separated ``log_dirs`` value into absolute source refs.
 
     Relative entries are resolved against the working directory rather than
@@ -295,16 +532,44 @@ def parse_log_dirs(raw: str) -> list[SourceRef]:
     Splitting on ``,`` is why a ref string may not contain one. A local filename
     with a comma in it is already mangled here, and has been since this function
     was written; that is not made worse, and not fixed, by refs.
+
+    **An entry that reads as a registered scheme is refused**, and this is the
+    debt ``SSH_TODO.md`` Phase 1 recorded and left for Phase 3 to pay. A
+    *relative* directory literally named ``journal:archive`` is not unreachable
+    — ``Path`` still resolves it against the working directory — but it is the
+    one entry ``normalize_ref`` hands back **unpinned**, so unlike every sibling
+    it means a different place depending on where CLV was launched from. It
+    works, right up until someone starts the viewer somewhere else, which is
+    worse than a clean refusal.
+
+    Every scheme entry is refused rather than only those that shadow a real
+    directory, and that is what keeps this a rule instead of a heuristic:
+    nothing legitimately puts a scheme ref in the global ``log_dirs``. The
+    journal comes from its provider's ``discover()``; a remote root comes from a
+    host section. CLV cannot write one back here either — ``sources.check_access``
+    rejects a scheme ref as missing, so ``persist_log_sources`` never sees one.
+
+    An **absolute** path of the same name still parses: ``is_local`` short
+    circuits on ``is_absolute()`` before the scheme regex is ever consulted.
     """
 
     entries: list[SourceRef] = []
     seen: set[str] = set()
-    for piece in raw.split(","):
-        # Stripping stays here rather than moving into normalize_ref: a
-        # trailing space is a legal filename component, so it may be tidied
-        # away from a config line and never from a ref.
-        text = piece.strip().strip('"').strip("'")
-        if not text:
+    for text in _split_list(raw):
+        scheme = scheme_of(text)
+        if scheme is not None:
+            if issues is not None:
+                noun, answer = _SCHEME_ANSWERS.get(
+                    scheme, (f"a {scheme} identifier", "")
+                )
+                sentences = [
+                    f"{text!r} reads as {noun}, not a path.",
+                    answer,
+                    "If you meant a directory of that name, give its absolute path.",
+                ]
+                issues.append(
+                    ConfigIssue("log_dirs", " ".join(part for part in sentences if part))
+                )
             continue
         ref = normalize_ref(text)
         key = format_ref(ref)
@@ -315,20 +580,247 @@ def parse_log_dirs(raw: str) -> list[SourceRef]:
     return entries
 
 
+# --- remote hosts -----------------------------------------------------------
+
+
+def _read_port(section, issues: list[ConfigIssue], origin: str) -> Optional[int]:
+    """The host's port, or ``None`` meaning the section cannot be used.
+
+    Deliberately not ``_read_int``: that clamps, and clamping 70000 to 65535
+    would quietly connect somewhere the operator never named. A port outside the
+    range is a typo, and a typo is reported.
+    """
+
+    raw = (section.get("port", fallback="") or "").strip()
+    if not raw:
+        return _DEFAULT_SSH_PORT
+    low, high = _PORT_RANGE
+    try:
+        port = int(raw)
+    except ValueError:
+        issues.append(
+            ConfigIssue(origin, f"port {raw!r} is not a number; give one in {low}-{high}.")
+        )
+        return None
+    if not low <= port <= high:
+        issues.append(
+            ConfigIssue(origin, f"port {port} is outside {low}-{high}.")
+        )
+        return None
+    return port
+
+
+def _read_optional_int(
+    section, option: str, issues: list[ConfigIssue], origin: str
+) -> Optional[int]:
+    """A per-host budget override, clamped, or ``None`` to inherit the global."""
+
+    raw = (section.get(option, fallback="") or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        issues.append(
+            ConfigIssue(
+                origin,
+                f"{option} = {raw!r} is not a number; the global value is used.",
+                "warning",
+            )
+        )
+        return None
+    return _clamp(value, option)
+
+
+def _read_remote_dirs(
+    raw: str, issues: list[ConfigIssue], origin: str
+) -> tuple[str, ...]:
+    """The host's roots, as strings on *that* machine.
+
+    Validated for absoluteness and nothing else. A bare relative path would mean
+    the SSH user's home directory on some shells and the login directory on
+    others; ``~/logs`` says the same thing unambiguously, so it is accepted and
+    the ambiguous form is refused.
+    """
+
+    dirs: list[str] = []
+    for text in _split_list(raw):
+        if not text.startswith(("/", "~")):
+            issues.append(
+                ConfigIssue(
+                    origin,
+                    f"log_dirs entry {text!r} is relative; give an absolute path "
+                    "on the remote host, or a ~-relative one.",
+                )
+            )
+            continue
+        if text not in dirs:
+            dirs.append(text)
+    return tuple(dirs)
+
+
+def _read_identity_file(
+    section, issues: list[ConfigIssue], origin: str
+) -> Optional[Path]:
+    """The named key file, warning rather than refusing when it is not there.
+
+    A warning because the host may still work: ssh-agent commonly already holds
+    the key, and ``~/.ssh/config`` may name another. Refusing here would lose a
+    working machine to a stale line, which Requirement 7 forbids more strongly
+    than it asks for strictness.
+    """
+
+    raw = (section.get("identity_file", fallback="") or "").strip()
+    if not raw:
+        return None
+    candidate = Path(raw).expanduser()
+    if not candidate.is_file():
+        issues.append(
+            ConfigIssue(
+                origin,
+                f"identity_file '{candidate}' does not exist; the connection "
+                "will fall back to ssh-agent and ~/.ssh/config.",
+                "warning",
+            )
+        )
+    return candidate
+
+
+def _parse_host(
+    name: str, section, issues: list[ConfigIssue], origin: str
+) -> Optional[RemoteHost]:
+    """One ``[ssh:<name>]`` section, or ``None`` if it cannot be used.
+
+    Everything that makes the host unusable — no name, an impossible port, no
+    roots — skips it and says why. Everything recoverable warns and keeps it.
+    Nothing raises: one malformed section may not cost the operator the rest of
+    their configuration.
+    """
+
+    for option in section:
+        answer = _REFUSED_HOST_KEYS.get(option.lower())
+        if answer is not None:
+            issues.append(
+                ConfigIssue(origin, f"{option} is not a supported option. {answer}")
+            )
+
+    port = _read_port(section, issues, origin)
+    if port is None:
+        return None
+
+    log_dirs = _read_remote_dirs(section.get("log_dirs", fallback="") or "", issues, origin)
+    if not log_dirs:
+        issues.append(
+            ConfigIssue(
+                origin,
+                "no usable log_dirs; name at least one absolute folder or file "
+                "on the remote host.",
+            )
+        )
+        return None
+
+    user = (section.get("user", fallback="") or "").strip() or None
+
+    return RemoteHost(
+        name=name,
+        # An absent `host` means the section name, which is exactly how a
+        # ~/.ssh/config `Host` alias already reads. `host` is the override for
+        # when CLV's name for a machine is not the address to reach it at.
+        host=(section.get("host", fallback="") or "").strip() or name,
+        user=user,
+        port=port,
+        identity_file=_read_identity_file(section, issues, origin),
+        log_dirs=log_dirs,
+        enabled=_read_bool(section, "enabled", True),
+        correct_clock_skew=_read_bool(section, "correct_clock_skew", False),
+        include_globs=_read_globs(section, "include_globs", None),
+        exclude_globs=_read_globs(section, "exclude_globs", None),
+        max_files=_read_optional_int(section, "max_files", issues, origin),
+        max_buffer_lines=_read_optional_int(section, "max_buffer_lines", issues, origin),
+    )
+
+
+def _parse_hosts(parser, issues: list[ConfigIssue]) -> tuple[RemoteHost, ...]:
+    hosts: list[RemoteHost] = []
+    claimed: set[str] = set()
+    for raw_section in parser.sections():
+        if not raw_section.startswith(SSH_SECTION_PREFIX):
+            continue
+        origin = f"[{raw_section}]"
+        name = raw_section[len(SSH_SECTION_PREFIX) :].strip()
+        if not name:
+            issues.append(
+                ConfigIssue(origin, "has no host name; use [ssh:<name>].")
+            )
+            continue
+        if name in claimed:
+            issues.append(
+                ConfigIssue(origin, f"a host named {name!r} is already configured; skipped.")
+            )
+            continue
+        try:
+            host = _parse_host(name, parser[raw_section], issues, origin)
+        except Exception as exc:  # pragma: no cover - defensive
+            issues.append(ConfigIssue(origin, f"could not be read: {exc}"))
+            continue
+        if host is not None:
+            claimed.add(name)
+            hosts.append(host)
+    return tuple(hosts)
+
+
+def _read_parser(
+    resolved: Optional[Path], issues: list[ConfigIssue]
+) -> configparser.ConfigParser:
+    """Parse the settings file, surviving a duplicate rather than discarding it.
+
+    The strict read comes first, so a well-formed file behaves exactly as it
+    always has. A duplicate section or option used to raise, be swallowed here,
+    and cost the operator **every setting in the file** — one repeated
+    ``[ssh:web01]`` and the whole configuration silently became defaults. It is
+    re-read non-strict instead (last definition wins) and the duplicate is
+    reported by name.
+    """
+
+    parser = configparser.ConfigParser()
+    if resolved is None:
+        return parser
+    try:
+        parser.read(resolved)
+        return parser
+    except (configparser.DuplicateSectionError, configparser.DuplicateOptionError) as exc:
+        issues.append(
+            ConfigIssue(
+                str(resolved),
+                f"{exc.message.splitlines()[0] if exc.message else exc}; "
+                "the last definition wins.",
+            )
+        )
+    except configparser.Error as exc:
+        issues.append(ConfigIssue(str(resolved), f"could not be parsed: {exc}"))
+        return configparser.ConfigParser()
+    except OSError as exc:
+        issues.append(ConfigIssue(str(resolved), f"could not be read: {exc}"))
+        return configparser.ConfigParser()
+
+    lenient = configparser.ConfigParser(strict=False)
+    try:
+        lenient.read(resolved)
+    except (OSError, configparser.Error):
+        return configparser.ConfigParser()
+    return lenient
+
+
 def load_config(path: Optional[Path] = None) -> LogConfig:
     """Load configuration, falling back to defaults for anything unusable."""
 
-    parser = configparser.ConfigParser()
+    issues: list[ConfigIssue] = []
     resolved = path if path is not None else get_config_file()
-    if resolved:
-        try:
-            parser.read(resolved)
-        except (OSError, configparser.Error):
-            pass
+    parser = _read_parser(resolved, issues)
 
     section = parser[CONFIG_SECTION] if CONFIG_SECTION in parser else _EMPTY
 
-    log_dirs = parse_log_dirs(section.get("log_dirs", fallback="") or "")
+    log_dirs = parse_log_dirs(section.get("log_dirs", fallback="") or "", issues)
 
     discovery = DiscoverySettings(
         include_globs=_read_globs(section, "include_globs", ()),
@@ -355,6 +847,9 @@ def load_config(path: Optional[Path] = None) -> LogConfig:
         cluster_lookback=_read_int(section, "cluster_lookback"),
         watch_bell=_read_bool(section, "watch_bell", False),
         enable_journald=_read_bool(section, "enable_journald", False),
+        enable_ssh=_read_bool(section, "enable_ssh", False),
+        hosts=_parse_hosts(parser, issues),
+        issues=tuple(issues),
     )
 
     # default_show_lines must not exceed what the buffer can hold.

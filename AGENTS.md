@@ -204,7 +204,16 @@ distros.
   keystroke; `max_buffer_lines` applies per member. An entry with no timestamp
   is anchored after the last timestamped line from **its own source** and
   counted, never dropped — "never silently lose a line" applied to ordering.
-- `config.py` — settings resolution, validation, clamping.
+- `config.py` — settings resolution, validation, clamping. Two section kinds:
+  `[log_viewer]` for the session, and one `[ssh:<name>]` per remote host, parsed
+  into a `RemoteHost` whose per-host overrides fall back to the global ones.
+  Nothing here connects to anything — `enable_ssh` (default **false**) is the
+  master switch, and hosts parse whether it is on or not, because a mistake
+  should be reported the launch it is made. Anything CLV cannot honour becomes a
+  `ConfigIssue` rather than a raise or a silence; `app.py` prints them beside the
+  plugin errors. **There is no password option and no sudo option**, and the
+  schema refuses both by name with a pointer to ssh-agent and to group/ACL
+  membership — the one place those requirements cannot be forgotten.
 - `sources.py` — session source management and settings persistence.
 - `export.py` — the three built-in output formats (JSON Lines, CSV, plain text)
   and the atomic write behind `Ctrl+E`. Core rather than drop-in plugins so a
