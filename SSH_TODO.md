@@ -15,7 +15,7 @@ filesystem assumption that had already spread further.
 | --- | --- | --- |
 | 0 — Doctrine | Reverse the non-goal in the internal contracts | ✅ **Complete** (`aba1b94`) |
 | 1 — Source identity | `SourceRef`, and the end of bare `Path(entry)` | ✅ **Complete** (`9c546c4`) |
-| 2 — Filesystem seam | Injectable backend, off the event loop | ⬜ Not started |
+| 2 — Filesystem seam | Injectable backend, off the event loop | ✅ **Complete** (`c3b21a0`) |
 | 3 — Configuration | `[ssh:<name>]` sections, `enable_ssh` | ⬜ Not started |
 | 4 — Transport & plugin | First readable remote log | ⬜ Not started |
 | 5 — Reachability | A host that goes away says so | ⬜ Not started |
@@ -481,6 +481,52 @@ in the commit message: discovery over a ≥2000-file local tree, before and
 after, no regression beyond noise. Both Python versions.
 
 **Commit.** `refactor: put a source backend behind discovery and reading`
+
+### As built (`c3b21a0`)
+
+Recorded where the phase departed from the plan above, so Phase 4 builds against
+what exists rather than what was proposed.
+
+- **The protocol is seven methods, not six.** `list_dir` was added: one level,
+  no recursion, and it **raises** where `walk` skips. `check_access` tests a
+  directory by listing it for real rather than trusting the permission bits,
+  because an ACL or an SELinux label can refuse a listing that `access` permits
+  — and the plan's "one-entry `walk`" would have swallowed that error, losing
+  the *"Permission denied while listing"* message entirely. A remote backend
+  implements it as one `ls`, and Phase 6's ad-hoc add of a remote folder wants
+  it too.
+- **`kind()` returns five values**, not four: `denied` is kept apart from
+  `missing` because they are different instructions to the operator.
+- **Cost marks are per implementation, not per protocol.** The marks on
+  `SourceBackend` say what a *caller* must assume; the marks on a class say what
+  it actually does. `LocalBackend` declares everything `@cheap`, so
+  `capabilities.blocking` is empty and nothing local changed. `GUARANTEED_CHEAP`
+  (`stat`, `identity`) is enforced: `blocking_methods` refuses a class that
+  declares either of them blocking.
+- **`BackendStat` carries `identity`**, so `poll()` costs one call rather than a
+  size lookup plus an identity lookup — two syscalls locally, two round trips
+  remotely.
+- **`walk` takes a caller-owned `seen` set.** The cycle guard could not move
+  wholly into the backend: `discover` shares one set across every root, so two
+  configured roots that overlap do not walk the shared subtree twice.
+- **Benchmark: ~2% slower end to end**, not a wash — 150 ms → 153 ms over a
+  2500-file tree. Stated rather than absorbed into "noise". The walk itself got
+  *faster* (24.0 ms against 28.6 ms; `os.scandir` gives `is_file()` free and
+  caches `stat()`, so an entry costs one syscall instead of two), and the
+  per-file indirection in `skip_reason` costs slightly more than that back.
+  Profiling puts `fnmatch` in `matched_glob` at roughly seven times the walk's
+  cost, untouched by this phase and the place to look if discovery ever needs
+  to be faster.
+- **The baseline is 885, not 791.** This file was written against 791; commit
+  `a2a2001` added tests afterwards. Phase 2 finished at **976 passed, 1 skipped**
+  on 3.11 and 3.14 (885 + 92 new), no existing assertion edited.
+
+**What Phase 4 inherits.** `BackendContract` in `tests/test_backend.py` is
+written against the protocol and knows nothing about the local filesystem:
+subclass it, override the `backend` and `workspace` fixtures, and every
+assertion runs against `RemoteBackend` unedited. `TestDeclaredBlockingBackend`
+already does exactly that with a second backend, so the reusability is
+demonstrated rather than promised.
 
 ---
 
