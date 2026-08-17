@@ -16,7 +16,7 @@ filesystem assumption that had already spread further.
 | 0 — Doctrine | Reverse the non-goal in the internal contracts | ✅ **Complete** (`aba1b94`) |
 | 1 — Source identity | `SourceRef`, and the end of bare `Path(entry)` | ✅ **Complete** (`9c546c4`) |
 | 2 — Filesystem seam | Injectable backend, off the event loop | ✅ **Complete** (`c3b21a0`) |
-| 3 — Configuration | `[ssh:<name>]` sections, `enable_ssh` | ✅ **Complete** |
+| 3 — Configuration | `[ssh:<name>]` sections, `enable_ssh` | ✅ **Complete** (`e2d1bb3`) |
 | 4 — Transport & plugin | First readable remote log | ⬜ Not started |
 | 5 — Reachability | A host that goes away says so | ⬜ Not started |
 | 6 — Parity | Star, merge, rotation, hierarchy, time, session | ⬜ Not started |
