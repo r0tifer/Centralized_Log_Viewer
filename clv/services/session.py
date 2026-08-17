@@ -430,7 +430,15 @@ class SourceSession:
 
         from .rotation import RotatedSetReader
 
-        reader = RotatedSetReader(rotated_set, max_lines=self._max_lines)
+        reader = RotatedSetReader(
+            rotated_set,
+            max_lines=self._max_lines,
+            # The session's own factory, so a set's live head is opened by
+            # whatever opens every other source. Local behaviour is identical —
+            # the default factory *is* `open_reader` — and it stops this being
+            # the one path that decides for itself.
+            reader_factory=self._reader_factory,
+        )
         buffer = SourceBuffer(
             reader.path,
             max_lines=self._max_lines,

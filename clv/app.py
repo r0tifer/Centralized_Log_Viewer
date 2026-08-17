@@ -945,7 +945,11 @@ class LogViewerApp(App[None]):
         ``prime``/``poll`` contract.
         """
 
-        backend = self._backends.for_ref(path)
+        # `backend` may arrive already resolved — `RotatedSetReader` knows which
+        # one answers for its set and says so. Trusting it rather than
+        # re-resolving keeps one answer per set, and avoids the duplicate
+        # keyword that made this a TypeError.
+        backend = kwargs.pop("backend", None) or self._backends.for_ref(path)
         if isinstance(path, RemoteRef) and hasattr(backend, "connection"):
             from .plugins.sources.ssh import RemoteFollowReader
 
@@ -1378,6 +1382,10 @@ class LogViewerApp(App[None]):
                     rotated_set,
                     max_lines=self._session.max_lines,
                     backend=self._backends.for_ref(rotated_set.head),
+                    # Without this the live head gets a `SourceReader`, whose
+                    # poll cannot see a remote file grow — the set would show
+                    # its history and then never update again.
+                    reader_factory=self._open_reader,
                 )
                 buffer = SourceBuffer(
                     rotated_set.head,

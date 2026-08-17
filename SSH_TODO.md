@@ -1124,6 +1124,22 @@ Python versions.
 - **Skew is reported always and corrected only on request**, with a two-second
   reporting threshold: every measurement carries the link's own latency, and a
   line that appears on every merge is one the operator learns to ignore.
+- **A remote rotated set never tailed, and the fix is Phase 6's.**
+  `RotatedSetReader` opened its live head with `open_reader` directly, so it
+  always got a `SourceReader` — whose `poll` asks the backend "did this grow?",
+  which the poll guard answers from a cache only a *follow* reader refreshes. A
+  remote set therefore showed its history and then went silent for ever, and
+  rotated sets are the ordinary shape of `/var/log`. The reader factory is now
+  injectable, as `SourceSession`'s already was. It went unnoticed because every
+  rotated-set test was local and every remote test was unrotated — the gap sat
+  exactly in the corner neither covered, which is the lesson worth keeping.
+- **Tailing now verifies continuity by content**, which is not an SSH matter at
+  all but was found chasing one. `stat` cannot tell a continuation from a
+  replacement: `copytruncate` keeps the inode, and a deleted-and-recreated log
+  can be handed the same inode back. Both showed a fragment of the new file and
+  dropped the rest, silently — a Requirement 2 violation that predates every
+  phase in this file. `reader.ANCHOR_SIZE` bytes are re-read at the boundary as
+  part of the read already being made, so it costs no syscall.
 - **What Phase 6 still owes** is the downstream verification sweep — export
   naming carrying `node`, and marks, watch rules, timeline and clustering
   checked against a remote source — plus the `README.md` "merging is local only"

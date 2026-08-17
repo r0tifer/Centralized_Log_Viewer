@@ -82,6 +82,13 @@ class Workspace:
     remove: Callable[[str], None]
     #: ``(relative_path) -> ref`` without creating anything.
     ref: Callable[[str], object]
+    #: ``(from_relative, to_relative) -> None``. Renames within the workspace.
+    #:
+    #: Exists so a test can rotate a log the way ``logrotate`` does — moving it
+    #: aside rather than deleting it — which is both the realistic shape and the
+    #: only one that reliably yields a **new inode**. See
+    #: :meth:`BackendContract.test_identity_changes_when_the_name_points_at_a_new_file`.
+    rename: Callable[[str, str], None]
 
 
 class BackendContract:
@@ -273,12 +280,26 @@ class BackendContract:
     def test_identity_changes_when_the_name_points_at_a_new_file(
         self, backend, workspace
     ) -> None:
+        """The log is moved aside, not deleted — which is what rotation *is*.
+
+        This used to unlink ``a.log`` and write it again, and that is not a
+        reliable way to obtain a new inode: a filesystem is free to hand the
+        just-freed one straight back, and ext4 routinely does. The assertion
+        therefore held on tmpfs and btrfs and failed on the CI runner, which is
+        the worst possible distribution of a test failure.
+
+        Renaming instead keeps the old inode alive under the rotated name, so a
+        new one is guaranteed everywhere — and it models what actually happens:
+        ``logrotate`` moves ``app.log`` to ``app.log.1`` and creates a fresh
+        ``app.log`` beside it.
+        """
+
         log = workspace.write("a.log", "alpha\n")
         if not backend.capabilities.stable_identity:
             pytest.skip("backend declares no stable identity")
 
         before = backend.identity(log)
-        workspace.remove("a.log")
+        workspace.rename("a.log", "a.log.1")
         workspace.write("a.log", "alpha\n")
 
         assert backend.identity(log) != before
@@ -387,8 +408,16 @@ def _local_workspace(root: Path) -> Workspace:
         else:
             target.unlink()
 
+    def rename(source: str, destination: str) -> None:
+        (root / source).rename(root / destination)
+
     return Workspace(
-        root=root, write=write, mkdir=mkdir, remove=remove, ref=lambda rel: root / rel
+        root=root,
+        write=write,
+        mkdir=mkdir,
+        remove=remove,
+        ref=lambda rel: root / rel,
+        rename=rename,
     )
 
 
@@ -647,10 +676,229 @@ class NoIdentityBackend(LocalBackend):
 
 
 def _rotate(path: Path, text: str) -> None:
-    """Replace *path* with a new file of the same name — a new inode."""
+    """Rotate *path* the way ``logrotate`` does: move it aside, create it again.
 
-    path.unlink()
+    **Not** unlink-then-write. That asks the filesystem for a new inode without
+    anything obliging it to provide one — ext4 hands the just-freed inode
+    straight back, so the "rotation" was invisible to ``(st_dev, st_ino)`` and
+    the test failed on CI while passing on tmpfs. Keeping the old file alive
+    under its rotated name forces a genuinely new inode on every filesystem, and
+    is what a real rotation looks like anyway.
+    """
+
+    path.rename(path.with_name(path.name + ".1"))
     path.write_text(text, encoding="utf-8")
+
+
+# ==========================================================================
+# Continuity: the assumption behind every incremental read
+# ==========================================================================
+#
+# Tailing rests on one claim — *the bytes at [offset, size) continue the file we
+# were reading* — and until now nothing checked it. `stat` cannot: an inode can
+# be reused, and `copytruncate` does not change the inode at all. Both cases
+# below produced **silently wrong output**: the pane showed a fragment of the
+# new file and dropped the rest, which is the one thing Requirement 2 of
+# AGENTS.md forbids.
+#
+# `SourceReader` now re-reads the last `ANCHOR_SIZE` bytes as part of the read it
+# was already making, and re-primes when they are not what it left there.
+
+
+def test_copytruncate_that_refills_fast_does_not_lose_lines(tmp_path: Path) -> None:
+    """The common one, and it never involves an inode.
+
+    ``logrotate copytruncate`` copies the log and truncates it **in place** —
+    same inode, so the identity test is irrelevant. The shrink test covers it
+    only while the file is still shorter than the offset we hold; a small log
+    that is rewritten past that between two polls slips through both.
+
+    Before the anchor this returned ``rotated=False`` and the single line
+    ``['new 3']``, silently discarding the two before it.
+    """
+
+    log = tmp_path / "a.log"
+    log.write_text("old 1\nold 2\n", encoding="utf-8")
+    reader = SourceReader(log, max_lines=10)
+    reader.prime()
+
+    with log.open("w", encoding="utf-8") as handle:   # truncate + refill, same inode
+        handle.write("new 1\nnew 2\nnew 3\n")
+
+    result = reader.poll()
+
+    assert result.rotated is True
+    assert result.lines == ["new 1", "new 2", "new 3"]
+
+
+class ReusedInodeBackend(LocalBackend):
+    """Local reads, but every file reports the same identity.
+
+    Simulates what ext4 does when a log is deleted and recreated: the freed
+    inode is handed straight back, so ``(st_dev, st_ino)`` cannot tell the new
+    file from the old.
+
+    Faked rather than provoked because it is a *filesystem* behaviour, and the
+    suite has to assert the same thing on tmpfs, btrfs and ext4. Provoking it
+    for real is what produced a test that passed on every developer machine and
+    failed on CI — see :func:`_rotate`.
+    """
+
+    _FIXED = ("reused", "inode")
+
+    @cheap
+    def stat(self, ref):
+        info = super().stat(ref)
+        return None if info is None else type(info)(
+            info.size, info.mtime_ns, self._FIXED
+        )
+
+    @cheap
+    def identity(self, ref):
+        return self._FIXED if super().identity(ref) is not None else None
+
+
+def test_a_reused_inode_does_not_lose_lines(tmp_path: Path) -> None:
+    """The one the CI failure led to.
+
+    A deleted-and-recreated log can be handed the very same inode back, so
+    ``(st_dev, st_ino)`` says "same file". If the replacement also passes the old
+    offset before the next poll, the shrink test says nothing either — and the
+    reader carries on from an offset that means nothing in the new file.
+
+    The identity is held constant by the backend above, so this asserts the
+    *anchor* is what catches it on every filesystem, rather than passing on a
+    tmpfs that happened to allocate a fresh inode.
+    """
+
+    log = tmp_path / "a.log"
+    log.write_text("old 1\nold 2\n", encoding="utf-8")
+    reader = SourceReader(log, max_lines=10, backend=ReusedInodeBackend())
+    reader.prime()
+
+    log.unlink()
+    log.write_text("new 1\nnew 2\nnew 3\n", encoding="utf-8")
+
+    result = reader.poll()
+
+    assert result.rotated is True
+    assert result.lines == ["new 1", "new 2", "new 3"]
+
+
+def test_an_ordinary_append_is_never_mistaken_for_a_replacement(
+    tmp_path: Path,
+) -> None:
+    """The other half, and the one that would make the fix worse than the bug.
+
+    A check that fires on ordinary growth would re-prime on every poll — the
+    pane would flicker, the parser would reset, and watch rules would re-fire.
+    This is the assertion that keeps the anchor honest.
+    """
+
+    log = tmp_path / "a.log"
+    log.write_text("line 1\n", encoding="utf-8")
+    reader = SourceReader(log, max_lines=10)
+    reader.prime()
+
+    for index in range(2, 12):
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(f"line {index}\n")
+        result = reader.poll()
+        assert result.rotated is False, f"append {index} read as a replacement"
+        assert result.lines == [f"line {index}"]
+
+
+def test_the_anchor_survives_a_write_larger_than_itself(tmp_path: Path) -> None:
+    """A burst bigger than ``ANCHOR_SIZE`` must still anchor to its own tail."""
+
+    log = tmp_path / "a.log"
+    log.write_text("start\n", encoding="utf-8")
+    reader = SourceReader(log, max_lines=500)
+    reader.prime()
+
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write("".join(f"padding line {index}\n" for index in range(50)))
+    assert reader.poll().rotated is False
+
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write("after\n")
+    result = reader.poll()
+
+    assert result.rotated is False
+    assert result.lines == ["after"]
+
+
+def test_a_file_shorter_than_the_anchor_still_tails(tmp_path: Path) -> None:
+    """Near the start of a file there are not ``ANCHOR_SIZE`` bytes to look back
+    over. The check uses what exists rather than refusing to read."""
+
+    log = tmp_path / "a.log"
+    log.write_text("a\n", encoding="utf-8")
+    reader = SourceReader(log, max_lines=10)
+    reader.prime()
+
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write("b\n")
+    result = reader.poll()
+
+    assert result.rotated is False
+    assert result.lines == ["b"]
+
+
+def test_the_anchor_costs_no_extra_open(tmp_path: Path) -> None:
+    """It rides along in the read that was happening anyway.
+
+    The check exists to be affordable at ``refresh_hz`` per merged source; one
+    that doubled the syscalls would be paid for on every poll of every source.
+    """
+
+    log = tmp_path / "a.log"
+    log.write_text("line 1\n", encoding="utf-8")
+
+    opens = 0
+
+    class Counting(LocalBackend):
+        @cheap
+        def open(self, ref, mode: str = "rb"):
+            nonlocal opens
+            opens += 1
+            return super().open(ref, mode)
+
+    reader = SourceReader(log, max_lines=10, backend=Counting())
+    reader.prime()
+
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write("line 2\n")
+    before = opens
+    reader.poll()
+
+    assert opens - before == 1, "the continuity check cost an extra open"
+
+
+def test_the_rotation_helper_keeps_the_old_inode_alive(tmp_path: Path) -> None:
+    """The guard on the mechanism the two tests below depend on.
+
+    ``_rotate`` must **move** the old log aside rather than delete it. An inode
+    is not freed while a link to it exists, so keeping one guarantees the
+    replacement gets a different inode — on every filesystem, by the rule rather
+    than by luck. Unlink-then-write has no such guarantee: ext4 hands the
+    just-freed inode straight back, which is exactly how this suite came to pass
+    on tmpfs and fail on CI.
+
+    Asserted here because the difference is invisible in the tests that rely on
+    it: they would simply start failing on some machines and not others.
+    """
+
+    log = tmp_path / "a.log"
+    log.write_text("alpha\n", encoding="utf-8")
+    before = log.stat().st_ino
+
+    _rotate(log, "bravo\n")
+
+    rotated = tmp_path / "a.log.1"
+    assert rotated.exists(), "_rotate deleted the old log instead of moving it"
+    assert rotated.stat().st_ino == before, "the old inode did not survive"
+    assert log.stat().st_ino != before
 
 
 def test_a_stable_identity_catches_a_same_size_rotation(tmp_path: Path) -> None:

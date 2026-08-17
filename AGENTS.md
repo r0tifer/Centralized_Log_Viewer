@@ -197,7 +197,13 @@ distros.
   returns *bytes*, never a verdict, so `reader.looks_binary_block` and
   `compressed.probe_block` stay the only place the rule lives.
 - `reader.py` — BOM-based encoding detection, bounded backwards reads,
-  incremental tailing, rotation and truncation recovery. `open_reader()` picks
+  incremental tailing, rotation and truncation recovery. Tailing verifies that
+  it is reading a **continuation**: metadata alone cannot say so, because
+  `copytruncate` keeps the inode and a deleted-and-recreated log can be handed
+  the same one back. `ANCHOR_SIZE` bytes at the read boundary are re-read as
+  part of the read that was happening anyway, and a mismatch re-primes. Both
+  cases previously showed a fragment of the new file and dropped the rest,
+  silently. `open_reader()` picks
   between `SourceReader` (streams) and `DocumentReader` (container documents);
   both expose `path` / `prime()` / `poll()` and a `RELOAD_NOTICE` template.
 - `documents.py` — stdlib-only text extraction for container formats.
@@ -421,7 +427,7 @@ installed" — the trade Item 12 asked for.
   and `workspace` fixtures, and every assertion runs against another backend —
   which is how `RemoteBackend` is held to the same behaviour as `LocalBackend`.
 
-Run: `python -m pytest` (1135 tests, 1 skipped, 11 deselected) on **both** 3.11
+Run: `python -m pytest` (1144 tests, 1 skipped, 11 deselected) on **both** 3.11
 and 3.14 — the local default is 3.14 and a green suite there is not evidence
 that the supported floor still works.
 

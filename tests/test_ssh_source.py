@@ -57,7 +57,7 @@ from clv.services.backend import (
 )
 from clv.services.config import RemoteHost
 from clv.services.discovery import DiscoverySettings, discover
-from clv.services.reader import SourceReader
+from clv.services.reader import SourceReader, open_reader
 from clv.services.refs import RemoteRef
 from clv.services.session import SourceBuffer
 
@@ -195,12 +195,16 @@ class TestRemoteBackend(BackendContract):
             else:
                 target.unlink()
 
+        def rename(source: str, destination: str) -> None:
+            (root / source).rename(root / destination)
+
         return Workspace(
             root=RemoteRef.build(HOST.name, str(root)),
             write=write,
             mkdir=mkdir,
             remove=remove,
             ref=ref,
+            rename=rename,
         )
 
     # --- the two contract assertions that cannot hold as written ------------
@@ -1290,6 +1294,93 @@ def test_the_stat_cache_follows_the_log_so_poll_stays_cheap(tmp_path: Path) -> N
         assert after.size > before
     finally:
         reader.close()
+
+
+@needs_shell
+def test_a_remote_rotated_set_tails_its_live_head(tmp_path: Path) -> None:
+    """The assertion whose absence let a whole feature ship silent.
+
+    ``RotatedSetReader`` used to open its live head with ``open_reader``
+    directly, which always yields a ``SourceReader`` — and a ``SourceReader``
+    asks the backend "did this grow?" on every poll. That is free locally and a
+    round trip remotely, so the poll guard answers it from a cache that only a
+    *follow* reader refreshes. A remote rotated set therefore showed its history
+    and then never updated again, for ever.
+
+    Rotated sets are the ordinary shape of ``/var/log``, so this was most of the
+    remote feature. It went unnoticed because every rotated-set test was local
+    and every remote test was unrotated — the gap was exactly in the corner
+    neither covered.
+    """
+
+    from clv.services.rotation import RotatedSetReader, group_rotated
+
+    (tmp_path / "app.log").write_text("live 1\n", encoding="utf-8")
+    (tmp_path / "app.log.1").write_text("older\n", encoding="utf-8")
+
+    run, spawn = shell_transport()
+    backend = RemoteBackend(
+        SSHConnection(HOST, runner=run, spawn=spawn, socket_dir=str(tmp_path))
+    )
+
+    def factory(path, **kwargs):
+        kwargs.pop("backend", None)
+        if isinstance(path, RemoteRef):
+            return RemoteFollowReader(path, backend=backend, **kwargs)
+        return open_reader(path, **kwargs)
+
+    sets, _singles = group_rotated(
+        [
+            RemoteRef.build(HOST.name, str(tmp_path / "app.log")),
+            RemoteRef.build(HOST.name, str(tmp_path / "app.log.1")),
+        ]
+    )
+    reader = RotatedSetReader(
+        sets[0], max_lines=50, backend=backend, reader_factory=factory
+    )
+    try:
+        assert reader.prime().lines == ["older", "live 1"]
+        assert isinstance(reader._live, RemoteFollowReader), (
+            "the live head is not a follow reader; it cannot tail"
+        )
+
+        with (tmp_path / "app.log").open("a", encoding="utf-8") as handle:
+            handle.write("live 2\n")
+            handle.flush()
+
+        arrived: list[str] = []
+        for _ in range(60):
+            with cheap_only():  # exactly what SourceBuffer.poll does
+                arrived += reader.poll().lines
+            if arrived:
+                break
+            time.sleep(0.05)
+
+        assert arrived == ["live 2"]
+    finally:
+        reader.close()
+
+
+def test_a_local_rotated_set_still_opens_the_way_it_always_did(tmp_path: Path) -> None:
+    """The other half: the injected factory must not move local behaviour.
+
+    ``RotatedSetReader``'s default factory *is* ``open_reader``, so a local set
+    gets exactly the reader it got before.
+    """
+
+    from clv.services.reader import SourceReader
+    from clv.services.rotation import RotatedSetReader, group_rotated
+
+    (tmp_path / "app.log").write_text("live 1\n", encoding="utf-8")
+    (tmp_path / "app.log.1").write_text("older\n", encoding="utf-8")
+
+    sets, _singles = group_rotated(
+        [tmp_path / "app.log", tmp_path / "app.log.1"]
+    )
+    reader = RotatedSetReader(sets[0], max_lines=50)
+
+    assert isinstance(reader._live, SourceReader)
+    assert reader.prime().lines == ["older", "live 1"]
 
 
 @needs_shell

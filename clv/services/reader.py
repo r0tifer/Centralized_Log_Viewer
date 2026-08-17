@@ -41,6 +41,16 @@ DEFAULT_MAX_READ_BYTES = 8 * 1024 * 1024
 #: :class:`~clv.services.backend.ClassifyRequest`.
 SNIFF_SIZE = 8192
 
+#: Bytes of content remembered at the read boundary, to prove the next read is a
+#: continuation of the same file rather than assume it.
+#:
+#: Small because it is re-read on every poll that has new data — and it costs no
+#: extra syscall, since the read that follows it was going to seek and read
+#: anyway. Large enough that two different files agreeing across it means their
+#: content genuinely matches, in which case the distinction was not worth
+#: drawing. See :meth:`SourceReader.poll`.
+ANCHOR_SIZE = 64
+
 
 @dataclass(frozen=True, slots=True)
 class TextEncoding:
@@ -120,6 +130,11 @@ class TailRead:
     #: ``None`` for the ordinary case, where every line came from ``path`` and
     #: a per-line answer would be the same answer repeated.
     origins: tuple[Path, ...] | None = None
+    #: The last :data:`ANCHOR_SIZE` **bytes** ending at :attr:`offset`, so the
+    #: next read can prove it is a continuation rather than assume it. Empty
+    #: when the read produced nothing to anchor to. See
+    #: :meth:`SourceReader.poll`.
+    anchor: bytes = b""
 
 
 def looks_binary(
@@ -235,7 +250,15 @@ def read_last_lines(
         lines = lines[1:]
 
     truncated = partial_start or len(lines) > max_lines
-    return TailRead(lines=lines[-max_lines:], offset=size, truncated=truncated)
+    return TailRead(
+        lines=lines[-max_lines:],
+        offset=size,
+        truncated=truncated,
+        # The tail of the raw block, which ends at the end of the file whatever
+        # the line budget trimmed. Handed back so the caller can anchor its next
+        # read to it without paying for a second open.
+        anchor=data[-ANCHOR_SIZE:],
+    )
 
 
 def _coerce_encoding(encoding: str | TextEncoding | None) -> TextEncoding | None:
@@ -292,6 +315,9 @@ class SourceReader:
         #: that arrives intact a fraction of a second later.
         self._byte_remainder = b""
         self._identity: object | None = None
+        #: The last bytes read, so the next read can *prove* it continues this
+        #: file rather than assume it. See :meth:`poll`.
+        self._anchor = b""
 
     @property
     def offset(self) -> int:
@@ -323,6 +349,7 @@ class SourceReader:
         self._remainder = ""
         self._byte_remainder = b""
         self._identity = self._stat_identity()
+        self._anchor = result.anchor
         return result
 
     def poll(self) -> TailRead:
@@ -344,6 +371,29 @@ class SourceReader:
         caught, and one replaced by a same-size file is not. The degradation is
         conservative and silent by design, and it is why
         ``stable_identity`` is reported rather than assumed.
+
+        **The continuation itself is verified, not assumed.** Every check above
+        is metadata, and metadata can agree while the content has been replaced
+        underneath it:
+
+        * ``logrotate copytruncate`` truncates **in place**, so the inode never
+          changes. The shrink test catches it only while the file is still
+          shorter than the offset held here — a small log rewritten past that
+          between two polls slips through both tests.
+        * A deleted-and-recreated log can be handed the very same inode back;
+          ext4 does this routinely, so the identity test cannot see it either.
+
+        In both cases the reader used to carry on from an offset that meant
+        nothing in the new file, showing a fragment of it and dropping
+        everything before — a silent loss, which Requirement 2 of ``AGENTS.md``
+        forbids outright. So :data:`ANCHOR_SIZE` bytes of content are remembered
+        at the read boundary and re-read as part of the next read; if they are
+        not what was left there, the file is treated as replaced.
+
+        It costs **no extra syscall** — the read was going to seek and read
+        anyway, and simply starts a little earlier — and it cannot fire on an
+        ordinary append, which is what makes it affordable at ``refresh_hz``
+        per merged source.
         """
 
         info = self._backend.stat(self.path)
@@ -382,18 +432,56 @@ class SourceReader:
         if size == self._offset:
             return TailRead(lines=[], offset=self._offset)
 
-        return self._read_from(self._offset, size)
+        result = self._read_from(self._offset, size, verify=True)
+        if not result.rotated:
+            return result
+        # The content check refused the continuation. Re-prime, which is the
+        # same recovery a detected rotation already takes.
+        primed = self.prime()
+        return TailRead(
+            lines=primed.lines,
+            offset=primed.offset,
+            truncated=primed.truncated,
+            rotated=True,
+        )
 
-    def _read_from(self, start: int, size: int) -> TailRead:
+    def _read_from(self, start: int, size: int, *, verify: bool = False) -> TailRead:
+        """Read ``[start, size)`` and turn it into lines.
+
+        *verify* asks for the continuity check described in :meth:`poll`: the
+        read begins :data:`ANCHOR_SIZE` bytes early and the bytes that come back
+        are compared against what was read last time. It is a keyword rather
+        than the default because the two callers that re-prime have just
+        established a new anchor and have nothing to compare against.
+
+        Returns a read whose :attr:`TailRead.rotated` is set when the check
+        fails, which the caller turns into a re-prime.
+        """
+
+        anchor = self._anchor if verify else b""
+        # Never look further back than the file's own start, or past the BOM,
+        # which is metadata rather than content.
+        back = min(len(anchor), max(0, start - self._encoding.bom_size))
         try:
             with self._backend.open(self.path, "rb") as handle:
-                handle.seek(start)
+                handle.seek(start - back)
                 # Never ingest more than one bounded read's worth in a single
-                # poll; a burst of writes must not stall the UI.
-                chunk = handle.read(min(size - start, self._max_bytes))
-                self._offset = start + len(chunk)
+                # poll; a burst of writes must not stall the UI. The anchor
+                # rides along in the same read, so checking costs no syscall.
+                chunk = handle.read(back + min(size - start, self._max_bytes))
         except OSError:
             return TailRead(lines=[], offset=self._offset)
+
+        if back:
+            seen, chunk = chunk[:back], chunk[back:]
+            if seen != anchor[-back:]:
+                # The bytes before our position are not the ones we read there.
+                # Whatever this file is now, it is not a continuation of the one
+                # we were reading — and neither `stat` nor the inode said so.
+                return TailRead(lines=[], offset=self._offset, rotated=True)
+
+        self._offset = start + len(chunk)
+        self._anchor = (self._anchor + chunk)[-ANCHOR_SIZE:] if chunk else self._anchor
 
         if not chunk:
             return TailRead(lines=[], offset=self._offset)

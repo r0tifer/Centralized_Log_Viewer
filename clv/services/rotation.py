@@ -174,6 +174,7 @@ class RotatedSetReader:
         *,
         max_lines: int,
         backend: SourceBackend = LOCAL,
+        reader_factory=None,
         **kwargs,
     ) -> None:
         self.rotated_set = rotated_set
@@ -185,7 +186,20 @@ class RotatedSetReader:
         #: answers for all of them -- unlike a merged view, which is the case
         #: that needs a resolver.
         self._backend = backend
-        self._live: AnyReader = open_reader(
+        #: How the **live head** is opened, injectable for the same reason
+        #: ``SourceSession`` takes one: which reader a source needs is not
+        #: decided by this module.
+        #:
+        #: Calling ``open_reader`` directly here was a real defect rather than a
+        #: tidiness one. It always produced a ``SourceReader``, whose ``poll``
+        #: asks the backend "did this grow?" — free locally, and a round trip
+        #: remotely, which the poll guard therefore answers from a cache that
+        #: only a *follow* reader refreshes. A remote rotated set consequently
+        #: opened, showed its history, and then went silent for ever. Rotated
+        #: sets are the ordinary shape of ``/var/log``, so that was most of the
+        #: feature.
+        self._reader_factory = reader_factory or open_reader
+        self._live: AnyReader = self._reader_factory(
             rotated_set.head, max_lines=max_lines, backend=backend, **kwargs
         )
         #: How many members the last prime actually opened, and how many it
