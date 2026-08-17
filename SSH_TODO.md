@@ -13,8 +13,8 @@ filesystem assumption that had already spread further.
 
 | Phase | Scope | State |
 | --- | --- | --- |
-| 0 — Doctrine | Reverse the non-goal in the internal contracts | ✅ **Complete** |
-| 1 — Source identity | `SourceRef`, and the end of bare `Path(entry)` | ⬜ Not started |
+| 0 — Doctrine | Reverse the non-goal in the internal contracts | ✅ **Complete** (`aba1b94`) |
+| 1 — Source identity | `SourceRef`, and the end of bare `Path(entry)` | ✅ **Complete** (`9c546c4`) |
 | 2 — Filesystem seam | Injectable backend, off the event loop | ⬜ Not started |
 | 3 — Configuration | `[ssh:<name>]` sections, `enable_ssh` | ⬜ Not started |
 | 4 — Transport & plugin | First readable remote log | ⬜ Not started |
