@@ -503,5 +503,29 @@ the rule stated at the head of [TODO.md](../../TODO.md).
 
 ---
 
+## The SSH transport is a module here, not a plugin
+
+`sources/ssh.py` lives in this package and its `register()` returns `[]`. That
+is not a stub — it is the point.
+
+A `LogSourceProvider` hands back a `ProviderSource`, which is deliberately *not*
+a path: starring, glob filtering and rotated-set grouping all test
+`isinstance(data, Path)` and therefore cannot see one. That is exactly right for
+a journal unit, which has no directory to walk and no file to persist. It is
+exactly wrong for `/var/log/syslog` on `web01`, which has both — and a remote
+log that cannot be starred or merged has not met the goal `SSH_TODO.md` sets.
+
+So the module supplies a **`SourceBackend`** instead. A remote root reaches
+`SourceManager` as an ordinary root, builds the same nested folder tree, and is
+read by the same `SourceReader`; `app.build_backends` wires the resolver in.
+
+What keeps it in this package is consent, not layering — the same reason the
+journal is here. Reading a remote source spawns `ssh`, a plugin may not spawn a
+subprocess without the operator asking, and `enable_ssh` is read fresh on every
+call rather than once at import. Nothing connects, and no socket exists, until
+it is true.
+
+---
+
 > 🧭 **Goal:**  
 > The plugin system empowers developers to extend CLV responsibly — adding sources, filters, or exporters — without sacrificing the project’s speed, security, or simplicity.

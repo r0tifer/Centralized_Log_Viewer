@@ -17,9 +17,10 @@ filesystem assumption that had already spread further.
 | 1 — Source identity | `SourceRef`, and the end of bare `Path(entry)` | ✅ **Complete** (`9c546c4`) |
 | 2 — Filesystem seam | Injectable backend, off the event loop | ✅ **Complete** (`c3b21a0`) |
 | 3 — Configuration | `[ssh:<name>]` sections, `enable_ssh` | ✅ **Complete** (`e2d1bb3`) |
-| 4 — Transport & plugin | First readable remote log | ⬜ Not started |
+| 4a — Transport & backend | First readable remote log | ✅ **Complete** |
+| 4b — Follow | It tails | ✅ **Complete** |
 | 5 — Reachability | A host that goes away says so | ⬜ Not started |
-| 6 — Parity | Star, merge, rotation, hierarchy, time, session | ⬜ Not started |
+| 6 — Parity | Star, merge, rotation, hierarchy, time, session | 🟡 **Mostly** — star, merge, rotation, `node`, the time rule; the downstream sweep remains |
 | 7 — Remote UI | Host dialog, cross-host merge, `node` in the chrome | ⬜ Not started |
 | 8 — Documentation & release | README, `settings.conf`, help overlay, version | ⬜ Not started |
 | 9 — The remote journal | `journalctl` over the same transport | ⬜ Not started |
@@ -766,8 +767,10 @@ The first phase with a user-visible feature: a remote log on screen, tailing.
   `ProviderSource` — that type is exactly what this plan is avoiding.
 - Nothing spawns until `enable_ssh` is true **and** the host is enabled.
 
-**Documentation changes.** `clv/plugins/README.md` gains the SSH source. Module
-docstring covers the transport choice, the inode advantage, the round-trip
+**Documentation changes.** `clv/plugins/AGENTS.md` gains the SSH source —
+`clv/plugins/README.md` does not exist and belongs to `PLUGIN_TODO.md`, which
+schedules it as a new author-facing quick start with its own phase; a note there
+carries the requirement forward. Module docstring covers the transport choice, the inode advantage, the round-trip
 budget, the binary-sniff decision, the `BatchMode` rationale, and the command
 profiles.
 
@@ -800,6 +803,104 @@ in a manual smoke test against a real host with **no perceptible UI stall**,
 recorded in the commit message. Both Python versions.
 
 **Commit.** `feat(ssh): read remote log folders over a multiplexed SSH connection`
+
+### As built — split into 4a and 4b
+
+Recorded where the phase departed from the plan above, so Phase 5 builds against
+what exists rather than what was proposed.
+
+- **The phase is two commits, not one.** 4a is everything up to and including a
+  remote log that opens, filters and queries; 4b is the persistent `tail -F` and
+  its non-blocking drain. Each leaves `main` shippable, which one 2 500-line
+  commit would not have. 4b is the only outstanding item.
+- **`RemoteRef` is in `clv/services/refs.py`, not in the plugin.** `parse_ref`
+  decodes `session.json` before any plugin is imported — the same reason
+  `KNOWN_SCHEMES` is static and closed — so a type registered at plugin-import
+  time would decode a starred `ssh:` ref differently depending on load order. It
+  is pure identity; the transport stays in the plugin because that is where
+  *consent* lives, not where layering puts it.
+- **`RemoteRef.relative_to` returns a `PurePosixPath`, not a ref.** A relative
+  path has no machine, and rewrapping one produces `ssh:web01nested/b.log` —
+  a string that is not a ref and does not round trip. `app._by_folder` was
+  changed from `relative == Path(".")` to `not relative.parts`, which is
+  identical for a local path and also true off POSIX.
+- **`stat` resolves the `GUARANTEED_CHEAP` conflict by asking who is calling.**
+  `stat` and `identity` must be cheap on every backend because `poll()` calls
+  them on the event loop, and `blocking_methods` refuses a class that declares
+  otherwise — but a remote `stat` is a round trip. New `backend.in_cheap_only()`
+  reports whether the caller is inside the guard: `RemoteBackend.stat` serves its
+  cache there and goes to the wire outside it, where the worker and the contract
+  suite live. This is the single most important design decision in the phase.
+- **The binary sniff became a protocol member, `classify`.** The plan offered
+  "batch it or defer it"; it is batched, as a batch-taking member of
+  `SourceBackend` with `LocalBackend` implementing today's per-file behaviour.
+  It returns **bytes, never a verdict** — a NUL test in `sh` would reject every
+  UTF-16 export — so `reader.looks_binary_block` and the new
+  `compressed.probe_block` remain the only place the rule lives.
+  `discovery._walk_directory` is the same per-entry loop with a bounded buffer in
+  front of it; the batch is capped at the remaining `max_files` budget plus one,
+  because a *pre-existing* Phase 2 assertion pins that lookahead.
+- **`probe_block` distinguishes a truncated sample from a truncated file.** A
+  valid 40 MB `.gz` will not always yield a decompressed byte from its first
+  4 KiB, so `EOFError` is a refusal only when `ClassifyResult.complete` says
+  there was nothing more to read. Without that, remote rotated members would
+  have been reported `unreadable` wholesale.
+- **The window cache lives on the backend, not on the handle.** Priming opens a
+  source three times — encoding sniff, again in `prime`, then the backwards read
+  — and a per-handle cache refetched the same megabyte each time. It is dropped
+  for a ref the moment `refresh` sees its size or identity change, so a rotated
+  log can never serve yesterday's bytes.
+- **Two contract assertions are overridden in `TestRemoteBackend`, and both are
+  replaced by stronger ones rather than dropped.** `test_the_cheap_methods_still_work_under_the_guard`
+  cannot hold as written because there is no cheap true answer about a file the
+  backend has never measured; the override asserts a measured file answers and an
+  unmeasured one returns `None` *instead of going to the wire*.
+  `test_walk_does_not_pay_for_what_the_caller_never_asks_for` cannot hold because
+  a remote `find` runs on the far side of a pipe and finishes before a ten-file
+  tree can be deleted; the override asserts the walker is a true iterator and that
+  abandoning it terminates the remote command. Remote walk order is the remote
+  filesystem's own, which is stated and tested rather than left to be found.
+- **Quoting is one function, `quote_all`, and the injection table runs the result
+  through a real `sh`.** Fifteen hostile shapes — `$(reboot)`, backticks, `;`,
+  newlines, a leading `-` — must come back byte-identical.
+- **`register()` returns `[]` and that is load-bearing.** Without it the loader
+  falls through to `__all__` and reports `RemoteBackend` as "does not implement a
+  CLV plugin interface". Nothing here is a `ProviderSource`, deliberately.
+- **A second fake was needed.** Fixture runners assert argv as strings; a
+  local-`sh` transport actually executes the generated scripts against a
+  `tmp_path`, which is what lets the Phase 2 contract suite run against
+  `RemoteBackend` for real. No network, no SSH server, no loopback.
+- **`clv/plugins/README.md` does not exist**; the SSH source is documented in
+  `clv/plugins/AGENTS.md` instead, which is the file that actually holds this
+  package's contract. **Resolved:** that file is `PLUGIN_TODO.md`'s to create —
+  a 16-page author-facing quick start with its own phase — so creating a stub
+  here would have given a planned document two owners. This file's two
+  references were corrected to name `AGENTS.md`, and `PLUGIN_TODO.md`'s own row
+  for the README now records that it must cover the SSH source when written.
+- **Still owed by Phase 6 at the time 4a landed:** a remote log opened and read
+  but could not be starred, merged or grouped as a rotated set. **Closed** —
+  see Phase 6's as-built notes below.
+
+- **What Phase 5 inherits, precisely.** The framing already tells *truncated*
+  from *empty*: a missing closing sentinel raises `SSHError` rather than
+  returning an empty body, and `_FAILURE_HINTS` maps host-key, auth, DNS,
+  refused and timeout stderr onto five distinct messages naming the host. What
+  is **not** done is what happens next — `walk` still swallows an `SSHError` and
+  yields nothing, matching `LocalBackend`, so a link that drops mid-discovery
+  currently shrinks the tree quietly. That is the phase-5 hazard stated in its
+  own words, and the machinery to report it is now in place.
+
+- **1006 + 101 = 1107 passed, 1 skipped, 9 deselected** on 3.11 and 3.14. No
+  existing assertion edited: `git diff -- tests/` is empty, and the two new
+  files are additions.
+
+**Verified since:** the opt-in suite now has a container harness
+(`tests/containers/run.sh alpine|gnu`) and **both images pass, 11 tests each** —
+including an app-level run that drives `LogViewerApp` headlessly from
+`settings.conf` to a tailing pane and times the poll. Alpine asserts the
+`busybox` profile, so the non-GNU path is proven rather than assumed. What is
+still yours is a smoke test against a host of your own: a container cannot tell
+you about your `~/.ssh/config`, your `ProxyJump`, or your network's latency.
 
 ---
 
@@ -958,6 +1059,76 @@ Python versions.
 
 **Commit.** `feat(ssh): full feature parity for remote sources`
 
+### As built — 4b
+
+- **`prime()` is the bounded backwards read, then `tail -F -c +<offset+1>`.**
+  Two round trips at open rather than one, and deliberately: `tail -n N -F`
+  would be one command but is bounded by *lines*, so a remote file whose lines
+  are enormous transfers without limit. Resuming at the primed byte means no
+  line is delivered twice and none is skipped.
+- **Killing the local `ssh` does not stop the remote `tail`.** This is the
+  phase's real finding, and the app-level container test is what caught it. A
+  process only learns its pipe is closed when it next *writes*, and a `tail` on
+  an idle log never writes again — so every source switch left one running on
+  the operator's server, indefinitely. Worse than any local leak: CLV's whole
+  claim is that it installs nothing and leaves nothing running.
+  The follow script therefore watches its own stdin (which `sshd` closes
+  promptly) and kills `tail` on EOF, with a background poller covering the other
+  direction so a `tail` that dies takes the shell with it.
+- **`cat` must be in the foreground**, and this is a one-character difference
+  between working and useless: POSIX reassigns a *backgrounded* command's stdin
+  to `/dev/null` in a non-interactive shell, so `{ cat …; } &` reads EOF
+  immediately and kills the follow before it produces a line. Found by the local
+  shell tests, which is precisely what they are for.
+- **No `exec`**, because the shell has to outlive `tail` to clean up after it —
+  so the frame's closing sentinel now arrives when the remote command exits.
+  The drain filters it and takes it as "the far end is done".
+- **The drain feeds the stat cache**, which is what makes 4a's cache-serving
+  `stat` useful rather than merely cheap: a followed source's size stays current
+  with no round trip from `poll()`.
+- **Rotation notices are best effort.** `tail -F` reopens by itself so lines
+  never stop; whether CLV *says* so comes from matching `tail`'s own stderr
+  wording, and an unrecognised spelling costs the redraw notice and nothing else.
+
+### As built — the parity half, and what is still outstanding
+
+- **Four `isinstance(data, Path)` narrowings became one predicate**,
+  `refs.is_source_ref`, a closed union over `(Path, RemoteRef)`. The sites were
+  `app._sync_merged_tree`, `app._star_target`, `app._find_node` and
+  `rotation.RotatedSet.__contains__`. A **union of types rather than a duck
+  test** is what keeps the guarantee `ProviderSource`'s docstring makes: a
+  journal node carries a `ProviderSource`, not a ref, so it is still invisible
+  to starring and grouping. That docstring was rewritten in the same edit,
+  because it cited the old spelling by name.
+- **Opening a merge and a rotated set moved to a worker.** Both primed inline on
+  the event loop, which is fine locally and N round trips of frozen UI with a
+  remote member. `SourceSession` gained `prepare_many` (build and prime, commit
+  nothing) beside `install_many`, mirroring 4a's `install`. An all-local merge
+  still takes the synchronous path byte-for-byte.
+- **`node` rides the provenance mechanism `tag_origins` already had**, and is
+  attached whether or not the source is merged — `node:web01` should answer on a
+  single open remote log too. `host` is untouched, so no saved query changed
+  meaning. A local source gains no key and copies no entry.
+- **The time rule is applied in the sort key, never to the entry.** A displayed
+  timestamp is exactly what the log said; only the ordering knows about zones
+  and skew. `SourceFacts` carries the host's measured zone and skew onto its
+  buffer, and `_localised` reads a naive stamp in its own machine's zone.
+- **It engages only when the zones actually disagree.** `_spans_zones` requires
+  more than one member *and* more than one distinct UTC offset, so every
+  all-local merge and every same-zone fleet takes the old branch unchanged.
+  That is what makes this safe to add to a merge that has worked for years, and
+  it is what Requirement 13 rests on here. Pinned by a test that asserts the
+  all-local ordering is what it always was — and the cross-zone test was
+  verified to **fail** with the fix disabled, so it is a regression test rather
+  than a tautology.
+- **Skew is reported always and corrected only on request**, with a two-second
+  reporting threshold: every measurement carries the link's own latency, and a
+  line that appears on every merge is one the operator learns to ignore.
+- **What Phase 6 still owes** is the downstream verification sweep — export
+  naming carrying `node`, and marks, watch rules, timeline and clustering
+  checked against a remote source — plus the `README.md` "merging is local only"
+  rewrite, which belongs with Phase 8's user-facing pass.
+
 ---
 
 ## Phase 7 — Remote UI
@@ -1096,7 +1267,8 @@ connection manager's `ssh` invocation and enumerating units per host.
   error — reusing the Phase 4 capability profile.
 
 **Documentation changes.** `README.md` systemd journal section gains remote
-hosts. `clv/plugins/README.md` updated. Both state the dual opt-in.
+hosts. `clv/plugins/AGENTS.md` updated — and `clv/plugins/README.md` too, if
+`PLUGIN_TODO.md` has created it by then. Both state the dual opt-in.
 
 **Testing** (extend `tests/test_journald.py`, `tests/test_ssh_source.py`)
 - Remote argv construction for the journal: all/unit/boot, with priority

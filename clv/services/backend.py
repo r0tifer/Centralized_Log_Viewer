@@ -62,7 +62,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Any, Callable, Iterator, Literal, Protocol
+from typing import IO, Any, Callable, Iterator, Literal, Protocol, Sequence
 
 from .refs import SourceRef
 
@@ -76,6 +76,8 @@ __all__ = [
     "BackendResolver",
     "BackendStat",
     "BlockingCallError",
+    "ClassifyRequest",
+    "ClassifyResult",
     "LocalBackend",
     "RefKind",
     "SourceBackend",
@@ -84,6 +86,7 @@ __all__ = [
     "blocking_methods",
     "cheap",
     "cheap_only",
+    "in_cheap_only",
 ]
 
 
@@ -146,6 +149,24 @@ def blocking(func: Callable) -> Callable:
     return guarded
 
 
+def in_cheap_only() -> bool:
+    """Whether this thread is currently inside :func:`cheap_only`.
+
+    Exists for the one legitimate reason a backend has to ask: a member that is
+    :data:`GUARANTEED_CHEAP` but whose honest implementation is a round trip has
+    to answer *something* cheap here, and it cannot know it is being asked from
+    the event loop any other way.
+
+    ``RemoteBackend.stat`` is that member. It serves its cache under the guard
+    and refreshes off the wire outside it, which is what lets ``poll()`` cost
+    nothing while a worker — and the backend contract suite — still see a true
+    answer. Reading the flag is *not* a licence to block under it; that is still
+    what :func:`blocking` exists to stop.
+    """
+
+    return bool(getattr(_GUARD, "cheap_only", False))
+
+
 @contextmanager
 def cheap_only() -> Iterator[None]:
     """Inside this block, a declared-blocking backend call raises.
@@ -202,6 +223,44 @@ class WalkEntry:
     #: into neither the tree nor the skip tally is the thing Requirement 2 of
     #: ``AGENTS.md`` forbids.
     unreadable: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ClassifyRequest:
+    """One file discovery wants a verdict on, and how much of it that needs.
+
+    *head_bytes* is set by the caller rather than by the backend because the
+    **rule** lives with the caller: ``reader.looks_binary`` wants a sniff block,
+    ``compressed.probe`` wants enough of an archive to parse its header, and a
+    backend that decided between them would have to import both — which is the
+    dependency cycle this parameter exists to avoid.
+    """
+
+    ref: SourceRef
+    head_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class ClassifyResult:
+    """What a batch verdict carries back. Measurement only, never judgement.
+
+    :attr:`head` is the file's leading bytes, so the decision about what they
+    *mean* stays in ``reader.looks_binary`` and ``compressed.probe`` and is made
+    identically whichever backend supplied them. That split is the whole reason
+    this member exists: a remote backend that answered "binary: yes" would have
+    reimplemented the UTF-16 rule in ``sh``, and got it wrong.
+    """
+
+    #: ``os.R_OK``, as :meth:`SourceBackend.access` would answer it.
+    readable: bool
+    #: Empty when unreadable, or when *head_bytes* was zero.
+    head: bytes = b""
+    #: True when :attr:`head` is the **entire** file. The difference matters to
+    #: ``compressed.probe``: a decompressor running out of input part way
+    #: through a large member means the member is fine and the sample was
+    #: short, while the same error on a complete file means the file is
+    #: truncated. Without this the two are indistinguishable.
+    complete: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,12 +356,36 @@ class SourceBackend(Protocol):
     def open(self, ref: SourceRef, mode: str = "rb") -> IO[bytes]:
         """A **seekable** binary handle. Raises ``OSError``."""
 
+    @blocking
+    def classify(
+        self, requests: Sequence[ClassifyRequest]
+    ) -> dict[SourceRef, ClassifyResult]:
+        """Readability and leading bytes for a **batch** of candidates.
+
+        The one member that takes a list, and the reason is Requirement 4 of
+        ``SSH_TODO.md``: discovery has to decide "readable? binary? a valid
+        archive?" about every file it found, and asking that one file at a time
+        is a round trip per file — the specific failure that makes a remote
+        ``/var/log`` unusable at 400 files, and the same thing that makes an
+        ``sshfs`` mount slow.
+
+        Locally this is exactly what ``skip_reason`` used to do inline and costs
+        the same; remotely it is one command over the whole batch. A backend may
+        split a batch it considers too large, but the count must stay
+        proportional to the *batch* rather than to the files in it.
+
+        A ref that could not be measured at all is absent from the result rather
+        than present-and-empty; the caller reports that as unreadable, which is
+        the same conclusion ``access`` returning False reached before.
+        """
+
 
 #: Every method an implementation must mark. Data rather than introspection so
 #: the check does not depend on ``typing`` internals, which moved between 3.11
 #: and 3.14 — the same reason ``refs.PROTOCOL_MEMBERS`` exists.
 PROTOCOL_METHODS: tuple[str, ...] = (
     "access",
+    "classify",
     "identity",
     "kind",
     "list_dir",
@@ -541,6 +624,48 @@ class LocalBackend:
     @cheap
     def open(self, ref: SourceRef, mode: str = "rb") -> IO[bytes]:
         return ref.open(mode)
+
+    @cheap
+    def classify(
+        self, requests: Sequence[ClassifyRequest]
+    ) -> dict[SourceRef, ClassifyResult]:
+        """One open and one bounded read per file — what discovery already did.
+
+        The batch is a *remote* optimisation and there is nothing here to batch:
+        a local open is a syscall, so looping is both the simplest
+        implementation and the fastest one. What matters is that the loop is
+        here rather than in ``discovery``, so the two backends are asked the
+        same question.
+
+        One read of ``head_bytes + 1``: the extra byte is what distinguishes "we
+        sampled the start of a longer file" from "that was all of it", which is
+        :attr:`ClassifyResult.complete` and which ``compressed.probe`` needs.
+        """
+
+        results: dict[SourceRef, ClassifyResult] = {}
+        for request in requests:
+            if not os.access(request.ref, os.R_OK):
+                results[request.ref] = ClassifyResult(readable=False)
+                continue
+            if request.head_bytes <= 0:
+                # Readability was the whole question -- a document, or
+                # `skip_binary` turned off. Opening the file to read nothing is
+                # what this member exists to avoid doing per file.
+                results[request.ref] = ClassifyResult(readable=True)
+                continue
+            try:
+                with request.ref.open("rb") as handle:
+                    head = handle.read(request.head_bytes + 1)
+            except OSError:
+                results[request.ref] = ClassifyResult(readable=False)
+                continue
+            complete = len(head) <= request.head_bytes
+            results[request.ref] = ClassifyResult(
+                readable=True,
+                head=head[: request.head_bytes],
+                complete=complete,
+            )
+        return results
 
 
 LOCAL_CAPABILITIES = BackendCapabilities(

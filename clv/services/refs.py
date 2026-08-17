@@ -1,9 +1,18 @@
 """What CLV requires of a log source, and how one survives a restart.
 
-A source is a **SourceRef**. ``pathlib.Path`` is one implementation and, as of
-this module, the only one — but it is no longer the assumed one. Remote sources
-over SSH are in scope (see ``SSH_TODO.md``), and the reason a plugin alone could
-not deliver them is that eight years of code said *a source is a path*.
+A source is a **SourceRef**. ``pathlib.Path`` is one implementation and
+:class:`RemoteRef` is the other — neither is the assumed one. The reason a
+plugin alone could not deliver remote sources is that eight years of code said
+*a source is a path*.
+
+**Why the remote ref type lives here and not in the SSH plugin.** ``parse_ref``
+decodes ``session.json`` before any plugin is imported, which is the same reason
+:data:`KNOWN_SCHEMES` is static and closed: a type registered at plugin-import
+time would decode the same file differently depending on load order, and a
+starred ``ssh:`` ref would be a remote source on one launch and a relative path
+on the next. :class:`RemoteRef` is pure identity — no IO, no connection, no
+subprocess — so nothing about it needs the transport that
+``clv/plugins/sources/ssh.py`` owns.
 
 This module answers *what a source is*. :mod:`clv.services.backend` answers
 *who reads it*, and owns every filesystem call that used to be made against a
@@ -40,16 +49,22 @@ from __future__ import annotations
 
 import os
 import re
-from pathlib import Path
-from typing import IO, Any, Protocol
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import IO, Any, NoReturn, Protocol
 
 __all__ = [
     "KNOWN_SCHEMES",
     "PROTOCOL_MEMBERS",
+    "SOURCE_REF_TYPES",
+    "SSH_SCHEME",
+    "RemoteRef",
+    "RemoteRefIOError",
     "SourceRef",
     "format_ref",
     "identity",
     "is_local",
+    "is_source_ref",
     "normalize_ref",
     "parse_ref",
     "ref_key",
@@ -245,6 +260,214 @@ def is_local(ref: "SourceRef") -> bool:
     return isinstance(ref, Path) and (ref.is_absolute() or scheme_of(ref) is None)
 
 
+# ---------------------------------------------------------------------------
+# The remote implementation
+# ---------------------------------------------------------------------------
+
+
+#: The scheme prefix, spelled once. Single-colon, like ``journal:`` — see
+#: :data:`_SCHEME_RE` for why ``ssh://`` is refused rather than supported.
+SSH_SCHEME = "ssh:"
+
+
+class RemoteRefIOError(TypeError):
+    """A remote ref was asked to perform IO of its own.
+
+    A ``TypeError`` rather than an ``OSError`` on purpose: this is not a read
+    that failed, it is a call that should never have been made, and the
+    ``except OSError`` guards scattered through discovery and the session would
+    otherwise swallow it into a plausible-looking "source unavailable".
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteRef:
+    """A log source on another machine: ``ssh:web01/var/log/syslog``.
+
+    Identity only. Holding one has connected to nothing and spawned nothing —
+    every byte comes from the ``RemoteBackend`` a resolver hands back, which is
+    the same split :class:`SourceRef` and :mod:`clv.services.backend` already
+    make for local sources.
+
+    **Not a ``pathlib.Path`` subclass**, deliberately. ``pyproject.toml``
+    requires ``>=3.11`` and practical ``Path`` subclassing only arrived in 3.12,
+    so this implements the surface CLV actually uses instead of inheriting one
+    it would have to keep fighting.
+
+    **No ``__fspath__``.** Declaring it would promise that ``open()`` and
+    ``os.scandir`` work on one of these, and the failure would surface as a
+    ``FileNotFoundError`` from inside the standard library rather than as the
+    plain error the IO members below raise. The protocol omits it for the same
+    reason.
+
+    Two hosts with the same path are two identities, which is a correctness
+    requirement rather than tidiness: ``str(ref)`` is what lands in
+    ``ORIGIN_FIELD`` on every entry of a merged set, so an unqualified
+    ``/var/log/syslog`` would make ``source:/var/log/syslog`` match every
+    machine at once.
+    """
+
+    #: CLV's name for the machine — the ``[ssh:<name>]`` section suffix, not
+    #: necessarily the address. ``RemoteHost.host`` is what is connected to.
+    node: str
+    #: Always absolute, always POSIX. A remote path is not this machine's.
+    path: PurePosixPath
+
+    # --- construction --------------------------------------------------------
+
+    @classmethod
+    def build(cls, node: str, path: "str | PurePosixPath") -> "RemoteRef":
+        """A ref for *path* on *node*, normalised the way ``Path`` would.
+
+        The single construction site. ``//`` collapses and a ``.`` component
+        drops, so one pass reaches a fixed point and the round trip through
+        :func:`format_ref` is exact — the same guarantee, and the same
+        exceptions, that ``Path`` gives locally.
+        """
+
+        posix = PurePosixPath(path)
+        if not posix.is_absolute():
+            posix = PurePosixPath("/") / posix
+        return cls(node=node, path=posix)
+
+    @classmethod
+    def parse(cls, text: str) -> "RemoteRef | None":
+        """``"ssh:web01/var/log"`` → a ref, or ``None`` if it is not one.
+
+        ``None`` rather than an exception because the caller is
+        :func:`parse_ref`, which sits on the persistence path and has nowhere to
+        report to: a malformed entry degrades to a visibly-wrong scheme ref
+        instead of taking a session restore down with it.
+        """
+
+        if not text.startswith(SSH_SCHEME):
+            return None
+        node, separator, remainder = text[len(SSH_SCHEME) :].partition("/")
+        if not node or not separator:
+            # `ssh:` alone, or `ssh:web01` with no path. There is no sensible
+            # default here -- "the whole filesystem" is not what anyone meant.
+            return None
+        if ".." in PurePosixPath(f"/{remainder}").parts:
+            # A stored ref that walks upwards cannot round trip and could name
+            # a place outside the root it was discovered under.
+            return None
+        return cls.build(node, f"/{remainder}")
+
+    # --- identity ------------------------------------------------------------
+
+    def __str__(self) -> str:
+        return f"{SSH_SCHEME}{self.node}{self.path}"
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"RemoteRef({str(self)!r})"
+
+    # --- naming and structure ------------------------------------------------
+
+    @property
+    def name(self) -> str:
+        return self.path.name
+
+    @property
+    def parent(self) -> "RemoteRef":
+        return RemoteRef(node=self.node, path=self.path.parent)
+
+    @property
+    def parts(self) -> tuple[str, ...]:
+        """As ``Path`` reports them, leading ``"/"`` included.
+
+        The host is deliberately absent: these are the path's components, and a
+        caller that wants the machine asks for :attr:`node`.
+        """
+
+        return self.path.parts
+
+    @property
+    def suffix(self) -> str:
+        return self.path.suffix
+
+    def with_name(self, name: str) -> "RemoteRef":
+        return RemoteRef(node=self.node, path=self.path.with_name(name))
+
+    def with_suffix(self, suffix: str) -> "RemoteRef":
+        return RemoteRef(node=self.node, path=self.path.with_suffix(suffix))
+
+    def relative_to(self, other: Any) -> PurePosixPath:
+        """The path below *other*, as a **relative** path rather than a ref.
+
+        A relative path has no machine, so wrapping one back into a
+        :class:`RemoteRef` would produce ``ssh:web01nested/b.log`` — a string
+        that is not a ref and does not round trip. ``Path.relative_to`` returns
+        a relative ``Path`` for exactly the same reason, and both callers want
+        the components rather than the identity: ``discovery.matched_glob``
+        takes ``str()`` of it, and ``app._by_folder`` takes ``.parts``.
+
+        Raises ``ValueError``, as ``Path`` does, when *other* is not a prefix —
+        including when it names a different machine.
+        """
+
+        if isinstance(other, RemoteRef):
+            if other.node != self.node:
+                raise ValueError(f"{self!s} is not on the same node as {other!s}")
+            return self.path.relative_to(other.path)
+        return self.path.relative_to(PurePosixPath(str(other)))
+
+    def __truediv__(self, other: str) -> "RemoteRef":
+        return RemoteRef(node=self.node, path=self.path / other)
+
+    # --- IO: never here ------------------------------------------------------
+    #
+    # Present because they are on :data:`PROTOCOL_MEMBERS` and absent-and-
+    # raising is louder than absent. A caller reaching one of these is a seam
+    # that rotted: the answer lives on the backend, which is what a
+    # ``BackendResolver`` exists to hand back.
+
+    def _no_io(self, operation: str) -> NoReturn:
+        raise RemoteRefIOError(
+            f"{operation}() is not answerable by a remote ref ({self!s}); "
+            "ask its backend instead."
+        )
+
+    def exists(self) -> bool:
+        self._no_io("exists")
+
+    def is_file(self) -> bool:
+        self._no_io("is_file")
+
+    def is_dir(self) -> bool:
+        self._no_io("is_dir")
+
+    def stat(self) -> os.stat_result:
+        self._no_io("stat")
+
+    def open(self, mode: str = "r", **kwargs: Any) -> IO[Any]:
+        self._no_io("open")
+
+
+#: Every concrete :class:`SourceRef`. One tuple, so the union has a single
+#: definition rather than one per call site.
+SOURCE_REF_TYPES: tuple[type, ...] = (Path, RemoteRef)
+
+
+def is_source_ref(value: object) -> bool:
+    """Whether *value* is a log source rather than something else in the tree.
+
+    The tree is typed on ``object`` and carries four different things:
+    ``SourceRef``s, ``SavedView`` records, ``ProviderSource`` records, and the
+    merged-view sentinel. Everything that walks it looking for a *source* used
+    to spell that ``isinstance(data, Path)``, which was correct for exactly as
+    long as ``Path`` was the only implementation.
+
+    **A provider source is still excluded, and by the same mechanism.** A
+    journal node carries a ``ProviderSource``, not a ref — it is a different
+    kind of thing, with no directory to walk and no file to persist — so the
+    union being over *ref types* rather than over "anything source-shaped" is
+    what keeps ``journal:unit/sshd.service`` out of the starred set. That was
+    the point of the original narrowing and it survives this widening intact.
+    """
+
+    return isinstance(value, SOURCE_REF_TYPES)
+
+
 def parse_ref(text: str) -> SourceRef:
     """The stored form of a source, back as a source.
 
@@ -257,9 +480,26 @@ def parse_ref(text: str) -> SourceRef:
     *not* exact on arbitrary input, because ``Path`` normalises a few shapes
     (``./x`` to ``x``, ``x//y`` to ``x/y``, ``x/`` to ``x``, ``""`` to ``"."``).
     One pass through ``parse_ref`` reaches a fixed point, which is all that
-    persistence needs.
+    persistence needs. :class:`RemoteRef` normalises the same shapes and gives
+    the same guarantee.
+
+    ``journal:`` is **not** given a type of its own and still comes back as a
+    ``Path``. The journald plugin builds its identifiers as ``Path`` and reads
+    them back through :func:`split_scheme`, and there is no backend behind one —
+    a provider answers for it instead, which is the distinction
+    ``ProviderSource`` exists to draw.
+
+    A malformed ``ssh:`` string falls through to ``Path``. There is nowhere to
+    report from here: this function is on the restore path, and one bad entry in
+    ``session.json`` must not cost the session. It degrades to a scheme ref that
+    resolves to nothing and is reported as missing — which is legible, where an
+    invented local path is not.
     """
 
+    if text.startswith(SSH_SCHEME) and scheme_of(text) == "ssh":
+        remote = RemoteRef.parse(text)
+        if remote is not None:
+            return remote
     return Path(text)
 
 

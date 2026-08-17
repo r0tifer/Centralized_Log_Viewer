@@ -20,7 +20,7 @@ import itertools
 import json
 from collections import deque
 from dataclasses import replace
-from datetime import datetime
+from datetime import timedelta
 from time import monotonic
 from pathlib import Path
 from typing import Iterable, Iterator, Literal, Optional, Sequence
@@ -96,9 +96,30 @@ from .services.query import (
     collect_field_names,
     entry_matches,
 )
-from .services.refs import SourceRef, format_ref, identity, parse_ref, ref_key
-from .services.rotation import RotatedSet, describe_set, group_rotated
-from .services.session import ORIGIN_FIELD, SourceSession
+from .services.refs import (
+    RemoteRef,
+    SourceRef,
+    format_ref,
+    identity,
+    is_local,
+    is_source_ref,
+    parse_ref,
+    ref_key,
+)
+from .services.rotation import (
+    RotatedSetReader,
+    RotatedSet,
+    describe_set,
+    group_rotated,
+)
+from .services.reader import open_reader
+from .services.session import (
+    ORIGIN_FIELD,
+    SourceBuffer,
+    SourceFacts,
+    SourceSession,
+    local_facts,
+)
 from .services.timeline import Timeline, build_timeline
 from .services.timeline import EMPTY as EMPTY_TIMELINE
 from .services.watch import (
@@ -220,6 +241,14 @@ ACTION_STYLE = Style(color="#95c8f5", bold=True)
 #: Used to place the merged group correctly when it appears mid-session,
 #: without rebuilding the tree around it.
 TREE_GROUP_LABELS: tuple[str, ...] = (VIEWS_GROUP, PROVIDERS_GROUP, STARRED_GROUP)
+
+#: How far two machines' clocks may disagree before the merged view says so.
+#:
+#: A threshold rather than zero because every measurement carries the link's
+#: own latency, and reporting 40 ms of "skew" on every merge would train the
+#: operator to ignore the line that matters. Two seconds is well inside what
+#: NTP holds and well outside what a round trip explains.
+SKEW_REPORTING_THRESHOLD = timedelta(seconds=2)
 
 #: Width of the source column in a merged view, per breakpoint. Content, not
 #: layout — the column is part of the line the pane renders, so CSS never sees
@@ -598,11 +627,23 @@ class LogViewerApp(App[None]):
         #: the report because these are not files and must not end up anywhere
         #: that assumes they are.
         self._provider_sources: list[ProviderSource] = []
+        #: Filled by every rescan; see `_is_file_node`.
+        self._file_refs: set[SourceRef] = set()
+        #: Which backend answers for which ref. `LOCAL` itself unless remote
+        #: sources are switched on, so nothing about the local path changes.
+        self._backends = build_backends(self._config)
         #: Readers and buffers, owned by a UI-free service. A single open log is
         #: a session of one, so nothing below has a single-source path of its
         #: own to keep in step — see clv/services/session.py.
-        self._session = SourceSession(max_lines=self._config.max_buffer_lines)
+        self._session = SourceSession(
+            max_lines=self._config.max_buffer_lines,
+            reader_factory=self._open_reader,
+            facts=self._source_facts,
+        )
         self._tail_timer: Timer | None = None
+        #: Identifies the in-flight remote open, so a newer selection can
+        #: discard an older one rather than have both install themselves.
+        self._open_token: object | None = None
 
         self._show_lines = self._config.default_show_lines
         self._sources_panel_width = self._config.tree_width
@@ -728,7 +769,12 @@ class LogViewerApp(App[None]):
         self._sources_panel_width = self.state.tree_width or self._config.tree_width
         self._apply_panel_width()
 
-        self._source_manager = SourceManager(*self._split_roots(self._config.log_dirs))
+        self._source_manager = SourceManager(
+            *self._split_roots(
+                list(self._config.log_dirs) + remote_roots(self._config)
+            ),
+            backends=self._backends,
+        )
         self._apply_state_to_widgets()
         # Nothing is opened implicitly: the viewer starts on the discovery
         # summary rather than resuming whatever happened to be open last.
@@ -753,6 +799,15 @@ class LogViewerApp(App[None]):
         directories: list[Path] = []
         files: list[Path] = []
         for entry in roots:
+            if not is_local(entry):
+                # A remote root comes from a host's `log_dirs`, which the config
+                # layer already validated as absolute directories. Asking the
+                # far end to confirm that would be a round trip **on mount**,
+                # before the first frame is drawn — and discovery is about to
+                # walk it anyway, from a worker, where a wrong answer is
+                # reported rather than paid for twice.
+                directories.append(entry)
+                continue
             try:
                 if entry.is_dir():
                     directories.append(entry)
@@ -860,6 +915,120 @@ class LogViewerApp(App[None]):
     def _discovery_settings(self):
         return self.advanced_drawer.settings.to_discovery(self._config.discovery)
 
+    def _is_file_node(self, data: object) -> bool:
+        """Whether a tree node holds a log file rather than a folder.
+
+        A local ref answers for itself, as it always has. A remote one **must
+        not** be asked: ``is_file`` on a ``RemoteRef`` is a round trip, and this
+        runs on a tree selection. The answer comes instead from the discovery
+        report that put the node there, which already knew and knew for free.
+        """
+
+        if isinstance(data, RemoteRef):
+            return data in self._file_refs
+        return isinstance(data, Path) and data.is_file()
+
+    def _open_reader(self, path, **kwargs):
+        """Build a reader for *path*, against whichever backend answers for it.
+
+        The session's factory. Dispatch is on the ref rather than on a flag:
+        ``LOCAL`` for a path on this machine, the host's ``RemoteBackend`` for a
+        ``RemoteRef``.
+
+        A remote log gets a **different reader**, and that is the one place
+        where "the same code reads both" stops being true — for a reason.
+        ``SourceReader.poll`` asks "did this grow?" with a ``stat``, which is
+        free locally and a round trip remotely; a remote source is followed by a
+        persistent ``tail -F`` whose output is drained instead, so the poll
+        costs nothing. Everything downstream — the parser, the buffer, the
+        merge — is unchanged, because both readers answer the same
+        ``prime``/``poll`` contract.
+        """
+
+        backend = self._backends.for_ref(path)
+        if isinstance(path, RemoteRef) and hasattr(backend, "connection"):
+            from .plugins.sources.ssh import RemoteFollowReader
+
+            return RemoteFollowReader(path, backend=backend, **kwargs)
+        return open_reader(path, backend=backend, **kwargs)
+
+    def _source_facts(self, path) -> SourceFacts:
+        """Which machine *path* is on, and what that means for ordering it.
+
+        Local sources get :func:`local_facts` unchanged, so nothing about a
+        local merge moves. A remote one carries its host's name — which becomes
+        the ``node`` field on every line — plus the zone and skew the capability
+        probe measured at connect, which is what lets a merged view across
+        machines be ordered rather than guessed at.
+
+        **Never blocks.** The probe has already happened by the time a source is
+        being opened, and if it somehow has not this reports what it knows
+        rather than reaching for the wire: an unknown zone degrades the merge to
+        the single-zone rule, which is what it did before this existed.
+        """
+
+        if not isinstance(path, RemoteRef):
+            return local_facts(path)
+
+        host = self._config.host(path.node)
+        backend = self._backends.for_ref(path)
+        connection = getattr(backend, "connection", None)
+        if connection is None or not connection.probed:
+            return SourceFacts(node=path.node)
+        facts = connection.facts()
+        return SourceFacts(
+            node=path.node,
+            zone=facts.tzinfo,
+            skew=facts.skew,
+            correct_skew=bool(host is not None and host.correct_clock_skew),
+        )
+
+    def _skew_detail(self) -> str:
+        """What the merged view says about the members' clocks.
+
+        Says nothing when they agree, which is the point: a phrase that appears
+        on every merge is noise, and one that appears only when the ordering is
+        less trustworthy than it looks is information.
+        """
+
+        spread = self._session.skew_spread()
+        parts: list[str] = []
+        if abs(spread) >= SKEW_REPORTING_THRESHOLD:
+            parts.append(f"clocks differ by up to {abs(spread.total_seconds()):.0f}s")
+        if self._session.corrected:
+            parts.append("timestamps adjusted for clock skew")
+        return f" · {' · '.join(parts)}" if parts else ""
+
+    def _discover_everything(self, roots, settings) -> DiscoveryReport:
+        """Walk the local roots and each host's, and fold them into one report.
+
+        Split per host rather than done in one call because **budgets are
+        per host**. Globally, one noisy machine consumes the whole ``max_files``
+        allowance and truncates the others silently, and the report cannot say
+        whose files were cut. Each host gets its own ceiling and its own
+        truncation line.
+
+        Runs in a worker. Every call below may be a round trip.
+        """
+
+        local = [root for root in roots if is_local(root)]
+        report = discover(local, settings, backends=self._backends)
+
+        by_node: dict[str, list[SourceRef]] = {}
+        for root in roots:
+            if isinstance(root, RemoteRef):
+                by_node.setdefault(root.node, []).append(root)
+
+        for node, host_roots in by_node.items():
+            host = self._config.host(node)
+            host_settings = (
+                settings if host is None else host.discovery_settings(settings)
+            )
+            report.extend(
+                discover(host_roots, host_settings, backends=self._backends)
+            )
+        return report
+
     async def _rescan(self) -> None:
         """Re-run discovery off the UI thread and rebuild the tree."""
 
@@ -873,12 +1042,13 @@ class LogViewerApp(App[None]):
         # exactly as long as they took, and when one hit its own timeout the
         # tree quietly came back short. Neither is discovery's judgement to
         # make: a provider that raises is still recorded and skipped.
+        #
+        # A remote root makes this load-bearing rather than merely prudent:
+        # every entry below is a network round trip, and doing it here would be
+        # the frozen UI Requirement 3 exists to prevent.
         worker = self.run_worker(
-            # `backends=LOCAL` is passed rather than left to the default, so the
-            # seam is visible at the call site that owns the walk. Phase 3 of
-            # SSH_TODO.md is where this stops being a constant.
             lambda: (
-                discover(roots, settings, backends=LOCAL),
+                self._discover_everything(roots, settings),
                 self._plugins.discover_sources(),
             ),
             thread=True,
@@ -890,6 +1060,9 @@ class LogViewerApp(App[None]):
         if report is None:
             report = DiscoveryReport()
         self._report = report
+        #: Every ref discovery listed as a *file*, so a tree node can be told
+        #: from a folder without asking a remote host on the event loop.
+        self._file_refs = {item.path for item in report.files}
         self._provider_sources = provider_sources
         self._refresh_plugin_status()
         # After the providers have run, so the drawer reports what they found
@@ -1003,7 +1176,13 @@ class LogViewerApp(App[None]):
         folders: dict[Path, list[Path]] = {}
         for item in items:
             relative = item.relative.parent
-            folders.setdefault(Path() if relative == Path(".") else relative, []).append(
+            # `not relative.parts` rather than `== Path(".")`: identical for a
+            # local path -- `Path(".").parts` is `()` and nothing else relative
+            # is empty -- and it also holds for the `PurePosixPath` a
+            # `RemoteRef` hands back, which compares unequal to `Path(".")` off
+            # POSIX. The alternative was a ref type whose `relative_to` lied
+            # about being host-qualified.
+            folders.setdefault(Path() if not relative.parts else relative, []).append(
                 item.path
             )
         return folders
@@ -1089,6 +1268,14 @@ class LogViewerApp(App[None]):
     # --- source selection and tailing --------------------------------------
 
     def _select_source(self, path: Path, *, announce: bool = True) -> bool:
+        if not is_local(path):
+            # Everything below — `is_file`, the prime inside `open_single` — is
+            # a round trip for a remote ref, and this method is called straight
+            # off a tree cursor move. Requirement 3 forbids doing that here, so
+            # the remote path becomes a worker with a pending state and this one
+            # is left exactly as it was.
+            return self._begin_remote_open(path, announce=announce)
+
         resolved = identity(path)
         if not resolved.is_file():
             if announce:
@@ -1108,13 +1295,141 @@ class LogViewerApp(App[None]):
         self._after_source_change()
         return True
 
+    def _begin_remote_open(self, ref: SourceRef, *, announce: bool) -> bool:
+        """Open a remote source from a worker, saying so while it happens.
+
+        ``_select_rotated_set`` set the precedent: it is "the one path in CLV
+        that is not instant" and it says what it did rather than going quiet.
+        A remote open inherits that treatment, because a pane that sits blank
+        for a round trip and a pane that failed look identical.
+
+        Returns True meaning *accepted*, not *opened* — the worker reports the
+        outcome itself. Every caller uses the result to decide whether to keep
+        going, and an open that is in flight has not failed.
+        """
+
+        self._stop_tail()
+        # A newer selection wins. Without this, switching sources twice while
+        # the first open is still in flight races two primes into one session
+        # and the pane ends up showing whichever finished last.
+        self._open_token = object()
+        node = ref.node if isinstance(ref, RemoteRef) else ""
+        if announce:
+            self._notify(f"Opening {ref.name} on {node}…")
+        self.run_worker(
+            self._finish_remote_open(ref, self._open_token, announce),
+            group="remote-open",
+            exit_on_error=False,
+        )
+        return True
+
+    async def _finish_remote_open(
+        self, ref: SourceRef, token: object, announce: bool
+    ) -> None:
+        """The blocking half, on a thread, committed back on the loop."""
+
+        def work() -> SourceBuffer:
+            backend = self._backends.for_ref(ref)
+            if backend.kind(ref) != "file":
+                raise OSError("not a readable file")
+            buffer = SourceBuffer(
+                ref,
+                max_lines=self._session.max_lines,
+                reader=self._open_reader(ref, max_lines=self._session.max_lines),
+                facts=self._source_facts(ref),
+            )
+            buffer.prime()
+            return buffer
+
+        worker = self.run_worker(
+            work, thread=True, name="remote-open", exit_on_error=False
+        )
+        try:
+            buffer = await worker.wait()
+        except Exception as exc:  # noqa: BLE001 - a remote read fails many ways
+            if token is self._open_token and announce:
+                self._notify(f"Failed to read {ref}: {exc}", "error")
+            return
+
+        if token is not self._open_token or self._is_shutting_down:
+            # The operator moved on while this was in flight. Release what the
+            # worker built rather than installing it over their new choice.
+            buffer.close()
+            return
+
+        self._session.install(buffer)
+        self._show_lines = min(
+            self._config.default_show_lines, self._config.max_buffer_lines
+        )
+        self._after_source_change()
+
+    def _begin_remote_rotated_open(self, rotated_set: RotatedSet) -> bool:
+        """A remote rotated set, primed on a worker and committed on the loop."""
+
+        self._stop_tail()
+        self._open_token = token = object()
+        self._notify(f"Opening {rotated_set.name} on {rotated_set.head.node}…")
+
+        async def finish() -> None:
+            def work() -> SourceBuffer:
+                # Every member of a set lives wherever the set does, so one
+                # backend answers for all of them — the reader says so itself.
+                reader = RotatedSetReader(
+                    rotated_set,
+                    max_lines=self._session.max_lines,
+                    backend=self._backends.for_ref(rotated_set.head),
+                )
+                buffer = SourceBuffer(
+                    rotated_set.head,
+                    max_lines=self._session.max_lines,
+                    reader=reader,
+                    facts=self._source_facts(rotated_set.head),
+                )
+                buffer.prime()
+                return buffer
+
+            worker = self.run_worker(
+                work, thread=True, name="remote-rotated", exit_on_error=False
+            )
+            try:
+                buffer = await worker.wait()
+            except Exception as exc:  # noqa: BLE001 - a remote read fails many ways
+                if token is self._open_token:
+                    self._notify(
+                        f"Failed to read {rotated_set.name}: {exc}", "error"
+                    )
+                return
+            if token is not self._open_token or self._is_shutting_down:
+                buffer.close()
+                return
+
+            self._session.install(buffer)
+            self._show_lines = min(
+                self._config.default_show_lines, self._config.max_buffer_lines
+            )
+            self._after_source_change()
+            self._notify(
+                describe_set(rotated_set, getattr(buffer.reader, "members_read", 0))
+            )
+
+        self.run_worker(finish(), group="remote-open", exit_on_error=False)
+        return True
+
     def _select_rotated_set(self, rotated_set: RotatedSet) -> bool:
         """Open a whole rotated log as one source.
 
         The one path in CLV that is not instant: older members have to be
         decompressed from the front, so this says what it read rather than
         going quiet for a second and hoping nobody notices.
+
+        A **remote** set is worse than not-instant — every member is a round
+        trip, and a twelve-member set opened inline would be twelve of them on
+        the event loop — so it takes the same worker path a single remote open
+        already does.
         """
+
+        if not is_local(rotated_set.head):
+            return self._begin_remote_rotated_open(rotated_set)
 
         self._stop_tail()
         try:
@@ -1177,7 +1492,56 @@ class LogViewerApp(App[None]):
             return
 
         self._stop_tail()
+
+        if any(not is_local(path) for path in paths):
+            # Every remote member is a round trip, so a five-host merge opened
+            # inline is five of them on the event loop. The local-only path
+            # below is untouched.
+            self._open_token = token = object()
+            self._notify(f"Opening {len(paths)} sources…")
+            self.run_worker(
+                self._finish_merged_open(paths, token),
+                group="remote-open",
+                exit_on_error=False,
+            )
+            return
+
         opened, failed = self._session.open_many(paths)
+        self._report_merge(opened, failed)
+
+    async def _finish_merged_open(self, paths, token: object) -> None:
+        """Prime every member on a worker, commit on the loop."""
+
+        worker = self.run_worker(
+            lambda: self._session.prepare_many(paths),
+            thread=True,
+            name="remote-merge",
+            exit_on_error=False,
+        )
+        try:
+            opened, failed = await worker.wait()
+        except Exception as exc:  # noqa: BLE001 - a remote read fails many ways
+            if token is self._open_token:
+                self._notify(f"Could not open the merged set: {exc}", "error")
+            return
+
+        if token is not self._open_token or self._is_shutting_down:
+            for buffer in opened:
+                buffer.close()
+            return
+
+        self._session.install_many(opened)
+        self._report_merge(opened, failed)
+
+    def _report_merge(self, opened, failed) -> None:
+        """Say what opened and name what did not. One place, both paths.
+
+        A member that has rotated away — or a host that is unreachable — must
+        not stop the others opening, and must not vanish without being
+        mentioned. That is ``open_many``'s contract and it is worth having one
+        implementation of the reporting half.
+        """
+
         for path, reason in failed:
             self._notify(f"{path.name} could not be opened: {reason}", "warning")
         if not opened:
@@ -1192,7 +1556,7 @@ class LogViewerApp(App[None]):
             if anchored
             else ""
         )
-        self._notify(f"Merged {len(opened)} sources.{detail}")
+        self._notify(f"Merged {len(opened)} sources.{detail}{self._skew_detail()}")
 
     def action_clear_merged(self) -> None:
         """Empty the merged set, so the next one starts from nothing.
@@ -1303,7 +1667,7 @@ class LogViewerApp(App[None]):
         # Every other node carrying a path — the file in its folder, and any
         # copy of it in the starred group — gains or loses the indicator.
         for node in _walk_nodes(tree.root):
-            if node.parent is group or not isinstance(node.data, Path):
+            if node.parent is group or not is_source_ref(node.data):
                 continue
             plain = node.label.plain
             if plain.startswith(ICON_MERGED):
@@ -2690,7 +3054,10 @@ class LogViewerApp(App[None]):
             opened = True
         elif view.source:
             source = parse_ref(view.source)
-            if source.is_file():
+            # A remote ref cannot answer `is_file` without a round trip on the
+            # event loop; the open below is the thing that finds out, and it
+            # already does so from a worker.
+            if not is_local(source) or source.is_file():
                 # _select_source renders once; nothing below may render again.
                 opened = self._select_source(source, announce=False)
                 if opened:
@@ -2817,7 +3184,9 @@ class LogViewerApp(App[None]):
             if tree is None or tree.cursor_node is None:
                 return None
             data = tree.cursor_node.data
-            return data if isinstance(data, Path) and data.is_file() else None
+            # `_is_file_node`, not `data.is_file()`: a remote ref cannot answer
+            # that without a round trip, and this runs on every cursor move.
+            return data if self._is_file_node(data) else None
 
         if tree is not None and tree.has_focus:
             target = cursor_file()
@@ -3058,16 +3427,28 @@ class LogViewerApp(App[None]):
         self._stop_tail()
         self._config = load_config()
         self._settings_path = get_config_file() or user_config_path()
+        # Connections belong to the configuration that named them: a host that
+        # was edited, disabled or removed must not keep a multiplex master open
+        # behind the new settings.
+        closer = getattr(self._backends, "close", None)
+        if closer is not None:
+            closer()
+        self._backends = build_backends(self._config)
         # The cap can have changed under us, so the session adopts the new one
         # before anything is read against it.
         self._session.resize(self._config.max_buffer_lines)
         self._entries = deque(maxlen=self._config.max_buffer_lines)
-        self._source_manager = SourceManager(*self._split_roots(self._config.log_dirs))
+        self._source_manager = SourceManager(
+            *self._split_roots(
+                list(self._config.log_dirs) + remote_roots(self._config)
+            ),
+            backends=self._backends,
+        )
         for path in added:
             self._source_manager.add(str(path))
 
         await self._rescan()
-        if selected is not None and selected.is_file():
+        if selected is not None and (not is_local(selected) or selected.is_file()):
             self._select_source(selected, announce=False)
         self._notify("Sources reloaded.")
 
@@ -3300,7 +3681,7 @@ class LogViewerApp(App[None]):
 
     def on_tree_node_selected(self, event: Tree.NodeSelected[object]) -> None:
         data = event.node.data
-        if isinstance(data, Path) and data.is_file():
+        if self._is_file_node(data):
             self._select_source(data)
         elif isinstance(data, RotatedSet):
             self._select_rotated_set(data)
@@ -3671,10 +4052,60 @@ class LogViewerApp(App[None]):
         # owns a subprocess — so shutdown releases them explicitly rather than
         # leaving it to garbage collection.
         self._session.close()
+        # A multiplex socket is a live authenticated connection any local
+        # process running as this user can ride, so it is torn down explicitly
+        # rather than left to ControlPersist.
+        closer = getattr(self._backends, "close", None)
+        if closer is not None:
+            closer()
         if self._persist_state:
             # Persist as-is: the selected source is deliberately kept so the
             # next launch reopens it.
             self._store.save(self.state)
+
+
+def build_backends(config: LogConfig):
+    """The resolver discovery and reading route every ref through.
+
+    Returns ``LOCAL`` **itself** when remote sources are switched off, which is
+    Requirements 8 and 13 in one line: nothing is constructed, nothing connects,
+    no ``ssh`` is spawned, and the local path is the same object it has always
+    been. A build with the transport module removed entirely takes the same
+    branch rather than failing to start.
+    """
+
+    if not getattr(config, "enable_ssh", False):
+        return LOCAL
+    hosts = [host for host in config.hosts if host.enabled]
+    if not hosts:
+        return LOCAL
+    try:
+        from .plugins.sources.ssh import RemoteResolver
+    except Exception:  # noqa: BLE001 - a build that shipped without it
+        return LOCAL
+    return RemoteResolver(
+        hosts, local=LOCAL, include_globs=config.discovery.include_globs
+    )
+
+
+def remote_roots(config: LogConfig) -> list[RemoteRef]:
+    """One ref per configured directory on each enabled host.
+
+    Built here rather than in ``config.py`` because ``RemoteHost.log_dirs`` is
+    deliberately a tuple of **strings**: those are paths on another machine, and
+    ``normalize_ref`` would resolve them against this one's working directory.
+    They become refs at the point where there is a host to qualify them with,
+    which is here.
+    """
+
+    if not getattr(config, "enable_ssh", False):
+        return []
+    return [
+        RemoteRef.build(host.name, directory)
+        for host in config.hosts
+        if host.enabled
+        for directory in host.log_dirs
+    ]
 
 
 def _plugin_name(plugin: object) -> str:
@@ -3702,7 +4133,7 @@ def _walk_nodes(node: TreeNode[object]) -> Iterator[TreeNode[object]]:
 
 
 def _find_node(node: TreeNode[Path], target: Path) -> Optional[TreeNode[Path]]:
-    if isinstance(node.data, Path) and identity(node.data) == target:
+    if is_source_ref(node.data) and identity(node.data) == target:
         return node
     for child in node.children:
         found = _find_node(child, target)

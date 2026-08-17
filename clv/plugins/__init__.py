@@ -66,11 +66,20 @@ class ProviderSource:
     identified by one: nothing on disk answers to ``journal:unit/sshd.service``.
     That is deliberate and is what keeps them out of every operation that
     assumes a real file — starring (which persists a path), include/exclude
-    globs (which describe a directory walk), and the rotated-set grouping — all
-    of which test ``isinstance(data, Path)`` and so cannot see one of these.
-    Those operations were generalised nowhere: a provider source is a different
-    kind of thing, and pretending otherwise is how it would end up in someone's
-    ``session.json`` as a path that does not exist.
+    globs (which describe a directory walk), and the rotated-set grouping. A
+    provider source is a different kind of thing, and pretending otherwise is
+    how it would end up in someone's ``session.json`` as a path that does not
+    exist.
+
+    **What excludes one is the type, and it still does.** Those operations test
+    ``refs.is_source_ref`` — a closed union of the concrete ``SourceRef``
+    implementations — and a tree node offering a provider source carries *this
+    record*, not a ref, so none of them can see it. The test used to be spelled
+    ``isinstance(data, Path)``, which meant the same thing for exactly as long
+    as ``Path`` was the only implementation; ``RemoteRef`` made it two, and the
+    union is what kept this guarantee intact while the set of ref types grew.
+    Widening it to "anything source-shaped" is what would let one of these
+    through, which is why it is a union of types rather than a duck test.
     """
 
     path: Path

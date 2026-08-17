@@ -36,8 +36,10 @@ _CHUNK_SIZE = 64 * 1024
 #: a file with no newlines at all).
 DEFAULT_MAX_READ_BYTES = 8 * 1024 * 1024
 
-#: Bytes sampled when deciding whether a file is text.
-_SNIFF_SIZE = 8192
+#: Bytes sampled when deciding whether a file is text. Public because discovery
+#: asks a backend for exactly this many in a batch — see
+#: :class:`~clv.services.backend.ClassifyRequest`.
+SNIFF_SIZE = 8192
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,9 +123,28 @@ class TailRead:
 
 
 def looks_binary(
-    path: Path, *, sniff: int = _SNIFF_SIZE, backend: SourceBackend = LOCAL
+    path: Path, *, sniff: int = SNIFF_SIZE, backend: SourceBackend = LOCAL
 ) -> bool:
     """Heuristic text/binary test: a NUL byte in the first block means binary.
+
+    Obtains the block and applies :func:`looks_binary_block` to it. Discovery
+    goes the other way round — it collects blocks for a whole batch through
+    ``backend.classify`` and calls the rule directly — so that a remote tree
+    costs one round trip instead of one per file. Both paths reach the same
+    function, which is the point of the split.
+    """
+
+    try:
+        with backend.open(path, "rb") as handle:
+            block = handle.read(sniff)
+    except OSError:
+        return False
+
+    return looks_binary_block(block)
+
+
+def looks_binary_block(block: bytes) -> bool:
+    """The rule itself, over bytes already in hand.
 
     This is the same rule git uses. It keeps journals, archives and databases
     out of the viewer without maintaining an extension blocklist, which matters
@@ -134,13 +155,12 @@ def looks_binary(
     every character. Reading bytes alone rejects perfectly readable UTF-16
     files -- which is how Windows and PowerShell write their exports -- for
     looking like the binaries they are not.
-    """
 
-    try:
-        with backend.open(path, "rb") as handle:
-            block = handle.read(sniff)
-    except OSError:
-        return False
+    Separated from :func:`looks_binary` so it can be applied to a block a
+    *batch* produced. A remote backend that answered "binary: yes" itself would
+    have had to reimplement the paragraph above in ``sh``, which is how the
+    UTF-16 case would quietly come back.
+    """
 
     encoding = detect_encoding(block)
     if encoding.unit_size == 1:

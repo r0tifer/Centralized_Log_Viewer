@@ -1,0 +1,36 @@
+# BusyBox — the profile that matters.
+#
+# Alpine is a first-class target rather than an edge case, and it is the image
+# that actually exercises Requirement 5: BusyBox `find` has no `-printf`, so the
+# walk takes its `-exec stat … {} +` fallback here and nowhere else in the
+# default suite. A fake runner will happily return whatever fixture it was
+# given; this will not.
+FROM docker.io/library/alpine:3.20
+
+RUN apk add --no-cache openssh-server \
+ && ssh-keygen -A \
+ && adduser -D -s /bin/sh clvtest \
+ && passwd -u clvtest 2>/dev/null || true
+
+# Key-only, no passwords, no root login — the same auth model CLV itself
+# enforces with `BatchMode=yes`. A run that could fall back to a password would
+# be testing something the product refuses to do.
+RUN mkdir -p /home/clvtest/.ssh \
+ && chmod 700 /home/clvtest/.ssh \
+ && chown clvtest:clvtest /home/clvtest/.ssh \
+ && printf '%s\n' \
+      'PermitRootLogin no' \
+      'PasswordAuthentication no' \
+      'ChallengeResponseAuthentication no' \
+      'PubkeyAuthentication yes' \
+      'AllowUsers clvtest' \
+    >> /etc/ssh/sshd_config
+
+COPY authorized_keys /home/clvtest/.ssh/authorized_keys
+RUN chmod 600 /home/clvtest/.ssh/authorized_keys \
+ && chown clvtest:clvtest /home/clvtest/.ssh/authorized_keys \
+ && mkdir -p /srv/logs \
+ && chown clvtest:clvtest /srv/logs
+
+EXPOSE 22
+CMD ["/usr/sbin/sshd", "-D", "-e"]

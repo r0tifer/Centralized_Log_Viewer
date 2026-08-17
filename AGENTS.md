@@ -124,7 +124,7 @@ distros.
 | **App shell** | `clv/app.py` | Layout, routing, lifecycle, breakpoints | Parse, filter, read files, or define widget visuals |
 | **Services** | `clv/services/` | Source identity (`refs.py`), source IO (`backend.py`), parsing, filtering, discovery, reading, buffering, config, source management | Touch the UI or import Textual, or reach past `backend.py` to `os` |
 | **Widgets** | `clv/widgets/` | Self-contained UI + own `DEFAULT_CSS` | Depend on other widgets' internals or import `clv.app` |
-| **Plugins** | `clv/plugins/` | Extension interfaces + loader | Break interface contracts |
+| **Plugins** | `clv/plugins/` | Extension interfaces + loader; also the two things that spawn a subprocess and so need consent — `sources/journald.py` and `sources/ssh.py` (the SSH transport and `RemoteBackend`) | Break interface contracts, or spawn anything before the operator opts in |
 | **State** | `clv/storage.py` | JSON session persistence (atomic), including `SavedView` records | Depend on the UI |
 
 ### Services
@@ -134,6 +134,15 @@ distros.
   normalised across formats — `host` means the same thing whether it came from
   syslog or from an access log. Values are strings and are never coerced; a
   continuation inherits timestamp and level but never fields.
+- `session.py` — the readers and buffers behind the pane, and **the two things
+  a source's machine contributes**. `SourceFacts` carries a remote source's node
+  name, its measured timezone and its clock skew. `node` is tagged onto every
+  entry as provenance (`host` is untouched and still means what the log says
+  about itself); the zone and skew are applied **only in the merge sort key**,
+  never to the entry, so a displayed timestamp is always exactly what the log
+  said. The cross-zone branch engages only when the members' offsets actually
+  disagree — a single-zone set, which every all-local merge is, takes the
+  original path unchanged.
 - `query.py` — the grammar behind `host:web01 status>=500`: tokenising,
   operators, and the rule that decides what is a field term at all. A token is
   one only when its key is a name the parser normalises or a key the buffer
@@ -164,19 +173,29 @@ distros.
   absolutises what a *person typed*. Collapsing them is what turns
   `journal:all` into `$CWD/journal:all` on the next launch. Also owns
   `identity` / `ref_key` — one canonical form, replacing the two copies that
-  used to live in `app.py` and `sources.py`.
+  used to live in `app.py` and `sources.py`. Two implementations now: `Path`,
+  and `RemoteRef` (`ssh:web01/var/log/syslog`) for a source on another machine.
+  The remote type lives here rather than in the SSH plugin because `parse_ref`
+  decodes `session.json` before any plugin is imported — a type registered at
+  import time would decode the same file differently depending on load order.
+  It is pure identity and performs no IO; its backend answers instead.
 - `backend.py` — where a source's bytes come from, and **what asking costs**.
   `refs.py` answered what a source is; this answers who reads it. `walk`,
-  `list_dir`, `kind`, `access`, `open`, `stat`, `identity` — `LocalBackend` is
-  the only implementation and its behaviour is what discovery and reading did
-  before. The part that is not a refactor is the blocking contract: every method
+  `list_dir`, `kind`, `access`, `open`, `stat`, `identity`, `classify` —
+  `LocalBackend`'s behaviour is what discovery and reading did before, and
+  `RemoteBackend` (`plugins/sources/ssh.py`) is the second implementation. The part that is not a refactor is the blocking contract: every method
   is marked `@cheap` or `@blocking`, the marks are what
   `BackendCapabilities.blocking` is derived from, and `cheap_only()` turns a
   blocking call on the event loop into an exception rather than a freeze. Two
   members carry reasoning worth knowing: `identity` is an **opaque** comparable
   whose `None` means "this backend has no stable answer" (rotation then degrades
   to shrink-only, and says so), and `walk` yields files only, lazily, so
-  `max_files` bounds work rather than merely output.
+  `max_files` bounds work rather than merely output. `classify` is the one
+  member that takes a **list**: discovery has to ask "readable? binary? a valid
+  archive?" of every file it found, and asking per file is a round trip per file
+  — locally the same open it always did, remotely one command per batch. It
+  returns *bytes*, never a verdict, so `reader.looks_binary_block` and
+  `compressed.probe_block` stay the only place the rule lives.
 - `reader.py` — BOM-based encoding detection, bounded backwards reads,
   incremental tailing, rotation and truncation recovery. `open_reader()` picks
   between `SourceReader` (streams) and `DocumentReader` (container documents);
@@ -392,7 +411,19 @@ installed" — the trade Item 12 asked for.
 - Layout regressions are caught by asserting widget `region` bounds at a given
   terminal size rather than by eyeballing screenshots.
 
-Run: `python -m pytest` (885 tests).
+- **The default run never touches a network**, and the one suite that does is
+  opt-in: `tests/containers/run.sh alpine` / `gnu`, which builds a throwaway
+  sshd container, runs `pytest -m remote_integration` against it and tears it
+  down. Deselected by `addopts`, never part of a gate. It is the only thing that can catch a BusyBox `find` with no `-printf`
+  or a BSD `stat`, because a fake runner returns whatever fixture it was given.
+- `tests/test_backend.py`'s `BackendContract` is written against the protocol and
+  knows nothing about the local filesystem. Subclass it, override the `backend`
+  and `workspace` fixtures, and every assertion runs against another backend —
+  which is how `RemoteBackend` is held to the same behaviour as `LocalBackend`.
+
+Run: `python -m pytest` (1135 tests, 1 skipped, 11 deselected) on **both** 3.11
+and 3.14 — the local default is 3.14 and a green suite there is not evidence
+that the supported floor still works.
 
 ---
 

@@ -1728,7 +1728,7 @@ reason that survives the decision to include everything else.
 | `clv/__main__.py` | 13,14 | `freeze_support()`, argv entry |
 | `clv/plugins/formats/` | 7 | **New** — drop-in directory and the nginx reference |
 | `examples/plugins/` | 16 | **New** — one copyable example per interface |
-| `clv/plugins/README.md` | 16 | **New** — author-facing quick start |
+| `clv/plugins/README.md` | 16 | **New** — author-facing quick start. Covers the **shipped** sources too: journald, and the SSH transport `SSH_TODO.md` Phase 4 added (a backend rather than a provider — see `clv/plugins/AGENTS.md`, which holds that contract until this file exists). |
 | `settings.conf`, `README.md` | 3,5,6,8,9,10,11,12,14,15,16 | Keys, chapter, sweep |
 | `tests/test_api_surface.py` | 2 | **New** — the freeze |
 | `tests/test_plugin_drawer.py` | 4 | **New** |

@@ -12,14 +12,22 @@ from __future__ import annotations
 
 import fnmatch
 import os
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Iterator, Sequence
 
-from .backend import LOCAL, BackendResolver, SourceBackend
-from .compressed import is_compressed, probe
+from .backend import (
+    LOCAL,
+    BackendResolver,
+    ClassifyRequest,
+    ClassifyResult,
+    SourceBackend,
+    WalkEntry,
+)
+from .compressed import PROBE_SIZE, is_compressed, probe_block
 from .documents import document_format_for
-from .reader import looks_binary
+from .reader import SNIFF_SIZE, looks_binary_block
 from .refs import SourceRef
 
 #: Skipped unless the user opts in. These are readable files that are not
@@ -156,10 +164,38 @@ class DiscoveryReport:
     skipped_sources: list[tuple[SourceRef, str]] = field(default_factory=list)
     #: True when max_files stopped the walk early.
     truncated: bool = False
+    #: The roots whose walk was cut short, so the report can say **whose** files
+    #: were dropped. A global bool was enough while every root was on this
+    #: machine and shared one budget; with a per-host ceiling, "stopped at the
+    #: limit" without naming the host is not something an operator can act on.
+    truncated_roots: list[SourceRef] = field(default_factory=list)
 
     @property
     def file_count(self) -> int:
         return len(self.files)
+
+    def extend(self, other: "DiscoveryReport") -> "DiscoveryReport":
+        """Fold *other* into this report, in place.
+
+        Discovery runs once per host so each can have its own ``max_files``
+        budget, and the results have to become one report because the tree, the
+        summary and the starred-set lookup are all built from a single one.
+        Counts add; the file list is re-sorted by :func:`discover`'s own rule so
+        a merged report is ordered exactly as an unsplit one would have been.
+        """
+
+        self.files.extend(other.files)
+        self.roots.extend(other.roots)
+        self.directories |= other.directories
+        self.skipped_unsupported += other.skipped_unsupported
+        self.skipped_filtered += other.skipped_filtered
+        self.skipped_unreadable += other.skipped_unreadable
+        self.unreadable_roots.extend(other.unreadable_roots)
+        self.skipped_sources.extend(other.skipped_sources)
+        self.truncated = self.truncated or other.truncated
+        self.truncated_roots.extend(other.truncated_roots)
+        self.files.sort(key=lambda item: str(item.path).lower())
+        return self
 
     @property
     def skipped_total(self) -> int:
@@ -187,6 +223,8 @@ class DiscoveryReport:
             lines.append("Skipped: " + ", ".join(skipped))
         if self.truncated:
             lines.append(f"Stopped at the {self.file_count}-file limit; narrow the include filter to see more.")
+        for root in self.truncated_roots:
+            lines.append(f"Reached its file limit: {root}")
         for path, reason in self.skipped_sources:
             lines.append(f"File skipped - {reason}: {path}")
         for root in self.unreadable_roots:
@@ -233,6 +271,7 @@ def skip_reason(
     *,
     named: bool = False,
     backend: SourceBackend = LOCAL,
+    measured: ClassifyResult | None = None,
 ) -> str | None:
     """Why *path* would not be listed, or None if it is a valid source.
 
@@ -244,6 +283,35 @@ def skip_reason(
     they want this one, and filters exist to narrow a walk — but the type-based
     exclusions still do, because those describe what can be displayed at all
     rather than what was asked for.
+
+    *measured* is this file's entry from a ``backend.classify`` batch, when the
+    caller already has one. The walk always does — that is how a remote tree
+    costs one round trip instead of one per file — and passing it here is what
+    keeps the *judgement* in a single function rather than forking a second
+    copy for the batched path. Absent, the measurement is taken for this one
+    file, which is what a directly named source does.
+    """
+
+    reason = _name_skip(path, root, settings, named=named)
+    if reason is not None:
+        return reason
+    if measured is None:
+        request = classify_request(path, settings)
+        measured = backend.classify([request]).get(request.ref)
+    return _content_skip(path, settings, measured)
+
+
+def _name_skip(
+    path: SourceRef,
+    root: SourceRef,
+    settings: DiscoverySettings,
+    *,
+    named: bool,
+) -> str | None:
+    """The half that costs no IO, so a filtered file is never read.
+
+    Split out because it is what decides whether a file is worth putting in a
+    ``classify`` batch at all. Ordering is unchanged: globs first, always.
     """
 
     exclude_globs = settings.exclude_globs
@@ -265,7 +333,40 @@ def skip_reason(
         and not matches_any(path, root, settings.include_globs)
     ):
         return FILTERED
-    if not backend.access(path, os.R_OK):
+    return None
+
+
+def classify_request(
+    path: SourceRef, settings: DiscoverySettings
+) -> ClassifyRequest:
+    """How much of *path* a verdict needs, and therefore what to ask for.
+
+    Three answers, and which one applies is decided from the **name** alone so
+    it costs nothing: a compressed member needs enough to parse its container
+    header, an ordinary file needs the text sniff block, and a document — or
+    any file when ``skip_binary`` is off — needs no bytes at all, only whether
+    it can be read.
+    """
+
+    if is_compressed(path):
+        return ClassifyRequest(ref=path, head_bytes=PROBE_SIZE)
+    if settings.skip_binary and not _is_document(path):
+        return ClassifyRequest(ref=path, head_bytes=SNIFF_SIZE)
+    return ClassifyRequest(ref=path, head_bytes=0)
+
+
+def _content_skip(
+    path: SourceRef,
+    settings: DiscoverySettings,
+    measured: ClassifyResult | None,
+) -> str | None:
+    """The half that needed the file's bytes, over bytes already in hand.
+
+    A ref missing from the batch is unreadable: the backend could not measure
+    it, which is the same conclusion ``access`` returning False used to reach.
+    """
+
+    if measured is None or not measured.readable:
         return UNREADABLE
     if is_compressed(path):
         # The binary sniff would reject every one of these for looking like
@@ -273,11 +374,15 @@ def skip_reason(
         # whether the archive opens at all. A corrupt one is `unreadable` --
         # CLV supports the format, this particular file is damaged -- which is
         # a different answer from `unsupported` and the actionable one.
-        return None if probe(path, backend=backend) else UNREADABLE
+        return (
+            None
+            if probe_block(path, measured.head, complete=measured.complete)
+            else UNREADABLE
+        )
     if (
         settings.skip_binary
         and not _is_document(path)
-        and looks_binary(path, backend=backend)
+        and looks_binary_block(measured.head)
     ):
         return UNSUPPORTED
     return None
@@ -298,8 +403,9 @@ def _accepts(
     settings: DiscoverySettings,
     report: DiscoveryReport,
     backend: SourceBackend,
+    measured: ClassifyResult | None = None,
 ) -> bool:
-    reason = skip_reason(path, root, settings, backend=backend)
+    reason = skip_reason(path, root, settings, backend=backend, measured=measured)
     if reason is None:
         return True
     _count_skip(report, reason)
@@ -316,6 +422,18 @@ def _is_document(path: SourceRef) -> bool:
     """
 
     return document_format_for(path) is not None
+
+
+#: Candidates measured in one :meth:`~clv.services.backend.SourceBackend.classify`
+#: call.
+#:
+#: A ceiling on two things at once. It bounds the argv a remote backend builds
+#: from the batch — a single command naming five thousand paths would exceed
+#: ``ARG_MAX`` — and it bounds the lookahead below, so a tree that is about to
+#: hit ``max_files`` measures at most one batch it never lists. Large enough
+#: that a 400-file ``/var/log`` is one round trip, which is the number
+#: Requirement 4 is about.
+CLASSIFY_BATCH = 500
 
 
 def _walk_directory(
@@ -335,24 +453,84 @@ def _walk_directory(
     *seen_dirs* is shared across every root in one pass, which is why it is
     threaded through rather than owned by the walk: two configured roots that
     overlap must not walk the shared subtree twice.
+
+    **The loop is the one it always was, with a buffer in front of it.** Entries
+    arrive in batches of :data:`CLASSIFY_BATCH` and are measured together, then
+    handed to the same per-entry judgement in the same order — so the accepted
+    set, the skip tallies and where ``max_files`` truncates are all unchanged.
+    What changes is the cost of asking: locally one open per file either way,
+    remotely one command per batch instead of one round trip per file.
     """
 
-    for entry in backend.walk(
+    entries = backend.walk(
         root, follow_symlinks=settings.follow_symlinks, seen=seen_dirs
-    ):
+    )
+    buffered: deque[WalkEntry] = deque()
+    measured: dict[SourceRef, ClassifyResult] = {}
+
+    while True:
+        if not buffered:
+            measured = _fill_batch(
+                entries, buffered, root, settings, backend, report.file_count
+            )
+            if not buffered:
+                return
         if report.file_count >= settings.max_files:
             report.truncated = True
+            report.truncated_roots.append(root)
             return
+        entry = buffered.popleft()
         if entry.unreadable:
             report.skipped_unreadable += 1
             continue
         candidate = entry.ref
-        if not _accepts(candidate, root, settings, report, backend):
+        if not _accepts(
+            candidate, root, settings, report, backend, measured.get(candidate)
+        ):
             continue
         report.files.append(
             DiscoveredFile(path=candidate, root=root, size=entry.size)
         )
         report.directories.add(candidate.parent)
+
+
+def _fill_batch(
+    entries: Iterator[WalkEntry],
+    buffered: deque[WalkEntry],
+    root: SourceRef,
+    settings: DiscoverySettings,
+    backend: SourceBackend,
+    found: int,
+) -> dict[SourceRef, ClassifyResult]:
+    """Pull one batch off the walk and measure the part of it that needs it.
+
+    Only entries that survive the **name** filters are measured, which is what
+    keeps a filtered-out tree free: ``skip_reason`` has always returned on a
+    glob before touching the file, and batching must not quietly start reading
+    what the operator's own ``exclude_globs`` hid.
+
+    **Laziness survives, and the budget is what bounds it.** The batch is capped
+    at whatever is left of ``max_files`` plus one — the extra entry being how
+    truncation is detected at all, exactly as the unbatched loop discovered it —
+    so pointing CLV at a 100 000-file tree with ``max_files = 5`` still measures
+    six files and not five hundred. That upper bound is a *pre-existing*
+    assertion in ``tests/test_discovery_reader.py``, and it is the reason this
+    parameter exists.
+    """
+
+    remaining = settings.max_files - found
+    limit = max(1, min(CLASSIFY_BATCH, remaining + 1))
+
+    requests: list[ClassifyRequest] = []
+    for entry in entries:
+        buffered.append(entry)
+        if not entry.unreadable and _name_skip(
+            entry.ref, root, settings, named=False
+        ) is None:
+            requests.append(classify_request(entry.ref, settings))
+        if len(buffered) >= limit:
+            break
+    return backend.classify(requests) if requests else {}
 
 
 def discover(
@@ -395,6 +573,8 @@ def discover(
             # explanation is the worst version of this.
             if report.file_count >= settings.max_files:
                 report.truncated = True
+                if root not in report.truncated_roots:
+                    report.truncated_roots.append(root)
                 continue
             reason = skip_reason(root, root, settings, named=True, backend=backend)
             if reason is not None:

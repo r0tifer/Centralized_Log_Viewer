@@ -32,6 +32,7 @@ from typing import Iterable, Sequence
 from .backend import LOCAL, SourceBackend
 from .compressed import is_compressed, read_compressed_tail, strip_compression_suffix
 from .reader import AnyReader, TailRead, open_reader, read_last_lines
+from .refs import is_source_ref
 
 #: ``app.log.1`` — the classic logrotate name. Higher is older.
 _NUMERIC_RE = re.compile(r"^(?P<base>.+)\.(?P<index>\d+)$")
@@ -87,7 +88,7 @@ class RotatedSet:
         return len(self.members)
 
     def __contains__(self, path: object) -> bool:
-        return isinstance(path, Path) and path in self.paths
+        return is_source_ref(path) and path in self.paths
 
 
 def _rank(path: Path) -> tuple[Path, tuple[int, int]] | None:

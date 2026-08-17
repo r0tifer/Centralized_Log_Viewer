@@ -39,6 +39,7 @@ import gzip
 import lzma
 from collections import deque
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Callable, IO
 
@@ -123,6 +124,16 @@ def strip_compression_suffix(path: Path) -> Path:
     return path.with_suffix("") if is_compressed(path) else path
 
 
+#: Leading bytes discovery asks a backend for when probing a compressed member.
+#:
+#: Enough to carry any of the three container headers plus the start of the
+#: first block, which is all :func:`probe_block` needs to tell a real archive
+#: from a file that merely ends in ``.gz``. Deliberately half the text sniff:
+#: these are a minority of a ``/var/log`` and the sample only has to reach the
+#: header.
+PROBE_SIZE = 4096
+
+
 def probe(path: Path, *, backend: SourceBackend = LOCAL) -> bool:
     """Whether *path* opens and decompresses far enough to be worth listing.
 
@@ -139,6 +150,41 @@ def probe(path: Path, *, backend: SourceBackend = LOCAL) -> bool:
         with backend.open(path, "rb") as raw:
             with compression.open(raw, "rb") as handle:
                 handle.read(1)
+    except Exception:  # noqa: BLE001 - every decompressor raises its own
+        return False
+    return True
+
+
+def probe_block(path: Path, block: bytes, *, complete: bool) -> bool:
+    """:func:`probe`, over a sample already in hand.
+
+    The batch form, so a remote ``/var/log`` full of ``.gz`` costs no round trip
+    per member. It answers the same question from the same decompressors; the
+    only thing it has to reason about that :func:`probe` does not is a sample
+    that stopped early.
+
+    **Running out of input is not a verdict when the sample was truncated.** A
+    perfectly good 40 MB ``syslog.2.gz`` will not always yield a decompressed
+    byte from its first :data:`PROBE_SIZE` — a large deflate block can span more
+    than that — and treating the resulting ``EOFError`` as corruption would drop
+    exactly the rotated members this module was written to reach. So a
+    header-level failure (``BadGzipFile``, ``LZMAError``, a bad magic number) is
+    a real refusal, while running out of input is a refusal *only* when
+    *complete* says there was nothing more to read. That distinction is why
+    :class:`~clv.services.backend.ClassifyResult` carries ``complete`` at all.
+    """
+
+    compression = compression_for(path)
+    if compression is None:
+        return False
+    try:
+        with compression.open(BytesIO(block), "rb") as handle:
+            handle.read(1)
+    except EOFError:
+        # The header parsed and the stream simply continued past the sample.
+        # An empty or genuinely truncated file has nothing more coming, and is
+        # the case this is still allowed to reject.
+        return not complete
     except Exception:  # noqa: BLE001 - every decompressor raises its own
         return False
     return True

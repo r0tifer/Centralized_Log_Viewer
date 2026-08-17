@@ -12,9 +12,10 @@ It supplements the **root AGENTS.md** by explaining how each internal component 
 |--------|----------------|-----------|
 | **app.py** | Application shell and orchestrator | - Owns main layout and lifecycle. <br> - Handles global keybindings, routing, and message coordination. <br> - Should not define widget visuals or logic directly. |
 | **storage.py** | State persistence and config IO | - Reads/writes JSON state files. <br> - Provides safe defaults when config is invalid. <br> - Must remain headless (no UI dependencies). <br> - `from_dict` dispatches on the **text** of a field's annotation; changing one silently drops the field on load. |
-| **services/refs.py** | Source identity | - Defines `SourceRef`, the surface CLV requires of a source. <br> - `parse_ref` / `format_ref` are the persistence boundary; `normalize_ref` is the user-input one. See the identity rule below. <br> - Owns `identity` / `ref_key`, the one canonical form. |
+| **services/refs.py** | Source identity | - Defines `SourceRef`, the surface CLV requires of a source. <br> - `parse_ref` / `format_ref` are the persistence boundary; `normalize_ref` is the user-input one. See the identity rule below. <br> - Owns `identity` / `ref_key`, the one canonical form. <br> - Two implementations: `Path`, and `RemoteRef` (`ssh:<node>/<path>`). The remote type lives **here, not in the SSH plugin** — `parse_ref` decodes `session.json` before any plugin is imported. It is pure identity and raises rather than performing IO. |
 | **services/config.py** | Settings, and what CLV could not honour | - `[log_viewer]` plus one `[ssh:<name>]` per remote host; per-host settings fall back to the global ones. <br> - Never raises and never goes quiet: a bad section is skipped and recorded as a `ConfigIssue`, which `app.py` prints beside the plugin errors. Own type, not `PluginError` — services may not import plugins. <br> - `enable_ssh` defaults false and gates connecting, not parsing. <br> - **No password option, no sudo option.** Both are refused by name; that absence is the enforcement point for those requirements. |
-| **services/backend.py** | Source IO, and what it costs | - Defines `SourceBackend`; `LocalBackend` is the only implementation and its behaviour is what `os` did before. <br> - Every method is marked `@cheap` or `@blocking`; `cheap_only()` makes a blocking call from `poll()` raise. See the seam rule below. <br> - `identity` is opaque and may be `None`; `walk` is lazy and yields files only. |
+| **services/backend.py** | Source IO, and what it costs | - Defines `SourceBackend`; `LocalBackend`'s behaviour is what `os` did before, and `RemoteBackend` is the second implementation. <br> - Every method is marked `@cheap` or `@blocking`; `cheap_only()` makes a blocking call from `poll()` raise. See the seam rule below. <br> - `identity` is opaque and may be `None`; `walk` is lazy and yields files only. <br> - `classify` takes a **batch** and returns bytes, never a verdict: it is what stops the discovery sniff being a round trip per file, and the rule stays in `reader` / `compressed`. |
+| **plugins/sources/ssh.py** | The SSH transport | - Owns the connection, the capability probe and `RemoteBackend`. Lives under `plugins/` because a plugin may not spawn a subprocess without consent and a *network* subprocess raises that bar. <br> - `register()` returns `[]` on purpose: this is a backend, not a `LogSourceProvider`, and a remote log must be an ordinary source rather than a `ProviderSource`. <br> - Every argv carries `BatchMode=yes`; `StrictHostKeyChecking` and `UserKnownHostsFile` appear nowhere. <br> - Every operator-supplied byte goes through `quote_all` before it enters a script. |
 | **widgets/query_bar.py** | Query, time, severity, and action controls | - Emits `ActionTriggered`, `TimeWindowChanged`, and `SeverityChanged` messages. <br> - No logic beyond UI validation. |
 | **widgets/segmented.py** | Generic segmented control | - Self-contained visual component. <br> - Should be reusable across other widgets. |
 | **widgets/advanced_drawer.py** | Advanced filters and secondary options | - Optional drawer for extended filtering and plugin-provided UI. <br> - Should expose show/hide events to `app.py`. |
@@ -81,10 +82,21 @@ reappears in a function that reads persisted state, the other if a boundary
 function stops naming its helper. The seam is one call wide and rots back in
 one line, which is why it is tested rather than documented alone.
 
-**What Phase 6 of `SSH_TODO.md` still owes.** Five sites narrow a source with
-`isinstance(data, Path)` — `app.py`'s `_sync_merged_tree`, `_star_target`,
-`on_tree_node_selected` and `_find_node`, plus `rotation.RotatedSet.__contains__`
-— and they are correct today only because `Path` is the sole implementation.
+**Narrowing a source is `refs.is_source_ref`, never `isinstance(data, Path)`.**
+The tree is typed on `object` and carries four different things — refs, saved
+views, provider sources, and the merged-set sentinel — and everything that walks
+it looking for a *source* goes through that one predicate. It is a **closed
+union of ref types**, not a duck test, and that distinction is load-bearing: a
+provider source is deliberately not a ref, which is what keeps
+`journal:unit/sshd.service` out of the starred set and out of anyone's
+`session.json`. `plugins/__init__.py`'s `ProviderSource` docstring explains the
+same rule from the other side; the two must move together.
+
+Two related answers live in `app.py` rather than here, because they are about
+the *tree* rather than about identity: `_is_file_node` tells a file node from a
+folder node without asking a remote host on the event loop (it reads the
+discovery report, which already knew), and `_source_facts` says which machine a
+source is on.
 They must change together with the prose claim in `plugins/__init__.py`'s
 `ProviderSource` docstring, which cites them by name. Changing them in
 isolation makes that docstring false; widening them structurally (an
@@ -113,7 +125,11 @@ a convention:
 
 `stat` and `identity` are **guaranteed cheap on every backend** — a backend that
 cannot honour that is a reason to change the reader, and `blocking_methods`
-refuses to build capabilities for one that tries. `BackendCapabilities.blocking`
+refuses to build capabilities for one that tries. A backend whose honest `stat`
+*is* a round trip satisfies this by asking **who wants to know**: `in_cheap_only()`
+reports whether the caller is inside the guard, so `RemoteBackend.stat` serves a
+cache there and goes to the wire outside it, where a worker and the contract
+suite both live. Reading that flag is not a licence to block under it. `BackendCapabilities.blocking`
 is derived from the marks, so it cannot drift from the code, and an unmarked
 method is refused outright. `SourceBuffer.poll` runs inside `cheap_only()`, so a
 blocking call there raises `BlockingCallError` rather than freezing the UI at
