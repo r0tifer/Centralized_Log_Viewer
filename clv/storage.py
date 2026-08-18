@@ -171,6 +171,11 @@ class SessionState:
     #: keeping it is recording their setup and not their reading — which is
     #: exactly the line marks fall on the other side of.
     watch_rules: tuple[WatchRule, ...] = ()
+    #: The CLV version that last drew the discovery summary. Kept so the
+    #: "new settings are available" line fires once after an upgrade rather than
+    #: on every launch — a notice an operator sees every time is one they learn
+    #: to look past, which is the same failure as not printing it.
+    last_seen_version: str = ""
 
     #: Fields written to disk. Every field on this class — the previous build
     #: persisted only three and dropped every filter on exit.
@@ -204,6 +209,7 @@ class SessionState:
         "views",
         "merged",
         "watch_rules",
+        "last_seen_version",
     )
 
     @classmethod

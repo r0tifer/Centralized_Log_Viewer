@@ -1515,7 +1515,7 @@ exists rather than what was proposed.
   can pop the screen while a probe is in flight.
 - **Requirement 8 gained a written exception** rather than a quiet one. See the
   requirement itself above for the wording and the test that pins it.
-- **1220 + 52 = 1272 passed, 1 skipped, 11 deselected** on 3.11 and 3.14.
+- **1220 + 55 = 1275 passed, 1 skipped, 11 deselected** on 3.11 and 3.14.
 
 
 ---

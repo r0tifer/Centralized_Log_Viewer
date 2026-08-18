@@ -530,13 +530,24 @@ def test_the_dialog_fits_eighty_columns_with_the_editor_open() -> None:
             assert dialog.region.right <= 80
             assert dialog.region.bottom <= 24
 
+            # The list is visible, and painting, while it is the thing on screen.
+            listing = app.screen.query_one("#host-list").region
+            assert listing.width > 0 and listing.height > 0
+            assert listing.bottom <= 24
+
             await pilot.press("a")
             await pilot.pause()
-            for widget_id in ("#host-list", "#host-editor", "#host-hint", "#dialog-actions"):
+            # It gives way to the editor deliberately — six fields, four lines of
+            # instructions and the buttons do not fit beside it in 24 rows.
+            assert app.screen.query_one("#host-list").region.height == 0
+            for widget_id in ("#host-editor", "#host-hint", "#dialog-actions"):
                 region = app.screen.query_one(widget_id).region
                 assert region.width > 0 and region.height > 0, widget_id
                 assert region.bottom <= 24, widget_id
                 assert region.right <= 80, widget_id
+            # Including the bottom border of the dialog itself: the buttons being
+            # on screen is not enough if the frame around them is clipped.
+            assert app.screen.query_one("#remote-hosts-dialog").region.bottom <= 24
 
     _run(scenario)
 
@@ -658,3 +669,102 @@ def test_removing_the_host_of_the_open_log_says_so_rather_than_no_such_file() ->
                 settings.write_text(original, encoding="utf-8")
 
     _run(scenario)
+
+
+def test_the_dialog_says_when_the_hosts_it_is_editing_are_switched_off() -> None:
+    """Adding a host and getting no sources is the "control that quietly does
+    nothing" failure, one level up. The switch stays the only writer of
+    `enable_ssh`; this is a status line and a pointer to it."""
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.push_screen(RemoteHostsDialog([WEB01], enabled=False))
+            await pilot.pause()
+
+            assert "Remote sources are off" in _hint(app.screen)
+            assert "press f" in _hint(app.screen)
+
+            app.pop_screen()
+            await pilot.pause()
+            app.push_screen(RemoteHostsDialog([WEB01], enabled=True))
+            await pilot.pause()
+
+            assert "Remote sources are off" not in _hint(app.screen)
+
+            # And with no hosts yet there is nothing being switched off, so the
+            # first-run dialog is not scolding anyone.
+            app.pop_screen()
+            await pilot.pause()
+            app.push_screen(RemoteHostsDialog([], enabled=False))
+            await pilot.pause()
+
+            assert "Remote sources are off" not in _hint(app.screen)
+
+    _run(scenario)
+
+
+def test_the_editor_explains_how_to_add_a_host_without_wrapping() -> None:
+    """Placeholders are not instructions, and a wrapped instruction costs rows.
+
+    Every line here is written to fit the dialog's text width. That is not
+    fussiness: each line that wraps costs a second row, and four wrapped lines
+    pushed the Close button off a 24-row terminal — which is how this dialog
+    first rendered.
+    """
+
+    from clv.widgets.remote_hosts_dialog import RemoteHostsDialog as Dialog
+
+    lines = Dialog.EDIT_HINT.splitlines()
+
+    assert len(lines) == 4
+    for line in lines:
+        assert len(line) <= 72, f"{line!r} is {len(line)} columns and will wrap"
+
+    body = Dialog.EDIT_HINT
+    assert "* required" in body, "which fields are mandatory is not guessable"
+    assert "Example" in body, "a worked example is the fastest instruction"
+    assert "web01.internal" in body
+    assert "/var/log, /srv/app/logs" in body, "the comma is the part people miss"
+    assert "no passwords" in body.lower()
+
+
+def test_the_required_fields_are_marked_and_the_examples_are_not_truncated() -> None:
+    """`~/.ssh/id_ed25519` rendered as `~/.ssh/id_ed2551` in an 18-column field —
+    an example that is not merely clipped but wrong, and copied by hand."""
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app.push_screen(RemoteHostsDialog())
+            await pilot.pause()
+            await pilot.press("a")
+            await pilot.pause()
+            screen = app.screen
+
+            marked = {
+                str(label.render())
+                for label in screen.query(".editor-label")
+            }
+            assert "Name *" in marked and "Log dirs *" in marked
+
+            # Asserted against what is actually *painted*, not against a
+            # computed column budget: the first version of this test allowed
+            # `region.width - 4` and happily passed the very placeholder that
+            # rendered as `~/.ssh/id_ed2551`.
+            strips = app.screen._compositor.render_strips()
+            painted = "\n".join(
+                "".join(segment.text for segment in strip) for strip in strips
+            )
+            for field_id in ("#host-name", "#host-address", "#host-user",
+                             "#host-port", "#host-identity", "#host-dirs"):
+                placeholder = screen.query_one(field_id, Input).placeholder
+                assert placeholder in painted, (
+                    f"{field_id} shows {placeholder!r} clipped, so the example an "
+                    f"operator copies is not the one that was written"
+                )
+
+    _run(scenario)
+

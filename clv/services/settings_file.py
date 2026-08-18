@@ -198,6 +198,24 @@ class SettingsDocument:
                 return self._lines[index].partition("=")[2].strip()
         return None
 
+    def options(self, section: str) -> list[str]:
+        """Every option name assigned within *section*, in file order.
+
+        Comments and blank lines are skipped, so this reports what the file
+        *sets* rather than what it mentions — which is the distinction that makes
+        it usable for "does this file carry that setting yet".
+        """
+
+        span = self._span(section)
+        if span is None:
+            return []
+        found: list[str] = []
+        for index in range(span.start, span.end):
+            name = _option_name(self._lines[index])
+            if name is not None and name not in found:
+                found.append(name)
+        return found
+
     # --- writing -------------------------------------------------------------
 
     def set(self, section: str, option: str, value: str) -> None:

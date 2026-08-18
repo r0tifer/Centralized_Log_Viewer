@@ -32,6 +32,7 @@ from typing import Iterable, Literal, Optional
 
 from .discovery import DEFAULT_EXCLUDE_GLOBS, DEFAULT_MAX_FILES, DiscoverySettings
 from .refs import SourceRef, format_ref, normalize_ref, scheme_of
+from .settings_file import SettingsDocument
 
 CONFIG_SECTION = "log_viewer"
 
@@ -378,6 +379,53 @@ def bundled_config_path() -> Path:
 #: Backwards-compatible alias; the template is only a "repo" path when running
 #: from a source checkout.
 repo_config_path = bundled_config_path
+
+
+def default_config_text() -> str:
+    """The shipped, fully-commented settings file, as text.
+
+    The same precedence :func:`ensure_user_settings_file` uses when it creates a
+    file, so what ``--print-default-config`` prints is exactly what a first run
+    would have written. It exists because that documentation is *already on every
+    user's disk* — PyInstaller puts it beside the binary — with nothing pointing
+    at it, and because an existing settings file is never updated: the prose
+    explaining a new option only ever reaches a first-run user.
+    """
+
+    template = bundled_config_path()
+    if template.exists():
+        try:
+            return template.read_text(encoding="utf-8")
+        except OSError:
+            pass
+    return DEFAULT_SETTINGS_TEMPLATE
+
+
+def undocumented_settings(settings_path: Optional[Path]) -> tuple[str, ...]:
+    """Options the shipped file sets that *settings_path* does not carry.
+
+    Read-only, and deliberately so. CLV never rewrites the operator's settings
+    file behind their back: it is theirs, the launch path is the worst possible
+    place to put a write, and every option is optional-with-a-default anyway — an
+    old file keeps working, it just stops learning. So this reports a difference
+    and nothing acts on it.
+
+    Only ``[log_viewer]`` is compared. A ``[ssh:<name>]`` section is a machine the
+    operator named, not a setting they are missing, and listing the example host
+    as an absence would be nonsense.
+    """
+
+    if settings_path is None or not settings_path.exists():
+        return ()
+    try:
+        current = SettingsDocument.load(settings_path).options(CONFIG_SECTION)
+    except OSError:
+        return ()
+    reference = SettingsDocument(default_config_text().splitlines())
+    known = set(current)
+    return tuple(
+        option for option in reference.options(CONFIG_SECTION) if option not in known
+    )
 
 
 def ensure_user_settings_file() -> Optional[Path]:

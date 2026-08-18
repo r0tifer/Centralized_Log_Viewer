@@ -102,10 +102,11 @@ class RemoteHostsDialog(ModalScreen[Optional[tuple[RemoteHost, ...]]]):
         background: $surface 8%;
     }
 
-    /* The list gives way, not the editor. Six fields in two rows plus the hint
-       and the buttons do not leave five rows of list inside 24, and the list is
-       the part an operator is not looking at while typing into the editor. */
-    #remote-hosts-dialog.-editing #host-list { max-height: 2; }
+    /* The list gives way, not the editor. Six fields in two rows, the worked
+       example and the buttons do not fit inside 24 rows alongside it — and the
+       list is not what an operator is reading while typing into the editor.
+       `Esc` brings it straight back. */
+    #remote-hosts-dialog.-editing #host-list { display: none; }
 
     #host-editor {
         layout: vertical;
@@ -169,8 +170,21 @@ class RemoteHostsDialog(ModalScreen[Optional[tuple[RemoteHost, ...]]]):
     """
 
     HINT = "a adds · Enter edits · space enables/disables · t tests · d deletes · Esc closes"
-    EDIT_HINT = "log_dirs is comma separated, absolute or ~-relative. Enter saves · Esc goes back."
-    NO_PASSWORD = "No password field: CLV uses ssh-agent and key files only."
+    #: Shown when hosts exist but `enable_ssh` does not. A dialog that accepts a
+    #: host and then produces no sources is the "control that quietly does
+    #: nothing" this project argues against everywhere else — but the switch
+    #: stays the single writer of that setting, so this is a status line and a
+    #: pointer, not a second place to change it.
+    OFF_HINT = "Remote sources are off — press f and turn on Remote (SSH) to use these."
+    #: Four lines, each written to fit the dialog's 72-column text width without
+    #: wrapping. Wrapped instructions cost two rows apiece and push the buttons
+    #: off a 24-row terminal, so the copy is measured, not just written.
+    EDIT_HINT = (
+        "* required · Address defaults to Name (a ~/.ssh/config alias works)\n"
+        "Log dirs: folders on the remote host, comma separated, absolute or ~\n"
+        "Example — web01 · web01.internal · ops · /var/log, /srv/app/logs\n"
+        "Enter saves · Esc goes back · no passwords: ssh-agent and keys only"
+    )
 
     def __init__(
         self,
@@ -179,8 +193,11 @@ class RemoteHostsDialog(ModalScreen[Optional[tuple[RemoteHost, ...]]]):
         statuses: Optional[Mapping[str, str]] = None,
         skipped: Iterable[str] = (),
         probe: Optional[HostProbe] = None,
+        enabled: bool = True,
     ) -> None:
         super().__init__()
+        #: Whether `enable_ssh` is on. Read only, to say so — never written here.
+        self._enabled = enabled
         self._hosts: list[RemoteHost] = list(hosts)
         self._statuses = dict(statuses or {})
         #: Sections ``config.py`` refused, as already-formatted messages. Shown
@@ -206,7 +223,7 @@ class RemoteHostsDialog(ModalScreen[Optional[tuple[RemoteHost, ...]]]):
             with Container(id="host-editor"):
                 with Horizontal(classes="editor-row"):
                     with Vertical(classes="editor-field"):
-                        yield Label("Name", classes="editor-label")
+                        yield Label("Name *", classes="editor-label")
                         yield Input(placeholder="web01", id="host-name")
                     with Vertical(classes="editor-field"):
                         yield Label("Address", classes="editor-label")
@@ -220,12 +237,10 @@ class RemoteHostsDialog(ModalScreen[Optional[tuple[RemoteHost, ...]]]):
                         yield Input(placeholder="22", id="host-port")
                     with Vertical(classes="editor-field"):
                         yield Label("Identity file", classes="editor-label")
-                        yield Input(
-                            placeholder="~/.ssh/id_ed25519", id="host-identity"
-                        )
+                        yield Input(placeholder="~/.ssh/id_rsa", id="host-identity")
                     with Vertical(classes="editor-field"):
-                        yield Label("Log dirs", classes="editor-label")
-                        yield Input(placeholder="/var/log", id="host-dirs")
+                        yield Label("Log dirs *", classes="editor-label")
+                        yield Input(placeholder="/var/log, /srv", id="host-dirs")
             yield Static(self.HINT, id="host-hint")
             with Container(id="dialog-actions"):
                 yield Button("Add", id="host-add")
@@ -234,7 +249,15 @@ class RemoteHostsDialog(ModalScreen[Optional[tuple[RemoteHost, ...]]]):
 
     def on_mount(self) -> None:
         self._refresh_list()
+        self._hint(self._resting_hint(), warning=not self._enabled and bool(self._hosts))
         self.query_one("#host-list", OptionList).focus()
+
+    def _resting_hint(self) -> str:
+        """The hint shown whenever nothing more specific needs saying."""
+
+        if self._hosts and not self._enabled:
+            return f"{self.OFF_HINT}  {self.HINT}"
+        return self.HINT
 
     # --- state ---------------------------------------------------------------
 
@@ -312,14 +335,15 @@ class RemoteHostsDialog(ModalScreen[Optional[tuple[RemoteHost, ...]]]):
         )
         self.query_one("#host-editor", Container).add_class("-active")
         self.query_one("#remote-hosts-dialog", Container).add_class("-editing")
-        self._hint(f"{self.EDIT_HINT} {self.NO_PASSWORD}")
+        self._hint(self.EDIT_HINT)
+        self.query_one("#host-hint", Static).styles.height = "auto"
         self.query_one("#host-name", Input).focus()
 
     def _close_editor(self) -> None:
         self.query_one("#host-editor", Container).remove_class("-active")
         self.query_one("#remote-hosts-dialog", Container).remove_class("-editing")
         self._editing_name = None
-        self._hint(self.HINT)
+        self._hint(self._resting_hint())
         self.query_one("#host-list", OptionList).focus()
 
     def _save_editor(self) -> None:
@@ -413,7 +437,7 @@ class RemoteHostsDialog(ModalScreen[Optional[tuple[RemoteHost, ...]]]):
         self._armed_delete = ""
         self._dirty = True
         self._refresh_list()
-        self._hint(f"Removed {host.name}. {self.HINT}")
+        self._hint(f"Removed {host.name}. {self._resting_hint()}")
 
     def _test_current(self) -> None:
         """Probe the host under the cursor, or the one being edited.
@@ -522,7 +546,7 @@ class RemoteHostsDialog(ModalScreen[Optional[tuple[RemoteHost, ...]]]):
         # Moving off an armed row disarms it, so `d` never deletes the wrong host.
         if self._armed_delete:
             self._armed_delete = ""
-            self._hint(self.HINT)
+            self._hint(self._resting_hint())
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         event.stop()

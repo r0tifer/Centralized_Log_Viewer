@@ -172,6 +172,38 @@ runtime in the **Advanced** drawer.
 
 ---
 
+### Upgrading
+
+Your settings file is **never rewritten** — not on install, not on launch. It is
+yours, and CLV does not edit it behind your back.
+
+That is safe because no setting is required: every option has a default, so a
+settings file written for an older build keeps working exactly as it did. What it
+stops doing is *learning* — the commented prose describing a new option only ever
+reaches a file created from scratch.
+
+So after an upgrade the discovery summary names any settings your file does not
+carry, once for that version, and points at:
+
+```bash
+clv --print-default-config      # the shipped, fully documented settings file
+clv --version                   # which build you are actually running
+```
+
+`--print-default-config` writes the reference to stdout. Reading it is the point;
+a plain `diff` against your own file is mostly noise, because the two are ordered
+and commented differently. To see just the names:
+
+```bash
+comm -23 \
+  <(clv --print-default-config | grep -oE '^[a-z_]+ =' | tr -d ' =' | sort) \
+  <(grep -oE '^[a-z_]+ =' ~/.config/clv/settings.conf | tr -d ' =' | sort)
+```
+
+Nothing in this is required. Every one of those settings is already in effect at
+its default, and remote hosts are managed from `R` and the Advanced drawer
+without touching the file at all.
+
 ## Usage
 
 ```bash

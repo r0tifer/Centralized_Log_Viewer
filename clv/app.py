@@ -18,6 +18,7 @@ import csv
 import io
 import itertools
 import json
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from dataclasses import dataclass, replace
@@ -64,13 +65,16 @@ from .services.clustering import (
     summarise,
 )
 from .services.settings_file import SettingsDocument
+from . import __version__
 from .services.config import (
     SSH_SECTION_PREFIX,
     LogConfig,
     RemoteHost,
     get_config_file,
+    default_config_text,
     host_options,
     load_config,
+    undocumented_settings,
     user_config_path,
 )
 from .services.discovery import DiscoveredFile, DiscoveryReport, discover
@@ -695,6 +699,9 @@ class LogViewerApp(App[None]):
         #: What the merged pane's source column calls each member. Rebuilt once
         #: per set by `_sync_column_labels`, never per rendered line.
         self._column_labels: dict[SourceRef, str] = {}
+        #: The upgrade notice is once per *version*, and a rescan redraws the
+        #: summary — so this keeps a `Ctrl+R` from repeating it within a session.
+        self._upgrade_notice_shown = False
         #: Which backend answers for which ref. `LOCAL` itself unless remote
         #: sources are switched on, so nothing about the local path changes.
         self._backends = build_backends(self._config)
@@ -2952,6 +2959,49 @@ class LogViewerApp(App[None]):
             table.add_row(*(["…"] * column_count))
         return table, "CSV preview"
 
+    def _show_upgrade_notice(self) -> None:
+        """After an upgrade, say once that newer settings exist.
+
+        **Not a `ConfigIssue`.** That type means "something the operator wrote
+        that CLV could not honour", and this is the opposite: nothing is wrong,
+        every absent option is simply taking its default. Borrowing the type
+        would have meant widening its severity to carry a case it was not built
+        for, so this gets its own line in the same place and a colour that does
+        not read as a fault.
+
+        Once per version, not once per launch. A line an operator sees every
+        time is a line they learn to look past, which fails in the same way as
+        never printing it — hence `last_seen_version` on the session state.
+        """
+
+        if self._upgrade_notice_shown or __version__ == self.state.last_seen_version:
+            return
+        self._upgrade_notice_shown = True
+        previous = self.state.last_seen_version
+        self._update_state(last_seen_version=__version__)
+        if not previous:
+            # A first run, or a state file from before this was recorded. There
+            # is nothing to have upgraded *from*, and greeting a new user with a
+            # migration notice would be nonsense.
+            return
+
+        missing = undocumented_settings(self._settings_path)
+        if not missing:
+            return
+        shown = ", ".join(missing[:4])
+        if len(missing) > 4:
+            shown += f" and {len(missing) - 4} more"
+        self.log_panel.write(Text(""))
+        self.log_panel.write(
+            Text(
+                f"CLV {__version__}: {_plural(len(missing), 'setting', 'settings')} "
+                f"your settings file does not carry — {shown}. "
+                "Each is optional and already using its default; run "
+                "`clv --print-default-config` to see them documented.",
+                style="#7aa3d1",
+            )
+        )
+
     def _show_discovery_summary(self, report: DiscoveryReport) -> None:
         self.log_panel.clear()
         for line in report.summary_lines():
@@ -2967,6 +3017,7 @@ class LogViewerApp(App[None]):
                     style="dim",
                 )
             )
+        self._show_upgrade_notice()
         if self._plugins.errors:
             self.log_panel.write(Text(""))
             for error in self._plugins.errors:
@@ -3443,6 +3494,7 @@ class LogViewerApp(App[None]):
                 statuses=self._host_statuses(),
                 skipped=skipped,
                 probe=self._probe_host,
+                enabled=bool(getattr(self._config, "enable_ssh", False)),
             ),
             wait_for_dismiss=True,
         )
@@ -4978,5 +5030,52 @@ def _find_node(node: TreeNode[Path], target: Path) -> Optional[TreeNode[Path]]:
     return None
 
 
-def run() -> None:  # pragma: no cover - script entry point
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Parse the command line and either print something or run the viewer.
+
+    Split out from :func:`run` so it is testable: ``run`` is the console-script
+    entry point and cannot be called from a test without taking the terminal.
+
+    The two flags are the answer to "how does someone upgrading learn about a
+    new setting". They are read-only by design: CLV does not rewrite the
+    operator's settings file, so what it offers instead is the reference, on
+    demand, in the form a first run would have written it.
+
+    Note that a plain ``diff`` against a hand-maintained settings file is mostly
+    noise — the two are ordered and commented differently, so nearly every line
+    differs. The discovery summary names the settings after an upgrade; this
+    flag is how the operator then reads what each of them *does*.
+    """
+
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="clv",
+        description="Centralized Log Viewer — a terminal log viewer.",
+    )
+    # Not decoration: an operator running a stale bundle has no way to tell, and
+    # "the feature is missing" and "the build is old" look identical from the UI.
+    parser.add_argument(
+        "--version", action="version", version=f"clv {__version__}"
+    )
+    parser.add_argument(
+        "--print-default-config",
+        action="store_true",
+        help=(
+            "print the shipped, fully commented settings file and exit. Your own "
+            "settings file is never rewritten on upgrade, so this is how to read "
+            "what a newer version documents."
+        ),
+    )
+    args = parser.parse_args(argv)
+
+    if args.print_default_config:
+        sys.stdout.write(default_config_text())
+        return 0
+
     LogViewerApp().run()
+    return 0
+
+
+def run() -> None:  # pragma: no cover - script entry point
+    raise SystemExit(main())
