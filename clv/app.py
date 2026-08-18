@@ -63,7 +63,16 @@ from .services.clustering import (
     describe as describe_clusters,
     summarise,
 )
-from .services.config import LogConfig, get_config_file, load_config, user_config_path
+from .services.settings_file import SettingsDocument
+from .services.config import (
+    SSH_SECTION_PREFIX,
+    LogConfig,
+    RemoteHost,
+    get_config_file,
+    host_options,
+    load_config,
+    user_config_path,
+)
 from .services.discovery import DiscoveredFile, DiscoveryReport, discover
 from .services.export import (
     BUILTIN_FORMATS,
@@ -100,10 +109,13 @@ from .services.query import (
 from .services.refs import (
     RemoteRef,
     SourceRef,
+    column_labels,
+    compact_of,
     format_ref,
     identity,
     is_local,
     is_source_ref,
+    node_of,
     parse_ref,
     ref_key,
     stem_of,
@@ -144,6 +156,11 @@ from .widgets.goto_dialog import GotoDialog
 from .widgets.help_overlay import HelpOverlay, HelpSection
 from .widgets.log_view import LogView
 from .widgets.query_bar import QueryBar
+from .widgets.remote_hosts_dialog import (
+    EDITABLE_KEYS,
+    ProbeResult,
+    RemoteHostsDialog,
+)
 from .widgets.severity import SEVERITY_COLORS
 from .widgets.timeline import TimelineBar
 from .widgets.view_dialogs import SaveViewDialog, ViewPickerDialog, ViewRequest
@@ -359,7 +376,9 @@ BINDING_CATEGORIES: dict[str, str] = {
     "toggle_merge": "Sources",
     "open_merged": "Sources",
     "clear_merged": "Sources",
+    "merge_across_hosts": "Sources",
     "reload_sources": "Sources",
+    "remote_hosts": "Sources",
     "save_session": "Session",
     "quit_app": "Session",
 }
@@ -626,6 +645,16 @@ class LogViewerApp(App[None]):
         Binding("x", "toggle_merge", "Add / remove from the merged set", show=False),
         Binding("u", "open_merged", "Open the merged view", show=False),
         Binding("X", "clear_merged", "Empty the merged set", show=False),
+        # A modifier on the merge gesture rather than a new top-level key, which
+        # keeps the keybinding budget intact. Textual's Input binds ctrl+x to
+        # cut, so this fires everywhere except inside the query input — the same
+        # trade, and the same decision, as ctrl+e below.
+        Binding(
+            "ctrl+x",
+            "merge_across_hosts",
+            "Merge this path across hosts",
+            show=False,
+        ),
         Binding("ctrl+b", "toggle_pane", "Switch pane", show=True),
         Binding("[", "shrink_sources_panel", "Narrower", show=False),
         Binding("]", "expand_sources_panel", "Wider", show=False),
@@ -640,6 +669,7 @@ class LogViewerApp(App[None]):
         Binding("ctrl+e", "export_view", "Export view", show=False),
         Binding("y", "copy_view", "Copy to clipboard", show=False),
         Binding("ctrl+s", "save_session", "Save sources", show=True),
+        Binding("R", "remote_hosts", "Remote hosts", show=False),
         Binding("ctrl+r", "reload_sources", "Reload", show=True),
         Binding("q", "quit_app", "Quit", show=True),
     ]
@@ -662,6 +692,9 @@ class LogViewerApp(App[None]):
         self._provider_sources: list[ProviderSource] = []
         #: Filled by every rescan; see `_is_file_node`.
         self._file_refs: set[SourceRef] = set()
+        #: What the merged pane's source column calls each member. Rebuilt once
+        #: per set by `_sync_column_labels`, never per rendered line.
+        self._column_labels: dict[SourceRef, str] = {}
         #: Which backend answers for which ref. `LOCAL` itself unless remote
         #: sources are switched on, so nothing about the local path changes.
         self._backends = build_backends(self._config)
@@ -837,6 +870,7 @@ class LogViewerApp(App[None]):
         # and exporter lines are correct the first time it is seen.
         self._refresh_plugin_status()
         self._sync_journald_status()
+        self._sync_ssh_status()
         self._update_status()
         self._persist_state = True
 
@@ -1166,6 +1200,7 @@ class LogViewerApp(App[None]):
         # After the providers have run, so the drawer reports what they found
         # rather than what they were about to look for.
         self._sync_journald_status()
+        self._sync_ssh_status()
         await self._install_report(report)
 
         if not any(isinstance(root, RemoteRef) for root in roots):
@@ -1591,10 +1626,47 @@ class LogViewerApp(App[None]):
 
     # --- the merged set ------------------------------------------------------
 
+    def _merge_target(self) -> Optional[SourceRef]:
+        """The source a merge gesture acts on, which is not the star target.
+
+        Two differences, both of which are bugs in the shared version rather than
+        preferences:
+
+        **A rotated set is its head.** ``group_rotated`` defaults on, so on any
+        machine with a real ``/var/log`` the thing under the cursor is a
+        ``RotatedSet`` branch, not a file — and ``_star_target`` answers ``None``
+        for it. Merging the canonical ``access.log`` therefore missed on the first
+        press, which is the one workflow this whole feature exists for.
+
+        **A tree ref is taken at its word.** ``_star_target`` filters the cursor
+        through ``_is_file_node`` and, finding nothing, silently falls back to the
+        log on screen. The merged group deliberately lists members discovery did
+        *not* find — a log that has rotated away "should be visible enough to
+        press `x` on rather than silently absent" — so that filter turns a press
+        on one of them into a press on something else entirely. Membership is
+        about the stored key, not about the file existing today.
+
+        ``_star_target`` itself is left alone: whether starring should follow is a
+        separate question with a separate answer.
+        """
+
+        try:
+            tree = self.query_one("#source-tree", LogTree)
+        except NoMatches:
+            tree = None
+
+        if tree is not None and tree.has_focus and tree.cursor_node is not None:
+            data = tree.cursor_node.data
+            if isinstance(data, RotatedSet):
+                return data.head
+            if is_source_ref(data):
+                return data
+        return self._star_target()
+
     def action_toggle_merge(self) -> None:
         """Add or remove the source under the tree cursor from the merged set."""
 
-        target = self._star_target()
+        target = self._merge_target()
         if target is None:
             self._notify("Move to a log in the tree to merge it.", "warning")
             return
@@ -1619,6 +1691,93 @@ class LogViewerApp(App[None]):
         self._notify(
             f"{action} the merged set ({len(current)} source(s)). Press u to open it."
         )
+
+    def action_merge_across_hosts(self) -> None:
+        """Merge this path on every machine discovery found it on, then open it.
+
+        Comparing one log across a fleet is the reason this product is called
+        *Centralized* Log Viewer, and building that set by pressing `x` on five
+        leaves inside five separately collapsed host trees is tedious enough to
+        stop people doing it at all.
+
+        **No round trip.** ``_file_refs`` is every file the last discovery listed,
+        local and remote, and a ``RemoteRef`` is frozen and hashable — so the
+        whole set is a scan of a set already in memory. Nothing here connects to
+        anything; opening does, and that path was already threaded.
+
+        Three outcomes are reported, because Requirement 7 says they are three
+        different facts: hosts that have the path, hosts that were walked and do
+        not, and hosts that could not be walked at all. A machine inside its
+        reconnect backoff is in the third group with the reason that put it there
+        — reporting it as *not having the file* would be a confident answer CLV
+        has no evidence for.
+        """
+
+        target = self._merge_target()
+        if target is None:
+            self._notify(
+                "Move to a log in the tree to merge it across hosts.", "warning"
+            )
+            return
+
+        wanted = _path_text(target)
+        matches = [ref for ref in self._file_refs if _path_text(ref) == wanted]
+        if not any(identity(ref) == identity(target) for ref in matches):
+            # The target can be something discovery no longer lists — a member of
+            # the merged group, or the open log. It is still the thing the
+            # operator pointed at.
+            matches.append(target)
+        matches.sort(key=lambda ref: (node_of(ref), str(ref)))
+
+        found = {node_of(ref) for ref in matches}
+        walked = {node_of(ref) for ref in self._file_refs}
+        unreachable = self._unreachable_nodes()
+        lacking = sorted(node for node in walked if node and node not in found)
+
+        if len(matches) < 2:
+            self._notify(
+                f"{stem_of(target)} was only found on one source"
+                f"{self._merge_scope_detail(lacking, unreachable)}",
+                "warning",
+            )
+            return
+
+        self._update_state(merged=tuple(sorted(ref_key(ref) for ref in matches)))
+        self._sync_merged_tree()
+        self._notify(
+            f"Merging {target.name} across {len(matches)} sources"
+            f"{self._merge_scope_detail(lacking, unreachable)}"
+        )
+        self.action_open_merged()
+
+    def _unreachable_nodes(self) -> dict[str, str]:
+        """Machines the last discovery could not walk, and why.
+
+        Read off the report rather than asked of the backends: the report is what
+        actually happened on the walk, and it already distinguishes a host that
+        refused from one that was skipped inside its backoff.
+        """
+
+        reasons: dict[str, str] = {}
+        report = self._report
+        if report is None:
+            return reasons
+        for root in report.unreadable_roots:
+            node = node_of(root)
+            if node and node not in reasons:
+                reasons[node] = report.root_reasons.get(root, "")
+        return reasons
+
+    @staticmethod
+    def _merge_scope_detail(lacking: list[str], unreachable: dict[str, str]) -> str:
+        """The two negatives, named. Silence about either would be the bug."""
+
+        parts = []
+        if lacking:
+            parts.append(f"not on {', '.join(lacking)}")
+        if unreachable:
+            parts.append(f"could not reach {', '.join(sorted(unreachable))}")
+        return f" — {'; '.join(parts)}." if parts else "."
 
     def action_open_merged(self) -> None:
         """Open every source in the merged set as one timestamp-ordered stream."""
@@ -1688,7 +1847,10 @@ class LogViewerApp(App[None]):
         """
 
         for path, reason in failed:
-            self._notify(f"{path.name} could not be opened: {reason}", "warning")
+            # `stem_of`, not `.name`: the canonical cross-host merge is one path
+            # across a fleet, so a failure list keyed on the basename reads as
+            # the same file failing five times.
+            self._notify(f"{stem_of(path)} could not be opened: {reason}", "warning")
         if not opened:
             self._notify("None of the merged sources could be opened.", "error")
             return
@@ -1894,6 +2056,7 @@ class LogViewerApp(App[None]):
     def _after_source_change(self) -> None:
         """Everything that has to be rebuilt when the buffer becomes new."""
 
+        self._sync_column_labels()
         self._sync_field_names()
         self._sync_regex_validation()
         # Rules are recompiled against this source's vocabulary and the primed
@@ -2189,6 +2352,19 @@ class LogViewerApp(App[None]):
         """
 
         return self._session.origin_of(entry)
+
+    def _sync_column_labels(self) -> None:
+        """Decide what the merged source column calls each member, once per set.
+
+        Once per set rather than once per line: a filtered view is thousands of
+        entries and the member list is single digits, so deriving the rule inside
+        the render loop would put that product on the redraw path. The same
+        argument ``session.moment_mapper`` makes for the histogram.
+        """
+
+        self._column_labels = column_labels(
+            [buffer.path for buffer in self._session.buffers]
+        )
 
     def _origins(self) -> list[Optional[Path]]:
         """Every source the open session draws from.
@@ -2685,7 +2861,9 @@ class LogViewerApp(App[None]):
 
         width = MERGED_COLUMN_WIDTHS.get(self._breakpoint, MERGED_COLUMN_WIDTHS["-narrow"])
         origin = self._origin(entry)
-        name = origin.name if origin is not None else "?"
+        name = self._column_labels.get(origin) if origin is not None else None
+        if name is None:
+            name = origin.name if origin is not None else "?"
         if len(name) > width:
             # From the left: rotated members and unit names differ at the end.
             name = "…" + name[-(width - 1) :]
@@ -3187,6 +3365,152 @@ class LogViewerApp(App[None]):
     def action_watch_rules(self) -> None:
         """Add, edit, enable, disable or delete the live-alert rules."""
         self.run_worker(self._prompt_watch_rules(), group="dialogs", exit_on_error=False)
+
+    def action_remote_hosts(self) -> None:
+        """Add, edit, test and remove the machines CLV reads logs from."""
+        self.run_worker(
+            self._prompt_remote_hosts(), group="dialogs", exit_on_error=False
+        )
+
+    def _host_statuses(self) -> dict[str, str]:
+        """What is already known about each host, without asking any of them.
+
+        ``reachability()`` is in ``GUARANTEED_CHEAP`` because it reports state
+        already held, and ``probed`` says whether anything has been held at all —
+        which matters, because a fresh ``SSHConnection`` reports ``connected``
+        optimistically. Without that distinction a host nobody has contacted
+        looks exactly like one that answered.
+        """
+
+        statuses: dict[str, str] = {}
+        backends = getattr(self._backends, "backends", {}) or {}
+        for name, backend in backends.items():
+            connection = getattr(backend, "connection", None)
+            if connection is not None and not connection.probed:
+                statuses[name] = "not tried"
+                continue
+            state = backend.reachability()
+            statuses[name] = "connected" if state.ok else (state.reason or state.state)
+        return statuses
+
+    def _probe_host(self, host: RemoteHost) -> ProbeResult:
+        """One bounded probe, on a throwaway connection. Runs on a thread.
+
+        **Its own ``socket_dir``**, which is not a detail. ``SSHConnection.socket``
+        is a hash of ``(name, host, user, port)``, so a second connection built
+        from the same record resolves to the *same* ``ControlPath`` — and the
+        ``close()`` below would then run ``ssh -O exit`` on the multiplex master
+        the resolver is actively using, costing a full handshake on the next read
+        every time Test is pressed.
+
+        Throwaway rather than reused for a second reason: ``facts()`` caches, so
+        asking the live connection would answer the second press from memory with
+        no sign that it never tried — and would answer about the *saved* record
+        rather than what the operator just typed.
+        """
+
+        import shutil
+        import tempfile
+
+        from .plugins.sources.ssh import SSHConnection
+
+        directory = tempfile.mkdtemp(prefix="clv-probe-")
+        connection = SSHConnection(host, socket_dir=directory)
+        try:
+            facts = connection.facts()
+            skew = facts.skew.total_seconds()
+            detail = f"connected · {facts.profile.name} · {facts.uname or 'unknown'}"
+            if abs(skew) >= 1:
+                detail += f" · clock {skew:+.0f}s"
+            return ProbeResult(True, detail)
+        except Exception as exc:  # noqa: BLE001 - a connection fails many ways
+            return ProbeResult(False, str(exc))
+        finally:
+            try:
+                connection.close()
+            finally:
+                shutil.rmtree(directory, ignore_errors=True)
+
+    async def _prompt_remote_hosts(self) -> None:
+        skipped = [
+            str(issue)
+            for issue in self._config.issues
+            if issue.origin.startswith("[ssh:")
+        ]
+        hosts = await self.push_screen(
+            RemoteHostsDialog(
+                self._config.hosts,
+                statuses=self._host_statuses(),
+                skipped=skipped,
+                probe=self._probe_host,
+            ),
+            wait_for_dismiss=True,
+        )
+        if hosts is None:
+            return
+
+        removed = {host.name for host in self._config.hosts} - {
+            host.name for host in hosts
+        }
+        try:
+            self._write_hosts(hosts)
+        except OSError as exc:
+            self._notify(f"Could not save the host list: {exc}", "error")
+            return
+
+        self._notify(
+            f"Wrote {_plural(len(hosts), 'host', 'hosts')} to {self._settings_path}."
+        )
+        selected = self._selected_source
+        if (
+            removed
+            and isinstance(selected, RemoteRef)
+            and selected.node in removed
+        ):
+            # Reloading would re-select this ref, and with its host gone the
+            # resolver hands it to the local backend — which reports "no such
+            # file" for a path on a machine that was simply removed. Saying so
+            # here is the difference between an answer and a red herring.
+            self._stop_tail()
+            self._selected_source = None
+            self._session.close()
+            self._notify(
+                f"Closed {stem_of(selected)}: {selected.node} is no longer configured.",
+                "warning",
+            )
+        await self.action_reload_sources()
+
+    def _write_hosts(self, hosts: Sequence[RemoteHost]) -> None:
+        """Merge *hosts* into ``settings.conf``, key by key, in one pass.
+
+        **Key-level, never section-level.** Only the six keys the dialog offers
+        are written or cleared; a per-host glob, a budget, a comment beside them,
+        and a refused ``password =`` still earning its warning are all left
+        exactly as the operator left them. Regenerating the section from the
+        record would silently eat every one of them.
+
+        A section the parser *skipped* is in neither list — it never reached
+        ``config.hosts`` — so it is never rewritten and never removed. That falls
+        out of diffing records rather than diffing the file, which is the reason
+        it is done that way.
+        """
+
+        document = SettingsDocument.load(self._settings_path)
+        current = {host.name for host in hosts}
+        for name in sorted({host.name for host in self._config.hosts} - current):
+            document.remove_section(f"{SSH_SECTION_PREFIX}{name}")
+        for host in hosts:
+            section = f"{SSH_SECTION_PREFIX}{host.name}"
+            options = dict(host_options(host))
+            if not document.has_section(section):
+                document.add_section(section, host_options(host))
+                continue
+            for key in EDITABLE_KEYS:
+                if key in options:
+                    document.set(section, key, options[key])
+                else:
+                    document.remove_option(section, key)
+        document.save(self._settings_path)
 
     def _sync_watch_rules(self) -> None:
         """Recompile the rules and re-read the buffer against them.
@@ -4220,6 +4544,8 @@ class LogViewerApp(App[None]):
             self._set_clustering(message.value)
         elif message.field == "journald":
             self._set_journald(message.value)
+        elif message.field == "ssh":
+            self._set_enable_ssh(message.value)
         else:
             self._set_structured(message.value)
 
@@ -4309,6 +4635,89 @@ class LogViewerApp(App[None]):
             else "systemd journal disabled."
         )
         self.run_worker(self._rescan(), group="discovery", exit_on_error=False)
+
+    def _set_enable_ssh(self, value: bool) -> None:
+        """Turn remote sources on or off, and record the choice in settings.conf.
+
+        **Not a copy of `_set_journald`, and the difference is the whole point.**
+        The journald plugin re-reads the settings file on every scan, so flipping
+        that switch needs nothing but a rescan. `enable_ssh` is read *here*:
+        `build_backends` and `remote_roots` both short-circuit on it, so a rescan
+        alone would re-walk the same local roots through the same local resolver
+        and report that nothing had changed.
+
+        What is needed is everything a configuration change needs — which is what
+        `action_reload_sources` already is, down to closing every multiplex master
+        when the switch goes off. A persisted `ControlMaster` socket is a live
+        authenticated connection any process running as this user can ride, so
+        "I turned that off" may not leave one behind.
+        """
+
+        try:
+            persist_setting(self._settings_path, "enable_ssh", str(value).lower())
+        except OSError as exc:
+            self._notify(f"Could not save the remote-sources setting: {exc}", "error")
+            self._sync_ssh_status()
+            return
+
+        self._notify(
+            f"Remote sources enabled — written to {self._settings_path}."
+            if value
+            else "Remote sources disabled; open connections closed."
+        )
+        self.run_worker(
+            self.action_reload_sources(), group="discovery", exit_on_error=False
+        )
+
+    def _sync_ssh_status(self) -> None:
+        """Summarise the fleet in the drawer's one line.
+
+        Reachability is read from the backends, never probed: `reachability()` is
+        in `GUARANTEED_CHEAP` precisely because it reports state already held. A
+        drawer that opened a connection to draw itself would be the Requirement 3
+        violation this whole plan is built to avoid.
+        """
+
+        import shutil
+
+        enabled = bool(getattr(self._config, "enable_ssh", False))
+        if shutil.which("ssh") is None:
+            # The same treatment the journal gets where `journalctl` is absent,
+            # and for the same reason: a switch that writes an opt-in nothing can
+            # act on is worse than one that is visibly unavailable, and "why is
+            # there no remote here" should be answered on screen.
+            self.advanced_drawer.set_ssh(
+                False, available=False, reason="no ssh client found on this machine"
+            )
+            return
+
+        hosts = [host for host in self._config.hosts if host.enabled]
+        if not hosts:
+            self.advanced_drawer.set_ssh(
+                enabled,
+                available=True,
+                reason=(
+                    "no hosts configured yet — press R to add one"
+                    if enabled
+                    else "off; press R to manage hosts"
+                ),
+            )
+            return
+
+        backends = getattr(self._backends, "backends", {}) or {}
+        unreachable = sorted(
+            name
+            for name, backend in backends.items()
+            if not backend.reachability().ok
+        )
+        detail = f"{_plural(len(hosts), 'host', 'hosts')}"
+        if enabled:
+            detail += f" · {len(hosts) - len(unreachable)} reachable"
+            if unreachable:
+                detail += f" · {', '.join(unreachable)} unreachable"
+        else:
+            detail += " configured, off"
+        self.advanced_drawer.set_ssh(enabled, available=True, reason=detail)
 
     def _sync_journald_status(self) -> None:
         """Show journal state in the drawer, including why it may be off."""
@@ -4528,10 +4937,27 @@ def _plural(count: int, singular: str, plural: str) -> str:
     return f"{count} {singular if count == 1 else plural}"
 
 
-def _compact_path(path: Path) -> str:
-    """``deeper/a.log`` — enough to tell identically named logs apart."""
-    parent = path.parent.name
-    return f"{parent}/{path.name}" if parent else path.name
+def _path_text(ref: SourceRef) -> str:
+    """The path *ref* names, with the machine stripped off.
+
+    ``/var/log/nginx/access.log`` for both a local ref and a remote one, which is
+    exactly what a cross-host merge matches on: the whole premise is that the
+    same path means the same role on every machine in a fleet.
+    """
+
+    return str(ref.path) if isinstance(ref, RemoteRef) else str(ref)
+
+
+def _compact_path(path: SourceRef) -> str:
+    """``deeper/a.log`` — enough to tell identically named logs apart.
+
+    Delegates, because "enough" stopped being true the moment two machines could
+    be in the tree at once: the starred and merged groups list refs from any host
+    and this is the label they get. ``refs.compact_of`` puts the machine in front
+    of a remote one and leaves a local one exactly as it was.
+    """
+
+    return compact_of(path)
 
 
 def _walk_nodes(node: TreeNode[object]) -> Iterator[TreeNode[object]]:

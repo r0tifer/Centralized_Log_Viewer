@@ -28,7 +28,7 @@ import shutil
 import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Iterable, Literal, Optional
 
 from .discovery import DEFAULT_EXCLUDE_GLOBS, DEFAULT_MAX_FILES, DiscoverySettings
 from .refs import SourceRef, format_ref, normalize_ref, scheme_of
@@ -583,6 +583,139 @@ def parse_log_dirs(
 # --- remote hosts -----------------------------------------------------------
 
 
+def validate_port(raw: str) -> tuple[Optional[int], Optional[str]]:
+    """``(port, complaint)`` for something typed or read as a port.
+
+    Shared by the parser and the host dialog so the two cannot describe the same
+    typo differently. Deliberately not clamped: clamping 70000 to 65535 would
+    quietly connect somewhere the operator never named, so an impossible port is
+    reported and the host is refused.
+    """
+
+    low, high = _PORT_RANGE
+    text = (raw or "").strip()
+    if not text:
+        return _DEFAULT_SSH_PORT, None
+    try:
+        port = int(text)
+    except ValueError:
+        return None, f"port {text!r} is not a number; give one in {low}-{high}."
+    if not low <= port <= high:
+        return None, f"port {port} is outside {low}-{high}."
+    return port, None
+
+
+def validate_identity_file(raw: str) -> tuple[Optional[Path], Optional[str]]:
+    """``(path, warning)``. A missing key file warns; it never refuses.
+
+    The host may still work: ssh-agent commonly already holds the key and
+    ``~/.ssh/config`` may name another. Refusing here would lose a working
+    machine to a stale line, which Requirement 7 forbids more strongly than it
+    asks for strictness — so the second element is a *warning* at both call
+    sites, and a dialog that treated it as blocking would be wrong.
+    """
+
+    text = (raw or "").strip()
+    if not text:
+        return None, None
+    candidate = Path(text).expanduser()
+    if candidate.is_file():
+        return candidate, None
+    return candidate, (
+        f"identity_file '{candidate}' does not exist; the connection "
+        "will fall back to ssh-agent and ~/.ssh/config."
+    )
+
+
+def validate_remote_dirs(raw: str) -> tuple[tuple[str, ...], list[str]]:
+    """``(dirs, complaints)`` for a host's roots, as paths on *that* machine.
+
+    Validated for absoluteness and nothing else — there is nothing on this
+    machine to check them against. A bare relative path means the SSH user's
+    home directory on some shells and the login directory on others; ``~/logs``
+    says the same thing unambiguously, so it is accepted and the ambiguous form
+    is refused.
+    """
+
+    dirs: list[str] = []
+    complaints: list[str] = []
+    for text in _split_list(raw):
+        if not text.startswith(("/", "~")):
+            complaints.append(
+                f"log_dirs entry {text!r} is relative; give an absolute path "
+                "on the remote host, or a ~-relative one."
+            )
+            continue
+        if text not in dirs:
+            dirs.append(text)
+    return tuple(dirs), complaints
+
+
+def validate_host_name(name: str, existing: Iterable[str] = ()) -> Optional[str]:
+    """What is wrong with *name* as a ``[ssh:<name>]`` suffix, or ``None``.
+
+    The dialog's rule rather than the parser's, and the wording differs on
+    purpose: the parser is describing a *section* it found in a file and says so
+    ("has no host name; use [ssh:<name>]"), while this is describing a field
+    someone is typing into. The two share the shape of the rule, not the
+    sentence, because a message that reads correctly in both places reads
+    naturally in neither.
+
+    ``[`` and ``]`` are refused because a name carrying one produces a header
+    ``configparser`` reads as a different section than the one intended, and
+    surrounding whitespace because ``_parse_hosts`` strips it — so ``[ssh: web01 ]``
+    and ``[ssh:web01]`` are one host with two spellings, and the file would not
+    round trip.
+    """
+
+    if not name.strip():
+        return "Give the host a name."
+    if name != name.strip():
+        return "A host name cannot start or end with a space."
+    if any(character in name for character in "[]\n"):
+        return "A host name cannot contain [ or ]."
+    if name in set(existing):
+        return f"A host named {name!r} is already configured."
+    return None
+
+
+def host_options(host: RemoteHost) -> list[tuple[str, str]]:
+    """*host* as the ``key = value`` lines a ``[ssh:<name>]`` section carries.
+
+    The exact inverse of :func:`_parse_host`, pinned by a round-trip test —
+    a serialiser that drifts from its parser writes a file that reads back as a
+    different machine.
+
+    Only non-default values are emitted. A section listing all eleven options at
+    their defaults is noise in a file whose whole design is that an absent option
+    inherits, and the operator has to read it every time they open the file.
+    """
+
+    options: list[tuple[str, str]] = []
+    if host.host and host.host != host.name:
+        options.append(("host", host.host))
+    if host.user:
+        options.append(("user", host.user))
+    if host.port != _DEFAULT_SSH_PORT:
+        options.append(("port", str(host.port)))
+    if host.identity_file is not None:
+        options.append(("identity_file", str(host.identity_file)))
+    options.append(("log_dirs", ", ".join(host.log_dirs)))
+    if host.include_globs is not None:
+        options.append(("include_globs", ", ".join(host.include_globs)))
+    if host.exclude_globs is not None:
+        options.append(("exclude_globs", ", ".join(host.exclude_globs)))
+    if host.max_files is not None:
+        options.append(("max_files", str(host.max_files)))
+    if host.max_buffer_lines is not None:
+        options.append(("max_buffer_lines", str(host.max_buffer_lines)))
+    if host.correct_clock_skew:
+        options.append(("correct_clock_skew", "true"))
+    if not host.enabled:
+        options.append(("enabled", "false"))
+    return options
+
+
 def _read_port(section, issues: list[ConfigIssue], origin: str) -> Optional[int]:
     """The host's port, or ``None`` meaning the section cannot be used.
 
@@ -591,22 +724,9 @@ def _read_port(section, issues: list[ConfigIssue], origin: str) -> Optional[int]
     range is a typo, and a typo is reported.
     """
 
-    raw = (section.get("port", fallback="") or "").strip()
-    if not raw:
-        return _DEFAULT_SSH_PORT
-    low, high = _PORT_RANGE
-    try:
-        port = int(raw)
-    except ValueError:
-        issues.append(
-            ConfigIssue(origin, f"port {raw!r} is not a number; give one in {low}-{high}.")
-        )
-        return None
-    if not low <= port <= high:
-        issues.append(
-            ConfigIssue(origin, f"port {port} is outside {low}-{high}.")
-        )
-        return None
+    port, complaint = validate_port(section.get("port", fallback="") or "")
+    if complaint is not None:
+        issues.append(ConfigIssue(origin, complaint))
     return port
 
 
@@ -643,20 +763,9 @@ def _read_remote_dirs(
     the ambiguous form is refused.
     """
 
-    dirs: list[str] = []
-    for text in _split_list(raw):
-        if not text.startswith(("/", "~")):
-            issues.append(
-                ConfigIssue(
-                    origin,
-                    f"log_dirs entry {text!r} is relative; give an absolute path "
-                    "on the remote host, or a ~-relative one.",
-                )
-            )
-            continue
-        if text not in dirs:
-            dirs.append(text)
-    return tuple(dirs)
+    dirs, complaints = validate_remote_dirs(raw)
+    issues.extend(ConfigIssue(origin, complaint) for complaint in complaints)
+    return dirs
 
 
 def _read_identity_file(
@@ -670,19 +779,11 @@ def _read_identity_file(
     than it asks for strictness.
     """
 
-    raw = (section.get("identity_file", fallback="") or "").strip()
-    if not raw:
-        return None
-    candidate = Path(raw).expanduser()
-    if not candidate.is_file():
-        issues.append(
-            ConfigIssue(
-                origin,
-                f"identity_file '{candidate}' does not exist; the connection "
-                "will fall back to ssh-agent and ~/.ssh/config.",
-                "warning",
-            )
-        )
+    candidate, warning = validate_identity_file(
+        section.get("identity_file", fallback="") or ""
+    )
+    if warning is not None:
+        issues.append(ConfigIssue(origin, warning, "warning"))
     return candidate
 
 

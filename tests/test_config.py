@@ -23,9 +23,14 @@ from clv.services.config import (
     RemoteHost,
     bundled_config_path,
     ensure_user_settings_file,
+    host_options,
     load_config,
     parse_log_dirs,
     user_config_path,
+    validate_host_name,
+    validate_identity_file,
+    validate_port,
+    validate_remote_dirs,
 )
 from clv.services.discovery import DEFAULT_EXCLUDE_GLOBS, DiscoverySettings
 
@@ -762,3 +767,111 @@ def test_the_builtin_template_documents_ssh_too(tmp_path) -> None:
     assert config.enable_ssh is False
     assert config.hosts == ()
     assert config.issues == ()
+
+
+# --- the serialiser and the validators the host dialog shares with the parser
+
+
+def _round_trip(tmp_path, host: RemoteHost) -> RemoteHost:
+    """Write *host* the way the dialog does, and read it back the way CLV does."""
+
+    lines = [f"[ssh:{host.name}]"]
+    lines += [f"{key} = {value}" for key, value in host_options(host)]
+    path = tmp_path / "settings.conf"
+    path.write_text(
+        "[log_viewer]\nenable_ssh = true\n\n" + "\n".join(lines) + "\n",
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    assert config.issues == (), config.issues
+    return config.host(host.name)
+
+
+def test_a_fully_populated_host_survives_the_serialiser(tmp_path) -> None:
+    """``host_options`` is the inverse of ``_parse_host``, and a test says so.
+
+    A serialiser that drifts from its parser writes a file that reads back as a
+    different machine — and the dialog is the only thing that would ever notice,
+    by which point the operator's settings file is already wrong.
+    """
+
+    key = tmp_path / "id_ed25519"
+    key.write_text("not really a key", encoding="utf-8")
+    host = RemoteHost(
+        name="web01",
+        host="web01.internal",
+        user="ops",
+        port=2222,
+        identity_file=key,
+        log_dirs=("/var/log", "/srv/app/logs"),
+        enabled=False,
+        correct_clock_skew=True,
+        include_globs=("*.log", "syslog*"),
+        exclude_globs=("*.gz",),
+        max_files=2000,
+        max_buffer_lines=1000,
+    )
+
+    assert _round_trip(tmp_path, host) == host
+
+
+def test_an_all_defaults_host_serialises_to_one_line(tmp_path) -> None:
+    """An absent option inherits, so writing the defaults back is noise.
+
+    The operator reads this file; eleven options at their default values is ten
+    lines of nothing between them and the one that matters.
+    """
+
+    host = RemoteHost(name="web01", host="web01", log_dirs=("/var/log",))
+
+    assert host_options(host) == [("log_dirs", "/var/log")]
+    assert _round_trip(tmp_path, host) == host
+
+
+def test_the_validators_say_what_the_parser_says(tmp_path) -> None:
+    """One wording per fault, so the dialog and a config error cannot disagree."""
+
+    assert validate_port("") == (22, None)
+    assert validate_port("2222") == (2222, None)
+    assert validate_port("nope") == (
+        None,
+        "port 'nope' is not a number; give one in 1-65535.",
+    )
+    assert validate_port("70000") == (None, "port 70000 is outside 1-65535.")
+
+    dirs, complaints = validate_remote_dirs("/var/log, logs, ~/app, /var/log")
+    assert dirs == ("/var/log", "~/app")
+    assert complaints == [
+        "log_dirs entry 'logs' is relative; give an absolute path on the "
+        "remote host, or a ~-relative one."
+    ]
+
+    assert validate_identity_file("") == (None, None)
+    missing, warning = validate_identity_file(str(tmp_path / "absent"))
+    assert missing == tmp_path / "absent"
+    assert warning is not None and "ssh-agent" in warning
+
+    present = tmp_path / "id_ed25519"
+    present.write_text("x", encoding="utf-8")
+    assert validate_identity_file(str(present)) == (present, None)
+
+
+def test_a_host_name_must_round_trip_through_its_own_section_header() -> None:
+    """``[ssh: web01 ]`` and ``[ssh:web01]`` are one host with two spellings.
+
+    ``_parse_hosts`` strips the suffix, so a padded name parses to the same host
+    and writes back to a header the file never had. A bracket is worse: the
+    header means a different section than the one intended.
+    """
+
+    assert validate_host_name("web01") is None
+    assert validate_host_name("") == "Give the host a name."
+    assert validate_host_name("   ") == "Give the host a name."
+    assert validate_host_name(" web01") == (
+        "A host name cannot start or end with a space."
+    )
+    assert validate_host_name("web[01]") == "A host name cannot contain [ or ]."
+    assert validate_host_name("web01", ["db02", "web01"]) == (
+        "A host named 'web01' is already configured."
+    )
+    assert validate_host_name("web01", ["db02"]) is None

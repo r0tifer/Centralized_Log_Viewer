@@ -21,7 +21,7 @@ filesystem assumption that had already spread further.
 | 4b — Follow | It tails | ✅ **Complete** |
 | 5 — Reachability | A host that goes away says so | ✅ **Complete** |
 | 6 — Parity | Star, merge, rotation, hierarchy, time, session | ✅ **Complete** |
-| 7 — Remote UI | Host dialog, cross-host merge, `node` in the chrome | ⬜ Not started |
+| 7 — Remote UI | Host dialog, cross-host merge, `node` in the chrome | ✅ **Complete** |
 | 8 — Documentation & release | README, `settings.conf`, help overlay, version | ⬜ Not started |
 | 9 — The remote journal | `journalctl` over the same transport | ⬜ Not started |
 
@@ -114,6 +114,19 @@ break.
 8. **Opt-in.** No connection is attempted, and no `ssh` process spawned, until
    `enable_ssh` is true. `clv/plugins/AGENTS.md` already forbids a subprocess
    without consent; a *network* subprocess raises the bar, it does not lower it.
+
+   **One exception, added in Phase 7 and written down rather than absorbed.** A
+   connection the operator initiates by pressing **Test connection** in the host
+   dialog is attempted whatever `enable_ssh` says, because pressing a button
+   labelled *Test connection* is itself the explicit act of consent this
+   requirement exists to demand — and a first run in which a host cannot be
+   verified until an unrelated switch is found is how an operator concludes the
+   feature is broken. It probes once, reports, and connects to nothing else. The
+   mechanism that keeps this from widening is a test: the probe fires only on
+   that button, never on dialog open, close, list navigation or editor save
+   (`tests/test_remote_hosts_dialog.py::test_the_probe_runs_only_when_the_operator_asks_for_it`).
+   Nothing else in this file is relaxed: discovery, reading and tailing all
+   remain behind `enable_ssh`.
 9. **No credentials, ever.** No password field in the config schema, the
    dialog, `SessionState`, or memory. If a connection needs interactive input,
    it fails as unreachable.
@@ -1408,6 +1421,102 @@ the rows.
 versions.
 
 **Commit.** `feat(ui): remote host management and cross-host merge`
+
+### As built
+
+Recorded where the phase departed from the plan above, so Phase 8 documents what
+exists rather than what was proposed.
+
+- **The writeback needed its own module, and two live bugs came out with it.**
+  `persist_setting` and `persist_log_sources` were **section-blind**: they scanned
+  the whole file and, on no match, appended at end of file. That was harmless
+  while `[log_viewer]` was the only section anyone had. It stops being harmless
+  the moment one real `[ssh:<name>]` section exists, in two directions — the
+  drawer's own `enable_ssh` lands *inside the last host*, where `_parse_host`
+  ignores it and the refused-key table does not name it, so the switch reports
+  success and is off again next launch; and `log_dirs` is a key in **both**
+  schemas, so a `[log_viewer]` relying on the default meant `Ctrl+S` rewrote a
+  *remote host's* roots with paths from this machine. Both are fixed by scoping,
+  both have named regression tests, and both predate this phase.
+- **`persist_log_sources` also had a slice bug.** `line[: len(line) - len(stripped)]`
+  with `stripped = line.strip()` counts *trailing* whitespace as leading, so
+  `"log_dirs = /var/log   "` came back as `loglog_dirs = ...`. `persist_setting`
+  used `lstrip()` and was correct; the two had drifted.
+- **Editing is key-level and never regenerates a section.** This one rule is what
+  keeps three separate promises at once, and it is why `replace_section` does not
+  exist: the operator's comments survive, a refused `password =` keeps producing
+  its warning instead of being silently eaten, and a section the parser *skipped*
+  — a host with an impossible port never reaches `LogConfig.hosts` — is not
+  deleted by a UI that cannot see it. The last falls out of diffing *records*
+  rather than diffing the file.
+- **Removal never touches a line above a header**, and the shipped file is why.
+  `settings.conf` ends *inside* a commented-out `# [ssh:db02]` example with no
+  blank line after it, so appending one real section is enough to make that
+  example look like a note belonging to the new host. The tempting
+  comment-ownership heuristic would have deleted documentation the operator never
+  wrote, and `test_config.py`'s existing guard checks the *other* example, so it
+  would have passed.
+- **The editor offers seven fields, not twelve.** `RemoteHost` has eleven
+  configurable options and they do not fit in 24 rows beside a list, a hint and a
+  button row. `correct_clock_skew`, both glob overrides and both budgets stay
+  file-only — and because the writeback is key-level, leaving them alone
+  preserves them for free. `enabled` is `space` on the list row, which is exactly
+  what `WatchRulesDialog` already does with the same field.
+- **`ctrl+x` would have missed the workflow it exists for.** `group_rotated`
+  defaults on, so on any real machine `/var/log/nginx/access.log` and its
+  `.1` render as one `RotatedSet` branch — and `_star_target` answers `None` for
+  one. The canonical press said *"Move to a log in the tree to merge it"* while
+  sitting on the log. `_merge_target` unwraps the set to its head.
+- **And `_star_target` silently retargets, which is a live bug for local sources
+  too.** The merged group deliberately lists members discovery did not find, so
+  they can be pressed `x` on; `cursor_file()` filters them out through
+  `_is_file_node` and falls through to *the log on screen*, so the row said one
+  thing and did another. `_merge_target` takes a tree ref at its word.
+  `_star_target` itself is untouched — whether starring should follow is a
+  separate question.
+- **The merged source column had the same blindness the export filename did.**
+  `origin.name` rendered `access.log` in every row of a five-host merge, and the
+  existing left-ellipsis at the `-compact` width of 8 turned `web01-access.log`
+  into `…ess.log` — identical for every machine, in the one place the pane is
+  supposed to answer which machine a line came from. `refs.column_labels` picks
+  the *distinguishing* part per set: the basename for a set on one machine
+  (byte-for-byte what it always rendered, which is what Requirement 13 rests on
+  here), the node when one path spans several, and `node/name` otherwise. Built
+  once per set, never per rendered line.
+- **The drawer label is `Remote (SSH)` and the length is load-bearing.**
+  `.drawer-toggle` is `width: auto`, so that row's width is the sum of its label
+  lengths, and `-compact` only stacks it below 90 columns. `Remote sources (SSH)`
+  overflows between 90 and 96 — where nothing stacks — and the 80-column layout
+  test cannot see it, because at 80 the row is already stacked. Verified by
+  widening the label and watching the new 90/96 test fail.
+- **`_set_enable_ssh` is not a copy of `_set_journald`.** The journald plugin
+  re-reads the settings file on every scan, so that switch needs only a rescan.
+  `enable_ssh` is read by `build_backends` and `remote_roots`, which both
+  short-circuit on it — so a rescan alone re-walks the same local roots through
+  the same local resolver. What is needed is everything a configuration change
+  needs, which `action_reload_sources` already is, down to closing every
+  multiplex master when the switch goes off.
+- **Test connection uses a throwaway `SSHConnection` with its own `socket_dir`,
+  and both halves matter.** `SSHConnection.socket` hashes only
+  `(name, host, user, port)`, so a second connection built from the same record
+  resolves to the *same* `ControlPath` — and its `close()` would run
+  `ssh -O exit` on the master the resolver is actively using, costing a full
+  handshake on the next read every time Test was pressed. And `facts()` caches,
+  so reusing the live connection would answer the second press from memory with
+  no sign it never tried, about the *saved* record rather than what was just
+  typed.
+- **The reachability column has three states.** A fresh `SSHConnection` reports
+  `connected` optimistically and `RemoteResolver.for_ref` builds backends on
+  demand, so *an untried host reports reachable*. `SSHConnection.probed` is what
+  separates `connected` from `not tried`, and without it a green row on a brand
+  new host reads as evidence it works.
+- **A worker inside a `ModalScreen` is new ground here** — no other dialog runs
+  one. It carries a generation token and an `is_mounted` check, because Escape
+  can pop the screen while a probe is in flight.
+- **Requirement 8 gained a written exception** rather than a quiet one. See the
+  requirement itself above for the wording and the test that pins it.
+- **1220 + 52 = 1272 passed, 1 skipped, 11 deselected** on 3.11 and 3.14.
+
 
 ---
 

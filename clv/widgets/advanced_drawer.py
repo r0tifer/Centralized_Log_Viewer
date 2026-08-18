@@ -150,6 +150,7 @@ class AdvancedFiltersDrawer(Static):
        plugin line as a second detail of the same block. */
     AdvancedFiltersDrawer #export-status,
     AdvancedFiltersDrawer #journald-status,
+    AdvancedFiltersDrawer #ssh-status,
     AdvancedFiltersDrawer #watch-status {
         color: $text-muted;
         height: auto;
@@ -216,6 +217,7 @@ class AdvancedFiltersDrawer(Static):
         self._timeline = False
         self._clustering = False
         self._journald = False
+        self._ssh = False
         self.add_class("-hidden")
 
     # --- composition --------------------------------------------------------
@@ -311,6 +313,15 @@ class AdvancedFiltersDrawer(Static):
             with Vertical(classes="drawer-toggle"):
                 yield Label("Journal (systemd)")
                 yield Switch(value=self._journald, id="drawer-journald")
+            # `Remote (SSH)` rather than `Remote sources (SSH)`, and the reason
+            # is measurable: `.drawer-toggle` is `width: auto`, so this row's
+            # width is the sum of its label lengths, and `-compact` only stacks
+            # them below 90 columns. The longer label overflows the row between
+            # 90 and 96 — where nothing stacks and the 80-column test cannot see
+            # it — before the Input beside it gets a single cell.
+            with Vertical(classes="drawer-toggle"):
+                yield Label("Remote (SSH)")
+                yield Switch(value=self._ssh, id="drawer-ssh")
             with Vertical(classes="drawer-field"):
                 yield Label("Buffered lines per source")
                 yield Input(
@@ -341,6 +352,7 @@ class AdvancedFiltersDrawer(Static):
         yield Static("", id="export-status")
         yield Static("", id="watch-status")
         yield Static("", id="journald-status")
+        yield Static("", id="ssh-status")
 
         with Container(id="drawer-actions"):
             yield Button("Rescan sources", id="rescan-sources", variant="primary")
@@ -388,6 +400,28 @@ class AdvancedFiltersDrawer(Static):
             switch.disabled = not available
             self.query_one("#journald-status", Static).update(
                 f"Journal: {reason}" if reason else ""
+            )
+        except NoMatches:  # not composed yet
+            pass
+
+    def set_ssh(self, enabled: bool, *, available: bool = True, reason: str = "") -> None:
+        """Show whether remote sources are on, and summarise the hosts in a line.
+
+        One line for the whole fleet, deliberately. The drawer is capped at
+        `max-height: 16` and every row added here pushes `#drawer-actions` below
+        the fold, where it lays out and paints nothing — so five hosts get
+        "3 hosts · 2 reachable · web03 unreachable" and the per-host detail lives
+        in the dialog `R` opens, which has room for it.
+        """
+
+        self._ssh = enabled
+        try:
+            switch = self.query_one("#drawer-ssh", Switch)
+            with self.prevent(Switch.Changed):
+                switch.value = enabled
+            switch.disabled = not available
+            self.query_one("#ssh-status", Static).update(
+                f"Remote: {reason}" if reason else ""
             )
         except NoMatches:  # not composed yet
             pass
@@ -490,6 +524,10 @@ class AdvancedFiltersDrawer(Static):
             # subprocess, which is why it is the app's decision and not this
             # widget's — see LogViewerApp._set_journald.
             "drawer-journald": "journald",
+            # Same mechanism and the same reason as the journal above: consent to
+            # spawn a subprocess is the app's decision, not this widget's. A
+            # *network* subprocess raises that bar rather than lowering it.
+            "drawer-ssh": "ssh",
         }.get(switch_id)
         if view_field is not None:
             event.stop()

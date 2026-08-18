@@ -7,6 +7,7 @@ from typing import Iterable, Literal, Sequence
 
 from .backend import LOCAL, LOCAL_ACCESS_HINT, BackendResolver, SourceBackend
 from .refs import SourceRef, identity, normalize_ref, ref_key
+from .settings_file import DEFAULT_SECTION, SettingsDocument
 
 
 #: What to tell an operator whose local read was refused.
@@ -198,82 +199,51 @@ class SourceManager:
         return SourceAddition(success=True, path=resolved, messages=messages)
 
 
-def persist_setting(settings_path: Path, option: str, value: str) -> None:
+def persist_setting(
+    settings_path: Path, option: str, value: str, *, section: str = DEFAULT_SECTION
+) -> None:
     """Write ``option = value`` into *settings_path*, in place.
 
-    The same edit-in-place approach as :func:`persist_log_sources`, and for the
-    same reason: the settings file is the operator's, full of their comments,
-    so it is edited rather than regenerated. Used for choices made through the
-    UI that must outlive the session — enabling the journal is the case that
+    The settings file is the operator's, full of their comments, so it is edited
+    rather than regenerated — see :mod:`clv.services.settings_file`, which owns
+    that and is where the section scoping lives. Used for choices made through
+    the UI that must outlive the session: enabling the journal is the case that
     needed it, because consent to run a subprocess is not something to ask for
     again every launch.
+
+    *section* defaults to the global one. It exists because ``[ssh:<name>]``
+    sections made "append at the end of the file" wrong — the end of the file is
+    inside the last host.
     """
 
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if settings_path.exists():
-        lines = settings_path.read_text(encoding="utf-8").splitlines()
-    else:
-        lines = ["[log_viewer]", ""]
-
-    for index, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("#") or "=" not in stripped:
-            continue
-        if stripped.split("=", 1)[0].strip() != option:
-            continue
-        leading = line[: len(line) - len(line.lstrip())]
-        lines[index] = f"{leading}{option} = {value}"
-        break
-    else:
-        if lines and lines[-1].strip():
-            lines.append("")
-        lines.append(f"{option} = {value}")
-
-    payload = "\n".join(lines)
-    if not payload.endswith("\n"):
-        payload += "\n"
-    settings_path.write_text(payload, encoding="utf-8")
+    document = SettingsDocument.load(settings_path)
+    document.set(section, option, value)
+    document.save(settings_path)
 
 
 def persist_log_sources(settings_path: Path, entries: Sequence[Path]) -> None:
-    """Merge *entries* into the `log_dirs` line within *settings_path*."""
+    """Merge *entries* into the `log_dirs` line within *settings_path*.
 
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if settings_path.exists():
-        lines = settings_path.read_text(encoding="utf-8").splitlines()
-    else:
-        lines = ["[log_viewer]", ""]
+    Scoped to ``[log_viewer]``, which is load-bearing rather than tidy:
+    ``log_dirs`` is a key in the remote-host schema too, so an unscoped search
+    for the first one in the file could rewrite **another machine's** roots with
+    paths from this one.
+    """
 
     entry_strings = [
         str(path)
-        for path in sorted({ _marker(path): path for path in entries }.values(), key=lambda p: str(p).lower())
+        for path in sorted(
+            {_marker(path): path for path in entries}.values(),
+            key=lambda p: str(p).lower(),
+        )
     ]
 
-    def _merge_values(raw: str) -> str:
-        values = [piece.strip() for piece in raw.split(",") if piece.strip()]
-        merged = list(dict.fromkeys(values + entry_strings))
-        return ", ".join(merged)
-
-    replaced = False
-    for idx, line in enumerate(lines):
-        stripped = line.strip()
-        if not stripped.startswith("log_dirs"):
-            continue
-        leading = line[: len(line) - len(stripped)]
-        _, _, value = line.partition("=")
-        merged = _merge_values(value)
-        lines[idx] = f"{leading}log_dirs = {merged}"
-        replaced = True
-        break
-
-    if not replaced:
-        if lines and lines[-1].strip():
-            lines.append("")
-        lines.append(f"log_dirs = {', '.join(entry_strings)}")
-
-    payload = "\n".join(lines)
-    if not payload.endswith("\n"):
-        payload += "\n"
-    settings_path.write_text(payload, encoding="utf-8")
+    document = SettingsDocument.load(settings_path)
+    current = document.get(DEFAULT_SECTION, "log_dirs") or ""
+    values = [piece.strip() for piece in current.split(",") if piece.strip()]
+    document.set(
+        DEFAULT_SECTION,
+        "log_dirs",
+        ", ".join(dict.fromkeys(values + entry_strings)),
+    )
+    document.save(settings_path)

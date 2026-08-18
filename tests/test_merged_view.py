@@ -1379,3 +1379,267 @@ def test_the_export_filename_carries_the_machine(tmp_path: Path) -> None:
     )
 
     assert stem == "web01-syslog+web02-syslog-20260811-142530"
+
+
+# --- merging one path across a fleet ----------------------------------------
+#
+# The set is built from `_file_refs`, which is what discovery already listed, so
+# these need no network and no SSH server: staging that set is staging exactly
+# what a walk would have left behind.
+
+
+ACCESS = "/var/log/nginx/access.log"
+
+
+def _stage_fleet(app: LogViewerApp, nodes: tuple[str, ...]) -> None:
+    """Stand in for a walk that found `ACCESS` on *nodes*, plus a stray log.
+
+    Called *after* the app has mounted, because `on_mount` runs a rescan and
+    `_install_report` replaces `_file_refs` wholesale — which is exactly the
+    mechanism being staged here.
+    """
+
+    from clv.services.refs import RemoteRef
+
+    app._file_refs = {RemoteRef.build(node, ACCESS) for node in nodes}
+    # web09 was walked and simply does not have the file — a different fact from
+    # a host that could not be walked, and it has to read as one.
+    app._file_refs.add(RemoteRef.build("web09", "/var/log/syslog"))
+
+
+def _notes(app: LogViewerApp) -> list[str]:
+    return [str(message) for message in app._notified]
+
+
+def _capture_notices(app: LogViewerApp) -> None:
+    app._notified = []
+    app._notify = lambda message, severity="information": app._notified.append(message)
+
+
+def test_merging_across_hosts_builds_the_set_and_names_who_lacked_it() -> None:
+    from clv.services.refs import RemoteRef
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            await pilot.pause()
+            _stage_fleet(app, ("web01", "web02", "web03"))
+            _capture_notices(app)
+            opened: list[bool] = []
+            app.action_open_merged = lambda: opened.append(True)
+
+            app._selected_source = RemoteRef.build("web01", ACCESS)
+            app.action_merge_across_hosts()
+            await pilot.pause()
+
+            assert app.state.merged == (
+                f"ssh:web01{ACCESS}",
+                f"ssh:web02{ACCESS}",
+                f"ssh:web03{ACCESS}",
+            )
+            assert opened == [True], "building the set hands off to the existing open"
+            assert "Merging access.log across 3 sources" in _notes(app)[0]
+            assert "not on web09" in _notes(app)[0]
+
+    asyncio.run(scenario())
+
+
+def test_a_host_that_could_not_be_walked_is_not_reported_as_lacking_the_file() -> None:
+    """Requirement 7: unreachable and does-not-have-it are two different facts.
+
+    A machine inside its reconnect backoff has told CLV nothing about its files.
+    Folding it into "not on web03" would be a confident answer with no evidence
+    behind it, and the operator would stop looking for the log that is there.
+    """
+
+    from clv.services.discovery import DiscoveryReport
+    from clv.services.refs import RemoteRef
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            await pilot.pause()
+            _stage_fleet(app, ("web01", "web02"))
+
+            report = DiscoveryReport()
+            root = RemoteRef.build("web03", "/var/log")
+            report.roots.append(root)
+            report.unreadable_roots.append(root)
+            report.root_reasons[root] = "web03 is unreachable: connection refused"
+            app._report = report
+            _capture_notices(app)
+            app.action_open_merged = lambda: None
+
+            app._selected_source = RemoteRef.build("web01", ACCESS)
+            app.action_merge_across_hosts()
+            await pilot.pause()
+
+            message = _notes(app)[0]
+            assert "could not reach web03" in message
+            assert "not on web09" in message
+            assert "not on web03" not in message
+
+    asyncio.run(scenario())
+
+
+def test_merging_across_hosts_with_only_one_match_says_so_and_changes_nothing() -> None:
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            await pilot.pause()
+            _stage_fleet(app, ("web01",))
+            _capture_notices(app)
+            from clv.services.refs import RemoteRef
+
+            app._selected_source = RemoteRef.build("web01", ACCESS)
+            app.action_merge_across_hosts()
+            await pilot.pause()
+
+            assert app.state.merged == ()
+            assert "only found on one source" in _notes(app)[0]
+
+    asyncio.run(scenario())
+
+
+def test_the_merge_gesture_reaches_a_rotated_set_through_its_head(tmp_path: Path) -> None:
+    """**The press that used to miss.** `group_rotated` is on by default, so on
+    any machine with a real /var/log the cursor is on a `RotatedSet` branch — and
+    `_star_target` answers None for one, so `x` said "move to a log in the tree"
+    while sitting on the log."""
+
+    root = tmp_path / "logs"
+    root.mkdir()
+    head = _write(root / "app.log", ["2026-08-11 10:00:00 - INFO - live"])
+    _write(root / "app.log.1", ["2026-08-11 09:00:00 - INFO - older"])
+
+    async def scenario() -> None:
+        from clv.app import LogTree
+        from clv.services.rotation import RotatedSet
+
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            app._source_manager = SourceManager([root], [])
+            await app._rescan()
+            await pilot.pause()
+
+            tree = app.query_one("#source-tree", LogTree)
+            for item in _walk(tree.root):
+                if item.allow_expand:
+                    item.expand()
+            await pilot.pause()
+            node = next(
+                item
+                for item in _walk(tree.root)
+                if isinstance(item.data, RotatedSet)
+            )
+            tree.focus()
+            tree.move_cursor(node)
+            await pilot.pause()
+            assert tree.cursor_node is node
+
+            assert app._merge_target() == head
+            app.action_toggle_merge()
+            await pilot.pause()
+
+            assert app.state.merged == (str(head),)
+
+    asyncio.run(scenario())
+
+
+def test_the_merge_gesture_acts_on_a_member_discovery_no_longer_lists(
+    tmp_path: Path,
+) -> None:
+    """The merged group lists a log that has rotated away on purpose, so that it
+    can be pressed `x` on. `_star_target` filtered it out and silently toggled
+    whatever was open instead — so the row said one thing and did another."""
+
+    alpha, beta = _sources(tmp_path)
+    vanished = alpha.parent / "gone.log"
+
+    async def scenario() -> None:
+        from clv.app import LogTree
+
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            app._source_manager = SourceManager([alpha.parent], [])
+            app._update_state(merged=(str(alpha), str(vanished)))
+            await app._rescan()
+            await pilot.pause()
+            app._select_source(beta)
+            await pilot.pause()
+
+            tree = app.query_one("#source-tree", LogTree)
+            for item in _walk(tree.root):
+                if item.allow_expand:
+                    item.expand()
+            await pilot.pause()
+            node = next(
+                item for item in _walk(tree.root) if item.data == vanished
+            )
+            tree.focus()
+            tree.move_cursor(node)
+            await pilot.pause()
+            assert tree.cursor_node is node
+
+            assert app._merge_target() == vanished
+            app.action_toggle_merge()
+            await pilot.pause()
+
+            assert str(vanished) not in app.state.merged, "the row acted on itself"
+            assert str(alpha) in app.state.merged, "and left the rest of the set alone"
+
+    asyncio.run(scenario())
+
+
+# --- the source column ------------------------------------------------------
+
+
+def test_the_source_column_names_the_machine_when_the_basename_cannot() -> None:
+    """Five hosts' `access.log` rendered `access.log` five times, and the
+    left-ellipsis at the -compact width of 8 turned `web01-access.log` into
+    `…ess.log` — the same string for every machine, in the one place the pane is
+    supposed to answer which machine a line came from."""
+
+    from clv.services.refs import RemoteRef, column_labels
+
+    fleet = [RemoteRef.build(node, ACCESS) for node in ("web01", "web02", "web03")]
+
+    assert column_labels(fleet) == {
+        fleet[0]: "web01",
+        fleet[1]: "web02",
+        fleet[2]: "web03",
+    }
+    assert all(len(label) <= 8 for label in column_labels(fleet).values())
+
+
+def test_the_source_column_is_unchanged_for_a_set_on_one_machine() -> None:
+    """Requirement 13 at the rule itself: an all-local merge keeps the labels it
+    has always had, and so does a fleet-free remote set."""
+
+    from clv.services.refs import RemoteRef, column_labels
+
+    local = [Path("/logs/alpha.log"), Path("/logs/beta.log")]
+    assert column_labels(local) == {local[0]: "alpha.log", local[1]: "beta.log"}
+
+    one_host = [
+        RemoteRef.build("web01", "/var/log/syslog"),
+        RemoteRef.build("web01", "/var/log/auth.log"),
+    ]
+    assert column_labels(one_host) == {one_host[0]: "syslog", one_host[1]: "auth.log"}
+
+
+def test_the_source_column_qualifies_both_when_names_and_machines_differ() -> None:
+    from clv.services.refs import RemoteRef, column_labels
+
+    mixed = [
+        RemoteRef.build("web01", ACCESS),
+        RemoteRef.build("web01", "/var/log/syslog"),
+        Path("/logs/alpha.log"),
+    ]
+
+    assert column_labels(mixed) == {
+        mixed[0]: "web01/access.log",
+        mixed[1]: "web01/syslog",
+        mixed[2]: "alpha.log",
+    }
+

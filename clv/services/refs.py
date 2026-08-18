@@ -51,7 +51,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import IO, Any, NoReturn, Protocol
+from typing import IO, Any, NoReturn, Protocol, Sequence
 
 __all__ = [
     "KNOWN_SCHEMES",
@@ -563,6 +563,69 @@ def stem_of(ref: SourceRef) -> str:
     if isinstance(ref, RemoteRef):
         return f"{ref.node}-{ref.path.name}"
     return ref.name
+
+
+#: What the merged pane's source column calls a local member when the set also
+#: holds remote ones. Not this machine's hostname: ``host`` already means "what
+#: the log says about itself", and borrowing it here would answer a different
+#: question than the column is asking.
+LOCAL_NODE_LABEL = "local"
+
+
+def compact_of(ref: SourceRef) -> str:
+    """``deeper/a.log``, with the machine in front of it when there is one.
+
+    ``web01:nginx/access.log``. The local form is exactly what ``app._compact_path``
+    produced before this existed, so nothing local moved — but two machines with
+    the same log rendered the same two words, which is the one thing a label whose
+    entire job is telling identically named logs apart may not do.
+
+    Lives here for the reason :func:`stem_of` does: one place in CLV knows a
+    source is a ``Path`` or a :class:`RemoteRef`, and a second copy of that union
+    is how the two drift apart.
+    """
+
+    if isinstance(ref, RemoteRef):
+        parent = ref.path.parent.name
+        tail = f"{parent}/{ref.path.name}" if parent else ref.path.name
+        return f"{ref.node}:{tail}"
+    parent = ref.parent.name
+    return f"{parent}/{ref.name}" if parent else ref.name
+
+
+def node_of(ref: SourceRef) -> str:
+    """CLV's name for the machine *ref* was read from; ``""`` for this one."""
+
+    return ref.node if isinstance(ref, RemoteRef) else ""
+
+
+def column_labels(origins: Sequence[SourceRef]) -> dict[SourceRef, str]:
+    """What to call each member of a merged set in the pane's source column.
+
+    The column exists to answer "which of these did this line come from", and the
+    canonical cross-host merge — one path across a fleet — is exactly the case
+    where the basename cannot answer it. Five hosts' ``access.log`` rendered
+    ``access.log`` five times, and at the ``-compact`` width of 8 the existing
+    left-ellipsis turned ``web01-access.log`` into ``…ess.log``, which is the same
+    string for every machine. So the *distinguishing* part is chosen per set:
+
+    * one machine (including an all-local set) → the basename, byte-for-byte what
+      this has always rendered;
+    * one basename across several machines → the machine, which is short enough to
+      survive the narrowest column;
+    * otherwise → ``node/name``, and the caller's truncation does the rest.
+    """
+
+    unique = list(dict.fromkeys(origins))
+    nodes = {node_of(ref) for ref in unique}
+    if len(nodes) <= 1:
+        return {ref: ref.name for ref in unique}
+    if len({ref.name for ref in unique}) == 1:
+        return {ref: node_of(ref) or LOCAL_NODE_LABEL for ref in unique}
+    return {
+        ref: (f"{node}/{ref.name}" if (node := node_of(ref)) else ref.name)
+        for ref in unique
+    }
 
 
 def normalize_ref(raw: str | SourceRef) -> SourceRef:

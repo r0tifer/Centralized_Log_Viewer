@@ -122,7 +122,7 @@ distros.
 | Layer | Location | Owns | Must not |
 | --- | --- | --- | --- |
 | **App shell** | `clv/app.py` | Layout, routing, lifecycle, breakpoints | Parse, filter, read files, or define widget visuals |
-| **Services** | `clv/services/` | Source identity (`refs.py`), source IO (`backend.py`), parsing, filtering, discovery, reading, buffering, config, source management | Touch the UI or import Textual, or reach past `backend.py` to `os` |
+| **Services** | `clv/services/` | Source identity (`refs.py`), source IO (`backend.py`), parsing, filtering, discovery, reading, buffering, config, settings-file editing (`settings_file.py`), source management | Touch the UI or import Textual, or reach past `backend.py` to `os` |
 | **Widgets** | `clv/widgets/` | Self-contained UI + own `DEFAULT_CSS` | Depend on other widgets' internals or import `clv.app` |
 | **Plugins** | `clv/plugins/` | Extension interfaces + loader; also the two things that spawn a subprocess and so need consent — `sources/journald.py` and `sources/ssh.py` (the SSH transport and `RemoteBackend`) | Break interface contracts, or spawn anything before the operator opts in |
 | **State** | `clv/storage.py` | JSON session persistence (atomic), including `SavedView` records | Depend on the UI |
@@ -245,7 +245,17 @@ distros.
   plugin errors. **There is no password option and no sudo option**, and the
   schema refuses both by name with a pointer to ssh-agent and to group/ACL
   membership — the one place those requirements cannot be forgotten.
-- `sources.py` — session source management and settings persistence.
+- `settings_file.py` — editing `settings.conf` in place without losing the
+  operator's comments. `configparser` reads that file and nothing writes it
+  back through `configparser`, whose `write()` discards every comment and
+  blank line. Every operation is scoped to a named section, because an
+  unscoped append lands at end of file — which, once one `[ssh:<name>]`
+  section exists, is *inside the last host*. Editing is key-level and never
+  regenerates a section, so comments, per-host budgets, options this version
+  does not know about, and a refused `password =` still earning its warning
+  all survive an edit untouched. Removal never touches a line above a header.
+- `sources.py` — session source management and settings persistence, both
+  routed through `settings_file.py`.
 - `export.py` — the three built-in output formats (JSON Lines, CSV, plain text)
   and the atomic write behind `Ctrl+E`. Core rather than drop-in plugins so a
   built-in cannot fail to load and the drawer's plugin count keeps meaning

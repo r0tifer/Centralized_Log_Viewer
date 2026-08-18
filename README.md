@@ -266,8 +266,19 @@ alongside the set, so save it with the filters you want to come back to.
 
 **A merged set can span machines.** With remote sources configured, a local log
 and a log on another host open in the same timestamp-ordered pane — comparing
-one path across a fleet is what the feature is for. Two things are worth knowing
-before you read causation out of the interleaving:
+one path across a fleet is what the feature is for.
+
+**`Ctrl+X` builds that set in one press.** On any log, it gathers the same path
+from every machine the last scan found it on and opens the result, rather than
+making you press `x` on five leaves inside five separately collapsed host trees.
+It reports what it did: how many sources it merged, which walked hosts do not
+have that path, and which hosts it could not reach at all — three different
+facts, kept apart, because a host that was unreachable has told CLV nothing
+about its files and saying "not on web03" would be a confident answer with no
+evidence behind it. When the members share a basename, the pane's source column
+switches to naming the *machine*, since that is the part that differs.
+
+Two things are worth knowing before you read causation out of the interleaving:
 
 - **Ordering across machines is only as trustworthy as their clocks**, and CLV
   says so rather than hiding it. Clock skew between hosts is measured and
@@ -279,9 +290,19 @@ before you read causation out of the interleaving:
   so it keeps meaning exactly what it always did and no saved query changes
   meaning. `node:web01 status>=500` is the query you want across a fleet.
 
-Setup, the authentication model and what degrades on a non-GNU remote are not
-documented here yet — that section lands with the release. Shipping logs to one
-host and merging them locally still works and always will.
+**Managing hosts.** `R` opens the host dialog: add, edit, enable, disable and
+remove machines, with a **Test connection** that makes one bounded probe and
+reports what it found — the reason verbatim if it failed, and the shell profile
+and measured clock skew if it worked. Changes are written back into
+`settings.conf` in place, so the comments, per-host budgets and glob overrides
+you have written there survive an edit untouched. There is no password field and
+no sudo toggle, because there is no password option and no sudo option: CLV
+connects with ssh-agent and key files, and reads as the configured user.
+
+The remaining setup detail, the authentication model in full and what degrades on
+a non-GNU remote are not documented here yet — that section lands with the
+release. Shipping logs to one host and merging them locally still works and
+always will.
 
 ### Compressed and rotated logs
 
@@ -619,6 +640,7 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `f` | Toggle the Advanced drawer |
 | `*` | Star / unstar the log under the cursor |
 | `x` | Add / remove the log under the cursor from the merged set |
+| `Ctrl+X` | Merge this path across every host that has it, then open it |
 | `u` | Open the merged set as one timestamp-ordered stream |
 | `X` | Empty the merged set |
 | `↑` / `↓` | Move the line cursor |
@@ -640,6 +662,7 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `Ctrl+E` | Export the filtered entries to a file |
 | `y` | Copy the selected line, or the visible lines, to the clipboard (OSC 52) |
 | `Ctrl+L` | Copy mode (hides all chrome) |
+| `R` | Add, edit, test and remove remote hosts (SSH) |
 | `Ctrl+S` | Save added sources to `settings.conf` |
 | `Ctrl+R` | Reload configuration and rescan |
 | `q` | Quit |

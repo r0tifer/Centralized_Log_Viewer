@@ -395,3 +395,153 @@ def test_the_query_syntax_reminder_and_watch_switch_are_present() -> None:
                 assert label.region.height >= 2, str(label.render())
 
     _run(scenario)
+
+
+# --- remote sources ---------------------------------------------------------
+
+
+def test_the_remote_switch_reports_through_the_app_not_the_widget() -> None:
+    """Consent to spawn a *network* subprocess is the app's decision.
+
+    The widget's job is to say the operator flipped it; what that means — write
+    the setting, rebuild the resolver, close any open master — belongs to
+    `LogViewerApp._set_enable_ssh`, exactly as it does for the journal.
+    """
+
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(120, 44)) as pilot:
+            await pilot.pause()
+            app.drawer.query_one("#drawer-ssh", Switch).toggle()
+            await pilot.pause()
+
+            assert [(m.field, m.value) for m in app.view_changes] == [("ssh", True)]
+
+    _run(scenario)
+
+
+def test_setting_the_remote_state_does_not_echo_back_as_a_change() -> None:
+    """`Switch.Changed` posts asynchronously, so a flag cleared at the end of
+    the setter is already back to False by the time the handler runs — which is
+    why this uses `prevent` and why the assertion is worth having."""
+
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(120, 44)) as pilot:
+            await pilot.pause()
+            app.drawer.set_ssh(True, reason="2 hosts · 2 reachable")
+            await pilot.pause()
+
+            assert app.view_changes == []
+            assert app.drawer.query_one("#drawer-ssh", Switch).value is True
+            assert "2 hosts" in str(app.drawer.query_one("#ssh-status", Static).render())
+
+    _run(scenario)
+
+
+def test_the_fleet_is_summarised_in_one_line_however_many_hosts() -> None:
+    """The drawer is capped at `max-height: 16` and `#drawer-actions` sits below
+    these status lines. A line per host is what pushes Rescan and Close off the
+    bottom, where they lay out and paint nothing — so the per-host detail lives
+    in the dialog, and this stays one line."""
+
+    from dataclasses import replace as _replace
+
+    from clv.services.config import RemoteHost
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(120, 44)) as pilot:
+            await pilot.pause()
+            app._config = _replace(
+                app._config,
+                enable_ssh=True,
+                hosts=tuple(
+                    RemoteHost(name=f"web{index:02d}", host=f"web{index:02d}", log_dirs=("/var/log",))
+                    for index in range(1, 6)
+                ),
+            )
+            app._sync_ssh_status()
+            await pilot.pause()
+
+            text = str(app.advanced_drawer.query_one("#ssh-status", Static).render())
+            assert "5 hosts" in text
+            assert "\n" not in text
+
+    _run(scenario)
+
+
+def test_the_source_discovery_row_still_fits_just_above_the_compact_breakpoint() -> None:
+    """The regression 80 columns cannot catch.
+
+    `.drawer-toggle` is `width: auto`, so this row's width is the sum of its
+    label lengths — and `-compact` only stacks the row below 90 columns. A label
+    a few characters too long therefore overflows between 90 and 96, where
+    nothing stacks, while the 80-column test sits happily in the stacked layout
+    and sees nothing at all.
+    """
+
+    async def scenario() -> None:
+        for width in (90, 96, 120):
+            app = LogViewerApp()
+            async with app.run_test(size=(width, 44)) as pilot:
+                await pilot.pause()
+                app.advanced_drawer.show()
+                await pilot.pause()
+                await pilot.pause()
+
+                switch = app.advanced_drawer.query_one("#drawer-ssh", Switch)
+                buffer = app.advanced_drawer.query_one("#max-buffer-lines", Input)
+                for widget, name in ((switch, "#drawer-ssh"), (buffer, "#max-buffer-lines")):
+                    assert widget.region.width > 0, f"{name} laid out to nothing at {width}"
+                    assert widget.region.height > 0, f"{name} painted nothing at {width}"
+                    assert widget.region.right <= width, f"{name} overflows at {width}"
+
+    _run(scenario)
+
+
+def test_the_drawer_actions_stay_on_screen_at_eighty_columns() -> None:
+    """The last thing in the drawer: if it is on screen, nothing above it has
+    been pushed off. The new switch and status line are two more rows in a
+    `max-height: 16` box, so this is the assertion that costs them."""
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app.advanced_drawer.show()
+            await pilot.pause()
+            await pilot.pause()
+
+            drawer = app.advanced_drawer
+            assert drawer.region.right <= 80
+            for widget_id in ("#drawer-ssh", "#ssh-status"):
+                assert drawer.query_one(widget_id).region.width > 0, widget_id
+
+    _run(scenario)
+
+
+def test_the_remote_switch_is_disabled_where_there_is_no_ssh_client(monkeypatch) -> None:
+    """"Why is there no remote here" is answered on screen, not in the docs.
+
+    The same treatment the journal switch gets where `journalctl` is absent: a
+    control that writes an opt-in nothing can act on is worse than one that is
+    visibly unavailable.
+    """
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(120, 44)) as pilot:
+            await pilot.pause()
+            monkeypatch.setattr("shutil.which", lambda name: None)
+            app._sync_ssh_status()
+            await pilot.pause()
+
+            switch = app.advanced_drawer.query_one("#drawer-ssh", Switch)
+            assert switch.disabled is True
+            assert "no ssh client" in str(
+                app.advanced_drawer.query_one("#ssh-status", Static).render()
+            )
+
+    _run(scenario)
+
