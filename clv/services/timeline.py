@@ -32,12 +32,18 @@ than as an empty rectangle.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Iterable, Optional, Sequence
+from typing import Callable, Iterable, Optional, Sequence
 
 from .filtering import TimeWindow, sortable_moment
 from .parsing import LogEntry, level_rank
+
+#: How to read an entry's stamp as an absolute instant. Supplied only when the
+#: plain timestamp is not one — a merged set spanning machines whose naive
+#: stamps mean different instants. The session owns the rule; this module only
+#: has to key the histogram by the same thing the pane sorts by.
+MomentOf = Callable[[LogEntry], Optional[datetime]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +73,23 @@ class Timeline:
     #: Whether the grid dropped UTC offsets because the source mixed aware and
     #: naive stamps. Carried so ``extend`` keys arrivals the same way.
     naive: bool = True
+    #: How to read an entry's stamp as an instant, when the plain timestamp is
+    #: not one — a merge spanning machines in different zones. ``None`` means
+    #: ``entry.timestamp``, which is every local case and the default.
+    #:
+    #: Carried on the grid for the reason ``naive`` is: ``extend`` has to key an
+    #: arrival exactly the way the build keyed the entries around it, and a
+    #: caller that had to remember to pass it twice would eventually not.
+    #: ``compare=False`` because two grids are equal when their buckets are —
+    #: a function object is machinery, not part of the histogram.
+    moment_of: Optional[MomentOf] = field(default=None, compare=False, repr=False)
+
+    def moment(self, entry: LogEntry) -> Optional[datetime]:
+        """*entry*'s place on the axis — the mapping, or its own stamp."""
+
+        if self.moment_of is None:
+            return entry.timestamp
+        return self.moment_of(entry)
 
     @property
     def total(self) -> int:
@@ -118,11 +141,12 @@ class Timeline:
         touched = False
 
         for entry in entries:
-            if entry.timestamp is None:
+            moment = self.moment(entry)
+            if moment is None:
                 undated += 1
                 touched = True
                 continue
-            index = self.index_of(entry.timestamp)
+            index = self.index_of(moment)
             if not (0 <= index < len(counts)):
                 return None
             counts[index] += 1
@@ -142,6 +166,7 @@ class Timeline:
             step=self.step,
             undated=undated,
             naive=self.naive,
+            moment_of=self.moment_of,
         )
 
 
@@ -151,22 +176,35 @@ class Timeline:
 EMPTY = Timeline(buckets=(), origin=datetime.min, step=timedelta(seconds=1), undated=0)
 
 
-def build_timeline(entries: Sequence[LogEntry], *, width: int) -> Timeline:
+def build_timeline(
+    entries: Sequence[LogEntry],
+    *,
+    width: int,
+    moment_of: Optional[MomentOf] = None,
+) -> Timeline:
     """Bucket *entries* into at most *width* columns.
 
     *entries* are the ones the operator can see — filtered, not the raw buffer
     — so the histogram answers "when did the thing I am looking at happen"
     rather than "when did anything happen".
+
+    *moment_of* is how to read an entry's stamp as an instant. Omitted — every
+    local case — it is ``entry.timestamp`` and nothing below changes. A merged
+    set spanning zones supplies the session's own rule, so the bar and the pane
+    beneath it agree about the order of the same lines. Two copies of that
+    decision would be two places for them to disagree, which is the whole
+    argument for :data:`clv.services.session._sortable` being an alias.
     """
 
     width = max(1, width)
     stamped: list[tuple[datetime, Optional[str]]] = []
     undated = 0
     for entry in entries:
-        if entry.timestamp is None:
+        moment = entry.timestamp if moment_of is None else moment_of(entry)
+        if moment is None:
             undated += 1
             continue
-        stamped.append((entry.timestamp, entry.level))
+        stamped.append((moment, entry.level))
 
     if not stamped:
         # Lines, but no time axis to put them on. The bar says so; an empty
@@ -177,6 +215,7 @@ def build_timeline(entries: Sequence[LogEntry], *, width: int) -> Timeline:
             origin=EMPTY.origin,
             step=EMPTY.step,
             undated=undated,
+            moment_of=moment_of,
         )
 
     # The set rule, decided once, exactly as the k-way merge decides it: if any
@@ -204,7 +243,14 @@ def build_timeline(entries: Sequence[LogEntry], *, width: int) -> Timeline:
         Bucket(origin + step * index, origin + step * (index + 1), counts[index], levels[index])
         for index in range(count)
     )
-    return Timeline(buckets=buckets, origin=origin, step=step, undated=undated, naive=naive)
+    return Timeline(
+        buckets=buckets,
+        origin=origin,
+        step=step,
+        undated=undated,
+        naive=naive,
+        moment_of=moment_of,
+    )
 
 
 def _step_for(span: timedelta, width: int) -> timedelta:
@@ -259,6 +305,7 @@ def describe_undated(timeline: Timeline) -> str:
 __all__ = [
     "EMPTY",
     "Bucket",
+    "MomentOf",
     "Timeline",
     "build_timeline",
     "describe_bucket",

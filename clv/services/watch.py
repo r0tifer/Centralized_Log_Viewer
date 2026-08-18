@@ -28,13 +28,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, replace
-from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Sequence
 
 from .filtering import compile_query
 from .marks import mark_key
 from .parsing import LogEntry
 from .query import MATCH_HIT, QueryError, match_terms, parse_query
+from .refs import SourceRef
 
 #: What a rule does when it matches.
 ACTION_HIGHLIGHT = "highlight"
@@ -192,7 +192,7 @@ class WatchIndex:
         self.evaluations = 0
 
     def evaluate(
-        self, source: Optional[Path], entries: Iterable[LogEntry]
+        self, source: Optional[SourceRef], entries: Iterable[LogEntry]
     ) -> list[tuple[LogEntry, tuple[str, ...]]]:
         """Answer for every entry in *entries*; return the ones that hit.
 
@@ -224,15 +224,15 @@ class WatchIndex:
                 fired.append((entry, names))
         return fired
 
-    def hits(self, source: Optional[Path], entry: LogEntry) -> tuple[str, ...]:
+    def hits(self, source: Optional[SourceRef], entry: LogEntry) -> tuple[str, ...]:
         """Rules this line hit. Empty for a line never evaluated."""
 
         return self._hits.get(mark_key(source, entry), ())
 
-    def watched(self, source: Optional[Path], entry: LogEntry) -> bool:
+    def watched(self, source: Optional[SourceRef], entry: LogEntry) -> bool:
         return bool(self.hits(source, entry))
 
-    def prune(self, source: Optional[Path], entries: Iterable[LogEntry]) -> None:
+    def prune(self, source: Optional[SourceRef], entries: Iterable[LogEntry]) -> None:
         """Drop cached answers for lines no longer in the buffer."""
 
         self.retain({mark_key(source, entry) for entry in entries})

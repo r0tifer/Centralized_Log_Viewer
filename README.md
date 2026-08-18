@@ -61,7 +61,9 @@ desktop terminal and on a headless 80-column SSH session.
 - ⧉ **Merge several logs into one stream.** `x` adds a log to the merged set,
   `u` opens the set as one timestamp-ordered pane with a source column. Filters,
   navigation, marks, the detail pane and export all work there exactly as they
-  do on a single file. Local only — remote aggregation stays a non-goal.
+  do on a single file. A set may span machines: with SSH configured, local and
+  remote logs interleave in one pane, and `node:` says which machine each line
+  came from.
 - 🧩 **Plugins.** `LogSourceProvider`, `FilterStage` and `Exporter` interfaces,
   loaded from `clv/plugins/` or from installed packages via the `clv.plugins`
   entry point group. A broken plugin is reported, never fatal. A plugin is
@@ -262,10 +264,24 @@ never drags someone else's merged group around with it. Note also that a view
 is a filter bundle first: it captures your query, severity and time window
 alongside the set, so save it with the filters you want to come back to.
 
-**Merging is local only.** Remote collection and multi-node aggregation are a
-documented non-goal and are not coming: CLV reads what the machine it runs on
-can read. If you want several machines in one pane, ship their logs to one host
-by whatever means you already use and merge them here.
+**A merged set can span machines.** With remote sources configured, a local log
+and a log on another host open in the same timestamp-ordered pane — comparing
+one path across a fleet is what the feature is for. Two things are worth knowing
+before you read causation out of the interleaving:
+
+- **Ordering across machines is only as trustworthy as their clocks**, and CLV
+  says so rather than hiding it. Clock skew between hosts is measured and
+  reported beside the merged view's `anchored` count; correcting for it is
+  opt-in per host, and when it is on the pane states that timestamps are being
+  adjusted. The raw line is never rewritten either way.
+- **`node:` is the machine CLV read a line from; `host:` is what the line says
+  about itself.** Syslog, access logs and journald all normalise into `host`,
+  so it keeps meaning exactly what it always did and no saved query changes
+  meaning. `node:web01 status>=500` is the query you want across a fleet.
+
+Setup, the authentication model and what degrades on a non-GNU remote are not
+documented here yet — that section lands with the release. Shipping logs to one
+host and merging them locally still works and always will.
 
 ### Compressed and rotated logs
 
@@ -544,14 +560,19 @@ subprocess.
 | Format | What it contains |
 | --- | --- |
 | JSON Lines | One object per entry — raw line, timestamp, level, message, detected format, continuation flag and every parsed field. The only lossless option. |
-| CSV | A fixed, rectangular table of the same columns, with the parsed fields as one JSON column. |
+| CSV | A fixed, rectangular table of the same columns, plus a `node` column, with the remaining parsed fields as one JSON column. |
 | Plain text | The raw lines, byte-identical to what is on screen. |
 
-Two things worth knowing:
+Three things worth knowing:
 
 - It exports the **whole filtered set**, not just the lines that fit on screen.
   The dialog states the count before it writes, so `+`/`-` never changes what an
   export contains.
+- **A merged export names its machines.** The `node` column (CSV) and the `node`
+  field (JSON Lines) carry the machine each line was read from, and the default
+  filename names one of them — `web01-syslog-20260817-142530`. `node` is empty
+  for a local source, which has no machine to name. Plain text is left alone:
+  it is the raw lines and nothing CLV added.
 - Writing is atomic (a sibling temp file, then a rename), and overwriting an
   existing file takes a second press of Export. A permission error is reported
   as a notification, not a traceback.

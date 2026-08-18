@@ -16,6 +16,13 @@ from textual.widgets import Switch
 
 from clv.app import LogViewerApp
 from clv.services.parsing import LogEntry, parse_lines
+from clv.services.session import (
+    ORIGIN_FIELD,
+    SourceBuffer,
+    SourceFacts,
+    SourceSession,
+    tag_origins,
+)
 from clv.services.timeline import (
     build_timeline,
     describe_bucket,
@@ -555,3 +562,158 @@ def test_a_hidden_bar_costs_nothing_to_maintain(tmp_path: Path) -> None:
             assert app.timeline_bar.timeline.buckets == ()
 
     asyncio.run(scenario())
+
+
+# --- the histogram and the pane must agree --------------------------------
+#
+# Phase 6's parity sweep found these. The merge learned to read a naive stamp
+# in its own machine's zone; the histogram did not, so a cross-zone merged view
+# ordered its lines one way and drew a bar describing a different ordering of
+# the same lines. `session.py` names that hazard in the comment above its
+# `_sortable` alias — one decision, or two places for them to disagree.
+
+
+def _cross_zone_session():
+    """A merge of a UTC host and a UTC-4 host, both emitting naive syslog stamps.
+
+    The four lines are one second apart in *absolute* time and four hours apart
+    by wall clock, which is exactly the shape that misbuckets.
+    """
+
+    session = SourceSession(max_lines=100)
+    members = (
+        (SourceFacts(node="utc-host", zone=timezone.utc), datetime(2026, 8, 17, 10, 0, 0)),
+        (
+            SourceFacts(node="east-host", zone=timezone(timedelta(hours=-4))),
+            datetime(2026, 8, 17, 6, 0, 1),
+        ),
+    )
+    buffers = []
+    for index, (facts, start) in enumerate(members):
+        path = Path(f"/log/{index}")
+        buffer = SourceBuffer(path, max_lines=100, facts=facts, tag_origin=True)
+        rows = [
+            LogEntry(raw=f"{facts.node} {offset}", timestamp=start + timedelta(seconds=offset))
+            for offset in (0, 2)
+        ]
+        # Through the real tagger rather than by hand: the mapper resolves an
+        # entry to its machine by reading exactly what `tag_origins` wrote, and
+        # a fixture that spelled the key itself would not be testing that.
+        buffer.entries.extend(tag_origins(rows, [path] * len(rows)))
+        buffer.revision += 1
+        buffers.append(buffer)
+    session.install_many(buffers)
+    return session
+
+
+def _span(timeline) -> timedelta:
+    return timeline.buckets[-1].end - timeline.buckets[0].start
+
+
+def test_a_cross_zone_merge_buckets_by_instant_not_by_wall_clock() -> None:
+    """**The regression this fix exists for.**
+
+    Four lines spanning three seconds must draw a bar three seconds wide. Read
+    as bare wall-clock stamps they span four hours, so the whole set collapses
+    into the first and last columns of a bar that claims a four-hour window —
+    and clicking either one filters to a range the pane never showed.
+
+    The second half of this test is what stops it being a tautology: the same
+    entries built *without* the mapper still misbucket, so the assertion above
+    is measuring the fix rather than the fixture.
+    """
+
+    session = _cross_zone_session()
+    entries = list(session.entries)
+
+    fixed = build_timeline(entries, width=30, moment_of=session.moment_mapper())
+    unfixed = build_timeline(entries, width=30)
+
+    assert fixed.total == 4
+    assert _span(fixed) <= timedelta(seconds=10)
+    # Without it: four hours of empty bar with two lines at each end.
+    assert _span(unfixed) > timedelta(hours=3)
+
+
+def test_the_mapper_is_absent_for_every_set_that_shares_a_zone() -> None:
+    """Requirement 13. A local histogram must take the code path it always did.
+
+    `moment_mapper` returning None is not an optimisation — it is the guarantee
+    that a bar which has been correct for years is not rebuilt around a new
+    rule it never needed.
+    """
+
+    session = SourceSession(max_lines=100)
+    zone = SourceFacts(zone=timezone.utc)
+    buffers = []
+    for index in range(2):
+        buffer = SourceBuffer(
+            Path(f"/log/{index}"), max_lines=100, facts=zone, tag_origin=True
+        )
+        buffer.entries.append(LogEntry(raw=f"line {index}", timestamp=BASE))
+        buffer.revision += 1
+        buffers.append(buffer)
+    session.install_many(buffers)
+
+    assert session.moment_mapper() is None
+
+
+def test_an_all_local_timeline_is_what_it_always_was() -> None:
+    """The same grid, built both ways, compared field by field."""
+
+    entries = _entries(120, step=5)
+
+    assert build_timeline(entries, width=40, moment_of=None) == build_timeline(
+        entries, width=40
+    )
+
+
+def test_the_grid_carries_its_mapping_so_extend_keys_arrivals_the_same_way() -> None:
+    """`naive` is carried for this reason; the mapping is carried for it too.
+
+    A tailed line folded into an existing grid has to be placed by the rule the
+    grid was built with. A caller obliged to pass it a second time is a caller
+    that will eventually not.
+    """
+
+    session = _cross_zone_session()
+    entries = list(session.entries)
+    timeline = build_timeline(entries, width=60, moment_of=session.moment_mapper())
+
+    assert timeline.moment_of is not None
+
+    # A fifth line from the eastern host. Its own stamp reads 06:00:02, four
+    # hours before the grid begins; the instant it names is 10:00:02Z, which is
+    # inside it. Read the wrong way `extend` gives up and demands a full
+    # rebuild on every single tailed line.
+    arrival = LogEntry(
+        raw="east 4",
+        timestamp=datetime(2026, 8, 17, 6, 0, 2),
+        fields={ORIGIN_FIELD: "/log/1"},
+    )
+
+    # The grid reads it as the instant it names, four hours from the stamp on
+    # the line — and the raw stamp is not even comparable against an aware
+    # grid, so a mapping the grid had forgotten would be a crash on the tail
+    # path rather than a quietly wrong column.
+    assert timeline.moment(arrival) == arrival.timestamp.replace(
+        tzinfo=timezone(timedelta(hours=-4))
+    )
+    assert 0 <= timeline.index_of(timeline.moment(arrival)) < len(timeline.buckets)
+
+    extended = timeline.extend([arrival])
+
+    assert extended is not None
+    assert extended.total == 5
+    assert extended.moment_of is timeline.moment_of
+
+
+def test_a_timeline_compares_by_its_buckets_not_by_its_machinery() -> None:
+    """`moment_of` is `compare=False`: two grids are equal when they describe
+    the same histogram. A function object is how it was built, not what it is."""
+
+    entries = _entries(10)
+
+    assert build_timeline(entries, width=20, moment_of=lambda entry: entry.timestamp) == (
+        build_timeline(entries, width=20)
+    )

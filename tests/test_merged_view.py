@@ -9,12 +9,15 @@ is the merge itself: order, anchoring, bounded memory, and tailing.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 from textual.widgets import Static
 
 from clv.app import MERGED_VIEW, LogViewerApp
 from clv.services import SourceManager
+from clv.services.export import default_stem
 from clv.services.session import ORIGIN_FIELD, SourceSession
 from clv.storage import SavedView, SessionState, StateStore
 from clv.widgets.log_view import GUTTER_WIDTH
@@ -1305,3 +1308,74 @@ def test_a_saved_merged_view_is_named_for_the_set(tmp_path: Path) -> None:
             assert "alpha.log+beta.log" in app._default_view_name()
 
     asyncio.run(scenario())
+
+
+# --- naming a set that spans machines ---------------------------------------
+#
+# Phase 6's parity sweep. The set name reaches the status line, the saved-view
+# auto-name and the export filename, and it was built from `parse_ref(...).name`
+# — the bare basename on both ref types. Comparing one path across a fleet is
+# the workflow this whole feature exists for, and it was the exact shape that
+# named itself worst.
+
+
+def _named(*members: str) -> str:
+    """`_merged_name` over a set, without the cost of opening one.
+
+    The method reads `state.merged` — the persisted strings — and nothing else,
+    so a running merge would be scaffolding rather than coverage.
+    """
+
+    app = LogViewerApp()
+    app.state = replace(app.state, merged=members)
+    return app._merged_name()
+
+
+def test_one_path_across_two_machines_names_both() -> None:
+    """**The regression this exists for.** `syslog+syslog` named the file twice
+    and neither machine, and it was the label on the exported file."""
+
+    name = _named("ssh:web01/var/log/syslog", "ssh:web02/var/log/syslog")
+
+    assert name == "web01-syslog+web02-syslog"
+    assert name != "syslog+syslog"
+
+
+def test_past_two_members_it_stays_a_handle_and_counts_the_rest() -> None:
+    """A filename is a handle, not a manifest — which machines are actually in
+    the file is answered by the `node` field on every exported row. The rule is
+    the one local sets have always used; only the member labels changed."""
+
+    assert (
+        _named(
+            "ssh:web01/var/log/syslog",
+            "ssh:web02/var/log/syslog",
+            "ssh:db02/var/log/syslog",
+        )
+        == "web01-syslog+2-more"
+    )
+
+
+def test_a_mixed_local_and_remote_set_tells_the_two_apart() -> None:
+    assert _named("/logs/alpha.log", "ssh:web01/var/log/syslog") == (
+        "alpha.log+web01-syslog"
+    )
+
+
+def test_an_all_local_set_is_named_exactly_as_it_always_was() -> None:
+    """Requirement 13 at the shared method, pinned without a running app."""
+
+    assert _named("/logs/alpha.log", "/logs/beta.log") == "alpha.log+beta.log"
+    assert _named() == "merged"
+
+
+def test_the_export_filename_carries_the_machine(tmp_path: Path) -> None:
+    """The set name is what `default_stem` is handed for a merge, so the two
+    facts above have to meet in the filename an operator actually gets."""
+
+    stem = default_stem(
+        _named("ssh:web01/var/log/syslog", "ssh:web02/var/log/syslog"),
+        now=datetime(2026, 8, 11, 14, 25, 30),
+    )
+
+    assert stem == "web01-syslog+web02-syslog-20260811-142530"

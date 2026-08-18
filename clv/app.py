@@ -106,6 +106,7 @@ from .services.refs import (
     is_source_ref,
     parse_ref,
     ref_key,
+    stem_of,
 )
 from .services.rotation import (
     RotatedSetReader,
@@ -1838,9 +1839,21 @@ class LogViewerApp(App[None]):
         return count
 
     def _merged_name(self) -> str:
-        """What to call the merged set — in the status line and in an export."""
+        """What to call the merged set — in the status line and in an export.
 
-        names = [parse_ref(entry).name for entry in self.state.merged]
+        Members are named through ``stem_of``, so a set built from one path
+        across two machines reads ``web01-syslog+web02-syslog`` rather than
+        ``syslog+syslog`` — a label that named the file twice and neither
+        machine. Local members are unaffected: ``stem_of`` of a ``Path`` *is*
+        its ``.name``.
+
+        Past two members it stays a handle rather than a manifest and the
+        remaining hosts are counted, not listed. Which machines are actually in
+        the file is answered by the ``node`` field on every exported row, which
+        a filename cannot carry and should not try to.
+        """
+
+        names = [stem_of(parse_ref(entry)) for entry in self.state.merged]
         if len(names) <= 2:
             return "+".join(names) or "merged"
         return f"{names[0]}+{len(names) - 1}-more"
@@ -2526,7 +2539,14 @@ class LogViewerApp(App[None]):
         if not self.state.timeline:
             self._timeline = EMPTY_TIMELINE
             return
-        self._timeline = build_timeline(entries, width=self._timeline_width())
+        # The session decides how a stamp is read, so the bar and the pane
+        # cannot disagree about the order of the same lines. It hands back None
+        # for every set that does not span time zones, which is every local one.
+        self._timeline = build_timeline(
+            entries,
+            width=self._timeline_width(),
+            moment_of=self._session.moment_mapper(),
+        )
         # is_running, not is_mounted: rendering is unit-tested without a screen,
         # and a widget refresh needs one. Same guard _update_status uses.
         if self.is_running:

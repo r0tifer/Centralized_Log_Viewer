@@ -28,6 +28,8 @@ from clv.services.clustering import (
     summarise,
 )
 from clv.services.parsing import LogEntry, parse_lines
+from clv.services.refs import RemoteRef
+from clv.services.session import tag_origins
 from clv.services.session import ORIGIN_FIELD
 from clv.storage import SessionState, StateStore
 from clv.widgets.export_dialog import ExportDialog
@@ -795,3 +797,57 @@ def test_clustering_persists_but_which_clusters_were_open_does_not(tmp_path: Pat
         assert "connection refused" not in raw
 
     asyncio.run(scenario())
+
+
+# --- remote sources ---------------------------------------------------------
+#
+# Phase 6's parity sweep. `shape_of` already keys on ORIGIN_FIELD, which
+# `tag_origins` writes as the host-qualified `format_ref` string — so clustering
+# is remote-correct with no change. Pinned rather than reasoned about, because
+# the failure it prevents is one an operator could not see: five machines each
+# reporting one outage, folded into a single row reading "5 ×", which reads as
+# one machine failing five times.
+
+
+def _remote_lines(*hosts: str):
+    """One identical ERROR line, read from each of *hosts* in turn."""
+
+    rows = []
+    for host in hosts:
+        entries = parse_lines(["2026-08-07 09:25:00 - ERROR - connection refused"])
+        rows.extend(tag_origins(entries, [RemoteRef.build(host, "/var/log/syslog")]))
+    return rows
+
+
+def test_the_same_line_on_two_machines_is_two_clusters() -> None:
+    rows = _remote_lines("web01", "web02")
+
+    assert shape_of(rows[0]) != shape_of(rows[1])
+
+    stream = cluster_entries(rows, lookback=DEFAULT_LOOKBACK)
+    assert stream.clustered == 0
+    assert len(stream.rows) == 2
+
+
+def test_repeats_on_one_machine_still_fold_together() -> None:
+    """The other direction, so the test above is a scoping assertion rather
+    than an assertion that clustering has stopped working."""
+
+    rows = _remote_lines("web01", "web01", "web01")
+
+    assert len({shape_of(row) for row in rows}) == 1
+
+    stream = cluster_entries(rows, lookback=DEFAULT_LOOKBACK)
+    assert len(stream.rows) == 1
+    assert isinstance(stream.rows[0], Cluster)
+    assert stream.rows[0].count == 3
+
+
+def test_a_remote_shape_is_distinct_from_the_local_file_of_that_name() -> None:
+    local = tag_origins(
+        parse_lines(["2026-08-07 09:25:00 - ERROR - connection refused"]),
+        [Path("/var/log/syslog")],
+    )
+    remote = _remote_lines("web01")
+
+    assert shape_of(local[0]) != shape_of(remote[0])

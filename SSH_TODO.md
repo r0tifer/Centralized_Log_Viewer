@@ -20,7 +20,7 @@ filesystem assumption that had already spread further.
 | 4a — Transport & backend | First readable remote log | ✅ **Complete** |
 | 4b — Follow | It tails | ✅ **Complete** |
 | 5 — Reachability | A host that goes away says so | ✅ **Complete** |
-| 6 — Parity | Star, merge, rotation, hierarchy, time, session | 🟡 **Mostly** — star, merge, rotation, `node`, the time rule; the downstream sweep remains |
+| 6 — Parity | Star, merge, rotation, hierarchy, time, session | ✅ **Complete** |
 | 7 — Remote UI | Host dialog, cross-host merge, `node` in the chrome | ⬜ Not started |
 | 8 — Documentation & release | README, `settings.conf`, help overlay, version | ⬜ Not started |
 | 9 — The remote journal | `journalctl` over the same transport | ⬜ Not started |
@@ -1254,10 +1254,93 @@ Python versions.
   dropped the rest, silently — a Requirement 2 violation that predates every
   phase in this file. `reader.ANCHOR_SIZE` bytes are re-read at the boundary as
   part of the read already being made, so it costs no syscall.
-- **What Phase 6 still owes** is the downstream verification sweep — export
-  naming carrying `node`, and marks, watch rules, timeline and clustering
-  checked against a remote source — plus the `README.md` "merging is local only"
-  rewrite, which belongs with Phase 8's user-facing pass.
+### As built — the downstream sweep
+
+The last third of the phase: export naming, and marks, watch rules, timeline and
+clustering checked against a remote source. Phase 6's own framing said these sit
+downstream of the buffer and *should* be free, and that "should be free" is how a
+gap ships. Two of the five were free. Two were not.
+
+- **The sweep paid for itself twice, and the timeline was the one that mattered.**
+  `build_timeline` takes entries and a width and has never seen `SourceFacts`, so
+  a cross-zone merged view ordered its lines by instant in the pane and drew a bar
+  bucketing the same lines by wall clock above it — four hours of empty histogram
+  over three seconds of log, and a bucket click filtering to a range the pane
+  never showed. `session.py` names that exact hazard in the comment above its
+  `_sortable` alias: one decision, or two places for the merge and the histogram
+  to disagree. The merge was fixed in the parity half and the histogram was not,
+  which is what a sweep is for.
+
+- **The fix is a mapper, not a per-entry method**, and the shape is the point.
+  `SourceSession.moment_mapper()` returns `None` for every set that does not span
+  zones — every all-local merge, every same-zone fleet — so the histogram keeps
+  the code path it has always had, and that is what Requirement 13 rests on here
+  exactly as it does for `_merged`. When it does return one, the origin lookup is
+  built once for a whole histogram rather than once per line: a filtered set is
+  thousands of entries and the buffer list is single digits, and rebuilding the
+  map inside the loop would put that product on the redraw path. `Timeline`
+  carries it so `extend` keys a tailed arrival the way the build keyed the entries
+  around it — the precedent `naive` already set — and it is `compare=False`,
+  because two grids are equal when their buckets are.
+
+- **Export named the file and not the machine.** `default_stem` used `source.name`
+  and `RemoteRef.name` is the bare basename, so `/var/log/syslog` on `web01`
+  exported as `syslog-…`, indistinguishable from the local file of that name and
+  overwriting it in a downloads folder. Worse, `_merged_name` mapped members
+  through `parse_ref(...).name`, so the canonical workflow — one path across a
+  fleet — named itself `syslog+syslog`: the file twice and neither machine.
+  New `refs.stem_of` is the fix, in `refs.py` because that is where the closed
+  `(Path, RemoteRef)` union already lives; a second copy of the union in `export`
+  is how two copies drift apart. For a `Path` it *is* `.name`, so nothing local
+  moved and `test_the_export_filename_names_the_set` passes unedited.
+
+- **`node` was promoted out of the `fields` blob into a CSV column**, and the
+  module's own rationale is the argument for it: `fields` travels as one JSON
+  column because it is a different shape on every line. `node` is not — it is one
+  value per source, like `level` and `format` already promoted above it. A
+  five-machine merge whose only record of which machine a row came from was a
+  JSON string inside a cell is not a table anyone can group by, and grouping by
+  machine is why the merge exists. It is a user-visible schema change to a shipped
+  format: a local export gains one empty trailing column. JSON Lines needed
+  nothing, and **plain text was deliberately left alone** — prefixing a host onto
+  a raw line would put text in an export that no log on any machine contained.
+
+- **Marks, watch rules and clustering were genuinely free**, which is the outcome
+  Phases 1 and 2 were bought for. `mark_key` is `f"{source}\0{digest}"` and a
+  `RemoteRef` stringifies host-qualified; `WatchRule` binds to no source at all;
+  `clustering.shape_of` keys on `ORIGIN_FIELD`, which `tag_origins` writes through
+  `format_ref`. None of them needed a line changed. They are now pinned by
+  assertions rather than by a reading — the failure they prevent is one an
+  operator could not see, five machines each reporting one outage folded into a
+  single row reading "5 ×", which reads as one machine failing five times.
+
+- **`_merged_session` was tagging nothing, and the fallback hid it.** The shared
+  time-rule fixture built buffers with `tag_origin=True` and then appended past
+  `_feed`, so no entry carried `ORIGIN_FIELD` — which the merge does not need,
+  because it reads facts off buffers directly, and the mapper does. It fell back
+  to the first member's clock and returned a plausible wrong answer twice before
+  the fixture was fixed to tag through the real `tag_origins`. Recorded because
+  the defensive fallback is what made a broken fixture look like a broken feature;
+  it survives, documented, for a case `prepare_many` makes unreachable.
+
+- **Clipboard is verified unchanged, not fixed.** `action_copy_view` emits
+  `entry.raw` only, so a merged copy carries no provenance — identical to the
+  local merged behaviour that has always shipped, and not a remote regression.
+
+- **The `Optional[Path]` annotations in `marks.py` and `watch.py` were stale.**
+  The value has been a `SourceRef` since Phase 1; nothing branched on them, so
+  this is a retype and not a behaviour change.
+
+- **`README.md`'s two "merging is local only" passages are rewritten here**, not
+  deferred. A shipped document denying a capability the same commit claims parity
+  for is the mirror image of the lie Phase 0 was avoiding. The full "Remote
+  sources over SSH" section remains Phase 8's; these two passages and the export
+  table are all that moved.
+
+- **1185 + 35 = 1220 passed, 1 skipped, 11 deselected** on 3.11 and 3.14. No
+  existing assertion edited: `git diff -- tests/` removes exactly eight lines,
+  all of them the body of `_merged_session`, replaced by a version that tags
+  through the real `tag_origins`.
 
 ---
 

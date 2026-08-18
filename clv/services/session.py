@@ -807,6 +807,44 @@ class SourceSession:
             return self._buffers[0].path
         return None
 
+    def moment_mapper(self) -> Optional[Callable[[LogEntry], Optional[datetime]]]:
+        """How the histogram should read a stamp — or ``None`` for "as written".
+
+        The timeline has to key its buckets by the same thing :meth:`_merged`
+        sorts by, or the bar and the pane beneath it describe two different
+        orderings of the same lines. That only diverges when the members
+        disagree about what a naive stamp means, so this returns ``None`` in
+        every other case and the histogram keeps the code path it has always
+        had — the same guard, and the same reason for it, as the merge.
+
+        Returns a **mapper rather than a per-entry method** so the origin
+        lookup is built once for a whole histogram instead of once per line: a
+        filtered set is thousands of entries and the buffer list is single
+        digits, and rebuilding the map inside the loop would put that product
+        on the redraw path. The closure stays valid for as long as the buffers
+        do, which is exactly as long as the grid it is stored on does.
+        """
+
+        if not self._spans_zones():
+            return None
+
+        facts = {format_ref(buffer.path): buffer.facts for buffer in self._buffers}
+        fallback = self._buffers[0].facts
+
+        def mapper(entry: LogEntry) -> Optional[datetime]:
+            moment = entry.timestamp
+            if moment is None:
+                return None
+            # An untagged entry can only be the single-buffer case, which
+            # `_spans_zones` has already excluded — but a member whose origin
+            # is unknown must not be silently placed on another machine's
+            # clock, so it falls back to the first member exactly as the merge
+            # would have read it before any of this existed.
+            origin = entry.fields.get(ORIGIN_FIELD, "")
+            return _localised(moment, facts.get(origin, fallback))
+
+        return mapper
+
     # --- tailing ------------------------------------------------------------
 
     def poll(self) -> list[PollOutcome]:

@@ -433,7 +433,7 @@ installed" — the trade Item 12 asked for.
   and `workspace` fixtures, and every assertion runs against another backend —
   which is how `RemoteBackend` is held to the same behaviour as `LocalBackend`.
 
-Run: `python -m pytest` (1144 tests, 1 skipped, 11 deselected) on **both** 3.11
+Run: `python -m pytest` (1220 tests, 1 skipped, 11 deselected) on **both** 3.11
 and 3.14 — the local default is 3.14 and a green suite there is not evidence
 that the supported floor still works.
 
@@ -508,4 +508,8 @@ the rule stated at the head of [TODO.md](TODO.md).
     says so**. Merging was local-only, so there was one clock and one timezone;
     across hosts both assumptions fail silently and the operator reads causation
     out of a wrong interleaving.
+  - **Every view of an ordering uses the same rule.** The pane, the timeline
+    histogram and any future summary order the same lines the same way or they
+    describe two different logs. `SourceSession.moment_mapper` is that one
+    decision; a second copy of it is two places for them to disagree.
 - **Keep it consistent**: identical keyboard and mouse paths everywhere.

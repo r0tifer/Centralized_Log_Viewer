@@ -70,6 +70,7 @@ __all__ = [
     "ref_key",
     "scheme_of",
     "split_scheme",
+    "stem_of",
 ]
 
 
@@ -540,6 +541,28 @@ def ref_key(ref: SourceRef) -> str:
     """:func:`identity`, in the form that goes in a dict, a set, or on disk."""
 
     return format_ref(identity(ref))
+
+
+def stem_of(ref: SourceRef) -> str:
+    """What to call *ref* in a filename — the machine included when there is one.
+
+    ``syslog`` locally, ``web01-syslog`` for the same path on a remote host.
+    Not an identity and never persisted: :func:`format_ref` remains the form
+    that goes on disk, and this is only ever read by a human off an export.
+
+    It exists because ``ref.name`` is the bare basename on both types, so an
+    export of ``/var/log/syslog`` on ``web01`` was indistinguishable from an
+    export of the local file of the same name — and a merged set built from one
+    path across two machines named itself ``syslog+syslog``.
+
+    The union is spelled out here rather than in ``export`` for the reason
+    :func:`is_source_ref` is: one place in CLV knows that a source is a ``Path``
+    or a :class:`RemoteRef`, and a second copy is how the two drift apart.
+    """
+
+    if isinstance(ref, RemoteRef):
+        return f"{ref.node}-{ref.path.name}"
+    return ref.name
 
 
 def normalize_ref(raw: str | SourceRef) -> SourceRef:

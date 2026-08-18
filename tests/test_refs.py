@@ -22,6 +22,7 @@ import pytest
 from clv.services import refs
 from clv.services.marks import mark_key
 from clv.services.refs import (
+    RemoteRef,
     format_ref,
     identity,
     normalize_ref,
@@ -29,6 +30,7 @@ from clv.services.refs import (
     ref_key,
     scheme_of,
     split_scheme,
+    stem_of,
 )
 
 
@@ -865,3 +867,51 @@ def test_the_boundary_map_is_not_silently_empty() -> None:
 
     assert len(_BOUNDARY_FUNCTIONS) >= 15
     assert _PERSISTED_READS and _PERSISTED_NAMES
+
+
+# --- naming a source in a filename -----------------------------------------
+#
+# `stem_of` is the one thing in this module that is neither an identity nor a
+# round trip: it is read by a human off an export and never written to disk.
+# It lives here because it needs the `(Path, RemoteRef)` union, and a second
+# copy of that union is how two copies drift apart.
+
+
+def test_stem_of_a_local_path_is_its_name() -> None:
+    """Requirement 13's half of it: `default_stem` behaves as it always did."""
+
+    assert stem_of(Path("/var/log/syslog")) == "syslog"
+    assert stem_of(Path("/var/log/app.log.1")) == "app.log.1"
+
+
+def test_stem_of_a_remote_ref_names_the_machine() -> None:
+    assert stem_of(RemoteRef.build("web01", "/var/log/syslog")) == "web01-syslog"
+    assert stem_of(RemoteRef.build("db02", "/srv/app/logs/a.log")) == "db02-a.log"
+
+
+def test_two_machines_one_path_are_two_stems() -> None:
+    """The regression it exists for. Exported side by side under one name, the
+    second file replaces the first and the operator has one machine's log."""
+
+    web01 = RemoteRef.build("web01", "/var/log/syslog")
+    db02 = RemoteRef.build("db02", "/var/log/syslog")
+
+    assert stem_of(web01) != stem_of(db02)
+    assert stem_of(web01) != stem_of(Path("/var/log/syslog"))
+
+
+def test_a_stem_never_smuggles_a_separator_into_a_filename() -> None:
+    """A stem becomes a filename. A node name is a config section suffix and an
+    operator may write anything in one, so the result is checked rather than
+    trusted — `default_stem` scrubs `os.sep`, and it can only scrub what it can
+    see in one string."""
+
+    assert "/" not in stem_of(RemoteRef.build("web01", "/var/log/nested/deep.log"))
+    assert stem_of(RemoteRef.build("web01", "/")) == "web01-"
+
+
+def test_stem_of_leaves_a_scheme_ref_alone() -> None:
+    """A journald source is a `Path` holding an identifier, not a location.
+    `stem_of` must not invent a machine for one."""
+
+    assert stem_of(parse_ref("journal:unit/sshd.service")) == "sshd.service"

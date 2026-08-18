@@ -1766,18 +1766,24 @@ def _merged_session(*members):
     """
 
     from clv.services.parsing import LogEntry
-    from clv.services.session import SourceBuffer, SourceSession
+    from clv.services.session import SourceBuffer, SourceSession, tag_origins
 
     session = SourceSession(max_lines=100)
     buffers = []
     for index, (facts, rows) in enumerate(members):
-        buffer = SourceBuffer(
-            Path(f"/log/{index}"), max_lines=100, facts=facts, tag_origin=True
-        )
-        for stamp, message in rows:
-            buffer.entries.append(
-                LogEntry(raw=message, message=message, timestamp=stamp)
-            )
+        path = Path(f"/log/{index}")
+        buffer = SourceBuffer(path, max_lines=100, facts=facts, tag_origin=True)
+        entries = [
+            LogEntry(raw=message, message=message, timestamp=stamp)
+            for stamp, message in rows
+        ]
+        # Through the real tagger, because `tag_origin=True` above is a claim
+        # about what `_feed` would have done and appending past it makes the
+        # claim false. `moment_mapper` resolves an entry to its machine by
+        # reading exactly what `tag_origins` writes, so a fixture that skipped
+        # it would put every line on the first member's clock — plausibly, and
+        # wrongly, which is the failure mode this whole section exists for.
+        buffer.entries.extend(tag_origins(entries, [path] * len(entries)))
         buffer.revision += 1
         buffers.append(buffer)
     session.install_many(buffers)
@@ -3021,3 +3027,61 @@ def test_a_local_reader_is_never_scheduled_for_reconnection(tmp_path: Path) -> N
             assert app._reconnects == {}
 
     asyncio.run(scenario())
+
+
+def test_the_histogram_takes_its_ordering_rule_from_the_session() -> None:
+    """The bar and the pane must not describe two orderings of the same lines.
+
+    ``session.py`` names this hazard in the comment above its ``_sortable``
+    alias — one decision, or two places for the merge and the histogram to
+    disagree about a mixed-zone source. The mapper is that one decision, handed
+    to :func:`build_timeline` rather than re-derived there.
+    """
+
+    from clv.services.session import SourceFacts
+
+    session = _merged_session(
+        (
+            SourceFacts(node="utc-host", zone=timezone.utc),
+            [(datetime(2026, 8, 17, 10, 0, 0), "utc")],
+        ),
+        (
+            SourceFacts(node="east-host", zone=timezone(timedelta(hours=-4))),
+            [(datetime(2026, 8, 17, 6, 0, 1), "east")],
+        ),
+    )
+
+    mapper = session.moment_mapper()
+    assert mapper is not None
+
+    # The eastern line names the instant the merge sorted it by, an offset away
+    # from the stamp printed on it — which is never rewritten.
+    east = next(entry for entry in session.entries if entry.message == "east")
+    assert east.timestamp == datetime(2026, 8, 17, 6, 0, 1)
+    assert mapper(east) == datetime(2026, 8, 17, 10, 0, 1, tzinfo=timezone.utc)
+
+
+def test_no_mapper_exists_for_a_set_that_does_not_span_zones() -> None:
+    """Requirement 13, at the seam the histogram now goes through.
+
+    Returning ``None`` is not an optimisation — it is the guarantee that every
+    local histogram, and every fleet sharing a zone, keeps the code path it has
+    always had. A mapper that was merely a no-op would still have moved them.
+    """
+
+    from clv.services.session import SourceFacts
+
+    local = _merged_session(
+        (SourceFacts(zone=timezone.utc), [(datetime(2026, 8, 17, 10, 0), "a")]),
+        (SourceFacts(zone=timezone.utc), [(datetime(2026, 8, 17, 10, 1), "b")]),
+    )
+    assert local.moment_mapper() is None
+
+    # A single remote source is one clock, however far away it is.
+    alone = _merged_session(
+        (
+            SourceFacts(node="web01", zone=timezone(timedelta(hours=-4))),
+            [(datetime(2026, 8, 17, 6, 0), "a")],
+        ),
+    )
+    assert alone.moment_mapper() is None

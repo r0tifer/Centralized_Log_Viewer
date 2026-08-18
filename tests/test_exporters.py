@@ -13,6 +13,7 @@ import csv
 import io
 import json
 import os
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -33,6 +34,8 @@ from clv.services.export import (
     write_text,
 )
 from clv.services.parsing import parse_lines
+from clv.services.refs import RemoteRef
+from clv.services.session import NODE_FIELD
 from clv.widgets.export_dialog import ExportDialog
 
 LINES = [
@@ -519,3 +522,93 @@ def test_a_read_only_directory_surfaces_as_an_error(tmp_path: Path) -> None:
             write_atomically(locked / "out.log", parse_lines(LINES), write_text)
     finally:
         locked.chmod(0o700)
+
+
+# --- provenance: the machine a line was read from -------------------------
+#
+# Phase 6's parity sweep. `node` is *where CLV read a line from*, distinct from
+# `host`, which is whatever the line claims about itself. An export that drops
+# it turns a five-machine merge into an unattributable pile of text, and an
+# export filename that drops it collides with the local file of the same name.
+
+
+def _remote_entries(node: str = "web01"):
+    """LINES as they arrive from *node* — tagged exactly as `SourceBuffer` does."""
+
+    return [
+        replace(entry, fields={**entry.fields, NODE_FIELD: node})
+        for entry in parse_lines(LINES)
+    ]
+
+
+def test_csv_gives_the_node_a_column_of_its_own() -> None:
+    rows = list(csv.reader(io.StringIO(_render(write_csv, _remote_entries()))))
+
+    assert "node" in CSV_COLUMNS
+    assert all(row[CSV_COLUMNS.index("node")] == "web01" for row in rows[1:])
+
+
+def test_the_node_column_is_empty_for_a_local_source() -> None:
+    # Local logs have no machine to name, and inventing one ("localhost") would
+    # be a claim CLV cannot make about a path.
+    rows = list(csv.reader(io.StringIO(_render(write_csv, parse_lines(LINES)))))
+
+    assert rows[0] == list(CSV_COLUMNS)
+    assert all(row[CSV_COLUMNS.index("node")] == "" for row in rows[1:])
+
+
+def test_a_multi_host_csv_can_be_sorted_by_machine() -> None:
+    # The whole point of the column rather than the `fields` blob: a value
+    # buried in a JSON string inside a cell is not something a spreadsheet can
+    # group by, and grouping by machine is why the merge exists.
+    entries = _remote_entries("web01") + _remote_entries("db02")
+
+    rows = list(csv.reader(io.StringIO(_render(write_csv, entries))))[1:]
+    nodes = [row[CSV_COLUMNS.index("node")] for row in rows]
+
+    assert set(nodes) == {"web01", "db02"}
+    assert nodes.count("web01") == len(LINES)
+
+
+def test_jsonl_still_carries_the_node_among_the_fields() -> None:
+    # JSON Lines is the lossless format and needs no promotion: `fields` is
+    # already a mapping there, so `node` is addressable without a second pass.
+    rendered = _render(write_jsonl, _remote_entries())
+    payloads = [json.loads(line) for line in rendered.splitlines()]
+
+    assert all(payload["fields"][NODE_FIELD] == "web01" for payload in payloads)
+
+
+def test_plain_text_never_fabricates_provenance() -> None:
+    # The raw line is what the source produced. Prefixing a host onto it would
+    # put text in an export that no log on any machine ever contained, which is
+    # the one thing CLV promises not to do.
+    rendered = _render(write_text, _remote_entries())
+
+    assert rendered == "".join(f"{line}\n" for line in LINES)
+    assert "web01" not in rendered.replace(LINES[0], "")
+
+
+def test_default_stem_names_the_machine_for_a_remote_source() -> None:
+    moment = datetime(2026, 8, 11, 14, 25, 30)
+
+    remote = RemoteRef.build("web01", "/var/log/syslog")
+
+    assert default_stem(remote, now=moment) == "web01-syslog-20260811-142530"
+    # The regression that motivates it: without the node the two are one name,
+    # and the second export written to a downloads folder replaces the first.
+    assert default_stem(remote, now=moment) != default_stem(
+        Path("/var/log/syslog"), now=moment
+    )
+
+
+def test_default_stem_is_unchanged_for_every_local_source() -> None:
+    # Requirement 13, at the one place this phase touched a shared function.
+    moment = datetime(2026, 8, 11, 14, 25, 30)
+
+    assert default_stem(Path("/var/log/syslog"), now=moment) == "syslog-20260811-142530"
+    assert default_stem(Path("/var/log/app.log.1"), now=moment).startswith("app.log.1-")
+    assert default_stem("web01-syslog+2-more", now=moment).startswith(
+        "web01-syslog+2-more-"
+    )
+    assert default_stem(None, now=moment) == "clv-export-20260811-142530"
