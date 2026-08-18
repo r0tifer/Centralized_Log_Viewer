@@ -157,6 +157,17 @@ class DiscoveryReport:
     #: Present and of a supported type, but the read failed.
     skipped_unreadable: int = 0
     unreadable_roots: list[SourceRef] = field(default_factory=list)
+    #: Why a root in :attr:`unreadable_roots` could not be read, where the
+    #: backend could say. A separate mapping rather than a richer list because
+    #: the list is the *fact* and the reason is what is known about it — most
+    #: roots have none, and a local one never will.
+    #:
+    #: This is what stops a host that went away shrinking the tree in silence.
+    #: A remote walk yields nothing when its link drops, exactly as a local one
+    #: does when a directory will not list, and the two are indistinguishable
+    #: from inside the walk — so the reason comes from asking the backend
+    #: afterwards rather than from the walk itself.
+    root_reasons: dict[SourceRef, str] = field(default_factory=dict)
     #: Named sources that were skipped, with the reason. A file the operator
     #: typed out by hand deserves to be named back at them rather than folded
     #: into a count -- otherwise adding a PDF as a source looks like CLV did
@@ -191,6 +202,7 @@ class DiscoveryReport:
         self.skipped_filtered += other.skipped_filtered
         self.skipped_unreadable += other.skipped_unreadable
         self.unreadable_roots.extend(other.unreadable_roots)
+        self.root_reasons.update(other.root_reasons)
         self.skipped_sources.extend(other.skipped_sources)
         self.truncated = self.truncated or other.truncated
         self.truncated_roots.extend(other.truncated_roots)
@@ -228,7 +240,12 @@ class DiscoveryReport:
         for path, reason in self.skipped_sources:
             lines.append(f"File skipped - {reason}: {path}")
         for root in self.unreadable_roots:
-            lines.append(f"Could not read source: {root}")
+            reason = self.root_reasons.get(root)
+            lines.append(
+                f"Could not read source: {root} - {reason}"
+                if reason
+                else f"Could not read source: {root}"
+            )
         return lines
 
 
@@ -533,6 +550,23 @@ def _fill_batch(
     return backend.classify(requests) if requests else {}
 
 
+def _unreadable_root(
+    report: DiscoveryReport, root: SourceRef, backend: SourceBackend
+) -> None:
+    """Record a root that produced nothing, with the reason where there is one.
+
+    Deduplicated, because a root can reach this twice: a walk that dropped
+    mid-stream is both unreachable and short, and saying so twice would be a
+    report that looks like two problems.
+    """
+
+    if root not in report.unreadable_roots:
+        report.unreadable_roots.append(root)
+    state = backend.reachability()
+    if not state.ok and state.reason:
+        report.root_reasons[root] = state.reason
+
+
 def discover(
     roots: Iterable[SourceRef],
     settings: DiscoverySettings | None = None,
@@ -562,9 +596,16 @@ def discover(
 
         if kind == "dir":
             if not backend.access(root, os.R_OK | os.X_OK):
-                report.unreadable_roots.append(root)
+                _unreadable_root(report, root, backend)
                 continue
             _walk_directory(root, settings, report, seen_dirs, backend)
+            # Asked *after* the walk, because a walk that fails part way through
+            # yields what it got and stops -- which is the correct behaviour
+            # (a subdirectory that vanished is not worth a failed pass) and is
+            # also exactly what a dropped connection looks like. The backend
+            # knows which of the two happened; the walk does not.
+            if not backend.reachability().ok:
+                _unreadable_root(report, root, backend)
         elif kind == "file":
             # A directly named file bypasses the operator's own globs: they
             # already said they want this one. Type-based exclusions still
@@ -583,15 +624,16 @@ def discover(
                 continue
             info = backend.stat(root)
             if info is None:
-                report.unreadable_roots.append(root)
+                _unreadable_root(report, root, backend)
                 continue
             report.files.append(DiscoveredFile(path=root, root=root, size=info.size))
             report.directories.add(root.parent)
         else:
             # `missing`, `denied`, and anything that is neither file nor
             # directory. Three facts, one report line -- as before: what the
-            # operator can act on is that this root produced nothing.
-            report.unreadable_roots.append(root)
+            # operator can act on is that this root produced nothing. What is
+            # new is that a backend which knows *why* gets to say so.
+            _unreadable_root(report, root, backend)
 
     report.files.sort(key=lambda item: str(item.path).lower())
     return report

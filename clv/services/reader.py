@@ -135,6 +135,21 @@ class TailRead:
     #: when the read produced nothing to anchor to. See
     #: :meth:`SourceReader.poll`.
     anchor: bytes = b""
+    #: Why this source has stopped producing, in the operator's terms. Empty for
+    #: every ordinary read, including one that found nothing.
+    #:
+    #: Carried **in band rather than raised**, and that is the point. ``poll()``
+    #: is driven from a timer and ``SourceBuffer.poll`` swallows ``OSError`` on
+    #: purpose — a source that vanished mid-session is not worth taking the pane
+    #: down for — so an exception here would either be absorbed by that guard or
+    #: force it open for the local case it was written to protect. A field is
+    #: reported by whoever wants to report it and ignored by everyone else, which
+    #: is why a reader on this machine never sets one and nothing local moves.
+    #:
+    #: Set **once** per stoppage by the reader that noticed, not on every
+    #: subsequent poll: the pane needs to say it happened, not to keep saying so
+    #: twice a second.
+    problem: str = ""
 
 
 def looks_binary(

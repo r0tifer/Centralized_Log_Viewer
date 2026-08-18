@@ -160,3 +160,38 @@ def test_count_matches_powers_the_hit_counter() -> None:
     entries = _entries()
     assert count_matches(entries, None) == len(MIXED)
     assert count_matches(entries, compile_query("error")) >= 1
+
+
+def test_an_unreachable_source_is_reported_rather_than_called_empty() -> None:
+    """"No log entries in the selected source" is a claim about the source.
+
+    CLV is in no position to make it about one it cannot currently see, and an
+    unreachable source rendered as an empty one is the outcome Requirement 7
+    exists to prevent. The reason wins over every filter explanation, because a
+    filter that hid nothing is not why the pane is empty.
+    """
+
+    entries = parse_lines(["2026-08-07 09:25:01 - INFO - hello"])
+    spec = FilterSpec(query="nothing-matches-this")
+    result = filter_entries(entries, spec)
+
+    assert describe_empty_result(result.stats, spec) == (
+        "No matches — 1 filtered out by the query."
+    )
+    assert (
+        describe_empty_result(
+            result.stats, spec, unreachable="web01: the host did not answer."
+        )
+        == "web01: the host did not answer."
+    )
+
+
+def test_an_empty_unreachable_reason_changes_nothing() -> None:
+    """The keyword is additive: every existing caller gets what it always did."""
+
+    result = filter_entries([], FilterSpec())
+    spec = FilterSpec()
+
+    assert describe_empty_result(result.stats, spec, unreachable="") == (
+        describe_empty_result(result.stats, spec)
+    )

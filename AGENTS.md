@@ -181,7 +181,8 @@ distros.
   It is pure identity and performs no IO; its backend answers instead.
 - `backend.py` — where a source's bytes come from, and **what asking costs**.
   `refs.py` answered what a source is; this answers who reads it. `walk`,
-  `list_dir`, `kind`, `access`, `open`, `stat`, `identity`, `classify` —
+  `list_dir`, `kind`, `access`, `open`, `stat`, `identity`, `classify`,
+  `reachability` —
   `LocalBackend`'s behaviour is what discovery and reading did before, and
   `RemoteBackend` (`plugins/sources/ssh.py`) is the second implementation. The part that is not a refactor is the blocking contract: every method
   is marked `@cheap` or `@blocking`, the marks are what
@@ -195,7 +196,12 @@ distros.
   archive?" of every file it found, and asking per file is a round trip per file
   — locally the same open it always did, remotely one command per batch. It
   returns *bytes*, never a verdict, so `reader.looks_binary_block` and
-  `compressed.probe_block` stay the only place the rule lives.
+  `compressed.probe_block` stay the only place the rule lives. `reachability`
+  is cheap for a different reason from the others: it is not an operation but a
+  report of what the last one learned, and it must never probe — the status line
+  reads it on every render. It exists because `SourceBuffer.poll` swallows
+  `OSError` on purpose, which is right for a rotated local file and silent for a
+  dropped connection.
 - `reader.py` — BOM-based encoding detection, bounded backwards reads,
   incremental tailing, rotation and truncation recovery. Tailing verifies that
   it is reading a **continuation**: metadata alone cannot say so, because

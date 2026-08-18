@@ -18,8 +18,9 @@ import csv
 import io
 import itertools
 import json
+from concurrent.futures import ThreadPoolExecutor
 from collections import deque
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from time import monotonic
 from pathlib import Path
@@ -52,7 +53,7 @@ from .plugins import (
     load_plugins,
 )
 from .services import SourceManager, persist_log_sources, persist_setting
-from .services.backend import LOCAL
+from .services.backend import LOCAL, RECONNECT_ATTEMPTS, backoff_for
 from .services.clipboard import prepare_payload
 from .services.clustering import (
     COUNT_PREFIX,
@@ -115,6 +116,7 @@ from .services.rotation import (
 from .services.reader import open_reader
 from .services.session import (
     ORIGIN_FIELD,
+    PollOutcome,
     SourceBuffer,
     SourceFacts,
     SourceSession,
@@ -241,6 +243,36 @@ ACTION_STYLE = Style(color="#95c8f5", bold=True)
 #: Used to place the merged group correctly when it appears mid-session,
 #: without rebuilding the tree around it.
 TREE_GROUP_LABELS: tuple[str, ...] = (VIEWS_GROUP, PROVIDERS_GROUP, STARRED_GROUP)
+
+@dataclass
+class _Reconnect:
+    """One buffer's attempt to get its source back, and how hard it has tried.
+
+    Per buffer rather than per host, because what has to be resumed is a
+    *reader*: two logs on the same machine each hold their own ``tail`` and each
+    has its own byte offset to resume at. The connection they share means the
+    second one's attempt is nearly free, which is what makes this affordable.
+    """
+
+    #: What went wrong, as the pane and the status line report it.
+    reason: str
+    #: Failed attempts so far. Indexes into the backoff schedule.
+    attempts: int = 0
+    #: The pending wake-up, so a source switch can cancel it.
+    timer: Timer | None = None
+    #: True once the schedule is spent: nothing further is tried automatically
+    #: and the pane says so, rather than looking as though it were still working.
+    exhausted: bool = False
+
+
+#: How many hosts are walked at once during discovery.
+#:
+#: Concurrency here buys latency hiding, not throughput: the work is a remote
+#: `find` and the time is spent waiting. Bounded anyway, because a fleet of
+#: fifty would otherwise mean fifty simultaneous handshakes from a viewer whose
+#: whole claim is that it is unobtrusive.
+MAX_HOST_WORKERS = 8
+
 
 #: How far two machines' clocks may disagree before the merged view says so.
 #:
@@ -644,6 +676,19 @@ class LogViewerApp(App[None]):
         #: Identifies the in-flight remote open, so a newer selection can
         #: discard an older one rather than have both install themselves.
         self._open_token: object | None = None
+        #: In-flight reconnections, one per buffer that lost its source, keyed
+        #: by `ref_key`. Bounded and cancelled on every source change: a timer
+        #: left running against a buffer nobody is looking at would reconnect to
+        #: a host for a pane that no longer exists.
+        self._reconnects: dict[object, _Reconnect] = {}
+        #: Identifies the in-flight rescan, so a second one started while the
+        #: first is still walking hosts wins rather than racing it.
+        self._scan_token: object | None = None
+        #: Reasons the current sources have stopped, keyed the same way. Read by
+        #: the status line and by the empty pane, which is how a drop stays
+        #: visible after its toast has gone rather than only at the instant it
+        #: happened.
+        self._source_problems: dict[object, str] = {}
 
         self._show_lines = self._config.default_show_lines
         self._sources_panel_width = self._config.tree_width
@@ -1003,41 +1048,97 @@ class LogViewerApp(App[None]):
             parts.append("timestamps adjusted for clock skew")
         return f" · {' · '.join(parts)}" if parts else ""
 
-    def _discover_everything(self, roots, settings) -> DiscoveryReport:
-        """Walk the local roots and each host's, and fold them into one report.
+    def _discover_local(self, roots, settings) -> DiscoveryReport:
+        """Walk only what is on this machine. Runs in a worker.
 
-        Split per host rather than done in one call because **budgets are
-        per host**. Globally, one noisy machine consumes the whole ``max_files``
-        allowance and truncates the others silently, and the report cannot say
-        whose files were cut. Each host gets its own ceiling and its own
-        truncation line.
-
-        Runs in a worker. Every call below may be a round trip.
+        Split from the remote half so a host that is down cannot delay the local
+        tree by so much as a millisecond. It used to be one pass, which meant
+        the tree waited behind every configured machine's connect timeout —
+        three unreachable hosts and the operator watched an empty panel for a
+        minute for logs that were on their own disk the whole time.
         """
 
-        local = [root for root in roots if is_local(root)]
-        report = discover(local, settings, backends=self._backends)
+        return discover(
+            [root for root in roots if is_local(root)],
+            settings,
+            backends=self._backends,
+        )
+
+    def _discover_hosts(self, roots, settings) -> DiscoveryReport:
+        """Walk each configured host's roots, concurrently. Runs in a worker.
+
+        **Split per host** because budgets are per host: globally, one noisy
+        machine consumes the whole ``max_files`` allowance and truncates the
+        others silently, and the report cannot say whose files were cut. Each
+        host gets its own ceiling and its own truncation line.
+
+        **Concurrently** because the failure they are most likely to share is
+        waiting. Serially, N unreachable hosts cost N connect timeouts one after
+        another; in parallel they cost one, and a host that is up is not held up
+        behind a host that is down. Each thread has its own connection and its
+        own ``cheap_only`` guard — that flag is thread-local precisely so this
+        is safe.
+
+        A host already known unreachable, whose backoff has not expired, is
+        **skipped rather than attempted**: it is reported from what is already
+        known, at no cost, instead of spending a timeout to learn it again.
+        """
 
         by_node: dict[str, list[SourceRef]] = {}
         for root in roots:
             if isinstance(root, RemoteRef):
                 by_node.setdefault(root.node, []).append(root)
+        if not by_node:
+            return DiscoveryReport()
 
-        for node, host_roots in by_node.items():
+        def walk_host(item: tuple[str, list[SourceRef]]) -> DiscoveryReport:
+            node, host_roots = item
             host = self._config.host(node)
             host_settings = (
                 settings if host is None else host.discovery_settings(settings)
             )
-            report.extend(
-                discover(host_roots, host_settings, backends=self._backends)
-            )
+            backend = self._backends.for_ref(host_roots[0])
+            state = backend.reachability()
+            if not state.may_attempt(monotonic()) and not state.ok:
+                # Known bad and not yet due for another try. Reported from what
+                # is known rather than paid for again — and reported, because a
+                # host that vanishes from the tree with no line about it is the
+                # one outcome a remote feature may not produce.
+                skipped = DiscoveryReport()
+                for root in host_roots:
+                    skipped.roots.append(root)
+                    skipped.unreadable_roots.append(root)
+                    if state.reason:
+                        skipped.root_reasons[root] = state.reason
+                return skipped
+            return discover(host_roots, host_settings, backends=self._backends)
+
+        report = DiscoveryReport()
+        with ThreadPoolExecutor(
+            max_workers=min(len(by_node), MAX_HOST_WORKERS),
+            thread_name_prefix="clv-host",
+        ) as pool:
+            for found in pool.map(walk_host, by_node.items()):
+                report.extend(found)
         return report
 
     async def _rescan(self) -> None:
-        """Re-run discovery off the UI thread and rebuild the tree."""
+        """Re-run discovery off the UI thread and rebuild the tree.
+
+        **Two stages, and the split is the point.** The local tree is built and
+        shown from the first one; hosts are folded in by the second. A machine
+        that is down therefore costs the local tree nothing, where one pass made
+        every local log wait behind every configured host's connect timeout.
+
+        The cost is one extra tree build shortly after launch, which re-collapses
+        folders the operator may have opened in the second or so between them.
+        That is the right trade: a folder to re-open is an annoyance, and a
+        panel that sits empty for a minute looks like a broken program.
+        """
 
         roots = self._source_manager.all_sources()
         settings = self._discovery_settings()
+        self._scan_token = token = object()
 
         # Both halves run in the thread. The walk touches the filesystem and
         # can be slow on a large tree; a provider may *shell out*, which is
@@ -1046,13 +1147,9 @@ class LogViewerApp(App[None]):
         # exactly as long as they took, and when one hit its own timeout the
         # tree quietly came back short. Neither is discovery's judgement to
         # make: a provider that raises is still recorded and skipped.
-        #
-        # A remote root makes this load-bearing rather than merely prudent:
-        # every entry below is a network round trip, and doing it here would be
-        # the frozen UI Requirement 3 exists to prevent.
         worker = self.run_worker(
             lambda: (
-                self._discover_everything(roots, settings),
+                self._discover_local(roots, settings),
                 self._plugins.discover_sources(),
             ),
             thread=True,
@@ -1063,15 +1160,54 @@ class LogViewerApp(App[None]):
         report, provider_sources = found if found else (None, [])
         if report is None:
             report = DiscoveryReport()
-        self._report = report
-        #: Every ref discovery listed as a *file*, so a tree node can be told
-        #: from a folder without asking a remote host on the event loop.
-        self._file_refs = {item.path for item in report.files}
         self._provider_sources = provider_sources
         self._refresh_plugin_status()
         # After the providers have run, so the drawer reports what they found
         # rather than what they were about to look for.
         self._sync_journald_status()
+        await self._install_report(report)
+
+        if not any(isinstance(root, RemoteRef) for root in roots):
+            return
+
+        # Stage two. Every call inside is a network round trip, which is exactly
+        # why it is here and not above: doing it on the event loop is the frozen
+        # UI Requirement 3 exists to prevent, and doing it *before* the tree is
+        # the delay this split exists to prevent.
+        self._notify(f"Discovering {self._host_count(roots)} host(s)…")
+        remote_worker = self.run_worker(
+            lambda: self._discover_hosts(roots, settings),
+            thread=True,
+            name="discover-hosts",
+            exit_on_error=False,
+        )
+        try:
+            remote = await remote_worker.wait()
+        except Exception as exc:  # noqa: BLE001 - a remote walk fails many ways
+            self._notify(f"Could not discover remote sources: {exc}", "warning")
+            return
+        if token is not self._scan_token or self._is_shutting_down:
+            # A second rescan started while this was in flight. Its own stage
+            # two will fold in fresher results; installing these over them would
+            # show the older walk.
+            return
+        await self._install_report(report.extend(remote or DiscoveryReport()))
+
+    @staticmethod
+    def _host_count(roots) -> int:
+        return len({root.node for root in roots if isinstance(root, RemoteRef)})
+
+    async def _install_report(self, report: DiscoveryReport) -> None:
+        """Adopt *report* as what discovery found, and rebuild the tree from it.
+
+        One place, because both rescan stages end the same way and a second copy
+        would be a second chance for the tree and `_file_refs` to disagree.
+        """
+
+        self._report = report
+        #: Every ref discovery listed as a *file*, so a tree node can be told
+        #: from a folder without asking a remote host on the event loop.
+        self._file_refs = {item.path for item in report.files}
         await self._build_tree(report)
         if self._selected_source is None:
             self._show_discovery_summary(report)
@@ -1775,6 +1911,10 @@ class LogViewerApp(App[None]):
         if self._tail_timer is not None:
             self._tail_timer.stop()
             self._tail_timer = None
+        # The source set is about to change, and a pending attempt belongs to
+        # the set it was scheduled against: resuming a reader the session no
+        # longer holds would open a connection for a pane that has gone.
+        self._cancel_reconnects()
 
     def _poll_tail(self) -> None:
         if not self._session or self._is_shutting_down:
@@ -1782,6 +1922,14 @@ class LogViewerApp(App[None]):
         outcomes = self._session.poll()
         if not outcomes:
             return
+
+        # Before every early return below. A source that stopped usually stops
+        # with no lines to show for it, so handling this after the
+        # `if not new_entries` guard would be handling it never — which is
+        # precisely how a dropped link used to render as a quiet log.
+        problems = [outcome for outcome in outcomes if outcome.problem]
+        if problems:
+            self._report_problems(problems)
 
         rotated = [outcome for outcome in outcomes if outcome.rotated]
         if rotated:
@@ -1820,6 +1968,178 @@ class LogViewerApp(App[None]):
         else:
             self._append_entries(new_entries)
         self._update_status()
+
+    # --- when a source goes away --------------------------------------------
+
+    def _report_problems(self, outcomes: Sequence[PollOutcome]) -> None:
+        """Say that a source stopped, and start trying to get it back.
+
+        Three channels, and **none of them is a log row**: `_notify` stopped
+        writing into the pane because copy mode copied what it wrote, and a
+        fabricated line saying "connection lost" is exactly the kind of thing
+        CLV promises never to put in a log. So: a toast now, the empty-pane
+        explanation for as long as the pane is empty, and a status-line segment
+        for as long as it lasts.
+        """
+
+        for outcome in outcomes:
+            buffer = outcome.buffer
+            if buffer.path is None:
+                continue
+            key = ref_key(buffer.path)
+            if self._source_problems.get(key) == outcome.problem:
+                # Already said. A reader reports a stoppage once, but a rotated
+                # set can re-report through its head, and a toast twice a second
+                # is a worse failure than the silence this replaces.
+                continue
+            self._source_problems[key] = outcome.problem
+            self._notify(outcome.problem, "warning")
+            self._schedule_reconnect(buffer, outcome.problem)
+
+        # The pane may be showing "no entries in the selected source", which is
+        # a claim CLV cannot make about a source it cannot see.
+        self._render_log()
+        self._update_status()
+
+    def _schedule_reconnect(self, buffer: SourceBuffer, reason: str) -> None:
+        """Queue one bounded attempt at *buffer*'s source, after a backoff.
+
+        Only for readers that can actually resume. A local reader has nothing to
+        reconnect **to** — its file is either there on the next poll or it is
+        not — so the absence of `resume` is the answer rather than a case to
+        special-case on a ref type.
+        """
+
+        if buffer.path is None or not hasattr(buffer.reader, "resume"):
+            return
+        key = ref_key(buffer.path)
+        record = self._reconnects.get(key)
+        if record is None:
+            record = _Reconnect(reason=reason)
+            self._reconnects[key] = record
+        else:
+            record.reason = reason
+        if record.exhausted or record.timer is not None:
+            return
+
+        delay = backoff_for(record.attempts + 1)
+        # A timer rather than a poll-tick check, which is the whole point: at
+        # `refresh_hz` a "should I retry yet" test is twice a second, and the
+        # version of this that reconnects when it is due is the fork bomb with a
+        # nice name that `journald` names in its own poll.
+        record.timer = self.set_timer(
+            delay, lambda: self._attempt_reconnect(key, buffer)
+        )
+
+    def _attempt_reconnect(self, key: object, buffer: SourceBuffer) -> None:
+        """One resume, on a worker. Never on the event loop."""
+
+        record = self._reconnects.get(key)
+        if record is None or self._is_shutting_down:
+            return
+        record.timer = None
+        if buffer not in list(self._session):
+            # The operator moved on. Reconnecting a buffer nothing is showing
+            # would open a connection for a pane that no longer exists.
+            self._reconnects.pop(key, None)
+            return
+        self.run_worker(
+            self._finish_reconnect(key, buffer),
+            group="reconnect",
+            exit_on_error=False,
+        )
+
+    async def _finish_reconnect(self, key: object, buffer: SourceBuffer) -> None:
+        """The blocking half on a thread, the verdict back on the loop."""
+
+        reader = buffer.reader
+        resume = getattr(reader, "resume", None)
+        if resume is None:  # pragma: no cover - guarded at scheduling time
+            return
+
+        worker = self.run_worker(
+            resume, thread=True, name="reconnect", exit_on_error=False
+        )
+        try:
+            await worker.wait()
+        except Exception:  # noqa: BLE001 - a remote read fails many ways
+            record = self._reconnects.get(key)
+            if record is None or self._is_shutting_down:
+                return
+            record.attempts += 1
+            if record.attempts >= RECONNECT_ATTEMPTS:
+                # Bounded on purpose. A host that has been gone this long is not
+                # coming back because CLV asked again, and an endless retry is a
+                # stream of ssh processes at a machine the operator may have
+                # taken down deliberately. Say it has stopped, and say what
+                # resumes it.
+                record.exhausted = True
+                message = (
+                    f"{record.reason} Gave up after {record.attempts} attempts — "
+                    "press Ctrl+R to retry."
+                )
+                self._source_problems[key] = message
+                self._notify(message, "error")
+                self._render_log()
+                self._update_status()
+                return
+            # The original reason, not this attempt's exception appended to it:
+            # six failures would otherwise build a sentence six clauses long
+            # that says the same thing six times.
+            self._schedule_reconnect(buffer, record.reason)
+            return
+
+        if self._is_shutting_down:
+            return
+        self._reconnects.pop(key, None)
+        self._source_problems.pop(key, None)
+        name = buffer.path.name if buffer.path is not None else "the source"
+        self._notify(f"{name}: reconnected.")
+        self._render_log()
+        self._update_status()
+
+    def _cancel_reconnects(self) -> None:
+        """Drop every pending attempt. Called whenever the source set changes."""
+
+        for record in self._reconnects.values():
+            if record.timer is not None:
+                record.timer.stop()
+        self._reconnects.clear()
+        self._source_problems.clear()
+
+    def _unreachable_detail(self) -> str:
+        """What the open source's reachability adds to the pane and status line.
+
+        Reads `backend.reachability`, which is `@cheap` and never probes — the
+        status line renders on every poll, so anything else here would be the
+        round trip on the event loop that the whole design exists to refuse.
+        """
+
+        if not self._session:
+            return ""
+        stopped = [
+            self._source_problems[ref_key(buffer.path)]
+            for buffer in self._session
+            if buffer.path is not None
+            and ref_key(buffer.path) in self._source_problems
+        ]
+        if not stopped:
+            # Nothing has stopped producing, but a host can still be known bad
+            # — a follow that never started, a walk that failed. Ask the
+            # backends rather than inventing a second bookkeeping path.
+            unreachable = [
+                state.reason
+                for buffer in self._session
+                if buffer.path is not None
+                for state in (self._backends.for_ref(buffer.path).reachability(),)
+                if not state.ok and state.reason
+            ]
+            stopped = unreachable
+        if not stopped:
+            return ""
+        if len(stopped) == 1:
+            return stopped[0]
+        return f"{len(stopped)} of {len(self._session)} sources are unreachable."
 
     # --- filtering and rendering -------------------------------------------
 
@@ -1912,7 +2232,17 @@ class LogViewerApp(App[None]):
             return
 
         if not self._entries:
-            self.log_panel.write(Text("No log entries in the selected source.", style="dim"))
+            # An unreachable source is reported, never rendered as an empty one:
+            # "no log entries in the selected source" is a claim about the
+            # source, and CLV is in no position to make it about one it cannot
+            # currently see.
+            unreachable = self._unreachable_detail()
+            self.log_panel.write(
+                Text(
+                    unreachable or "No log entries in the selected source.",
+                    style="#facc15" if unreachable else "dim",
+                )
+            )
             self._clear_timeline()
             self._sync_detail_pane()
             return
@@ -1926,8 +2256,13 @@ class LogViewerApp(App[None]):
             return
 
         if not result.entries:
-            message = describe_empty_result(result.stats, self._filter_spec())
-            self.log_panel.write(Text(message, style="dim"))
+            unreachable = self._unreachable_detail()
+            message = describe_empty_result(
+                result.stats, self._filter_spec(), unreachable=unreachable
+            )
+            self.log_panel.write(
+                Text(message, style="#facc15" if unreachable else "dim")
+            )
             self._clear_timeline()
             self._sync_detail_pane()
             return
@@ -2513,6 +2848,12 @@ class LogViewerApp(App[None]):
             # Says what collapsing bought, and — when it bought nothing — that
             # it is on and found no repeats, rather than looking switched off.
             parts.append(describe_clusters(self._clusters) or "no repeats collapsed")
+        unreachable = self._unreachable_detail()
+        if unreachable:
+            # Persists for as long as the problem does, which is what the toast
+            # cannot do: a drop the operator was away from must still be visible
+            # when they come back.
+            parts.append(unreachable)
         marks = self._marks.count_for(*self._origins())
         if marks:
             parts.append(f"{marks} marked")
@@ -3429,19 +3770,27 @@ class LogViewerApp(App[None]):
         self._notify(f"Saved {len(new_paths)} source(s) to {self._settings_path}.")
 
     async def action_reload_sources(self) -> None:
+        """Re-read the configuration and re-walk every root.
+
+        **Per host, rather than from scratch.** Reload used to close every
+        multiplex master and open them again, which is a full handshake per host
+        on every press — over five connections that is most of the wait, and all
+        of it spent on hosts whose settings had not moved. A connection belongs
+        to the configuration that named it, so what has to go is one whose host
+        record *changed* or which the new configuration no longer names.
+
+        A host that was unreachable is reset rather than skipped: pressing
+        reload means "try again now", and the operator may well have just fixed
+        what broke it.
+        """
+
         selected = self._selected_source
         added = list(self._source_manager.added_paths)
 
         self._stop_tail()
         self._config = load_config()
         self._settings_path = get_config_file() or user_config_path()
-        # Connections belong to the configuration that named them: a host that
-        # was edited, disabled or removed must not keep a multiplex master open
-        # behind the new settings.
-        closer = getattr(self._backends, "close", None)
-        if closer is not None:
-            closer()
-        self._backends = build_backends(self._config)
+        refreshed = self._reconcile_backends()
         # The cap can have changed under us, so the session adopts the new one
         # before anything is read against it.
         self._session.resize(self._config.max_buffer_lines)
@@ -3458,7 +3807,40 @@ class LogViewerApp(App[None]):
         await self._rescan()
         if selected is not None and (not is_local(selected) or selected.is_file()):
             self._select_source(selected, announce=False)
-        self._notify("Sources reloaded.")
+        self._notify(f"Sources reloaded{refreshed}.")
+
+    def _reconcile_backends(self) -> str:
+        """Adopt the re-read configuration, keeping the connections still valid.
+
+        Returns what to add to the reload message, so the operator can see that
+        a reload reused four connections and reopened one rather than having to
+        infer it from how long it took.
+        """
+
+        previous = self._backends
+        reconcile = getattr(previous, "reconcile", None)
+        enabled = bool(getattr(self._config, "enable_ssh", False))
+        if reconcile is None or not enabled:
+            # `LOCAL`, or the operator has just switched remote sources off. In
+            # the second case every open master has to go: a persisted socket is
+            # a live authenticated connection, and "I turned that off" must not
+            # leave one behind.
+            closer = getattr(previous, "close", None)
+            if closer is not None:
+                closer()
+            self._backends = build_backends(self._config)
+            return ""
+
+        kept, closed = reconcile(self._config.hosts)
+        self._backends = previous
+        if not kept and not closed:
+            return ""
+        parts = []
+        if kept:
+            parts.append(f"{len(kept)} host(s) refreshed")
+        if closed:
+            parts.append(f"{len(closed)} reconnected")
+        return " — " + ", ".join(parts)
 
     def action_quit_app(self) -> None:
         self.exit()

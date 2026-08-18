@@ -15,7 +15,7 @@ It supplements the **root AGENTS.md** by explaining how each internal component 
 | **services/refs.py** | Source identity | - Defines `SourceRef`, the surface CLV requires of a source. <br> - `parse_ref` / `format_ref` are the persistence boundary; `normalize_ref` is the user-input one. See the identity rule below. <br> - Owns `identity` / `ref_key`, the one canonical form. <br> - Two implementations: `Path`, and `RemoteRef` (`ssh:<node>/<path>`). The remote type lives **here, not in the SSH plugin** — `parse_ref` decodes `session.json` before any plugin is imported. It is pure identity and raises rather than performing IO. |
 | **services/config.py** | Settings, and what CLV could not honour | - `[log_viewer]` plus one `[ssh:<name>]` per remote host; per-host settings fall back to the global ones. <br> - Never raises and never goes quiet: a bad section is skipped and recorded as a `ConfigIssue`, which `app.py` prints beside the plugin errors. Own type, not `PluginError` — services may not import plugins. <br> - `enable_ssh` defaults false and gates connecting, not parsing. <br> - **No password option, no sudo option.** Both are refused by name; that absence is the enforcement point for those requirements. |
 | **services/backend.py** | Source IO, and what it costs | - Defines `SourceBackend`; `LocalBackend`'s behaviour is what `os` did before, and `RemoteBackend` is the second implementation. <br> - Every method is marked `@cheap` or `@blocking`; `cheap_only()` makes a blocking call from `poll()` raise. See the seam rule below. <br> - `identity` is opaque and may be `None`; `walk` is lazy and yields files only. <br> - `classify` takes a **batch** and returns bytes, never a verdict: it is what stops the discovery sniff being a round trip per file, and the rule stays in `reader` / `compressed`. |
-| **plugins/sources/ssh.py** | The SSH transport | - Owns the connection, the capability probe and `RemoteBackend`. Lives under `plugins/` because a plugin may not spawn a subprocess without consent and a *network* subprocess raises that bar. <br> - `register()` returns `[]` on purpose: this is a backend, not a `LogSourceProvider`, and a remote log must be an ordinary source rather than a `ProviderSource`. <br> - Every argv carries `BatchMode=yes`; `StrictHostKeyChecking` and `UserKnownHostsFile` appear nowhere. <br> - Every operator-supplied byte goes through `quote_all` before it enters a script. |
+| **plugins/sources/ssh.py** | The SSH transport | - Owns the connection, the capability probe and `RemoteBackend`. Lives under `plugins/` because a plugin may not spawn a subprocess without consent and a *network* subprocess raises that bar. <br> - `register()` returns `[]` on purpose: this is a backend, not a `LogSourceProvider`, and a remote log must be an ordinary source rather than a `ProviderSource`. <br> - Every argv carries `BatchMode=yes`; `StrictHostKeyChecking` and `UserKnownHostsFile` appear nowhere. <br> - Every operator-supplied byte goes through `quote_all` before it enters a script. <br> - Two hint tables, not one: `_FAILURE_HINTS` is the *transport* failing (host key, credentials, DNS) and `_REMOTE_HINTS` is the *command* failing (a missing utility, a path the SSH user cannot read). Merging them would report a file mode as an authentication problem. <br> - Reconnection is bounded — `RECONNECT_BACKOFF`, then it stops and names `Ctrl+R`. Never a reconnect per poll tick. |
 | **widgets/query_bar.py** | Query, time, severity, and action controls | - Emits `ActionTriggered`, `TimeWindowChanged`, and `SeverityChanged` messages. <br> - No logic beyond UI validation. |
 | **widgets/segmented.py** | Generic segmented control | - Self-contained visual component. <br> - Should be reusable across other widgets. |
 | **widgets/advanced_drawer.py** | Advanced filters and secondary options | - Optional drawer for extended filtering and plugin-provided UI. <br> - Should expose show/hide events to `app.py`. |
@@ -123,7 +123,7 @@ a convention:
 | `@cheap` | A `stat`-sized operation | Anywhere, including `poll()` |
 | `@blocking` | May be a network round trip | A worker thread only |
 
-`stat` and `identity` are **guaranteed cheap on every backend** — a backend that
+`stat`, `identity` and `reachability` are **guaranteed cheap on every backend** — a backend that
 cannot honour that is a reason to change the reader, and `blocking_methods`
 refuses to build capabilities for one that tries. A backend whose honest `stat`
 *is* a round trip satisfies this by asking **who wants to know**: `in_cheap_only()`
@@ -135,6 +135,15 @@ method is refused outright. `SourceBuffer.poll` runs inside `cheap_only()`, so a
 blocking call there raises `BlockingCallError` rather than freezing the UI at
 `refresh_hz`. That exception is deliberately **not** caught: it is a design
 error, not a source that went away.
+
+`reachability` is the third, and it is cheap by *nature* rather than by
+concession: it reports state the backend already holds and is forbidden to
+probe. A source that cannot be reached says so through it, because
+`SourceBuffer.poll` deliberately swallows `OSError` — a source that vanished
+mid-session is not worth taking the pane down for — and that is exactly right
+for a rotated local file and exactly wrong for a dropped link, which would
+otherwise render as a log that had simply gone quiet. A reader that knows *why*
+it stopped reports it in band on `TailRead.problem` instead, once.
 
 When adding a method to the protocol: mark it, add it to `PROTOCOL_METHODS`, and
 put it in `GUARANTEED_CHEAP` only if every conceivable backend can answer it

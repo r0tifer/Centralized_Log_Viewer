@@ -363,6 +363,42 @@ class BackendContract:
             assert backend.stat(log) is not None
             backend.identity(log)
 
+    def test_reachability_answers_under_the_guard_and_says_what_it_knows(
+        self, backend, workspace
+    ) -> None:
+        """Requirement 3, extended to the member the status line reads.
+
+        Asked on every render and on every empty pane, so it has to answer from
+        inside the guard — and it has to answer *honestly*, which for a backend
+        with nothing wrong means saying so rather than declining to say. A
+        backend that could only report trouble would leave "is this source live"
+        unanswerable, which is the question the pane is asking.
+        """
+
+        with cheap_only():
+            state = backend.reachability()
+
+        assert state.state in {"connected", "connecting", "unreachable", "disabled"}
+        assert state.ok is (state.state == "connected")
+
+    def test_a_working_backend_reports_itself_reachable(
+        self, backend, workspace
+    ) -> None:
+        """Nothing has gone wrong, so nothing may claim it has.
+
+        The paired assertion to the failure cases: a reachability that defaulted
+        to pessimism would put a warning beside every healthy source, and a
+        warning that is always there is one nobody reads.
+        """
+
+        log = workspace.write("a.log", "alpha\n")
+        assert backend.stat(log) is not None
+
+        state = backend.reachability()
+        assert state.ok
+        assert state.reason == ""
+        assert not state.exhausted
+
 
 def _call_with_placeholder_arguments(method, ref):
     """Call *method* with whatever shape its name implies.
@@ -1171,7 +1207,7 @@ def test_a_missing_method_is_refused() -> None:
 def test_the_protocol_split_covers_every_method_exactly_once() -> None:
     assert GUARANTEED_CHEAP | MAY_BLOCK == frozenset(PROTOCOL_METHODS)
     assert not (GUARANTEED_CHEAP & MAY_BLOCK)
-    assert GUARANTEED_CHEAP == frozenset({"stat", "identity"})
+    assert GUARANTEED_CHEAP == frozenset({"stat", "identity", "reachability"})
 
 
 def test_local_resolves_to_itself() -> None:

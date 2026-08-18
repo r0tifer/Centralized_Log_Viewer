@@ -19,7 +19,7 @@ filesystem assumption that had already spread further.
 | 3 — Configuration | `[ssh:<name>]` sections, `enable_ssh` | ✅ **Complete** (`e2d1bb3`) |
 | 4a — Transport & backend | First readable remote log | ✅ **Complete** |
 | 4b — Follow | It tails | ✅ **Complete** |
-| 5 — Reachability | A host that goes away says so | ⬜ Not started |
+| 5 — Reachability | A host that goes away says so | ✅ **Complete** |
 | 6 — Parity | Star, merge, rotation, hierarchy, time, session | 🟡 **Mostly** — star, merge, rotation, `node`, the time rule; the downstream sweep remains |
 | 7 — Remote UI | Host dialog, cross-host merge, `node` in the chrome | ⬜ Not started |
 | 8 — Documentation & release | README, `settings.conf`, help overlay, version | ⬜ Not started |
@@ -957,6 +957,120 @@ says what happened within one backoff interval, and recovers when it returns.
 Suite green on both Python versions.
 
 **Commit.** `feat(ssh): make connection state visible and recoverable`
+
+### As built
+
+Recorded where the phase departed from the plan above, so Phase 6's remaining
+sweep and Phase 7 build against what exists rather than what was proposed.
+
+- **The silence had *two* layers, not one, and the second was the surprise.**
+  The phase was written against `SourceBuffer.poll` swallowing `OSError`. That
+  is real and is fixed — but `SourceSession.poll` also filtered its outcomes
+  down to those with `entries or rotated`, which means a source that had died
+  reported nothing to report, **because a source that has died is precisely one
+  with no lines**. The verdict never reached `app.py` at all. Found by the
+  app-level test rather than by reading, which is the argument for having
+  written that test: both layers are individually reasonable and together they
+  are a guarantee that a drop can never be seen.
+
+- **A stoppage is carried in band on `TailRead.problem`, never raised.** An
+  exception would either be caught by the guard that exists to protect the local
+  case or force that guard open, and the local case is the one Requirement 13
+  protects. A field is set by the reader that noticed and ignored by everyone
+  else, so `SourceReader` never mentions it and nothing local moved.
+
+- **It is reported once per stoppage, not per poll.** `RemoteFollowReader`
+  latches `_reported`, and `app._report_problems` compares against
+  `_source_problems` before speaking. A dead follow produces the same verdict on
+  every subsequent tick, and a toast twice a second is a worse failure mode than
+  the silence being replaced.
+
+- **The notice is never a log row, and that constraint came from `_notify`'s own
+  docstring**: messages stopped going into the log pane because copy mode copied
+  them. A fabricated "connection lost" line is a line the source never produced,
+  in the one place CLV promises not to invent one. So there are three channels —
+  a toast at the moment, the **empty-pane explanation** through
+  `describe_empty_result(..., unreachable=...)`, and a **status-line segment**
+  that persists. The plan's `describe_empty_result` bullet is satisfied by an
+  additive keyword, so every existing call and assertion is untouched.
+
+- **Two hint tables, and the split is the phase's most useful small decision.**
+  `run()` already distinguished a frame that never closed (the transport) from a
+  frame that closed non-zero (the remote command), so `_REMOTE_HINTS` was added
+  beside `_FAILURE_HINTS` rather than extending it. `Permission denied` means
+  the key was refused when `ssh` says it and means the SSH user cannot read a
+  file when the remote shell says it; one table would send an operator to their
+  ssh-agent for an hour over a file mode. A failing *command* explicitly leaves
+  the host **reachable**, which is what stops a wrong permission starting a
+  reconnect against a connection that is working perfectly.
+
+- **`_stream_records` now checks that it reached its closing sentinel.**
+  `_unframe` had always drawn "produced nothing" apart from "stopped early" for
+  a one-shot command; the streaming twin did not, so a walk cut off mid-`find`
+  was indistinguishable from one that finished — the named phase-5 hazard, and
+  the mechanism by which a dropped link silently shrank the tree. A caller that
+  *abandons* the walk at `max_files` never reaches the check, because
+  `GeneratorExit` unwinds from the `yield`, so laziness is unaffected.
+  `stream()`'s stderr became a `PIPE` rather than `DEVNULL` for the same reason:
+  a stream that died now has an explanation, and the remote's own `2>/dev/null`
+  keeps the local pipe to `ssh`'s own chatter.
+
+- **`walk` still swallows and still yields nothing.** The protocol says so and
+  `LocalBackend` does the same. What changed is that the *connection* records
+  the failure, and `discover` asks `backend.reachability()` after the walk — so
+  the reason comes from the one component that can tell "the link went" from "a
+  subdirectory vanished", which the walk itself cannot.
+
+- **`-o ConnectTimeout=10` is the flag that makes a down host a fact rather than
+  a wait.** Without it a blackholed machine costs the full 45-second
+  `COMMAND_TIMEOUT` before anything can be said, which is most of a minute of a
+  pane that looks broken. It weakens no verification.
+
+- **Reconnection is `resume()`, emphatically not a re-prime.**
+  `SourceBuffer.prime` clears the buffer before refilling it, so reconnecting
+  through it would discard everything on screen in order to re-fetch most of it
+  over the link that had only just come back. `resume()` re-follows at the stored
+  offset: no line twice, none skipped, the pane untouched. The two *remainders*
+  survive it as well as the offset — a half-line and a half-character were
+  already counted into the offset, so clearing them would drop a line at exactly
+  the seam a reconnection creates.
+
+- **Bounded, and the boundary is visible.** Six attempts on the
+  `1, 2, 5, 15, 30, 60` schedule, then it stops and the pane says so and names
+  `Ctrl+R`. Stopping *quietly* would have reintroduced the whole problem at a
+  longer timescale. `Ctrl+R` resets the backoff, because the gesture means
+  impatience and answering it with a wait is the wrong reply.
+
+- **Startup is two stages, and this is the largest behavioural change in the
+  phase.** `_rescan` builds and shows the tree from the local roots, then folds
+  the hosts in from a second worker that walks them **concurrently**. One pass
+  meant every local log waited behind every configured machine's connect
+  timeout — three unreachable hosts and the operator watched an empty panel for
+  a minute for files on their own disk. The cost is one extra tree build shortly
+  after launch, which re-collapses folders; a folder to re-open is an annoyance
+  and an empty panel looks like a broken program.
+
+- **A host inside its backoff is skipped, not retried**, and still *reported*
+  from what is already known. Spending a connect timeout to learn again what CLV
+  was told a second ago is what makes a rescan with a dead host feel broken; a
+  host that vanishes from the tree with no line about it is the one outcome a
+  remote feature may not produce.
+
+- **`Ctrl+R` keeps the connections that are still valid.** `RemoteResolver.
+  reconcile` closes only a connection whose `RemoteHost` record changed or which
+  the configuration no longer names, and *resets* the rest. Reload used to close
+  every multiplex master and pay a full handshake per host. Switching
+  `enable_ssh` off still closes everything, because a persisted socket is a live
+  authenticated connection and "I turned that off" must not leave one behind.
+
+- **`GUARANTEED_CHEAP` gained a third member.** `reachability` is cheap by
+  nature rather than by the concession `stat` makes: it reports state already
+  held and is forbidden to probe. Two assertions that enumerated the set by name
+  were updated — the only existing assertions this phase edits, and both because
+  the set genuinely grew. `BackendContract` gained two assertions, so both
+  implementations are held to them.
+
+- **1144 + 41 = 1185 passed, 1 skipped, 11 deselected** on 3.11 and 3.14.
 
 ---
 

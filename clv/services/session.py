@@ -163,6 +163,16 @@ class PollOutcome:
     #: The ring buffer dropped older lines to fit these, so the visible window
     #: shifted and an incremental append would render the wrong thing.
     overflowed: bool = False
+    #: Why this source has stopped producing, if it has. Empty on every ordinary
+    #: poll — including one that found nothing, which is the common case and
+    #: emphatically not a problem.
+    #:
+    #: Reported rather than raised, because a source going away is not an error
+    #: worth taking the pane down for and never has been. What Phase 5 adds is
+    #: that it is no longer *silent*: a remote log that stopped because its link
+    #: dropped now looks different from one that stopped because nobody is
+    #: writing to it, which is the whole of Requirement 7.
+    problem: str = ""
 
     @property
     def notice(self) -> str:
@@ -299,16 +309,20 @@ class SourceBuffer:
             entries = self._feed(result)
             self.entries.extend(entries)
             self.revision += 1
-            return PollOutcome(self, entries, rotated=True)
+            return PollOutcome(self, entries, rotated=True, problem=result.problem)
 
         if not result.lines:
-            return PollOutcome(self)
+            # The one place a *silent* stop used to be indistinguishable from a
+            # quiet log. Both still return here; only one of them says why.
+            return PollOutcome(self, problem=result.problem)
 
         entries = self._feed(result)
         overflowed = len(self.entries) + len(entries) > (self.entries.maxlen or 0)
         self.entries.extend(entries)
         self.revision += 1
-        return PollOutcome(self, entries, overflowed=overflowed)
+        return PollOutcome(
+            self, entries, overflowed=overflowed, problem=result.problem
+        )
 
     def close(self) -> None:
         """Release whatever the reader holds open.
@@ -801,12 +815,18 @@ class SourceSession:
         Returns one outcome per buffer that produced something, so the caller
         can decide between an incremental append and a redraw without asking
         each buffer again.
+
+        **A stoppage counts as something produced**, and that is the second
+        place this phase had to fix: filtering on lines alone meant a source
+        that had died reported nothing to report, because a source that has died
+        is precisely one with no lines. The verdict never reached the pane, and
+        the drop stayed as quiet here as it had been a layer below.
         """
 
         outcomes: list[PollOutcome] = []
         for buffer in self._buffers:
             outcome = buffer.poll()
-            if outcome.entries or outcome.rotated:
+            if outcome.entries or outcome.rotated or outcome.problem:
                 outcomes.append(outcome)
         return outcomes
 

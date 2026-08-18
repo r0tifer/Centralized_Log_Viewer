@@ -43,6 +43,17 @@ offer one either. ``SourceReader`` degrades to a shrink-only rotation test when
 is what lets ``poll()`` ask "did this file grow?" on the event loop while the
 read that answers it is driven from somewhere else.
 
+**``reachability`` is cheap for a different reason.** It is not an operation at
+all: it reports the *last known* state of whatever the backend talks to, and it
+must never probe. The status line reads it on every render and the log pane
+reads it on every empty result, so a version of it that connected would be the
+frozen UI in a new place. A backend that cannot reach its source is required to
+say so through it, because ``SourceBuffer.poll`` deliberately swallows
+``OSError`` — a source that vanished mid-session is not worth taking the pane
+down for — and that is exactly right for a rotated local file and exactly wrong
+for a dropped connection, which would otherwise render as a log that had merely
+gone quiet.
+
 Constraints a future backend inherits, recorded here because they are invisible
 until something breaks:
 
@@ -67,11 +78,14 @@ from typing import IO, Any, Callable, Iterator, Literal, Protocol, Sequence
 from .refs import SourceRef
 
 __all__ = [
+    "CONNECTED",
     "GUARANTEED_CHEAP",
     "LOCAL",
     "LOCAL_ACCESS_HINT",
     "MAY_BLOCK",
     "PROTOCOL_METHODS",
+    "RECONNECT_ATTEMPTS",
+    "RECONNECT_BACKOFF",
     "BackendCapabilities",
     "BackendResolver",
     "BackendStat",
@@ -79,9 +93,12 @@ __all__ = [
     "ClassifyRequest",
     "ClassifyResult",
     "LocalBackend",
+    "Reachability",
+    "ReachabilityState",
     "RefKind",
     "SourceBackend",
     "WalkEntry",
+    "backoff_for",
     "blocking",
     "blocking_methods",
     "cheap",
@@ -263,6 +280,82 @@ class ClassifyResult:
     complete: bool = False
 
 
+#: What a backend's connection to its source is doing. ``connected`` is not a
+#: claim that the last read worked — it is a claim that nothing has said
+#: otherwise, which is the honest thing a cheap answer can mean.
+ReachabilityState = Literal["connected", "connecting", "unreachable", "disabled"]
+
+
+#: How long to wait before each successive reconnection attempt, in seconds.
+#:
+#: Bounded and finite. A host that has been gone for an hour is not coming back
+#: because CLV asked a sixtieth time, and an open-ended retry loop is a stream of
+#: ``ssh`` processes against a machine the operator may have deliberately taken
+#: down. When the schedule is spent the pane says so and names ``Ctrl+R``, which
+#: puts the decision where it belongs.
+RECONNECT_BACKOFF: tuple[int, ...] = (1, 2, 5, 15, 30, 60)
+
+#: Automatic attempts before CLV stops trying and says it has.
+RECONNECT_ATTEMPTS = len(RECONNECT_BACKOFF)
+
+
+def backoff_for(attempt: int) -> int:
+    """Seconds to wait before *attempt* (1-based). Clamped to the last step."""
+
+    index = min(max(attempt, 1), len(RECONNECT_BACKOFF)) - 1
+    return RECONNECT_BACKOFF[index]
+
+
+@dataclass(frozen=True, slots=True)
+class Reachability:
+    """Whether a backend can currently reach its source, and why not.
+
+    Reported by a **cheap** member, so this is always a record of what was last
+    observed rather than the result of asking now. That is the only shape an
+    answer can take when the caller is the event loop.
+
+    :attr:`reason` is written for the operator and already names the host: it is
+    what the pane shows in place of an empty-source message and what the
+    discovery summary prints beside an unreadable root. Requirement 7 — an
+    unreachable host, a dropped connection and a host with no matching files are
+    three different facts and must read as three different messages.
+    """
+
+    state: ReachabilityState = "connected"
+    #: Actionable, and already naming the host. Empty when connected.
+    reason: str = ""
+    #: Consecutive failures. Drives which :data:`RECONNECT_BACKOFF` step applies.
+    attempts: int = 0
+    #: ``time.monotonic()`` deadline before which a retry is pointless. Zero
+    #: means "now", which is also what a fresh connection reports.
+    retry_at: float = 0.0
+    #: The backoff schedule is spent. Nothing further is attempted automatically
+    #: — only an explicit reload — and the pane says so rather than looking as
+    #: though it were still trying.
+    exhausted: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return self.state == "connected"
+
+    def may_attempt(self, now: float) -> bool:
+        """Whether a reconnection is worth making at *now*.
+
+        False while the backoff deadline stands, once the schedule is spent, and
+        for a host the operator switched off — three different reasons not to
+        spawn ``ssh``, all of which end in not spawning it.
+        """
+
+        if self.state == "disabled" or self.exhausted:
+            return False
+        return now >= self.retry_at
+
+
+#: The answer for a backend with nothing between it and its files. A constant
+#: rather than a fresh instance: ``LocalBackend`` reports it on every render.
+CONNECTED = Reachability()
+
+
 @dataclass(frozen=True, slots=True)
 class BackendCapabilities:
     """What this backend can do, and what it costs to ask."""
@@ -308,6 +401,15 @@ class SourceBackend(Protocol):
     @cheap
     def identity(self, ref: SourceRef) -> object | None:
         """An opaque comparable, or ``None`` when the backend has no stable one."""
+
+    @cheap
+    def reachability(self) -> Reachability:
+        """Whether this backend can currently reach its source. **Never probes.**
+
+        Cheap because the status line asks on every render and the log pane asks
+        on every empty result. It reports what was last observed; a backend that
+        connected here would be the frozen UI in a new place.
+        """
 
     # --- may block: drive these from a worker --------------------------------
 
@@ -390,13 +492,14 @@ PROTOCOL_METHODS: tuple[str, ...] = (
     "kind",
     "list_dir",
     "open",
+    "reachability",
     "stat",
     "walk",
 )
 
 #: Callable from ``poll()`` on **any** backend. A backend that cannot honour
 #: this is not a backend; it is a reason to change the reader.
-GUARANTEED_CHEAP: frozenset[str] = frozenset({"identity", "stat"})
+GUARANTEED_CHEAP: frozenset[str] = frozenset({"identity", "reachability", "stat"})
 
 #: The rest — a caller must assume a round trip and use a worker.
 MAY_BLOCK: frozenset[str] = frozenset(PROTOCOL_METHODS) - GUARANTEED_CHEAP
@@ -504,6 +607,17 @@ class LocalBackend:
     def identity(self, ref: SourceRef) -> object | None:
         info = self.stat(ref)
         return None if info is None else info.identity
+
+    @cheap
+    def reachability(self) -> Reachability:
+        """Always connected. There is nothing between this backend and its files.
+
+        A local file that is gone is *missing*, which ``kind`` already reports
+        and which is a different fact from a source CLV cannot get to. Conflating
+        them is precisely what this member exists to stop.
+        """
+
+        return CONNECTED
 
     # --- also cheap here, though the protocol lets them block ----------------
 

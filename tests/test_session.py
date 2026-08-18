@@ -195,3 +195,89 @@ def test_resize_adopts_a_new_cap(tmp_path: Path) -> None:
     session.open_single(_log(tmp_path, lines=20))
 
     assert len(session.entries) == 7
+
+
+# --- a source that stopped, versus one that is merely quiet -----------------
+#
+# `SourceBuffer.poll` swallows `OSError` on purpose: a source that vanished
+# mid-session is not an error worth taking the pane down for. That is right for
+# a rotated local file and silent for a dropped connection, so a reader that
+# knows *why* it stopped says so in band instead.
+
+
+class _StoppedReader:
+    """A reader whose source went away and that is willing to say so."""
+
+    RELOAD_NOTICE = "{name} was rotated; reloaded."
+
+    def __init__(self, path: Path, problem: str = "") -> None:
+        self.path = path
+        self._problem = problem
+
+    def prime(self):
+        from clv.services.reader import TailRead
+
+        return TailRead(lines=["first"], offset=5)
+
+    def poll(self):
+        from clv.services.reader import TailRead
+
+        problem, self._problem = self._problem, ""
+        return TailRead(lines=[], offset=5, problem=problem)
+
+
+def test_a_quiet_poll_reports_no_problem(tmp_path: Path) -> None:
+    """The overwhelmingly common case, and it must stay silent.
+
+    A log with nothing new to say is not a problem, and a session that treated
+    it as one would put a warning on screen twice a second for every idle log.
+    """
+
+    buffer = SourceBuffer(
+        tmp_path / "app.log", max_lines=10, reader=_StoppedReader(tmp_path / "app.log")
+    )
+    buffer.prime()
+
+    assert buffer.poll().problem == ""
+
+
+def test_a_reader_that_stopped_says_so_through_the_outcome(tmp_path: Path) -> None:
+    """The regression this phase exists for, at the session layer.
+
+    Both polls above and below return no lines. Before Phase 5 they were the
+    same value, so a dropped link and an idle log were indistinguishable to
+    everything downstream — which is how a pane went quiet with no explanation.
+    """
+
+    reader = _StoppedReader(tmp_path / "app.log", "web01: the host did not answer.")
+    buffer = SourceBuffer(tmp_path / "app.log", max_lines=10, reader=reader)
+    buffer.prime()
+
+    outcome = buffer.poll()
+
+    assert outcome.problem == "web01: the host did not answer."
+    assert outcome.entries == []
+    # The buffer keeps what it had. A source that stopped is not a source that
+    # was emptied, and the operator must not lose what is on screen.
+    assert [entry.message for entry in buffer.entries] == ["first"]
+
+
+def test_a_local_reader_never_sets_a_problem(tmp_path: Path) -> None:
+    """Requirement 13, at this seam: nothing local moved.
+
+    `SourceReader` does not know the word, so every local poll carries the empty
+    default and the local path is byte-for-byte what it was.
+    """
+
+    path = _log(tmp_path)
+    session = SourceSession(max_lines=100)
+    buffer = session.open_single(path)
+
+    assert buffer.poll().problem == ""
+
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("2026-08-11 10:00:09 - INFO - line 9\n")
+
+    outcome = buffer.poll()
+    assert [entry.message for entry in outcome.entries] == ["line 9"]
+    assert outcome.problem == ""

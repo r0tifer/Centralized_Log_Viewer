@@ -112,6 +112,41 @@ is built as a single argv element with every operator-supplied byte passed
 through :func:`shlex.quote` first. A path containing ``$(reboot)`` is data.
 :func:`quote_all` is the only way a path enters a script, and a table-driven
 test in ``tests/test_ssh_source.py`` holds it there.
+
+When the network is not there
+-----------------------------
+
+A remote pane that goes quiet because the link dropped is the single worst
+outcome of this feature, and it is what the obvious code produces:
+``SourceBuffer.poll`` swallows ``OSError`` on purpose, which is right for a
+rotated local file and silent for a dropped connection. So failure is reported
+rather than absorbed, along three lines.
+
+**Two hint tables, because there are two different failures.** :meth:`
+SSHConnection.run` already tells them apart — a frame that never closed is the
+*transport* failing, while a frame that closed with a non-zero status is the
+*remote command* failing — and they call for opposite instructions.
+:data:`_FAILURE_HINTS` covers the first: an unknown host key, a refused key, a
+name that does not resolve. :data:`_REMOTE_HINTS` covers the second: a utility
+the remote does not have, and a path the SSH user may not read. Folding them
+together would report a log file whose permissions are wrong as an
+authentication problem, which sends the operator to their ssh-agent for an hour.
+
+**Reconnection is bounded, and driven from a worker.** Every command records
+:class:`~clv.services.backend.Reachability` on its connection, so the status
+line and the log pane can ask what state a host is in without probing it.
+Attempts follow ``RECONNECT_BACKOFF`` and stop after
+``RECONNECT_ATTEMPTS``; the pane then says it has stopped and names ``Ctrl+R``.
+A host that has been gone for an hour is not coming back because CLV asked a
+sixtieth time, and a reconnect per poll tick would be the fork bomb with a nice
+name that ``journald`` already warns about in its own poll.
+
+**The notice is never a log row.** ``app._notify`` stopped writing into the log
+pane because copy mode copied what it wrote. So a drop surfaces as a toast when
+it happens, as the *empty-pane explanation* through
+``filtering.describe_empty_result``, and as a status-line segment for as long as
+it lasts — three channels, none of which fabricates a line the source never
+produced.
 """
 
 from __future__ import annotations
@@ -131,12 +166,15 @@ from pathlib import PurePosixPath
 from typing import IO, Any, Iterator, Optional, Sequence
 
 from ...services.backend import (
+    RECONNECT_ATTEMPTS,
     BackendCapabilities,
     BackendStat,
     ClassifyRequest,
     ClassifyResult,
+    Reachability,
     RefKind,
     WalkEntry,
+    backoff_for,
     blocking,
     blocking_methods,
     cheap,
@@ -345,6 +383,15 @@ CONTROL_PERSIST = 60
 #: slow link. Generous because a first connection may negotiate a ProxyJump.
 COMMAND_TIMEOUT = 45
 
+#: Seconds to wait for the TCP connection itself.
+#:
+#: Much shorter than :data:`COMMAND_TIMEOUT`, and deliberately: a host that is
+#: reachable but slow is answering, while a host that has not completed a
+#: handshake in ten seconds is down. Bounding the second case separately is what
+#: lets a dead host be reported within one backoff interval instead of within
+#: three quarters of a minute.
+CONNECT_TIMEOUT = 10
+
 _SENTINEL_RE = re.compile(rb"^__clv_(?P<token>[0-9a-f]{16})_(?P<kind>start|end)")
 
 
@@ -397,6 +444,56 @@ class SSHConnection:
         #: Commands issued, so a test can assert a round-trip budget rather than
         #: a reviewer having to count call sites.
         self.commands: list[list[str]] = []
+        #: What the last command learned about whether this host is there. A
+        #: host the operator switched off is a *third* state, distinct from
+        #: reachable and from unreachable: nothing has been attempted and
+        #: nothing should be.
+        self._reach = Reachability(
+            state="connected" if host.enabled else "disabled"
+        )
+
+    # --- reachability -------------------------------------------------------
+
+    @property
+    def reachability(self) -> Reachability:
+        """The last observed state. Cheap by construction: it never probes."""
+
+        return self._reach
+
+    def note_success(self) -> None:
+        """A command worked, so whatever was wrong is not wrong now."""
+
+        if not self._reach.ok:
+            self._reach = Reachability()
+
+    def note_failure(self, reason: str) -> Reachability:
+        """A command failed, with the backoff step that failure earns.
+
+        Attempts accumulate rather than resetting per call site, because the
+        question a reconnect asks is "how long has this host been away", not
+        "how did I most recently find out".
+        """
+
+        attempts = self._reach.attempts + 1
+        self._reach = Reachability(
+            state="unreachable",
+            reason=reason,
+            attempts=attempts,
+            retry_at=time.monotonic() + backoff_for(attempts),
+            exhausted=attempts >= RECONNECT_ATTEMPTS,
+        )
+        return self._reach
+
+    def reset(self) -> None:
+        """Forget the backoff. What ``Ctrl+R`` calls.
+
+        An operator asking for a reload is a reason to try a host *now*: they
+        may well have just fixed the thing that broke it. A disabled host stays
+        disabled, because that is a configuration fact rather than a network one.
+        """
+
+        if self._reach.state != "disabled":
+            self._reach = Reachability()
 
     # --- the socket ---------------------------------------------------------
 
@@ -436,6 +533,12 @@ class SSHConnection:
         ``LogLevel=ERROR`` keeps the client's own chatter out of the framed
         output. What is *absent* is as deliberate: no
         ``StrictHostKeyChecking``, no ``UserKnownHostsFile``, ever.
+
+        ``ConnectTimeout`` is the fourth, and it is what makes a host being down
+        a *fact* rather than a wait. Without it a machine that blackholes packets
+        costs the full :data:`COMMAND_TIMEOUT` before anything can be said about
+        it, which is most of a minute of a pane that looks broken. It weakens no
+        verification; it only bounds how long CLV believes in a silence.
         """
 
         argv = [
@@ -443,6 +546,7 @@ class SSHConnection:
             "-T",
             "-o", "BatchMode=yes",
             "-o", "LogLevel=ERROR",
+            "-o", f"ConnectTimeout={CONNECT_TIMEOUT}",
             "-o", "ControlMaster=auto",
             "-o", f"ControlPath={self.socket}",
             "-o", f"ControlPersist={CONTROL_PERSIST}",
@@ -522,25 +626,37 @@ class SSHConnection:
         runner = self._runner or _run
         try:
             stdout, stderr, returncode = runner(argv, timeout)
-        except SSHError:
+        except SSHError as exc:
+            self.note_failure(_describe_failure(self.host, str(exc), 0))
             raise
         except Exception as exc:  # noqa: BLE001 - an injected runner is test code
-            raise SSHError(f"{self.host.name}: could not run ssh: {exc}") from exc
+            reason = f"{self.host.name}: could not run ssh: {exc}"
+            self.note_failure(reason)
+            raise SSHError(reason) from exc
 
         body, remote_status, complete = _unframe(stdout, self._token)
         if not complete:
+            # The frame never closed, so this is the *transport*: the link, the
+            # host key, the credentials. Recorded as unreachable, because it is.
             raise SSHError(
-                _describe_failure(self.host, stderr, returncode),
+                self.note_failure(
+                    _describe_failure(self.host, stderr, returncode)
+                ).reason,
                 stderr=stderr,
                 returncode=returncode,
             )
         if remote_status:
+            # The frame closed, so the connection is fine and the *command*
+            # failed — a path that cannot be read, a utility the remote does not
+            # have. Emphatically not a reachability problem: reporting it as one
+            # would send the operator to their ssh-agent over a file mode.
+            self.note_success()
             raise SSHError(
-                f"{self.host.name}: remote command exited {remote_status}"
-                + (f": {_first_line(stderr)}" if stderr.strip() else ""),
+                _describe_remote_failure(self.host, stderr, remote_status),
                 stderr=stderr,
                 returncode=remote_status,
             )
+        self.note_success()
         return body
 
     def stream(self, script: str, *, separator: bytes) -> Iterator[bytes]:
@@ -565,15 +681,32 @@ class SSHConnection:
 
         argv = self.command(script)
         self.commands.append(argv)
+        # stderr is a pipe rather than ``DEVNULL`` so a stream that died has an
+        # explanation. It is only ever read on the failure path, and the remote
+        # side already has its own ``2>/dev/null``, so what can arrive here is
+        # ``ssh``'s own chatter — which ``LogLevel=ERROR`` keeps to a line or
+        # two, well inside the pipe buffer.
         process = self._spawn(
             argv,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=False,
             env=child_environment(),
         )
         try:
             yield from _stream_records(process.stdout, self._token, separator)
+        except SSHError:
+            # The stream stopped before its closing sentinel. That is a *short
+            # tree*, and the whole reason this is not swallowed here: a walk
+            # that quietly returns half a filesystem is a host disappearing
+            # without saying so.
+            raise SSHError(
+                self.note_failure(
+                    _describe_failure(self.host, _stderr_text(process), 0)
+                ).reason
+            ) from None
+        else:
+            self.note_success()
         finally:
             _terminate(process)
 
@@ -589,14 +722,22 @@ class SSHConnection:
 
         argv = self.command(script)
         self.commands.append(argv)
-        process = self._spawn(
-            argv,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=False,
-            env=child_environment(),
-        )
+        try:
+            process = self._spawn(
+                argv,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=False,
+                env=child_environment(),
+            )
+        except OSError as exc:
+            # Spawning failed outright, which is this side's problem rather than
+            # the far side's — but it still leaves the source unfollowable, and
+            # a source that is not being followed has to say so.
+            raise SSHError(
+                self.note_failure(f"{self.host.name}: could not start ssh: {exc}").reason
+            ) from exc
         # **Both** streams, not just stdout. `tail` writes its rotation
         # diagnostic to stderr, and a blocking read of an empty stderr on the
         # event loop is the same freeze this whole design exists to avoid — the
@@ -811,6 +952,14 @@ def _stream_records(
     for a ``find`` over the whole filesystem. The sentinels are always
     newline-terminated even when the records are NUL-terminated, which is what
     lets a GNU walk survive a newline inside a filename.
+
+    **Reaching the closing sentinel is checked, not assumed**, and that is the
+    difference between a root with three files in it and a root whose walk was
+    cut off after three. :func:`_unframe` has always drawn that distinction for a
+    one-shot command; a stream that ended early used to look exactly like one
+    that finished, which is how a dropped link silently shrank the tree. A caller
+    that abandons the generator never reaches this — ``GeneratorExit`` unwinds
+    from the ``yield`` — so stopping at ``max_files`` is not a failure.
     """
 
     if stdout is None:
@@ -820,6 +969,7 @@ def _stream_records(
     end = f"__clv_{token}_end".encode()
     buffer = b""
     started = False
+    complete = False
 
     while True:
         chunk = stdout.read(65536)
@@ -852,8 +1002,19 @@ def _stream_records(
 
     if started and buffer.strip() and not buffer.startswith(end):
         for trailing in buffer.split(separator):
-            if trailing.strip() and not trailing.startswith(end):
+            if trailing.startswith(end):
+                complete = True
+                continue
+            if trailing.strip():
                 yield trailing
+    elif buffer.startswith(end):
+        # The ordinary GNU exit. Records are NUL-separated while the sentinel is
+        # newline-terminated, so the closing frame is what is left in the buffer
+        # after the last record rather than a record in its own right.
+        complete = True
+
+    if not complete:
+        raise SSHError("the remote command stopped before its closing marker")
 
 
 def _terminate(process: Any) -> None:
@@ -921,8 +1082,37 @@ _FAILURE_HINTS: tuple[tuple[str, str], ...] = (
 )
 
 
+#: The *other* table: the connection worked and the command on the far side did
+#: not. Kept apart from :data:`_FAILURE_HINTS` because the instructions are
+#: opposite. ``Permission denied`` above means ``ssh`` refused the key and the
+#: answer is ssh-agent; ``Permission denied`` here means the SSH user cannot read
+#: a file and the answer is group membership or an ACL. One table would report
+#: the second as the first and send the operator to their agent over a file mode.
+_REMOTE_HINTS: tuple[tuple[str, str], ...] = (
+    (
+        "not found",
+        "the remote is missing a utility CLV needs. It reads logs with find, "
+        "stat, tail, head and od; a container image without them cannot be "
+        "read from.",
+    ),
+    (
+        "permission denied",
+        "the SSH user cannot read that path. Add the user to a group that can "
+        "(adm, systemd-journal) or set an ACL on the file. CLV never uses sudo.",
+    ),
+    (
+        "no such file or directory",
+        "the path is not there on that host.",
+    ),
+)
+
+
 def _describe_failure(host: RemoteHost, stderr: str, returncode: int) -> str:
-    """Name the host, say what happened, and say what to do about it."""
+    """Name the host, say what happened, and say what to do about it.
+
+    The **transport** half. Everything here is a reason CLV could not talk to
+    the machine at all, which is what makes it a reachability answer.
+    """
 
     lowered = stderr.lower()
     for fragment, hint in _FAILURE_HINTS:
@@ -935,6 +1125,51 @@ def _describe_failure(host: RemoteHost, stderr: str, returncode: int) -> str:
         f"{host.name} ({host.host}): the connection produced no output "
         f"(ssh exited {returncode})."
     )
+
+
+def _describe_remote_failure(host: RemoteHost, stderr: str, status: int) -> str:
+    """The **command** half: the host answered, and said no.
+
+    The remote's own stderr is quoted rather than summarised, because it names
+    the path — which is the one thing this side cannot supply, since a script
+    may touch several.
+    """
+
+    lowered = stderr.lower()
+    detail = _first_line(stderr)
+    for fragment, hint in _REMOTE_HINTS:
+        if fragment in lowered:
+            said = f" The remote said: {detail}" if detail else ""
+            return f"{host.name}: {hint}{said}"
+    if detail:
+        return f"{host.name}: the remote command failed: {detail}"
+    return f"{host.name}: the remote command exited {status}."
+
+
+def _stderr_text(process: Any) -> str:
+    """Whatever a finished process left on stderr, without ever blocking on it.
+
+    Read only when something already went wrong, and non-blocking regardless: a
+    blocking read of an empty stderr is the same freeze this module is built to
+    avoid, in the one place it would be hardest to attribute.
+    """
+
+    stream = getattr(process, "stderr", None)
+    if stream is None:
+        return ""
+    try:
+        os.set_blocking(stream.fileno(), False)
+    except (OSError, AttributeError, ValueError):
+        pass
+    try:
+        data = stream.read()
+    except (BlockingIOError, ValueError, OSError):
+        return ""
+    if not data:
+        return ""
+    if isinstance(data, bytes):
+        return data.decode("utf-8", errors="replace")
+    return str(data)
 
 
 def _first_line(text: str) -> str:
@@ -1282,6 +1517,18 @@ class RemoteBackend:
         info = self.stat(ref)
         return None if info is None else info.identity
 
+    @cheap
+    def reachability(self) -> Reachability:
+        """What the last command learned about this host. **Never probes.**
+
+        Unlike :meth:`stat` there is no version of this that could go to the
+        wire even from a worker: the honest answer to "can I reach this host" is
+        the one the last attempt produced, and a fresh probe here would mean the
+        status line opening connections as it renders.
+        """
+
+        return self._connection.reachability
+
     # --- may block ----------------------------------------------------------
 
     @blocking
@@ -1526,18 +1773,24 @@ class RemoteBackend:
         )
 
     def note_follow_failure(self, ref: SourceRef, exc: BaseException) -> None:
-        """A follow could not be started. Recorded, never raised.
+        """A follow died or could not be started. Recorded, never raised.
 
         The bounded read has already succeeded by the time this can happen, so
         the operator has their log; what failed is only liveness. Turning that
         into an exception would make a readable source unopenable over
         something that costs a refresh key.
 
-        Phase 5 owns turning this into something the pane says. Until then it is
-        kept rather than discarded, so the reason exists to be reported.
+        **It reaches the connection's reachability**, which is what makes it
+        something the pane says rather than a list nobody reads: a source whose
+        follow is dead is not being tailed, and a pane that has stopped updating
+        with no explanation is the outcome this whole phase exists to prevent.
+        The primed content stays on screen; what changes is that the status line
+        stops claiming it is live.
         """
 
-        self.follow_errors.append((ref, str(exc)))
+        reason = str(exc)
+        self.follow_errors.append((ref, reason))
+        self._connection.note_failure(reason)
 
     # --- the window cache ---------------------------------------------------
 
@@ -1826,6 +2079,12 @@ _REMOTE_BLOCKING = blocking_methods(RemoteBackend)
 #: spelling means lines keep flowing from the new file with no reload notice,
 #: never that lines are lost. Requirement 2 is not at risk here; only the
 #: redraw is.
+#: Bytes of a follow's stderr kept at once. A follow can live for hours, so this
+#: is bounded — and it is the *tail* that is kept, because what explains a dead
+#: connection is the last thing said before it died.
+_STDERR_KEPT = 4096
+
+
 _ROTATION_NOTICES: tuple[str, ...] = (
     "has appeared",              # GNU: "...has appeared;  following new file"
     "following new file",
@@ -1894,6 +2153,15 @@ class RemoteFollowReader:
         #: Set when the closing sentinel arrives: the remote command has ended,
         #: whether because `tail` exited or because the link went.
         self._finished = False
+        #: What `tail` and `ssh` said on stderr, kept rather than only scanned
+        #: for rotation wording. When the follow dies this is the only evidence
+        #: of *why*, and "why" is the difference between a message an operator
+        #: can act on and one that says something went wrong.
+        self._stderr = ""
+        #: Reported once, then not again. A follow that ended produces the same
+        #: verdict on every subsequent poll, and a toast twice a second is a
+        #: worse failure mode than the silence this replaces.
+        self._reported = False
 
     @property
     def offset(self) -> int:
@@ -1968,6 +2236,8 @@ class RemoteFollowReader:
         self._started = False
         self._banner = b""
         self._finished = False
+        self._stderr = ""
+        self._reported = False
 
         try:
             self._process = self._backend.connection.follow(self.command())
@@ -1989,10 +2259,24 @@ class RemoteFollowReader:
             # `tail` exited. Draining once more catches what it wrote on the
             # way out; re-running it every tick would be the fork bomb with a
             # nice name that `journald` names in its own poll.
+            #
+            # **This is the branch that used to go quiet.** Before Phase 5 it
+            # closed the reader and returned an ordinary empty read, which is
+            # indistinguishable from a log that has nothing new to say — so a
+            # dropped link rendered as a source that had simply stopped. The
+            # verdict is now carried out in band, once.
+            returncode = self._process.poll() or 0
             lines = self._drain()
             rotated, self._rotated = self._rotated, False
+            problem = "" if self._reported else self._explain(returncode)
+            self._reported = True
             self.close()
-            return TailRead(lines=lines, offset=self._offset, rotated=rotated)
+            return TailRead(
+                lines=lines,
+                offset=self._offset,
+                rotated=rotated,
+                problem=problem,
+            )
 
         lines = self._drain()
         rotated, self._rotated = self._rotated, False
@@ -2008,6 +2292,60 @@ class RemoteFollowReader:
                 rotated=True,
             )
         return TailRead(lines=lines, offset=self._offset)
+
+    def _explain(self, returncode: int) -> str:
+        """Why the follow ended, in the operator's terms, and record it.
+
+        Two different endings, and they are not the same fact. A **closed frame**
+        means the remote shell ran to completion and printed its sentinel: the
+        connection was fine and ``tail`` stopped, which is what a deleted file
+        looks like. **No closing frame** means the far side never got to say
+        goodbye, which is a dropped link — and is the one the reconnect exists
+        for. Both leave a pane that is no longer updating, so both are said.
+        """
+
+        host = self._backend.connection.host
+        if self._finished:
+            reason = (
+                f"{host.name}: the remote tail stopped following {self.path.name}. "
+                "The file may have been removed."
+            )
+        else:
+            reason = _describe_failure(host, self._stderr, returncode)
+        # Through the backend rather than straight at the connection, so a
+        # follow that died and one that never started leave the same trace and
+        # the status line has one thing to read.
+        self._backend.note_follow_failure(self.path, SSHError(reason))
+        return reason
+
+    # --- reconnecting -------------------------------------------------------
+
+    def resume(self) -> None:
+        """Start following again from where the last one stopped. **Blocks.**
+
+        Worker-driven, like every other round trip here — and deliberately *not*
+        a re-prime. ``SourceBuffer.prime`` clears the buffer before refilling it,
+        so reconnecting through it would throw away everything the operator had
+        on screen in order to re-fetch most of it across the link that just came
+        back. Resuming at :attr:`offset` costs one command, delivers no line
+        twice, and leaves the pane exactly as it was with new lines appended.
+
+        The state that has to be reset is the *framing* state, not the read
+        state: a new connection means a new banner to skip past and a new
+        closing sentinel to watch for. What must **survive** is the offset and
+        the two remainders — a half-line and a half-character were already
+        counted into the offset, so the resumed stream continues them exactly,
+        and clearing them here would drop a line at the seam.
+        """
+
+        self.close()
+        self._rotated = False
+        self._started = False
+        self._banner = b""
+        self._finished = False
+        self._stderr = ""
+        self._reported = False
+        self._process = self._backend.connection.follow(self.command())
 
     # --- draining -----------------------------------------------------------
 
@@ -2104,7 +2442,13 @@ class RemoteFollowReader:
         return remainder
 
     def _check_stderr(self) -> None:
-        """Look for ``tail``'s own rotation diagnostic. Never blocks."""
+        """Look for ``tail``'s own rotation diagnostic, and keep the rest.
+
+        Never blocks. The text is accumulated rather than examined and dropped,
+        because the same stream carries both the benign diagnostic and the
+        explanation of a dead connection, and which one it was is not known
+        until the process is found to have gone.
+        """
 
         stderr = getattr(self._process, "stderr", None)
         if stderr is None:
@@ -2117,6 +2461,10 @@ class RemoteFollowReader:
             return
         if isinstance(chunk, bytes):
             chunk = chunk.decode("utf-8", errors="replace")
+        # Bounded: a follow can live for hours and a remote that chatters must
+        # not become a leak. The tail is what matters — the last thing said
+        # before it died.
+        self._stderr = (self._stderr + chunk)[-_STDERR_KEPT:]
         lowered = chunk.lower()
         if any(notice in lowered for notice in _ROTATION_NOTICES):
             self._rotated = True
@@ -2214,6 +2562,44 @@ class RemoteResolver:
             )
             self._backends[ref.node] = backend
         return backend
+
+    def reconcile(self, hosts: Sequence[RemoteHost]) -> tuple[list[str], list[str]]:
+        """Adopt a re-read configuration without dropping working connections.
+
+        Returns ``(kept, closed)`` by host name, so a reload can say what it
+        actually did.
+
+        A reload used to close **every** multiplex master and open them again,
+        which meant a full handshake per host on every ``Ctrl+R`` — over five
+        connections that is most of the wait, and all of it wasted on hosts
+        whose settings had not moved. A connection belongs to the configuration
+        that named it, so what has to go is a connection whose host record
+        *changed* or which the new configuration no longer names. Everything
+        else is still valid and still authenticated.
+
+        A host that was **unreachable** is reset rather than closed: pressing
+        reload is an operator saying "try again now", and they may well have
+        just fixed the thing that broke it. Making them wait out a backoff they
+        explicitly interrupted would be the wrong answer to the one gesture that
+        means impatience.
+        """
+
+        replacement = {host.name: host for host in hosts}
+        kept: list[str] = []
+        closed: list[str] = []
+
+        for name, backend in list(self._backends.items()):
+            host = replacement.get(name)
+            if host is None or host != backend.connection.host:
+                backend.connection.close()
+                self._backends.pop(name, None)
+                closed.append(name)
+                continue
+            backend.connection.reset()
+            kept.append(name)
+
+        self._hosts = replacement
+        return kept, closed
 
     def close(self) -> None:
         """Tear down every multiplex master this resolver opened."""

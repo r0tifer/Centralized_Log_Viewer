@@ -50,7 +50,9 @@ from clv.plugins.sources.ssh import (
 )
 from clv.services.backend import (
     LOCAL,
+    RECONNECT_ATTEMPTS,
     ClassifyRequest,
+    backoff_for,
     blocking_methods,
     cheap_only,
     PROTOCOL_METHODS,
@@ -58,7 +60,7 @@ from clv.services.backend import (
 from clv.services.config import RemoteHost
 from clv.services.discovery import DiscoverySettings, discover
 from clv.services.reader import SourceReader, open_reader
-from clv.services.refs import RemoteRef
+from clv.services.refs import RemoteRef, ref_key
 from clv.services.session import SourceBuffer
 
 from test_backend import BackendContract, Workspace
@@ -1567,7 +1569,11 @@ def test_the_remote_backend_implements_every_protocol_method() -> None:
 
     declared = blocking_methods(RemoteBackend)
 
-    assert declared == frozenset(PROTOCOL_METHODS) - {"stat", "identity"}
+    assert declared == frozenset(PROTOCOL_METHODS) - {
+        "stat",
+        "identity",
+        "reachability",
+    }
     for name in PROTOCOL_METHODS:
         assert callable(getattr(RemoteBackend, name, None)), name
 
@@ -2053,3 +2059,965 @@ def test_per_host_budgets_are_applied_and_named(tmp_path: Path) -> None:
 
     report = DiscoveryReport(truncated=True, truncated_roots=[RemoteRef.build("web01", "/var/log")])
     assert "Reached its file limit: ssh:web01/var/log" in report.summary_lines()
+
+
+# ==========================================================================
+# Reachability — the phase that exists for a pane that went quiet
+# ==========================================================================
+#
+# The hazard is a deliberate existing behaviour: `SourceBuffer.poll` swallows
+# `OSError` because a source that vanished mid-session is not worth taking the
+# pane down for. Exactly right for a rotated local file, exactly wrong for a
+# dropped SSH connection — where it renders as a log that simply stopped.
+
+
+@pytest.mark.parametrize(
+    ("stderr", "status", "fragment", "forbidden"),
+    [
+        (
+            "/bin/sh: find: not found",
+            127,
+            "missing a utility",
+            "ssh-agent",
+        ),
+        (
+            "tail: /var/log/secure: Permission denied",
+            1,
+            "Add the user to a group",
+            "ssh-agent",
+        ),
+        (
+            "stat: /var/log/nope: No such file or directory",
+            1,
+            "not there on that host",
+            "ssh-agent",
+        ),
+    ],
+)
+def test_a_failing_remote_command_is_not_reported_as_an_auth_failure(
+    stderr: str, status: int, fragment: str, forbidden: str
+) -> None:
+    """The second hint table, and why there has to be one.
+
+    `Permission denied` means two completely different things depending on which
+    side said it. From ``ssh`` it means the key was refused and the answer is
+    ssh-agent; from the remote shell it means the SSH user cannot read a file and
+    the answer is a group or an ACL. One table would report the second as the
+    first and send the operator to their agent for an hour over a file mode.
+    """
+
+    connection = SSHConnection(
+        HOST, runner=fixture_runner(stderr=stderr, returncode=status), socket_dir="/tmp"
+    )
+
+    with pytest.raises(SSHError) as caught:
+        connection.run("find /var/log")
+
+    message = str(caught.value)
+    assert fragment in message
+    assert "web01" in message
+    assert forbidden not in message
+    # The command failed; the *host* answered. Reporting this as unreachable
+    # would start a reconnect against a connection that is working perfectly.
+    assert connection.reachability.ok
+
+
+def test_a_transport_failure_is_recorded_as_unreachable_with_a_backoff() -> None:
+    """A frame that never closed is the link, and the link is reachability."""
+
+    def refused(argv, timeout):
+        return b"", "connect to host web01 port 22: Connection refused", 255
+
+    connection = SSHConnection(HOST, runner=refused, socket_dir="/tmp")
+    assert connection.reachability.ok
+
+    with pytest.raises(SSHError):
+        connection.run("echo hi")
+
+    state = connection.reachability
+    assert state.state == "unreachable"
+    assert "nothing is listening" in state.reason
+    assert state.attempts == 1
+    assert not state.exhausted
+    # A deadline in the future, so nothing retries on the next tick.
+    assert not state.may_attempt(time.monotonic())
+
+
+def test_the_backoff_is_bounded_rather_than_one_attempt_per_tick() -> None:
+    """N failures produce N *bounded* attempts, and then it stops.
+
+    The requirement this pins is negative: a reconnect driven from the poll tick
+    would be `refresh_hz` connection attempts a second at a host that is down —
+    the fork bomb with a nice name that `journald` names in its own poll. Each
+    failure has to buy a longer wait, and the schedule has to end.
+    """
+
+    def refused(argv, timeout):
+        return b"", "connect to host web01 port 22: Connection refused", 255
+
+    connection = SSHConnection(HOST, runner=refused, socket_dir="/tmp")
+
+    waits = []
+    for expected in range(1, RECONNECT_ATTEMPTS + 1):
+        before = time.monotonic()
+        with pytest.raises(SSHError):
+            connection.run("echo hi")
+        state = connection.reachability
+        assert state.attempts == expected
+        waits.append(round(state.retry_at - before))
+
+    assert waits == [backoff_for(n) for n in range(1, RECONNECT_ATTEMPTS + 1)]
+    assert waits == sorted(waits), "each failure must buy a longer wait"
+    assert connection.reachability.exhausted
+    # Spent: nothing further is attempted automatically, at any time.
+    assert not connection.reachability.may_attempt(time.monotonic() + 10_000)
+
+
+def test_a_working_command_clears_a_previous_failure() -> None:
+    """A host that came back is not still down. Recovery needs no gesture."""
+
+    outcomes = iter(
+        [
+            (b"", "connect to host web01 port 22: Connection refused", 255),
+            None,
+        ]
+    )
+    canned = fixture_runner("ok")
+
+    def flaky(argv, timeout):
+        nxt = next(outcomes, None)
+        return canned(argv, timeout) if nxt is None else nxt
+
+    connection = SSHConnection(HOST, runner=flaky, socket_dir="/tmp")
+    with pytest.raises(SSHError):
+        connection.run("echo hi")
+    assert not connection.reachability.ok
+
+    assert connection.run("echo hi").strip() == "ok"
+    assert connection.reachability.ok
+    assert connection.reachability.attempts == 0
+
+
+def test_a_reload_forgets_the_backoff_because_asking_is_a_reason_to_try() -> None:
+    """`Ctrl+R` means "try now", and waiting out an interrupted backoff is rude."""
+
+    def refused(argv, timeout):
+        return b"", "connect to host web01 port 22: Connection refused", 255
+
+    connection = SSHConnection(HOST, runner=refused, socket_dir="/tmp")
+    with pytest.raises(SSHError):
+        connection.run("echo hi")
+    assert not connection.reachability.may_attempt(time.monotonic())
+
+    connection.reset()
+
+    assert connection.reachability.ok
+    assert connection.reachability.may_attempt(time.monotonic())
+
+
+def test_a_disabled_host_is_a_third_state_and_never_attempted() -> None:
+    """Off is not down. Nothing is spawned for a host the operator switched off."""
+
+    connection = SSHConnection(
+        RemoteHost(name="db02", host="db02.internal", enabled=False),
+        runner=fixture_runner(),
+        socket_dir="/tmp",
+    )
+
+    state = connection.reachability
+    assert state.state == "disabled"
+    assert not state.may_attempt(time.monotonic())
+    # And a reload does not quietly turn it back on.
+    connection.reset()
+    assert connection.reachability.state == "disabled"
+
+
+def test_reachability_is_cheap_and_answers_under_the_poll_guard() -> None:
+    """Requirement 3, extended to the new member.
+
+    The status line reads this on every render and the log pane on every empty
+    result. A version that probed would be the frozen UI in a new place, so this
+    asserts the strong form: not "fast", but *no command at all*.
+    """
+
+    runner = fixture_runner()
+    connection = SSHConnection(HOST, runner=runner, socket_dir="/tmp")
+    backend = RemoteBackend(connection)
+
+    with cheap_only():
+        assert backend.reachability().ok
+        assert LOCAL.reachability().ok
+
+    assert runner.calls == []
+
+
+@needs_shell
+def test_a_walk_that_drops_mid_stream_is_a_short_tree_not_a_quiet_one(
+    tmp_path: Path,
+) -> None:
+    """The named phase-5 hazard, as a test.
+
+    A remote walk yields nothing when its link goes, exactly as a local one does
+    when a directory will not list — so from inside the walk they are the same
+    event. What must differ is what the *report* says: a host that went away
+    cannot be allowed to shrink the tree in silence.
+    """
+
+    root = tmp_path / "logs"
+    root.mkdir()
+    (root / "syslog").write_text("hello\n", encoding="utf-8")
+
+    run, spawn = shell_transport()
+
+    def truncating_spawn(argv, **kwargs):
+        # A `find` whose output stops before the closing sentinel: a connection
+        # that died part way through enumerating the tree.
+        kwargs.pop("env", None)
+        kwargs.pop("text", None)
+        script = _script_of(argv)
+        marker = script.split(None, 2)[2].split(";")[0].strip()
+        return subprocess.Popen(
+            ["/bin/sh", "-c", f"printf '%s\\n' {marker}; printf 'partial'"],
+            **kwargs,
+        )
+
+    connection = SSHConnection(
+        HOST, runner=run, spawn=truncating_spawn, socket_dir=str(tmp_path)
+    )
+    backend = RemoteBackend(connection)
+    ref = RemoteRef.build(HOST.name, str(root))
+
+    # The walk still yields nothing and still does not raise -- `LocalBackend`
+    # behaves identically and the protocol says so.
+    assert list(backend.walk(ref)) == []
+    # What is new: the backend now knows, so the caller can report it.
+    assert not backend.reachability().ok
+    assert "web01" in backend.reachability().reason
+
+
+@needs_shell
+def test_a_complete_walk_leaves_the_host_reachable(tmp_path: Path) -> None:
+    """The other direction, so the check above cannot pass by always failing."""
+
+    root = tmp_path / "logs"
+    root.mkdir()
+    (root / "syslog").write_text("hello\n", encoding="utf-8")
+
+    run, spawn = shell_transport()
+    backend = RemoteBackend(
+        SSHConnection(HOST, runner=run, spawn=spawn, socket_dir=str(tmp_path))
+    )
+    ref = RemoteRef.build(HOST.name, str(root))
+
+    assert [entry.ref.name for entry in backend.walk(ref)] == ["syslog"]
+    assert backend.reachability().ok
+
+
+@needs_shell
+def test_a_mid_session_drop_produces_a_notice_rather_than_silence(
+    tmp_path: Path,
+) -> None:
+    """**The regression this phase exists for.**
+
+    Before Phase 5 the branch below closed the reader and returned an ordinary
+    empty read — indistinguishable from a log with nothing new to say. A pane
+    that goes quiet because the link dropped is Requirement 7's single worst
+    outcome, and it looked exactly like a pane that was up to date.
+    """
+
+    log = tmp_path / "syslog"
+    log.write_text("line 0\n", encoding="utf-8")
+    connection, backend, reader = _follow(tmp_path, log)
+    try:
+        assert reader.prime().lines == ["line 0"]
+        # An ordinary quiet poll says nothing, which is what must stay true.
+        assert reader.poll().problem == ""
+
+        # The link goes. Killing the local process is what a dropped connection
+        # looks like from this side.
+        reader._process.kill()
+        reader._process.wait(timeout=5)
+
+        for _ in range(100):
+            result = reader.poll()
+            if result.problem:
+                break
+            time.sleep(0.05)
+
+        assert result.problem, "a dropped follow must say so"
+        assert "web01" in result.problem
+        # And the backend agrees, so the status line has something to show for
+        # as long as it lasts rather than only at the instant it happened.
+        assert not backend.reachability().ok
+    finally:
+        reader.close()
+
+
+@needs_shell
+def test_a_stoppage_is_reported_once_not_on_every_tick(tmp_path: Path) -> None:
+    """A toast twice a second is a worse failure than the silence it replaces."""
+
+    log = tmp_path / "syslog"
+    log.write_text("line 0\n", encoding="utf-8")
+    _connection, _backend, reader = _follow(tmp_path, log)
+    try:
+        reader.prime()
+        reader._process.kill()
+        reader._process.wait(timeout=5)
+
+        problems = []
+        for _ in range(20):
+            problems.append(reader.poll().problem)
+            time.sleep(0.02)
+
+        assert len([problem for problem in problems if problem]) == 1
+    finally:
+        reader.close()
+
+
+@needs_shell
+def test_a_recovered_source_resumes_without_losing_its_buffer(
+    tmp_path: Path,
+) -> None:
+    """Reconnecting must not cost the operator what was already on screen.
+
+    This is why reconnection is `resume()` and not a re-prime: `SourceBuffer.
+    prime` clears the buffer before refilling it, so going back through it would
+    throw away everything visible in order to re-fetch most of it over the link
+    that has only just come back. Resuming at the stored offset delivers no line
+    twice and skips none.
+    """
+
+    log = tmp_path / "syslog"
+    log.write_text("line 0\n", encoding="utf-8")
+    _connection, _backend, reader = _follow(tmp_path, log)
+    buffer = SourceBuffer(reader.path, max_lines=100, reader=reader)
+    try:
+        buffer.prime()
+        assert [entry.message for entry in buffer.entries] == ["line 0"]
+        offset_before = reader.offset
+
+        reader._process.kill()
+        reader._process.wait(timeout=5)
+        for _ in range(100):
+            if buffer.poll().problem:
+                break
+            time.sleep(0.05)
+
+        # Lines written while the link was down are not lost either: the resumed
+        # follow starts at the byte the last one stopped at.
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write("line 1\n")
+            handle.flush()
+
+        reader.resume()
+        assert reader.offset == offset_before
+
+        for _ in range(100):
+            buffer.poll()
+            if len(buffer.entries) >= 2:
+                break
+            time.sleep(0.05)
+
+        assert [entry.message for entry in buffer.entries] == ["line 0", "line 1"]
+    finally:
+        reader.close()
+
+
+@needs_shell
+def test_resuming_delivers_no_line_twice(tmp_path: Path) -> None:
+    """Requirement 2, across a reconnection: not one line more, not one less."""
+
+    log = tmp_path / "syslog"
+    log.write_text("".join(f"line {n}\n" for n in range(5)), encoding="utf-8")
+    _connection, _backend, reader = _follow(tmp_path, log)
+    try:
+        assert len(reader.prime().lines) == 5
+        reader._process.kill()
+        reader._process.wait(timeout=5)
+        for _ in range(100):
+            if reader.poll().problem:
+                break
+            time.sleep(0.05)
+
+        reader.resume()
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write("line 5\n")
+            handle.flush()
+
+        assert _drain_until(reader, 1) == ["line 5"]
+    finally:
+        reader.close()
+
+
+def test_a_follow_that_never_started_leaves_the_host_marked_unreachable() -> None:
+    """4a kept the reason in a list. Phase 5 is where it becomes visible.
+
+    A bounded read that worked followed by a follow that did not is a *readable*
+    source that is not live, and the pane must stop claiming otherwise.
+    """
+
+    connection = SSHConnection(HOST, runner=fixture_runner(), socket_dir="/tmp")
+    backend = RemoteBackend(connection)
+    ref = RemoteRef.build(HOST.name, "/var/log/syslog")
+
+    backend.note_follow_failure(ref, OSError("web01: could not start ssh"))
+
+    assert backend.follow_errors == [(ref, "web01: could not start ssh")]
+    assert not backend.reachability().ok
+    assert "web01" in backend.reachability().reason
+
+
+# --- discovery reports it, so a down host does not shrink the tree ---------
+
+
+@needs_shell
+def test_an_unreachable_host_is_named_rather_than_missing(tmp_path: Path) -> None:
+    """Requirement 7: a host that is down must read differently from one with
+    no matching files. Both produce an empty branch; only one is a problem."""
+
+    def refused(argv, timeout):
+        return b"", "ssh: Could not resolve hostname web01", 255
+
+    connection = SSHConnection(HOST, runner=refused, socket_dir=str(tmp_path))
+    backend = RemoteBackend(connection)
+
+    class OneHost:
+        def for_ref(self, ref):
+            return backend
+
+    root = RemoteRef.build(HOST.name, "/var/log")
+    report = discover([root], DiscoverySettings(), backends=OneHost())
+
+    assert report.unreadable_roots == [root]
+    assert "does not resolve" in report.root_reasons[root]
+    summary = "\n".join(report.summary_lines())
+    assert "Could not read source: ssh:web01/var/log" in summary
+    assert "does not resolve" in summary
+
+
+def test_a_local_root_that_is_simply_absent_gains_no_invented_reason(
+    tmp_path: Path,
+) -> None:
+    """The other side of the same rule: a missing local path is not a network
+    problem and must not be dressed up as one."""
+
+    missing = tmp_path / "nope"
+    report = discover([missing], DiscoverySettings())
+
+    assert report.unreadable_roots == [missing]
+    assert report.root_reasons == {}
+    assert "Could not read source: " in "\n".join(report.summary_lines())
+
+
+# --- the resolver keeps what still works ----------------------------------
+
+
+def test_a_reload_keeps_a_connection_whose_host_did_not_change(
+    tmp_path: Path,
+) -> None:
+    """`Ctrl+R` used to close every master and pay a full handshake per host.
+
+    Over five connections that is most of the wait, and all of it spent on hosts
+    whose settings had not moved.
+    """
+
+    resolver = RemoteResolver(
+        [HOST], local=LOCAL, runner=fixture_runner(), socket_dir=str(tmp_path)
+    )
+    backend = resolver.for_ref(RemoteRef.build("web01", "/var/log"))
+
+    kept, closed = resolver.reconcile([HOST])
+
+    assert (kept, closed) == (["web01"], [])
+    assert resolver.for_ref(RemoteRef.build("web01", "/var/log")) is backend
+
+
+def test_a_reload_drops_a_connection_whose_host_was_edited(tmp_path: Path) -> None:
+    """A connection belongs to the configuration that named it."""
+
+    resolver = RemoteResolver(
+        [HOST], local=LOCAL, runner=fixture_runner(), socket_dir=str(tmp_path)
+    )
+    backend = resolver.for_ref(RemoteRef.build("web01", "/var/log"))
+    moved = RemoteHost(name="web01", host="web01.dr.internal", user="ops", port=22)
+
+    kept, closed = resolver.reconcile([moved])
+
+    assert (kept, closed) == ([], ["web01"])
+    assert resolver.for_ref(RemoteRef.build("web01", "/var/log")) is not backend
+
+
+def test_a_reload_drops_a_connection_the_config_no_longer_names(
+    tmp_path: Path,
+) -> None:
+    """A host that was removed must not keep a live authenticated socket open."""
+
+    resolver = RemoteResolver(
+        [HOST], local=LOCAL, runner=fixture_runner(), socket_dir=str(tmp_path)
+    )
+    resolver.for_ref(RemoteRef.build("web01", "/var/log"))
+
+    kept, closed = resolver.reconcile([])
+
+    assert (kept, closed) == ([], ["web01"])
+    assert resolver.backends == {}
+
+
+def test_a_reload_resets_the_backoff_on_a_host_that_was_down(
+    tmp_path: Path,
+) -> None:
+    """The gesture that means impatience must not be answered with a wait."""
+
+    def refused(argv, timeout):
+        return b"", "connect to host web01 port 22: Connection refused", 255
+
+    resolver = RemoteResolver(
+        [HOST], local=LOCAL, runner=refused, socket_dir=str(tmp_path)
+    )
+    backend = resolver.for_ref(RemoteRef.build("web01", "/var/log"))
+    with pytest.raises(SSHError):
+        backend.connection.run("echo hi")
+    assert not backend.reachability().ok
+
+    resolver.reconcile([HOST])
+
+    assert backend.reachability().ok
+
+
+# --- the flag that makes a down host a fact rather than a wait -------------
+
+
+def test_every_argv_bounds_the_connect_it_is_waiting_on() -> None:
+    """Without this a blackholed host costs the whole command timeout.
+
+    Most of a minute of a pane that looks broken, when the answer was knowable in
+    ten seconds. It weakens no verification — it only bounds how long CLV
+    believes in a silence.
+    """
+
+    connection = SSHConnection(HOST, runner=fixture_runner(), socket_dir="/tmp")
+    argv = connection.base_argv()
+
+    assert f"ConnectTimeout={ssh.CONNECT_TIMEOUT}" in argv
+    assert ssh.CONNECT_TIMEOUT < ssh.COMMAND_TIMEOUT
+    # And the security posture is unchanged by the addition.
+    joined = " ".join(argv)
+    assert "StrictHostKeyChecking" not in joined
+    assert "UserKnownHostsFile" not in joined
+
+
+# ==========================================================================
+# The app: a host being down costs the local tree nothing
+# ==========================================================================
+
+
+def _down_runner(delay: float = 0.0):
+    """A runner for a host that is not answering, optionally slowly.
+
+    The delay is what makes the ordering assertions mean something: a host that
+    fails instantly cannot demonstrate that the local tree did not wait for it.
+    """
+
+    def refused(argv, timeout):
+        if delay:
+            time.sleep(delay)
+        return b"", "connect to host web01 port 22: Connection refused", 255
+
+    return refused
+
+
+def _settings_with_a_host(root: Path) -> str:
+    return (
+        "[log_viewer]\n"
+        f"log_dirs = {root}\n"
+        "enable_ssh = true\n"
+        "\n[ssh:web01]\n"
+        "host = web01.internal\n"
+        "user = ops\n"
+        "log_dirs = /var/log\n"
+    )
+
+
+def _app_with_a_down_host(tmp_path: Path, *, delay: float = 0.0):
+    """A configured app whose one host refuses, wired to fakes rather than ssh."""
+
+    from clv.app import LogViewerApp
+    from clv.services.config import load_config, user_config_path
+
+    root = tmp_path / "local"
+    root.mkdir()
+    (root / "app.log").write_text("2026-08-11 10:00:00 - INFO - local\n", encoding="utf-8")
+
+    settings = user_config_path()
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(_settings_with_a_host(root), encoding="utf-8")
+
+    config = load_config()
+    app = LogViewerApp(config=config)
+    app._backends = RemoteResolver(
+        config.hosts,
+        local=LOCAL,
+        runner=_down_runner(delay),
+        socket_dir=str(tmp_path / "sockets"),
+    )
+    return app, root
+
+
+def test_a_host_that_is_down_never_delays_the_local_tree(tmp_path: Path) -> None:
+    """The local tree is built and shown before a host has even answered.
+
+    One pass used to mean every local log waited behind every configured
+    machine's connect timeout — three unreachable hosts and the operator watched
+    an empty panel for a minute for files that were on their own disk.
+
+    Asserted by *holding the host open* rather than by timing anything: the
+    remote walk is blocked on an event this test controls, so "the local tree
+    arrived first" is a fact about ordering rather than a race against a clock.
+    """
+
+    import asyncio
+    import threading
+
+    released = threading.Event()
+    released.set()
+
+    def held(argv, timeout):
+        released.wait(timeout=10)
+        return b"", "connect to host web01 port 22: Connection refused", 255
+
+    from clv.app import LogViewerApp
+    from clv.services.config import load_config, user_config_path
+
+    root = tmp_path / "local"
+    root.mkdir()
+    (root / "app.log").write_text(
+        "2026-08-11 10:00:00 - INFO - local\n", encoding="utf-8"
+    )
+    settings = user_config_path()
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(_settings_with_a_host(root), encoding="utf-8")
+
+    config = load_config()
+    app = LogViewerApp(config=config)
+    app._backends = RemoteResolver(
+        config.hosts, local=LOCAL, runner=held, socket_dir=str(tmp_path / "sockets")
+    )
+
+    installs: list[int] = []
+    original = app._install_report
+
+    async def recording(report):
+        installs.append(report.file_count)
+        await original(report)
+
+    app._install_report = recording  # type: ignore[method-assign]
+
+    async def scenario() -> None:
+        async with app.run_test(size=(150, 40)):
+            from clv.app import remote_roots
+            from clv.services import SourceManager
+
+            app._source_manager = SourceManager(
+                [root, *remote_roots(app._config)], []
+            )
+            # The mount already ran a rescan, which left the host inside its
+            # backoff. Clear it so this pass really does contact the host --
+            # a skipped host would prove nothing about waiting for one.
+            for backend in app._backends.backends.values():
+                backend.connection.reset()
+
+            released.clear()
+            installs.clear()
+            scan = asyncio.ensure_future(app._rescan())
+            try:
+                for _ in range(200):
+                    if installs:
+                        break
+                    await asyncio.sleep(0.02)
+
+                assert installs == [1], (
+                    "the local tree must be built and shown while the host is "
+                    "still being waited on"
+                )
+            finally:
+                released.set()
+                await scan
+
+            # And the host's results are folded in afterwards, in a second pass.
+            assert len(installs) == 2
+
+    asyncio.run(scenario())
+
+
+def test_an_unreachable_host_leaves_the_local_sources_fully_usable(
+    tmp_path: Path,
+) -> None:
+    """Requirement 7 and the startup rule together.
+
+    The host is named as a problem, the local log is still there to open, and
+    neither fact contaminates the other.
+    """
+
+    import asyncio
+
+    app, root = _app_with_a_down_host(tmp_path)
+
+    async def scenario() -> None:
+        async with app.run_test(size=(150, 40)) as pilot:
+            from clv.app import remote_roots
+            from clv.services import SourceManager
+
+            app._source_manager = SourceManager(
+                [root, *remote_roots(app._config)], []
+            )
+            await app._rescan()
+            await pilot.pause()
+
+            report = app._report
+            assert report is not None
+            # The local file is present and openable.
+            assert [item.path.name for item in report.files] == ["app.log"]
+            assert app._select_source(root / "app.log", announce=False) is True
+            assert [e.message for e in app._session.entries] == ["local"]
+
+            # And the host is *named*, not silently absent.
+            summary = "\n".join(report.summary_lines())
+            assert "ssh:web01/var/log" in summary
+            assert "nothing is listening" in summary
+
+    asyncio.run(scenario())
+
+
+def test_a_reload_with_a_host_down_completes_and_refreshes_the_rest(
+    tmp_path: Path,
+) -> None:
+    """`Ctrl+R` must not block on a machine that is not there.
+
+    The second walk is *skipped* rather than retried, because the backoff from
+    the first has not expired — so the reload costs a local walk and nothing
+    else, and still says what it could not refresh.
+    """
+
+    import asyncio
+
+    app, root = _app_with_a_down_host(tmp_path, delay=0.4)
+
+    async def scenario() -> None:
+        async with app.run_test(size=(150, 40)) as pilot:
+            from clv.app import remote_roots
+            from clv.services import SourceManager
+
+            app._source_manager = SourceManager(
+                [root, *remote_roots(app._config)], []
+            )
+            await app._rescan()
+            await pilot.pause()
+            assert not app._backends.for_ref(
+                RemoteRef.build("web01", "/var/log")
+            ).reachability().ok
+
+            # The reload resets the backoff — asking is a reason to try — so
+            # this one *does* attempt the host, once, and no more.
+            connection = app._backends.backends["web01"].connection
+            before = len(connection.commands)
+            started = time.monotonic()
+            await app.action_reload_sources()
+            await pilot.pause()
+            elapsed = time.monotonic() - started
+
+            # One attempt's worth of timeout, not a retry storm.
+            assert elapsed < 4 * 0.4, f"the reload took {elapsed:.2f}s"
+            assert len(connection.commands) - before <= 3
+            # The local sources came back regardless.
+            assert app._report is not None
+            assert [item.path.name for item in app._report.files] == ["app.log"]
+
+    asyncio.run(scenario())
+
+
+def test_a_skipped_host_costs_no_command_at_all(tmp_path: Path) -> None:
+    """A host inside its backoff is reported from what is known, not re-probed.
+
+    Spending a connect timeout to learn again what CLV was told a second ago is
+    the thing that makes a rescan with a dead host feel broken.
+    """
+
+    import asyncio
+
+    app, root = _app_with_a_down_host(tmp_path)
+
+    async def scenario() -> None:
+        async with app.run_test(size=(150, 40)) as pilot:
+            from clv.app import remote_roots
+            from clv.services import SourceManager
+
+            app._source_manager = SourceManager(
+                [root, *remote_roots(app._config)], []
+            )
+            await app._rescan()
+            await pilot.pause()
+
+            connection = app._backends.backends["web01"].connection
+            # Deepen the backoff so the window under test is seconds rather
+            # than the first step's one second, which a rescan can outlast.
+            for _ in range(3):
+                connection.note_failure("web01: still down.")
+            assert not connection.reachability.may_attempt(time.monotonic())
+            before = len(connection.commands)
+
+            await app._rescan()
+            await pilot.pause()
+
+            assert len(connection.commands) == before, (
+                "a host inside its backoff must not be probed again"
+            )
+            # And it is still reported rather than quietly dropped.
+            summary = "\n".join(app._report.summary_lines())
+            assert "ssh:web01/var/log" in summary
+            assert "still down" in summary
+
+    asyncio.run(scenario())
+
+
+@needs_shell
+def test_the_pane_says_a_source_stopped_rather_than_showing_nothing(
+    tmp_path: Path,
+) -> None:
+    """The three channels, end to end, and none of them is a log row.
+
+    `_notify` stopped writing into the pane because copy mode copied what it
+    wrote, so a fabricated "connection lost" line is not an option — it would be
+    a line the source never produced, in the one place CLV promises not to
+    invent one. What the operator gets instead is a toast now, the empty-pane
+    explanation while the pane is empty, and a status-line segment throughout.
+    """
+
+    import asyncio
+
+    from clv.app import LogViewerApp
+
+    log = tmp_path / "syslog"
+    log.write_text("line 0\n", encoding="utf-8")
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            await pilot.pause()
+
+            _connection, backend, reader = _follow(tmp_path, log)
+            ref = reader.path
+            buffer = SourceBuffer(ref, max_lines=100, reader=reader)
+            buffer.prime()
+            app._session.install(buffer)
+            app._backends = RemoteResolver(
+                [HOST], local=LOCAL, runner=fixture_runner(), socket_dir=str(tmp_path)
+            )
+            app._backends._backends["web01"] = backend
+
+            assert app._unreachable_detail() == ""
+
+            reader._process.kill()
+            reader._process.wait(timeout=5)
+            for _ in range(100):
+                app._poll_tail()
+                if app._source_problems:
+                    break
+                await asyncio.sleep(0.05)
+
+            detail = app._unreachable_detail()
+            assert detail, "the pane must say the source stopped"
+            assert "web01" in detail
+            # A bounded attempt was queued rather than one per poll tick.
+            assert len(app._reconnects) == 1
+            assert not app._reconnects[ref_key(ref)].exhausted
+            reader.close()
+
+    asyncio.run(scenario())
+
+
+@needs_shell
+def test_the_reconnect_gives_up_and_says_so_rather_than_trying_forever(
+    tmp_path: Path,
+) -> None:
+    """Bounded, and the boundary is visible.
+
+    A host that has been gone this long is not coming back because CLV asked
+    again, and an open-ended retry is a stream of ``ssh`` processes at a machine
+    the operator may have taken down deliberately. What is *not* acceptable is
+    stopping quietly: the pane has to say it has stopped, and say what resumes
+    it, or the operator is back to a log that went silent for no stated reason.
+    """
+
+    import asyncio
+
+    from clv.app import LogViewerApp
+
+    log = tmp_path / "syslog"
+    log.write_text("line 0\n", encoding="utf-8")
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            await pilot.pause()
+
+            _connection, backend, reader = _follow(tmp_path, log)
+            key = ref_key(reader.path)
+            buffer = SourceBuffer(reader.path, max_lines=100, reader=reader)
+            buffer.prime()
+            app._session.install(buffer)
+            reader.close()
+
+            # A resume that always fails, so the schedule runs to its end
+            # without a real host being involved.
+            def always_fails() -> None:
+                raise SSHError("web01: the host did not answer.")
+
+            reader.resume = always_fails  # type: ignore[method-assign]
+
+            app._schedule_reconnect(buffer, "web01: the host did not answer.")
+            for _ in range(RECONNECT_ATTEMPTS + 1):
+                record = app._reconnects.get(key)
+                if record is None or record.exhausted:
+                    break
+                if record.timer is not None:
+                    record.timer.stop()
+                    record.timer = None
+                await app._finish_reconnect(key, buffer)
+
+            record = app._reconnects[key]
+            assert record.exhausted
+            assert record.attempts == RECONNECT_ATTEMPTS
+            # And it is on screen, naming the way back.
+            assert "Ctrl+R" in app._source_problems[key]
+            assert "Ctrl+R" in app._unreachable_detail()
+
+    asyncio.run(scenario())
+
+
+def test_a_local_reader_is_never_scheduled_for_reconnection(tmp_path: Path) -> None:
+    """There is nothing to reconnect *to*.
+
+    A local file is either there on the next poll or it is not, so the absence
+    of ``resume`` is the answer rather than a ref-type check at the call site —
+    and a timer against a local log would be pure waste.
+    """
+
+    import asyncio
+
+    from clv.app import LogViewerApp
+
+    path = tmp_path / "app.log"
+    path.write_text("2026-08-11 10:00:00 - INFO - hi\n", encoding="utf-8")
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            await pilot.pause()
+            buffer = app._session.open_single(path)
+
+            app._schedule_reconnect(buffer, "something went wrong")
+
+            assert app._reconnects == {}
+
+    asyncio.run(scenario())

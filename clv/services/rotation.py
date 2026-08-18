@@ -279,6 +279,9 @@ class RotatedSetReader:
 
         result = self._live.poll()
         if not result.lines:
+            # Returned whole, so a `problem` the live head reported reaches the
+            # session unchanged. That is the usual shape of a dropped link: the
+            # verdict arrives with no lines beside it.
             return result
         return TailRead(
             lines=result.lines,
@@ -286,7 +289,27 @@ class RotatedSetReader:
             truncated=result.truncated,
             rotated=result.rotated,
             origins=(self.path,) * len(result.lines),
+            problem=result.problem,
         )
+
+    def resume(self) -> None:
+        """Follow the live head again after a drop. **Blocks**; worker-driven.
+
+        The rotated-out members are finished by definition — they are files that
+        will not change again — so reconnecting a set is reconnecting its head
+        and nothing else.
+
+        A **local** set's head cannot be resumed and does not need to be: its
+        file is either there on the next poll or it is not. It never reaches
+        here, because only a reader that can resume ever reports a `problem` and
+        only a reported problem schedules a reconnection. The raise is the
+        backstop for that invariant rather than a path the app takes.
+        """
+
+        resume = getattr(self._live, "resume", None)
+        if resume is None:
+            raise OSError(f"{self.path.name} cannot be resumed")
+        resume()
 
     def close(self) -> None:
         closer = getattr(self._live, "close", None)
