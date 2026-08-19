@@ -28,6 +28,14 @@ desktop terminal and on a headless 80-column SSH session.
   backwards from the end of the file; a 160 MB log opens in ~2 ms using under a
   megabyte. Tailing reads only what was appended. Compressed members are the
   honest exception — see [Compressed and rotated logs](#compressed-and-rotated-logs).
+- 🌐 **Anywhere includes another machine.** Name a host in `settings.conf` — or
+  press `R` and add it — and its folders appear in the same tree as the ones on
+  this disk, discovered recursively, tailed, filtered, starred and merged. It
+  reads over `ssh` with the setup you already have: your agent, your keys, your
+  `~/.ssh/config` with its `ProxyJump` and `known_hosts`. There is no password
+  option and no `sudo` option, nothing is installed on the remote and nothing is
+  left running there, and none of it happens until you turn `enable_ssh` on —
+  see [Remote sources over SSH](#remote-sources-over-ssh).
 - 🧭 **Any file, not just `*.log`.** Name folders or files; every readable text
   file counts — including UTF-16 exports from Windows and PowerShell, and
   `.ods` spreadsheets, which are unpacked into tab-separated rows. Binary
@@ -165,10 +173,44 @@ use.
 | `watch_bell` | Ring the terminal bell when a watch rule notifies. | `false` |
 | `cluster_lookback` | How far back, in entries, `c` may reach to fold a repeated line into a cluster. A bound, not a taste: it keeps one cluster from spanning a session. | `200` |
 | `enable_journald` | Offer the systemd journal as a source. Off by default: reading it runs `journalctl`, and CLV spawns no subprocess unasked. The drawer's switch writes this line for you. | `false` |
+| `enable_ssh` | Read log folders on machines named in `[ssh:<name>]` sections. Off by default, and for a stronger version of the same reason: a remote source spawns a *network* subprocess. With it false nothing connects, however many hosts are configured. | `false` |
 
 Invalid values fall back to safe defaults; the app never fails to start because
 of a malformed settings file. Most discovery options are also editable at
 runtime in the **Advanced** drawer.
+
+### Remote host sections
+
+One `[ssh:<name>]` section per machine, alongside `[log_viewer]`. Everything
+except `log_dirs` is optional, and every option left out falls back to the
+global value above. See [Remote sources over SSH](#remote-sources-over-ssh) for
+what these do and why two options you might look for are absent.
+
+| Option | Purpose | Default |
+| --- | --- | --- |
+| *(the section name)* | CLV's name for the machine: what the tree shows, what `node:` matches, and the address connected to unless `host` overrides it. | *(required)* |
+| `host` | The address or `~/.ssh/config` alias to connect to, when it differs from the name. | *(the section name)* |
+| `user` | SSH user. Left out, `ssh` decides — from `~/.ssh/config` or your local username. | *(unset)* |
+| `port` | SSH port. Outside 1–65535 the host is skipped and reported, never clamped: clamping would connect somewhere you never named. | `22` |
+| `identity_file` | A private key to offer. An unreadable one warns and keeps the host, since ssh-agent may already hold the key. | *(unset)* |
+| `log_dirs` | Folders and/or files **on that machine**, comma separated. Must be absolute; a relative entry is ambiguous and refused. | *(required)* |
+| `enabled` | Whether this host is read at all. `space` toggles it in the `R` dialog. | `true` |
+| `include_globs` / `exclude_globs` | Per-host overrides of the global glob lists. An empty value means "explicitly no filtering", which is not the same as leaving the line out. | *(inherit)* |
+| `max_files` | Per-host discovery budget, so one noisy machine cannot consume the whole allowance and truncate the others. | *(inherit)* |
+| `max_buffer_lines` | Per-host history budget. The pressure valve for a slow link. | *(inherit)* |
+| `correct_clock_skew` | Apply this host's measured clock offset when ordering a merged view. Skew is always *reported*; correcting it is opt-in, and the pane says when it is on. | `false` |
+
+The `R` dialog edits the first seven; the rest are file-only. That costs them
+nothing — writeback is key-level and never regenerates a section, so options the
+dialog does not show, comments you wrote, and even a line this version refuses
+all survive an edit untouched.
+
+**Two options do not exist**, and their absence is enforced by the schema rather
+than by convention: there is no password key of any spelling, and no `sudo` key
+of any spelling. Writing one is reported as unsupported and the value never
+reaches CLV's model of the host. See the section on
+[authentication](#authentication-your-agent-and-your-keys-and-nothing-else) for
+what to do instead.
 
 ---
 
@@ -349,17 +391,171 @@ Two things are worth knowing before you read causation out of the interleaving:
 
 **Managing hosts.** `R` opens the host dialog: add, edit, enable, disable and
 remove machines, with a **Test connection** that makes one bounded probe and
-reports what it found — the reason verbatim if it failed, and the shell profile
-and measured clock skew if it worked. Changes are written back into
-`settings.conf` in place, so the comments, per-host budgets and glob overrides
-you have written there survive an edit untouched. There is no password field and
-no sudo toggle, because there is no password option and no sudo option: CLV
-connects with ssh-agent and key files, and reads as the configured user.
+reports what it found. Changes are written back into `settings.conf` in place,
+so the comments, per-host budgets and glob overrides you have written there
+survive an edit untouched. The next section covers setup, the authentication
+model and what a non-GNU remote gives up.
 
-The remaining setup detail, the authentication model in full and what degrades on
-a non-GNU remote are not documented here yet — that section lands with the
-release. Shipping logs to one host and merging them locally still works and
-always will.
+### Remote sources over SSH
+
+A root may live on another machine. CLV connects with `ssh`, reads the files
+there, and puts them in the same tree as the ones on this disk — discovered
+recursively, opened, tailed, filtered, starred, merged. A remote log is not a
+second-class source type; that is the whole point, and it is why this is core
+plumbing rather than a plugin bolted on the side.
+
+**It is off until you say otherwise.** With `enable_ssh = false` — the default —
+nothing connects and no `ssh` process is spawned, however many hosts are
+configured. Reading the journal spawns a subprocess; reading a remote host
+spawns a *network* subprocess, which raises the bar for asking rather than
+lowering it.
+
+#### Setting a host up
+
+Three routes, and none of them requires the other:
+
+- **The dialog.** `R` lists your machines: add, edit, enable, disable, remove,
+  and **Test connection**, which makes one bounded probe and reports what it
+  found. Also reachable from the Add Source dialog (`a`).
+- **Scan SSH config.** If your machines are already named in `~/.ssh/config`,
+  the Advanced drawer's **Scan SSH config** lists the `Host` aliases that are
+  not configured here yet and writes the ones you pick — the alias and a
+  `log_dirs` line, nothing else, leaving `ssh` to apply your own `Host` block.
+- **The file**, one `[ssh:<name>]` section per machine:
+
+```ini
+[log_viewer]
+enable_ssh = true
+
+[ssh:web01]
+log_dirs = /var/log, /srv/app/logs
+```
+
+That is a complete host. The name after `ssh:` is CLV's name for the machine:
+it is what the source tree shows, what `node:` matches in a query, and the
+address connected to — so if the name is already a `Host` alias in your
+`~/.ssh/config`, there is nothing else to write. Add `host =` only when CLV's
+name for a machine is not the address to reach it at.
+
+#### Authentication: your agent and your keys, and nothing else
+
+CLV inherits `~/.ssh/config` wholesale — aliases, `ProxyJump`, per-host keys,
+`known_hosts`, agent forwarding. A host you can already reach by hand is a host
+CLV can read.
+
+**There is no password option, and there will not be one.** No password field
+exists in the settings schema, in any dialog, in session state, or in memory.
+Every invocation carries `BatchMode=yes`, which turns every interactive prompt
+into a clean failure with a usable reason instead of a process waiting on a
+stdin nobody is reading. A connection that would need you to type something is
+reported as unreachable, with the reason. Load your key with `ssh-add`, or point
+`identity_file` at one.
+
+**Host key verification is never disabled.** `StrictHostKeyChecking=no` and
+`UserKnownHostsFile` appear in no argv CLV builds, not behind a flag and not for
+testing — there is a test asserting they never will. The first connection to a
+machine you have not trusted yet therefore fails, and says:
+
+> the host key is not trusted. Connect once by hand to verify it: CLV never
+> disables host key checking.
+
+Do exactly that — `ssh web01` once, check the fingerprint, accept it — and CLV
+works from then on. A key that has *changed* gets a different and louder message,
+because that is a different fact.
+
+**There is no `sudo` option either**, anywhere, local or remote. CLV reads as the
+configured SSH user and never escalates. A log that user cannot read is reported,
+naming the host and the path, with the fix: add the user to a group that can read
+it (`adm`, `systemd-journal`) or set an ACL on the file. Reading a log by becoming
+someone else is not something CLV will do on your behalf.
+
+#### The connection itself
+
+One multiplexed connection per host (`ControlMaster=auto`), so per-file commands
+cost a round trip rather than a handshake. The socket lives in a `0700` directory
+under `$XDG_RUNTIME_DIR`, is named from a hash rather than the host name (a long
+FQDN overflows `sun_path`, and the failure mode is silent loss of multiplexing),
+and is torn down explicitly with `ssh -O exit` when the host is reconfigured, when
+`enable_ssh` goes off, and at shutdown. `ControlPersist` is 60 seconds as a
+backstop for a CLV that was killed rather than quit — **a persisted multiplex
+socket is a live authenticated connection any local process running as you can
+ride**, so leaving one behind is a real exposure rather than an untidiness.
+
+Nothing is installed on the remote host and nothing is left running there. CLV
+issues bounded commands and one `tail -F` per open source, and that `tail` is
+killed when the connection closes — including the case where an idle log means
+it would otherwise never notice.
+
+When a host goes away, the pane says so. A dropped link is not a log that went
+quiet, and CLV will not render it as one: there is a toast, a status-line
+segment, and an explanation in the empty pane. Reconnection is bounded — six
+attempts at 1, 2, 5, 15, 30 and 60 seconds — and then it stops and tells you,
+naming `Ctrl+R`. `Ctrl+R` resets the backoff and keeps the connections that are
+still good.
+
+#### Non-GNU remotes, and what degrades
+
+`find -printf`, `stat -c` and `dd iflag=skip_bytes` are GNU extensions. BusyBox
+and BSD do not have all of them, so capability is **probed at connect, never
+assumed**, and the host gets one of four command profiles:
+
+| Profile | `find -printf` | `stat` format | Ranged read |
+| --- | --- | --- | --- |
+| `gnu` | yes | `%d %i %s %Y` | `dd iflag=skip_bytes` |
+| `busybox` | no | `%d %i %s %Y` | `dd iflag=skip_bytes` |
+| `bsd` | no | `%d %i %z %m` | `tail -c +N \| head -c M` |
+| `posix` | no | *(none)* | `tail -c +N \| head -c M` |
+
+Only the last row loses anything you would notice. Rotation detection compares
+`(device, inode)`, so a host with no readable `stat` degrades to comparing size
+and modification time — which misfires on a log rotated inside the same second,
+and CLV reports rotation conservatively rather than pretending. Everything else
+is a different argv for the same result. Alpine containers are a first-class
+target, not an edge case, and there is an opt-in test suite that runs against
+one.
+
+**Test connection** in the `R` dialog tells you which profile a host got, along
+with its measured clock skew.
+
+#### Over a slow link
+
+Discovery of a remote root is **one** command, not one per file — that is the
+specific cost that makes reading 400 remote files unusable, and there is a test
+that counts commands so it cannot come back. Opening a source reads a bounded
+tail; tailing transfers only appended bytes. `poll()` never makes a round trip
+at all, so the UI does not stall twice a second per merged source.
+
+Two per-host settings are the pressure valve, and both fall back to the global
+value when absent:
+
+- `max_files` — one noisy machine should not consume the whole file allowance
+  and truncate the others.
+- `max_buffer_lines` — five merged remote sources pull five times the history
+  over the link on open. Lower it for a slow connection.
+
+#### Known limitations
+
+Honest rather than absent:
+
+- **Plain-text export carries no machine column.** JSON Lines and CSV both carry
+  `node`; the plain-text format deliberately does not, because prefixing a host
+  onto a raw line would put text in an export that no log on any machine
+  contained.
+- **A clipboard copy carries no provenance.** `y` emits `entry.raw` only, which
+  is exactly what an all-local merged copy has always done.
+- **The `R` editor offers seven of the twelve host options.** `correct_clock_skew`,
+  both glob overrides and both budgets are file-only, because twelve fields do
+  not fit beside a list, a hint and a button row at 80 columns. Editing is
+  key-level, so leaving them alone in the dialog preserves them exactly.
+
+#### `sshfs` is a legitimate alternative
+
+If the machine is already mounted, or you would rather mount it, CLV has always
+been able to read a mounted remote folder and needs none of the code above to do
+it — you get full fidelity, real inodes, and every feature, for no configuration
+at all. What you pay is a per-file round trip during discovery, which is the
+specific thing this feature exists to avoid on a tree of a few hundred files.
+Neither answer is wrong. This one exists for people who do not want a mount.
 
 ### Compressed and rotated logs
 
