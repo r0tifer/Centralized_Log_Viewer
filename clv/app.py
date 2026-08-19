@@ -77,6 +77,8 @@ from .services.config import (
     undocumented_settings,
     user_config_path,
 )
+from .services.config_upgrade import describe as describe_upgrade
+from .services.config_upgrade import upgrade_user_settings
 from .services.discovery import DiscoveredFile, DiscoveryReport, discover
 from .services.export import (
     BUILTIN_FORMATS,
@@ -2972,6 +2974,12 @@ class LogViewerApp(App[None]):
         Once per version, not once per launch. A line an operator sees every
         time is a line they learn to look past, which fails in the same way as
         never printing it — hence `last_seen_version` on the session state.
+
+        **Still read-only, even now that `clv --upgrade-config` exists.** The
+        launch path does not write the settings file, and a notice that quietly
+        rewrote it while the operator was reading the notice would be the worst
+        possible place to put that write. It reports a difference and points at
+        the command; acting on it stays the operator's decision.
         """
 
         if self._upgrade_notice_shown or __version__ == self.state.last_seen_version:
@@ -2997,7 +3005,8 @@ class LogViewerApp(App[None]):
                 f"CLV {__version__}: {_plural(len(missing), 'setting', 'settings')} "
                 f"your settings file does not carry — {shown}. "
                 "Each is optional and already using its default; run "
-                "`clv --print-default-config` to see them documented.",
+                "`clv --print-default-config` to read them, or "
+                "`clv --upgrade-config` to fold them into your file.",
                 style="#7aa3d1",
             )
         )
@@ -5036,15 +5045,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     Split out from :func:`run` so it is testable: ``run`` is the console-script
     entry point and cannot be called from a test without taking the terminal.
 
-    The two flags are the answer to "how does someone upgrading learn about a
-    new setting". They are read-only by design: CLV does not rewrite the
-    operator's settings file, so what it offers instead is the reference, on
-    demand, in the form a first run would have written it.
-
-    Note that a plain ``diff`` against a hand-maintained settings file is mostly
-    noise — the two are ordered and commented differently, so nearly every line
-    differs. The discovery summary names the settings after an upgrade; this
-    flag is how the operator then reads what each of them *does*.
+    Both flags exist for the operator who has just upgraded.
+    ``--print-default-config`` is read-only and always has been: it prints the
+    reference so they can read what a newer build documents.
+    ``--upgrade-config`` is the one place in CLV that rewrites their settings
+    file, and it does so only because they asked -- the launch path still never
+    touches it. A plain ``diff`` between the two files is mostly noise, since
+    they are ordered and commented differently, which is why the merge is a
+    command rather than a suggestion.
     """
 
     import argparse
@@ -5062,9 +5070,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--print-default-config",
         action="store_true",
         help=(
-            "print the shipped, fully commented settings file and exit. Your own "
-            "settings file is never rewritten on upgrade, so this is how to read "
-            "what a newer version documents."
+            "print the shipped, fully commented settings file and exit. This is "
+            "the reference a newer version documents; --upgrade-config is how to "
+            "fold it into the file you already have."
+        ),
+    )
+    parser.add_argument(
+        "--upgrade-config",
+        action="store_true",
+        help=(
+            "rewrite your settings file from the shipped template, keeping your "
+            "values and hosts, after saving the previous one alongside it. Does "
+            "nothing if it is already current. The installer runs this for you."
         ),
     )
     args = parser.parse_args(argv)
@@ -5072,6 +5089,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.print_default_config:
         sys.stdout.write(default_config_text())
         return 0
+
+    if args.upgrade_config:
+        result = upgrade_user_settings()
+        stream = sys.stdout if result.ok else sys.stderr
+        print(describe_upgrade(result), file=stream)
+        return 0 if result.ok else 1
 
     LogViewerApp().run()
     return 0
