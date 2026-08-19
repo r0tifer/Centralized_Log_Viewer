@@ -36,13 +36,16 @@ Widgets are the building blocks of Centralized Log Viewer (CLV). Each one is **s
 |--------|----------|----------------|-------|
 | **QueryBar** | Main query and filter input row | `ActionTriggered`, `TimeWindowChanged`, `SeverityChanged` | Coordinates query, time, severity, and actions (Run/Clear/Save). |
 | **SegmentedButtons** | Multi-button selection group | `ValueChanged` | Used by QueryBar for Severity; reusable elsewhere. |
-| **AdvancedFiltersDrawer** | Secondary filter options | `Closed`, (future) `Changed` | Optional drawer for plugin or advanced UI elements. |
+| **AdvancedFiltersDrawer** | Secondary filter options | `SettingsChanged`, `ViewToggleChanged`, `RescanRequested`, `ScanSSHConfigRequested`, `Closed` | Optional drawer for plugin or advanced UI elements. Capped at `max-height: 16`: a new **row** pushes what follows below the fold, where it lays out and paints nothing — join an existing row, or add to `#drawer-actions`, which is horizontal and costs no rows. |
 | **FilterChip** | Displays active filters | `Dismissed` | Allows quick removal of active filters. |
 | **HelpOverlay** | Lists every keybinding | *(dismiss only)* | Modal; sections are built by the app from `BINDINGS`, so it cannot go stale. |
 | **ExportDialog** | Format + destination for `Ctrl+E` | *(dismisses with `ExportRequest`)* | Modal; states the entry count, offers "marked lines only", and overwriting takes a second press of Export. |
 | **LogView** | The log pane, with a line cursor | `CursorMoved`, `EntrySelected` | `ScrollView` + Line API. Rows are entry-indexed, not line-indexed, because one entry can wrap or render as a whole panel. Append is O(new); the row cap trims in batches so the rebuild is amortised. Owns the cursor keys as widget-scoped `BINDINGS`. |
 | **DetailPane** | Properties of the selected entry | *(none — driven by `show()`)* | Never renders a blank property list: four formats carry no fields, so each no-field case explains itself. |
 | **GotoDialog** | Where in time `g` moves the cursor | *(dismisses with the typed string)* | Modal; does no parsing of its own, so it cannot disagree with `filtering.parse_moment` about what `-15m` means. |
+| **AddSourceDialog** | A path to add, or the way to the machine list | *(dismisses with the typed string, or the `REMOTE_HOSTS` sentinel)* | Modal; the template the other dialogs copy. The sentinel carries NUL, which `services/refs` already excludes from a ref string — so no path anyone can type collides with it. The dialog does not know what the app does with it. |
+| **RemoteHostsDialog** | Add, edit, test and remove `[ssh:<name>]` hosts | *(dismisses with the host tuple, or `None` for unchanged)* | Modal; holds a working copy so Escape genuinely cancels and one confirm is one write. No password field and no sudo toggle — the schema refuses both. Probing is an injected callable, so the widget imports nothing from `clv.plugins`. |
+| **SSHConfigImportDialog** | Pick which `~/.ssh/config` aliases become hosts | *(dismisses with the host tuple, or `None`)* | Modal; records in, records out — reads no file and writes none. Nothing is ticked until somebody ticks it, because a forty-alias config describes a fleet and three boxes that no longer exist. Only `log_dirs` is editable: it is the only field OpenSSH cannot answer. |
 
 ---
 
