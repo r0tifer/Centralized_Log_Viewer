@@ -25,8 +25,10 @@ valid source. Filtering by name is the user's decision (`include_globs` /
 naming reasons.
 
 **Anywhere includes another machine.** A root may live on a host the operator
-names in `settings.conf`, read over SSH with their own credentials — see
-[SSH_TODO.md](SSH_TODO.md). A remote folder is a root like any other: discovered
+names in `settings.conf`, read over SSH with their own credentials — documented
+for operators under *Remote sources over SSH* in [README.md](README.md), with the
+reasoning behind each decision in [SSH_TODO.md](SSH_TODO.md). A remote folder is a
+root like any other: discovered
 recursively, listed under the same folder hierarchy, starrable, mergeable. It is
 not a second-class source type, and a source is therefore a `SourceRef` rather
 than a `pathlib.Path` — see the identity rule in [clv/AGENTS.md](clv/AGENTS.md).
@@ -245,6 +247,24 @@ distros.
   plugin errors. **There is no password option and no sudo option**, and the
   schema refuses both by name with a pointer to ssh-agent and to group/ACL
   membership — the one place those requirements cannot be forgotten.
+- `ssh_config.py` — reads OpenSSH's `~/.ssh/config` so its machines can be
+  offered for import, and **never writes a byte back**: that file belongs to
+  OpenSSH and to the operator. Only the *alias* is imported. `HostName`, `User`,
+  `Port` and `IdentityFile` are shown in the picker and deliberately not
+  persisted, because CLV connects by running `ssh`, which reads the same file —
+  writing `host = 10.0.0.9` into `settings.conf` would stop `ssh` matching the
+  `Host` block and silently lose `ProxyJump`, per-host keys and `known_hosts`.
+  Keeping the alias as the destination is what makes "inherits `~/.ssh/config`
+  wholesale" true rather than aspirational. It also settles the refused-key list
+  structurally: `SSHConfigHost` has no field a password or a sudo flag could land
+  in, however that file spells them.
+- `config_upgrade.py` — the one place in CLV that rewrites the operator's
+  settings file, and a narrowing of the old rule rather than an abandonment of
+  it: **the launch path still never writes.** It runs on `clv --upgrade-config`
+  or from `install.sh`, after copying the previous file aside. Every
+  `[ssh:<name>]` section is carried across **byte-identical, including one the
+  parser rejects** — regenerating sections from parsed state would silently
+  delete a host with a bad port.
 - `settings_file.py` — editing `settings.conf` in place without losing the
   operator's comments. `configparser` reads that file and nothing writes it
   back through `configparser`, whose `write()` discards every comment and
@@ -351,6 +371,9 @@ config.load_config ─→ SourceManager ─→ discovery.discover (thread)
 | `SaveViewDialog` | dismiss value | The name to save the current filters under, or `None` |
 | `ViewPickerDialog` | dismiss value | `ViewRequest(action, name, new_name)`, or `None` when closed. The dialog never edits state; the app acts and reopens it |
 | `WatchRulesDialog` | dismiss value | The edited rule set, or `None` when nothing changed — so a dialog that was only looked at costs no re-indexing |
+| `RemoteHostsDialog` | dismiss value | The full host list, or `None` when nothing was edited. The dialog holds a working copy and hands back the whole thing, so Escape genuinely discards; the app diffs *records* against the file, which is what leaves a section the parser skipped in place |
+| `SSHConfigImportDialog` | dismiss value | The `~/.ssh/config` aliases the operator ticked, or `None` when none were — never an empty tuple, so "cancelled" and "picked nothing" stay one fact |
+| `AdvancedFiltersDrawer` | `ScanSSHConfigRequested` | Look in `~/.ssh/config` for machines to import. Carries nothing: the drawer does not read that file, know what a host is, or write `settings.conf` |
 | `AdvancedFiltersDrawer` | `RescanRequested` / `Closed` | Explicit rescan / dismissal |
 
 ### Controls with two homes
@@ -443,7 +466,7 @@ installed" — the trade Item 12 asked for.
   and `workspace` fixtures, and every assertion runs against another backend —
   which is how `RemoteBackend` is held to the same behaviour as `LocalBackend`.
 
-Run: `python -m pytest` (1220 tests, 1 skipped, 11 deselected) on **both** 3.11
+Run: `python -m pytest` (1384 passed, 1 skipped, 11 deselected) on **both** 3.11
 and 3.14 — the local default is 3.14 and a green suite there is not evidence
 that the supported floor still works.
 
