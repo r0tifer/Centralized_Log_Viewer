@@ -232,6 +232,16 @@ jobs:
           wait "$PID" 2>/dev/null || true
           test -f "${XDG_CONFIG_HOME}/clv/settings.conf" \
             || { echo "::error::binary did not provision its user settings file" >&2; exit 1; }
+          # The file was just written from the bundled template, so the upgrade
+          # pass the installer runs must see it as current. Anything else means
+          # the template's config_version and CURRENT_CONFIG_VERSION have drifted,
+          # and every install would rewrite a file it had only just created.
+          "dist/${BIN_NAME}/${BIN_NAME}" --upgrade-config | tee "${RUNNER_TEMP}/upgrade.txt"
+          grep -q "nothing to do" "${RUNNER_TEMP}/upgrade.txt" \
+            || { echo "::error::a freshly provisioned settings file was not current" >&2; exit 1; }
+          if ls "${XDG_CONFIG_HOME}"/clv/settings.conf.bak-* > /dev/null 2>&1; then
+            echo "::error::the no-op upgrade took a backup" >&2; exit 1
+          fi
           echo "Smoke test passed for ${{ matrix.arch }}"
 
       - name: Stage install tree
