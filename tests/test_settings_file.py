@@ -354,3 +354,16 @@ def test_a_missing_file_is_seeded_with_the_global_section(tmp_path: Path) -> Non
     persist_setting(config, "enable_ssh", "true")
 
     assert config.read_text(encoding="utf-8") == "[log_viewer]\nenable_ssh = true\n"
+
+
+def test_an_empty_value_is_written_without_trailing_whitespace() -> None:
+    """`include_globs =` is how the shipped template writes "no globs", and this
+    file is one operators read and diff."""
+    document = SettingsDocument(["[log_viewer]", "include_globs = *.log"])
+
+    document.set("log_viewer", "include_globs", "")
+    document.set("log_viewer", "exclude_globs", "")
+
+    assert "include_globs =" in document.lines
+    assert "exclude_globs =" in document.lines
+    assert not any(line.endswith(" ") for line in document.lines)
