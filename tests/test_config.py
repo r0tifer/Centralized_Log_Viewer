@@ -895,3 +895,134 @@ def test_a_host_name_must_round_trip_through_its_own_section_header() -> None:
         "A host named 'web01' is already configured."
     )
     assert validate_host_name("web01", ["db02"]) is None
+
+
+# --- the shipped file against the documented defaults ------------------------
+#
+# `settings.conf` is two thirds prose and README carries a table of the same
+# options. Nothing mechanically tied the three together, so a default could be
+# changed in `config.py`, left alone in the template, and documented as a fourth
+# value in README without anything failing. These are the tie.
+
+
+def _shipped_template(monkeypatch) -> Path:
+    monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+    return bundled_config_path()
+
+
+def test_the_shipped_file_parses_into_the_documented_defaults(monkeypatch) -> None:
+    """Every value README's settings table names, read off the real file.
+
+    Asserted against literals rather than against `LogConfig()` defaults on
+    purpose: comparing the parser to itself would pass while the template and
+    the documentation both said something else.
+    """
+
+    config = load_config(_shipped_template(monkeypatch))
+
+    assert config.discovery.follow_symlinks is False
+    assert config.discovery.skip_binary is True
+    assert config.discovery.max_files == 5000
+    assert config.discovery.group_rotated is True
+    assert config.max_buffer_lines == 5000
+    assert config.default_show_lines == 500
+    assert config.min_show_lines == 10
+    assert config.show_step == 50
+    assert config.refresh_hz == 2
+    assert config.tree_width == 38
+    assert config.csv_max_rows == 20
+    assert config.csv_max_cols == 10
+    assert config.clipboard_max_bytes == 65536
+    assert config.watch_rate_limit == 60
+    assert config.watch_bell is False
+    assert config.cluster_lookback == 200
+    assert config.enable_journald is False
+    assert config.enable_ssh is False
+
+
+def test_the_shipped_file_names_no_hosts_and_reports_nothing(monkeypatch) -> None:
+    """A first run connects to nothing, and says nothing about a clean file.
+
+    The `[ssh:...]` examples below `enable_ssh` are commented out. If one were
+    ever uncommented by accident, this is what would notice — and an issue
+    reported off the shipped file would mean CLV starts by complaining about
+    configuration the operator has not written yet.
+    """
+
+    config = load_config(_shipped_template(monkeypatch))
+
+    assert config.hosts == ()
+    assert config.issues == ()
+
+
+def _uncomment_example(template: str, name: str) -> str:
+    """The commented ``[ssh:<name>]`` block from the shipped file, uncommented.
+
+    The block is documentation, so nothing parses it and it can drift from the
+    schema silently — an option renamed in `config.py` would leave the example
+    telling operators to write a line CLV now refuses. Running the real parser
+    over it is what closes that.
+    """
+
+    lines = template.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.strip() == f"# [ssh:{name}]")
+    block = []
+    for line in lines[start:]:
+        stripped = line.strip()
+        if not stripped.startswith("#"):
+            break
+        body = stripped[1:].strip()
+        if not body:
+            break
+        block.append(body)
+    return "[log_viewer]\nlog_dirs = /var/log\n\n" + "\n".join(block) + "\n"
+
+
+def test_the_commented_host_example_still_parses(tmp_path, monkeypatch) -> None:
+    """Uncommented, the README example is a working host with every option set.
+
+    One warning is expected and is the point: the example names a key file the
+    machine running this does not have, and an absent `identity_file` *warns and
+    keeps* the host rather than skipping it, because ssh-agent commonly already
+    holds the key. Nothing here may be an error.
+    """
+
+    template = _shipped_template(monkeypatch).read_text(encoding="utf-8")
+    body = _uncomment_example(template, "web01")
+
+    config = load_config(_write(tmp_path / "settings.conf", body))
+
+    assert [issue for issue in config.issues if issue.severity != "warning"] == []
+    assert [issue.origin for issue in config.issues] == ["[ssh:web01]"]
+    assert "identity_file" in config.issues[0].message
+    assert len(config.hosts) == 1
+    host = config.hosts[0]
+    assert host.name == "web01"
+    assert host.host == "web01.internal"
+    assert host.user == "ops"
+    assert host.port == 22
+    assert host.identity_file == Path("~/.ssh/id_ed25519").expanduser()
+    assert host.log_dirs == ("/var/log", "/srv/app/logs")
+    assert host.include_globs == ("*.log", "syslog*")
+    assert host.max_files == 2000
+    assert host.max_buffer_lines == 2000
+    assert host.correct_clock_skew is False
+    assert host.enabled is True
+
+
+def test_the_second_commented_host_example_still_parses(tmp_path, monkeypatch) -> None:
+    """The minimal example: a name, an address and a directory, and nothing else.
+
+    It is the shape the README calls "a complete host", so it has to be one.
+    """
+
+    template = _shipped_template(monkeypatch).read_text(encoding="utf-8")
+    body = _uncomment_example(template, "db02")
+
+    config = load_config(_write(tmp_path / "settings.conf", body))
+
+    assert config.issues == ()
+    assert len(config.hosts) == 1
+    assert config.hosts[0].name == "db02"
+    assert config.hosts[0].host == "10.0.0.12"
+    assert config.hosts[0].log_dirs == ("/var/log/postgresql",)
