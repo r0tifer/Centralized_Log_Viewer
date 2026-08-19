@@ -152,7 +152,7 @@ from .services.watch import (
     toggled,
 )
 from .storage import SavedView, SessionState, StateStore
-from .widgets.add_source_dialog import AddSourceDialog
+from .widgets.add_source_dialog import REMOTE_HOSTS, AddSourceDialog
 from .widgets.advanced_drawer import AdvancedFiltersDrawer, AdvancedSettings
 from .widgets.custom_time_dialog import CustomTimeRangeDialog
 from .widgets.detail_pane import DetailPane
@@ -4256,6 +4256,16 @@ class LogViewerApp(App[None]):
         result = await self.push_screen(AddSourceDialog(), wait_for_dismiss=True)
         if result is None:
             self._notify("Add log source canceled.")
+            return
+        # A machine is not a path, and the dialog that knows about paths should
+        # not be the one that knows about machines. It says which of the two the
+        # operator asked for; deciding what that means is this method's job.
+        #
+        # Awaited rather than handed to a second worker: this one is already in
+        # the "dialogs" group, so awaiting keeps exactly one modal on the stack,
+        # and `_prompt_remote_hosts` ends with its own reload.
+        if result == REMOTE_HOSTS:
+            await self._prompt_remote_hosts()
             return
         if not result.strip():
             self._notify("No path entered.", "warning")
