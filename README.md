@@ -174,35 +174,57 @@ runtime in the **Advanced** drawer.
 
 ### Upgrading
 
-Your settings file is **never rewritten** — not on install, not on launch. It is
-yours, and CLV does not edit it behind your back.
+Your settings file is created once, from the template shipped with whichever
+build you first installed. That template is two thirds prose — every option is
+introduced by the comment block explaining what it does — so a file created two
+years ago is still handing you two-year-old documentation, even though every
+release since may have added options.
 
-That is safe because no setting is required: every option has a default, so a
-settings file written for an older build keeps working exactly as it did. What it
-stops doing is *learning* — the commented prose describing a new option only ever
-reaches a file created from scratch.
+Nothing on the **launch path** ever rewrites that file. CLV does not edit your
+configuration behind your back while starting up. What it does instead is tell
+you, once per version, which settings your file does not carry, in the discovery
+summary.
 
-So after an upgrade the discovery summary names any settings your file does not
-carry, once for that version, and points at:
+Closing the gap is an explicit action:
 
 ```bash
-clv --print-default-config      # the shipped, fully documented settings file
+clv --upgrade-config            # fold your settings into the newer template
+clv --print-default-config      # or just read the newer template
 clv --version                   # which build you are actually running
 ```
 
-`--print-default-config` writes the reference to stdout. Reading it is the point;
-a plain `diff` against your own file is mostly noise, because the two are ordered
-and commented differently. To see just the names:
+`--upgrade-config` rewrites `~/.config/clv/settings.conf` from the shipped
+template and:
+
+- **keeps every value you set** — written into the new template, so it arrives
+  surrounded by the current prose rather than the old;
+- **keeps every `[ssh:<name>]` host**, copied across byte for byte, including a
+  host CLV itself cannot parse;
+- **keeps options this version no longer documents**, under a
+  `# --- Carried over from your previous settings file` banner, rather than
+  silently dropping them;
+- **does not keep comments you wrote yourself** inside `[log_viewer]`. The new
+  template is the base, and there is nowhere sensible to reattach a note about
+  an option whose surrounding prose has been rewritten.
+
+Because of that last point it always saves the previous file first, as
+`~/.config/clv/settings.conf.bak-<timestamp>`. It is also a no-op when there is
+nothing to do: the file carries a `config_version` marker, and a file already at
+the current version is not even touched.
+
+`install.sh` runs `--upgrade-config` for you after installing, so an upgrade
+picks this up without a second command. Skip it with:
 
 ```bash
-comm -23 \
-  <(clv --print-default-config | grep -oE '^[a-z_]+ =' | tr -d ' =' | sort) \
-  <(grep -oE '^[a-z_]+ =' ~/.config/clv/settings.conf | tr -d ' =' | sort)
+./install.sh --no-config-upgrade      # or CLV_NO_CONFIG_UPGRADE=1
 ```
 
-Nothing in this is required. Every one of those settings is already in effect at
-its default, and remote hosts are managed from `R` and the Advanced drawer
-without touching the file at all.
+Under `sudo`, the installer runs the upgrade as the invoking user rather than as
+root, so it updates your settings file and not `/root`'s.
+
+None of this is required. Every setting your file does not carry is already in
+effect at its default, and remote hosts are managed from `R` and the Advanced
+drawer without touching the file at all.
 
 ## Usage
 
