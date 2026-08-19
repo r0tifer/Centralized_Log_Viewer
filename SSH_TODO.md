@@ -22,7 +22,7 @@ filesystem assumption that had already spread further.
 | 5 — Reachability | A host that goes away says so | ✅ **Complete** |
 | 6 — Parity | Star, merge, rotation, hierarchy, time, session | ✅ **Complete** |
 | 7 — Remote UI | Host dialog, cross-host merge, `node` in the chrome | ✅ **Complete** |
-| 8 — Documentation & release | README, `settings.conf`, help overlay, version | ⬜ Not started |
+| 8 — Documentation & release | README, `settings.conf`, help overlay, version | ✅ **Complete** (2.8.0) |
 | 9 — The remote journal | `journalctl` over the same transport | ⬜ Not started |
 
 ---
@@ -1554,7 +1554,83 @@ on GNU and Alpine images. A frozen build on one distribution reads a remote log
 on another. Every requirement in this file traceable to a passing test or a
 stated limitation.
 
-**Commit.** `release: 2.7.0 — remote sources over SSH`
+**Commit.** `release: 2.8.0 — remote sources over SSH`
+
+### As built
+
+Recorded where the phase departed from the plan above, so Phase 9 documents what
+exists rather than what was proposed.
+
+- **The version is 2.8.0, not 2.7.0, and the plan above is left as written.**
+  `2.7.0` shipped at `cff6f18` — immediately after Phase 3, when the feature did
+  not yet exist — and seven patch releases of remote work landed on top of it.
+  By the time this phase ran, the number this file reserved had been spent. The
+  bullet is not corrected in place because the point of these notes is that the
+  plan and the outcome can be compared; a plan silently edited to match what
+  happened records nothing.
+
+- **Most of the README work had already been absorbed, and one paragraph was the
+  whole remaining debt.** Phases 6 and 7 rewrote the merge passages and the host
+  dialog as they landed, and `settings.conf` shipped its commented `[ssh:...]`
+  block in Phase 3, so three of this phase's bullets were already true. What was
+  outstanding was the paragraph Phase 6 left behind saying the reference material
+  "lands with the release" — a shipped document naming its own gap. Deleting that
+  paragraph is a one-line edit that looks like progress and is the exact failure
+  this phase could have shipped, which is why
+  `test_readme_docs.py::test_the_deferral_paragraph_is_gone` is paired with
+  `test_the_remote_section_exists` rather than standing alone.
+
+- **The security positions are pinned by tests, and the risk they guard is not
+  the one it looks like.** `test_ssh_source.py` already asserts that no argv
+  carries `StrictHostKeyChecking=no`, a password or `sudo`, so those cannot stop
+  being *true*. What can lapse is them being *said*: an operator who cannot find
+  "where do I put the password" in the documentation reasonably concludes there
+  is a way and they have missed it. `tests/test_readme_docs.py` is that guard,
+  modelled on `test_plugin_docs.py`.
+
+- **The shipped `settings.conf` is now tied to the parser in two directions.**
+  `test_the_shipped_file_parses_into_the_documented_defaults` asserts against
+  *literals*, not against `LogConfig()` — comparing the parser to itself would
+  pass while the template and the README both said something else. And the
+  commented `[ssh:web01]` and `[ssh:db02]` examples are uncommented by the test
+  and run through `load_config`, because they are documentation and nothing
+  parsed them: an option renamed in `config.py` would have left the example
+  telling operators to write a line CLV now refuses.
+
+- **One expected warning is asserted rather than suppressed.** The `web01`
+  example names `~/.ssh/id_ed25519`, which the machine running the suite does not
+  have, so the parse reports one `warning`. That is Phase 3's two-severity design
+  working — an absent `identity_file` warns and *keeps* the host, because
+  ssh-agent commonly already holds the key — so the test pins "no issue above
+  warning, and exactly that one warning" instead of demanding silence.
+
+- **`AGENTS.md`'s review found three real gaps, all of them post-Phase-7.**
+  `ssh_config.py` and `config_upgrade.py` had been added to `services/` without
+  reaching the Services list, and `RemoteHostsDialog`, `SSHConfigImportDialog`
+  and `ScanSSHConfigRequested` had no rows in the Message contracts table. The
+  stale test count was the fourth: it read 1220, which predated the same work.
+
+- **The help overlay needed nothing**, which is the payoff of it being generated.
+  `R` and `Ctrl+X` reach it through `BINDING_CATEGORIES` under *Sources*, and
+  `test_help_overlay` fails on an omission — so the bullet this phase carried for
+  it was already satisfied by Phase 7's construction rather than by an edit.
+
+- **`install.sh` needed nothing either.** Its `--upgrade-config` pass already
+  carries `[ssh:<name>]` sections across byte-identical, and `ssh.py` already
+  routes all three spawn points through journald's `child_environment()`, so the
+  PyInstaller `LD_LIBRARY_PATH` failure is handled in code. **What is therefore
+  still owed is a check of the built artifact, not a change to it** — a frozen
+  build on one distribution reading a remote log on another. A green suite cannot
+  see that, and neither can a container.
+
+- **No file under `clv/` changed except the version literal.** `git diff --stat`
+  over `clv/` is one line. That is what a documentation-and-release phase should
+  look like, and it is stated here so a future phase that finds itself editing
+  services under this heading knows it has drifted.
+
+- **1370 + 14 = 1384 passed, 1 skipped, 11 deselected** on 3.11 and 3.14. No
+  existing assertion edited: `git diff -- tests/` is 131 insertions and zero
+  removals, plus one new file.
 
 ---
 
