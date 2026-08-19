@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.widgets import Input, Static, Switch
 
 from clv.app import LogViewerApp
+from clv.services.config import load_config
 from clv.services.discovery import DiscoverySettings
 from clv.widgets.advanced_drawer import AdvancedFiltersDrawer, AdvancedSettings
+from clv.widgets.ssh_config_dialog import SSHConfigImportDialog
 
 
 def _run(scenario) -> None:
@@ -23,6 +26,7 @@ class _Harness(App[None]):
         self.changes: list[AdvancedFiltersDrawer.SettingsChanged] = []
         self.view_changes: list[AdvancedFiltersDrawer.ViewToggleChanged] = []
         self.rescans = 0
+        self.scans = 0
 
     def compose(self) -> ComposeResult:
         self.drawer = AdvancedFiltersDrawer()
@@ -37,6 +41,11 @@ class _Harness(App[None]):
 
     def on_advanced_filters_drawer_rescan_requested(self, _m) -> None:
         self.rescans += 1
+
+    # `sshconfig`, not `ssh_config` -- Textual's camel-to-snake pass fuses the
+    # run of capitals in `ScanSSHConfigRequested`. See the test below.
+    def on_advanced_filters_drawer_scan_sshconfig_requested(self, _m) -> None:
+        self.scans += 1
 
 
 def test_drawer_is_hidden_by_default() -> None:
@@ -492,7 +501,14 @@ def test_the_source_discovery_row_still_fits_just_above_the_compact_breakpoint()
 
                 switch = app.advanced_drawer.query_one("#drawer-ssh", Switch)
                 buffer = app.advanced_drawer.query_one("#max-buffer-lines", Input)
-                for widget, name in ((switch, "#drawer-ssh"), (buffer, "#max-buffer-lines")):
+                checks = [(switch, "#drawer-ssh"), (buffer, "#max-buffer-lines")]
+                # The actions row is `layout: horizontal` and never stacks, so a
+                # third button there is a width change at every one of these.
+                checks += [
+                    (app.advanced_drawer.query_one(button_id), button_id)
+                    for button_id in ("#scan-ssh-config", "#rescan-sources", "#close-advanced")
+                ]
+                for widget, name in checks:
                     assert widget.region.width > 0, f"{name} laid out to nothing at {width}"
                     assert widget.region.height > 0, f"{name} painted nothing at {width}"
                     assert widget.region.right <= width, f"{name} overflows at {width}"
@@ -517,6 +533,10 @@ def test_the_drawer_actions_stay_on_screen_at_eighty_columns() -> None:
             assert drawer.region.right <= 80
             for widget_id in ("#drawer-ssh", "#ssh-status"):
                 assert drawer.query_one(widget_id).region.width > 0, widget_id
+            for widget_id in ("#scan-ssh-config", "#rescan-sources", "#close-advanced"):
+                region = drawer.query_one(widget_id).region
+                assert region.width > 0, widget_id
+                assert region.right <= 80, f"{widget_id} overflows 80 columns"
 
     _run(scenario)
 
@@ -545,3 +565,171 @@ def test_the_remote_switch_is_disabled_where_there_is_no_ssh_client(monkeypatch)
 
     _run(scenario)
 
+
+
+def test_the_scan_ssh_config_button_posts_a_message() -> None:
+    """And posts *that* message: the branch must not fall through to rescan."""
+
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test(size=(150, 40)) as pilot:
+            await pilot.pause()
+            app.drawer.query_one("#scan-ssh-config").press()
+            await pilot.pause()
+
+            assert app.scans == 1
+            assert app.rescans == 0
+
+    asyncio.run(scenario())
+
+
+def test_the_scan_message_handler_name_matches_textuals_derivation() -> None:
+    """The wiring bug that produces no error anywhere.
+
+    Textual derives a handler name from the message class, and its
+    camel-to-snake pass fuses a run of capitals: `ScanSSHConfigRequested`
+    becomes `on_..._scan_sshconfig_requested`, not `..._scan_ssh_config_...`.
+    Spelling it the natural way silently unwires the drawer button, so the name
+    the app actually defines is pinned here against the name Textual will look
+    for.
+    """
+
+    handler = AdvancedFiltersDrawer.ScanSSHConfigRequested.handler_name
+
+    assert handler == "on_advanced_filters_drawer_scan_sshconfig_requested"
+    assert hasattr(LogViewerApp, handler)
+
+
+def test_the_third_action_button_costs_no_rows() -> None:
+    """Why this control is a button and not a switch.
+
+    The drawer is `max-height: 16` and this file records four times that a new
+    *row* pushes what follows below the fold, where it lays out and paints
+    nothing. `#drawer-actions` is `layout: horizontal`, so a button joins the
+    existing row instead — which is only true while all three share a `y`.
+    """
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 44)) as pilot:
+            await pilot.pause()
+            app.advanced_drawer.show()
+            await pilot.pause()
+            await pilot.pause()
+
+            actions = app.advanced_drawer.query_one("#drawer-actions")
+            regions = [
+                app.advanced_drawer.query_one(button_id).region
+                for button_id in ("#scan-ssh-config", "#rescan-sources", "#close-advanced")
+            ]
+            assert len({region.y for region in regions}) == 1, "a second row"
+            # One button tall plus the container's own `padding-top: 1` -- i.e.
+            # exactly what two buttons cost, which is the point.
+            tallest = max(region.height for region in regions)
+            assert actions.region.height == tallest + 1, actions.region
+
+    asyncio.run(scenario())
+
+
+def test_the_drawer_button_opens_the_picker(tmp_path: Path) -> None:
+    """End to end: the button reads ~/.ssh/config and offers what it found."""
+
+    home = Path(os.environ["HOME"])
+    (home / ".ssh").mkdir(parents=True, exist_ok=True)
+    (home / ".ssh" / "config").write_text(
+        "Host *\n  User root\n\nHost from-ssh-config\n  HostName 10.0.0.9\n",
+        encoding="utf-8",
+    )
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.advanced_drawer.show()
+            await pilot.pause()
+            app.advanced_drawer.query_one("#scan-ssh-config").press()
+            for _ in range(20):
+                await pilot.pause()
+                if isinstance(app.screen, SSHConfigImportDialog):
+                    break
+
+            assert isinstance(app.screen, SSHConfigImportDialog), app.screen
+            assert [c.name for c in app.screen._candidates] == ["from-ssh-config"]
+
+    asyncio.run(scenario())
+
+
+def _ssh_config(text: str) -> None:
+    home = Path(os.environ["HOME"])
+    (home / ".ssh").mkdir(parents=True, exist_ok=True)
+    (home / ".ssh" / "config").write_text(text, encoding="utf-8")
+
+
+def test_importing_through_the_app_writes_the_section(tmp_path: Path) -> None:
+    """The whole path: button, scan, pick, write — asserted on the file."""
+
+    _ssh_config("Host from-ssh-config\n  HostName 10.0.0.9\n")
+    config = tmp_path / "settings.conf"
+    config.write_text(
+        "[log_viewer]\n# keep me\nenable_ssh = true\n", encoding="utf-8"
+    )
+
+    async def scenario() -> None:
+        app = LogViewerApp(config=load_config(config))
+        async with app.run_test(size=(100, 30)) as pilot:
+            app._settings_path = config
+            await pilot.pause()
+            app.advanced_drawer.show()
+            await pilot.pause()
+            app.advanced_drawer.query_one("#scan-ssh-config").press()
+            for _ in range(20):
+                await pilot.pause()
+                if isinstance(app.screen, SSHConfigImportDialog):
+                    break
+            await pilot.press("space")
+            await pilot.pause()
+            app.screen.query_one("#import-confirm").press()
+            for _ in range(30):
+                await pilot.pause()
+                if not isinstance(app.screen, SSHConfigImportDialog):
+                    break
+
+    asyncio.run(scenario())
+
+    assert config.read_text(encoding="utf-8") == (
+        "[log_viewer]\n# keep me\nenable_ssh = true\n"
+        "\n[ssh:from-ssh-config]\nlog_dirs = /var/log\n"
+    )
+
+
+def test_an_alias_already_configured_is_not_offered_again(tmp_path: Path) -> None:
+    """Scanning twice must not reopen a picker with nothing new in it."""
+
+    _ssh_config("Host web01\n  HostName 10.0.0.9\n")
+    config = tmp_path / "settings.conf"
+    config.write_text(
+        "[log_viewer]\nenable_ssh = true\n\n[ssh:web01]\nlog_dirs = /var/log\n",
+        encoding="utf-8",
+    )
+
+    async def scenario() -> None:
+        app = LogViewerApp(config=load_config(config))
+        async with app.run_test(size=(100, 30)) as pilot:
+            app._settings_path = config
+            notes: list[tuple[str, str]] = []
+            app._notify = lambda text, severity="information": notes.append(
+                (severity, text)
+            )
+            await pilot.pause()
+            app.advanced_drawer.show()
+            await pilot.pause()
+            app.advanced_drawer.query_one("#scan-ssh-config").press()
+            for _ in range(20):
+                await pilot.pause()
+                if notes:
+                    break
+
+            assert not isinstance(app.screen, SSHConfigImportDialog)
+            assert notes and "already configured" in notes[0][1]
+
+    asyncio.run(scenario())

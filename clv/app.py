@@ -65,6 +65,7 @@ from .services.clustering import (
     summarise,
 )
 from .services.settings_file import SettingsDocument
+from .services.ssh_config import read_ssh_config
 from . import __version__
 from .services.config import (
     SSH_SECTION_PREFIX,
@@ -168,6 +169,7 @@ from .widgets.remote_hosts_dialog import (
     RemoteHostsDialog,
 )
 from .widgets.severity import SEVERITY_COLORS
+from .widgets.ssh_config_dialog import SSHConfigImportDialog
 from .widgets.timeline import TimelineBar
 from .widgets.view_dialogs import SaveViewDialog, ViewPickerDialog, ViewRequest
 from .widgets.watch_dialog import WatchRulesDialog
@@ -3541,6 +3543,85 @@ class LogViewerApp(App[None]):
             )
         await self.action_reload_sources()
 
+    def _configured_host_names(self) -> set[str]:
+        """Every name ``settings.conf`` already spends, whether or not it parses.
+
+        ``config.hosts`` alone is not enough. A section the parser *skipped* — an
+        impossible port, no usable ``log_dirs`` — never reaches it, so an import
+        offered that alias again would merge ``log_dirs`` into a section no UI
+        can show, which is the rule ``RemoteHostsDialog`` states as: a dialog
+        that cannot see a section must not be the thing that edits it.
+        """
+
+        names = {host.name for host in self._config.hosts}
+        try:
+            document = SettingsDocument.load(self._settings_path)
+        except OSError:
+            return names
+        return names | {
+            section[len(SSH_SECTION_PREFIX):]
+            for section in document.sections()
+            if section.startswith(SSH_SECTION_PREFIX)
+        }
+
+    async def _prompt_ssh_config_import(self) -> None:
+        """Offer the machines ``~/.ssh/config`` already names, and write the picks.
+
+        The scan runs on a thread because an ``Include`` glob can reach an NFS
+        mount, and a drawer button must not freeze the event loop to find that
+        out.
+        """
+
+        worker = self.run_worker(
+            read_ssh_config, thread=True, name="scan-ssh-config", exit_on_error=False
+        )
+        try:
+            scan = await worker.wait()
+        except Exception as exc:  # noqa: BLE001 - a scan must never take the app down
+            self._notify(f"Could not read ~/.ssh/config: {exc}", "error")
+            return
+
+        scan = scan.without(self._configured_host_names())
+        if not scan.hosts:
+            self._notify(
+                scan.notes[0]
+                if scan.notes
+                else "Nothing new in ~/.ssh/config — every alias is already configured.",
+                "warning",
+            )
+            return
+
+        chosen = await self.push_screen(
+            SSHConfigImportDialog(scan.hosts, notes=scan.notes), wait_for_dismiss=True
+        )
+        if not chosen:
+            return
+
+        # Existing hosts first, and this is not cosmetic: `_write_hosts` removes
+        # a section for every configured name *absent* from the tuple it is
+        # handed. Passing only the new ones would delete the whole fleet to add
+        # one machine. Handing it the union makes the removal set empty by
+        # construction, so the import is pure addition and the key-level merge
+        # below is reused rather than reimplemented.
+        try:
+            self._write_hosts(tuple(self._config.hosts) + tuple(chosen))
+        except OSError as exc:
+            self._notify(f"Could not save the imported hosts: {exc}", "error")
+            return
+
+        self._notify(
+            f"Imported {_plural(len(chosen), 'host', 'hosts')} from ~/.ssh/config "
+            f"into {self._settings_path}."
+        )
+        if not getattr(self._config, "enable_ssh", False):
+            # Same argument as RemoteHostsDialog.OFF_HINT: hosts that produce no
+            # sources read as a broken import rather than a switch left off.
+            self._notify(
+                "Remote sources are off — turn on Remote (SSH) to read them.",
+                "warning",
+            )
+        await self.action_reload_sources()
+
     def _write_hosts(self, hosts: Sequence[RemoteHost]) -> None:
         """Merge *hosts* into ``settings.conf``, key by key, in one pass.
 
@@ -4582,6 +4663,19 @@ class LogViewerApp(App[None]):
         self, _message: AdvancedFiltersDrawer.RescanRequested
     ) -> None:
         self.run_worker(self._rescan(), group="discovery", exit_on_error=False)
+
+    # `sshconfig`, not `ssh_config`, and it is not a typo: Textual derives the
+    # handler name from the message class, and its camel-to-snake pass fuses a
+    # run of capitals — `ScanSSHConfigRequested` becomes
+    # `..._scan_sshconfig_requested`. Spelling it the natural way silently
+    # unwires the button, with no error anywhere. Pinned by
+    # test_the_scan_message_handler_name_matches_textuals_derivation.
+    def on_advanced_filters_drawer_scan_sshconfig_requested(
+        self, _message: AdvancedFiltersDrawer.ScanSSHConfigRequested
+    ) -> None:
+        self.run_worker(
+            self._prompt_ssh_config_import(), group="dialogs", exit_on_error=False
+        )
 
     def on_input_changed(self, event: Input.Changed) -> None:  # type: ignore[override]
         if event.input.id != "query-input":

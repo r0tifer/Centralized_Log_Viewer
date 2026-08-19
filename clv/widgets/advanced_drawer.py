@@ -354,7 +354,15 @@ class AdvancedFiltersDrawer(Static):
         yield Static("", id="journald-status")
         yield Static("", id="ssh-status")
 
+        # A third button here rather than a fourth switch above, and the
+        # reason is the one recorded four times in this file: `#drawer-actions`
+        # is `layout: horizontal`, so a button joins this row and costs *zero*
+        # rows against `max-height: 16`, while any new toggle row pushes what
+        # follows below the fold where it lays out and paints nothing. It is
+        # also honest about what it is — a one-shot scan of somebody else's
+        # file, not a setting that stays on.
         with Container(id="drawer-actions"):
+            yield Button("Scan SSH config", id="scan-ssh-config")
             yield Button("Rescan sources", id="rescan-sources", variant="primary")
             yield Button("Close", id="close-advanced")
 
@@ -572,7 +580,10 @@ class AdvancedFiltersDrawer(Static):
             self._emit(previous)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "rescan-sources":
+        if event.button.id == "scan-ssh-config":
+            event.stop()
+            self.post_message(self.ScanSSHConfigRequested())
+        elif event.button.id == "rescan-sources":
             event.stop()
             self.post_message(self.RescanRequested())
         elif event.button.id == "close-advanced":
@@ -627,6 +638,15 @@ class AdvancedFiltersDrawer(Static):
 
     class RescanRequested(Message):
         """The user asked to re-run discovery now."""
+
+    class ScanSSHConfigRequested(Message):
+        """The user asked to look in ``~/.ssh/config`` for machines to import.
+
+        Carries nothing, because this drawer knows nothing to carry: it does not
+        read that file, does not know what a host is, and does not write
+        ``settings.conf``. The app owns the scan, the picker and the write —
+        which is the same division the SSH switch above already follows.
+        """
 
     class Closed(Message):
         """The drawer was dismissed."""
