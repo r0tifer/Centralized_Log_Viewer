@@ -36,6 +36,17 @@ from .settings_file import SettingsDocument
 
 CONFIG_SECTION = "log_viewer"
 
+#: The schema stamp the upgrade path reads. It lives in ``[log_viewer]`` like
+#: any other option -- an older build that does not know it simply ignores it,
+#: because nothing refuses unknown keys in the global section.
+CONFIG_VERSION_OPTION = "config_version"
+
+#: Bump this, and the marker in the shipped ``settings.conf``, whenever the
+#: template's option set changes. Deliberately not ``__version__``: most
+#: releases do not touch the settings schema, and stamping the app version
+#: would re-migrate every operator's file for nothing.
+CURRENT_CONFIG_VERSION = 1
+
 #: One remote host per section: ``[ssh:web01]``. The suffix is the host's name
 #: within CLV — what the tree shows, what ``node:`` matches, and the fallback
 #: for ``host`` when the operator does not give one.
@@ -77,6 +88,11 @@ _LIMITS: dict[str, tuple[int, int, int]] = {
 }
 
 DEFAULT_SETTINGS_TEMPLATE = f"""[{CONFIG_SECTION}]
+
+# Schema version of this file. Written and read by CLV's upgrade path
+# (`clv --upgrade-config`, and the installer); there is no reason to edit it
+# by hand. A file with no marker predates it and is upgraded on sight.
+config_version = {CURRENT_CONFIG_VERSION}
 
 # Folders and/or individual files to monitor, comma separated.
 # Folders are searched recursively. CLV is not limited to *.log files: any
@@ -401,14 +417,61 @@ def default_config_text() -> str:
     return DEFAULT_SETTINGS_TEMPLATE
 
 
+def config_version_of(settings_path: Optional[Path]) -> int:
+    """The schema version *settings_path* declares, or ``0`` if it declares none.
+
+    Zero is the answer for every file written before the marker existed, for a
+    file that is missing, and for a marker that is not an integer. All three
+    mean the same thing to the caller -- "older than anything we ship" -- and
+    none of them is worth an exception on a path that runs during an install.
+    """
+
+    if settings_path is None:
+        return 0
+    try:
+        if not settings_path.exists():
+            return 0
+        raw = SettingsDocument.load(settings_path).get(
+            CONFIG_SECTION, CONFIG_VERSION_OPTION
+        )
+    except OSError:
+        return 0
+    return _as_version(raw)
+
+
+def template_config_version() -> int:
+    """The schema version the *shipped* template declares.
+
+    Read out of the template rather than taken from
+    :data:`CURRENT_CONFIG_VERSION` so a bundle whose ``settings.conf`` was never
+    re-stamped cannot claim to be newer than the file it would write. The
+    constant is only the fallback for a template that carries no marker at all.
+    """
+
+    document = SettingsDocument(default_config_text().splitlines())
+    raw = document.get(CONFIG_SECTION, CONFIG_VERSION_OPTION)
+    version = _as_version(raw)
+    return version or CURRENT_CONFIG_VERSION
+
+
+def _as_version(raw: Optional[str]) -> int:
+    if raw is None:
+        return 0
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return 0
+
+
 def undocumented_settings(settings_path: Optional[Path]) -> tuple[str, ...]:
     """Options the shipped file sets that *settings_path* does not carry.
 
-    Read-only, and deliberately so. CLV never rewrites the operator's settings
-    file behind their back: it is theirs, the launch path is the worst possible
-    place to put a write, and every option is optional-with-a-default anyway — an
-    old file keeps working, it just stops learning. So this reports a difference
-    and nothing acts on it.
+    Read-only, and deliberately so. Nothing on the launch path rewrites the
+    operator's settings file: it is theirs, and every option is
+    optional-with-a-default anyway — an old file keeps working, it just stops
+    learning. So this reports a difference and nothing here acts on it.
+    :mod:`clv.services.config_upgrade` is what acts on it, and only when the
+    operator explicitly asks, via ``clv --upgrade-config`` or the installer.
 
     Only ``[log_viewer]`` is compared. A ``[ssh:<name>]`` section is a machine the
     operator named, not a setting they are missing, and listing the example host
@@ -423,6 +486,7 @@ def undocumented_settings(settings_path: Optional[Path]) -> tuple[str, ...]:
         return ()
     reference = SettingsDocument(default_config_text().splitlines())
     known = set(current)
+    known.add(CONFIG_VERSION_OPTION)
     return tuple(
         option for option in reference.options(CONFIG_SECTION) if option not in known
     )
@@ -458,10 +522,24 @@ def ensure_user_settings_file() -> Optional[Path]:
 
 
 def _names_sources(path: Path) -> bool:
+    try:
+        return _text_names_sources(path.read_text(encoding="utf-8"))
+    except OSError:
+        return False
+
+
+def _text_names_sources(text: str) -> bool:
+    """Whether *text* would give the viewer somewhere to look.
+
+    Split out from :func:`_names_sources` so the upgrade path can apply the same
+    guard to a merged document it has not written yet: handing the operator a
+    settings file with an empty ``log_dirs`` is worse than leaving theirs alone.
+    """
+
     parser = configparser.ConfigParser()
     try:
-        parser.read(path)
-    except (OSError, configparser.Error):
+        parser.read_string(text)
+    except configparser.Error:
         return False
     if CONFIG_SECTION not in parser:
         return False
