@@ -17,11 +17,13 @@ import sys
 from pathlib import Path
 
 from clv.services.config import (
+    CURRENT_CONFIG_VERSION,
     DEFAULT_SETTINGS_TEMPLATE,
     ConfigIssue,
     LogConfig,
     RemoteHost,
     bundled_config_path,
+    config_version_of,
     ensure_user_settings_file,
     host_options,
     load_config,
@@ -100,6 +102,24 @@ def test_a_template_naming_no_sources_is_not_copied(tmp_path, monkeypatch) -> No
     # Falls back to the built-in defaults rather than the empty template.
     assert created.read_text(encoding="utf-8") == DEFAULT_SETTINGS_TEMPLATE
     assert load_config(created).log_dirs
+
+
+def test_the_builtin_fallback_template_is_stamped_too(tmp_path, monkeypatch) -> None:
+    """The fallback writes a real settings file, so it needs a real version.
+
+    An unstamped fallback would read as version 0 and be "upgraded" on the very
+    next install, replacing a file written seconds earlier.
+    """
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+    _write(tmp_path / "settings.conf", "[log_viewer]\nlog_dirs =\n")
+    target = user_config_path()
+    if target.exists():
+        target.unlink()
+
+    created = ensure_user_settings_file()
+
+    assert created.read_text(encoding="utf-8") == DEFAULT_SETTINGS_TEMPLATE
+    assert config_version_of(created) == CURRENT_CONFIG_VERSION
 
 
 # --- parsing and validation -------------------------------------------------
