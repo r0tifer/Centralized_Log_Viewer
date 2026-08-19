@@ -768,3 +768,81 @@ def test_the_required_fields_are_marked_and_the_examples_are_not_truncated() -> 
 
     _run(scenario)
 
+
+
+# --- importing from ~/.ssh/config -------------------------------------------
+#
+# These live here rather than beside the picker because what they pin is
+# `_write_hosts`, whose contract they share with the tests above: the import
+# reuses that one writer instead of adding a second path to the same file.
+
+
+def test_an_ssh_config_import_adds_sections_and_leaves_the_file_intact(
+    tmp_path: Path,
+) -> None:
+    """An import is pure addition: two new lines, and nothing else moves."""
+
+    config = tmp_path / "settings.conf"
+    config.write_text(COMMENTED, encoding="utf-8")
+    app = _app_on(config)
+
+    imported = RemoteHost(name="web09", host="web09", log_dirs=("/var/log",))
+    app._write_hosts(tuple(app._config.hosts) + (imported,))
+
+    assert config.read_text(encoding="utf-8") == COMMENTED + (
+        "\n[ssh:web09]\nlog_dirs = /var/log\n"
+    )
+
+
+def test_an_import_that_omits_the_existing_hosts_removes_them(
+    tmp_path: Path,
+) -> None:
+    """The negative that makes the test above mean something.
+
+    `_write_hosts` removes a section for every configured name *absent* from the
+    tuple it is handed, so `_prompt_ssh_config_import` must pass the union. This
+    is what happens when it does not, recorded so nobody 'simplifies' that call.
+    """
+
+    config = tmp_path / "settings.conf"
+    config.write_text(COMMENTED, encoding="utf-8")
+    app = _app_on(config)
+
+    app._write_hosts((RemoteHost(name="web09", host="web09", log_dirs=("/var/log",)),))
+
+    text = config.read_text(encoding="utf-8")
+    assert "[ssh:web09]" in text
+    assert "[ssh:web01]" not in text
+    assert "[ssh:db02]" not in text
+
+
+def test_a_section_the_parser_skipped_is_never_offered_for_import(
+    tmp_path: Path,
+) -> None:
+    """A dialog that cannot see a section must not be the thing that edits it.
+
+    A host with an impossible port never reaches `config.hosts`, so the name is
+    invisible to every UI — and an import that offered it again would merge
+    `log_dirs` into a section nobody can see.
+    """
+
+    config = tmp_path / "settings.conf"
+    config.write_text(
+        "[log_viewer]\nenable_ssh = true\n\n"
+        "[ssh:web01]\nlog_dirs = /var/log\nport = 70000\n",
+        encoding="utf-8",
+    )
+    app = _app_on(config)
+
+    assert [host.name for host in app._config.hosts] == []
+    assert app._configured_host_names() == {"web01"}
+
+
+def test_configured_names_cover_both_parsed_and_skipped_sections(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "settings.conf"
+    config.write_text(COMMENTED + "\n[ssh:broken]\nport = 70000\n", encoding="utf-8")
+    app = _app_on(config)
+
+    assert app._configured_host_names() == {"web01", "db02", "broken"}

@@ -171,6 +171,9 @@ enable_ssh = false
 # One section per remote machine. The name after "ssh:" is CLV's name for it -
 # what the tree shows and what `node:` matches in a query.
 #
+# Press R to manage these in the app, or use "Scan SSH config" in the Advanced
+# drawer (f) to import the Host aliases already in your ~/.ssh/config.
+#
 # Authentication is ssh-agent and key files only, so CLV inherits your existing
 # ~/.ssh/config wholesale: aliases, ProxyJump, per-host keys, known_hosts.
 # There is no password option, and there never will be - CLV does not store or

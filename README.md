@@ -224,7 +224,10 @@ root, so it updates your settings file and not `/root`'s.
 
 None of this is required. Every setting your file does not carry is already in
 effect at its default, and remote hosts are managed from `R` and the Advanced
-drawer without touching the file at all.
+drawer without touching the file at all. If your machines are already named in
+`~/.ssh/config`, **Scan SSH config** in the Advanced drawer lists the aliases
+that are not configured yet and writes the ones you pick — it imports the alias
+and a `log_dirs` line, leaving `ssh` to apply your own `Host` block.
 
 ## Usage
 
@@ -689,7 +692,7 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `/` | Focus the query input |
 | `Enter` | Apply filters (in the query input) · open the detail pane (in the log pane) |
 | `Esc` | Clear the query |
-| `a` | Add a log source |
+| `a` | Add a log source (or open the remote host list from the same dialog) |
 | `t` / `s` | Cycle time window / severity |
 | `f` | Toggle the Advanced drawer |
 | `*` | Star / unstar the log under the cursor |
@@ -716,7 +719,7 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `Ctrl+E` | Export the filtered entries to a file |
 | `y` | Copy the selected line, or the visible lines, to the clipboard (OSC 52) |
 | `Ctrl+L` | Copy mode (hides all chrome) |
-| `R` | Add, edit, test and remove remote hosts (SSH) |
+| `R` | Add, edit, test and remove remote hosts (SSH); also reachable from `a` |
 | `Ctrl+S` | Save added sources to `settings.conf` |
 | `Ctrl+R` | Reload configuration and rescan |
 | `q` | Quit |
