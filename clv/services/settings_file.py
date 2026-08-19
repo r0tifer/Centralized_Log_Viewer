@@ -113,6 +113,19 @@ def _leading(line: str) -> str:
     return line[: len(line) - len(line.lstrip())]
 
 
+def _assignment(option: str, value: str, leading: str = "") -> str:
+    """``option = value``, or ``option =`` when there is no value.
+
+    The empty case is not cosmetic pedantry: ``include_globs =`` is how the
+    shipped template writes "no globs", and rendering it as ``include_globs = ``
+    puts trailing whitespace into a file operators read and diff.
+    """
+
+    if not value:
+        return f"{leading}{option} ="
+    return f"{leading}{option} = {value}"
+
+
 def spans_of(lines: Sequence[str]) -> list[SectionSpan]:
     """Every section in *lines*, in file order, duplicates included."""
 
@@ -216,6 +229,26 @@ class SettingsDocument:
                 found.append(name)
         return found
 
+    def lines_assigning(self, section: str, options: Iterable[str]) -> list[str]:
+        """The raw lines within *section* that assign any of *options*.
+
+        Verbatim, in file order. A caller moving options between documents wants
+        the operator's own text -- a refused ``password = hunter2`` has to come
+        through unchanged for :mod:`clv.services.config` to keep reporting it,
+        and spacing in a key this version does not understand is not ours to
+        normalise.
+        """
+
+        wanted = set(options)
+        span = self._span(section)
+        if span is None:
+            return []
+        return [
+            self._lines[index]
+            for index in range(span.start, span.end)
+            if _option_name(self._lines[index]) in wanted
+        ]
+
     # --- writing -------------------------------------------------------------
 
     def set(self, section: str, option: str, value: str) -> None:
@@ -234,10 +267,12 @@ class SettingsDocument:
 
         for index in range(span.start, span.end):
             if _option_name(self._lines[index]) == option:
-                self._lines[index] = f"{_leading(self._lines[index])}{option} = {value}"
+                self._lines[index] = _assignment(
+                    option, value, _leading(self._lines[index])
+                )
                 return
 
-        self._lines.insert(span.end, f"{option} = {value}")
+        self._lines.insert(span.end, _assignment(option, value))
 
     def remove_option(self, section: str, option: str) -> bool:
         """Delete *option* from *section*. Returns whether there was one."""
@@ -251,6 +286,37 @@ class SettingsDocument:
                 return True
         return False
 
+    def append_lines(self, lines: Sequence[str]) -> None:
+        """Append *lines* verbatim at end of file, after one blank separator.
+
+        The separator is what keeps an appended block from opening on the last
+        line of a comment: the shipped ``settings.conf`` ends *inside* a
+        commented-out ``# [ssh:db02]`` example with no blank line after it, so
+        appending directly would splice the new text into that example.
+        """
+
+        if not lines:
+            return
+        if self._lines and self._lines[-1].strip():
+            self._lines.append("")
+        self._lines.extend(lines)
+
+    def insert_into_section(self, section: str, lines: Sequence[str]) -> None:
+        """Insert *lines* verbatim after the last real content line of *section*.
+
+        The same landing site :meth:`set` uses for a new option, and for the
+        same reason: end of file is inside whatever section happens to be last.
+        A section that is not there falls back to appending.
+        """
+
+        if not lines:
+            return
+        span = self._span(section)
+        if span is None:
+            self.append_lines(lines)
+            return
+        self._lines[span.end : span.end] = list(lines)
+
     def add_section(self, section: str, options: Iterable[tuple[str, str]] = ()) -> None:
         """Append ``[section]`` with *options* at end of file.
 
@@ -258,10 +324,9 @@ class SettingsDocument:
         appended host never opens on the last line of a comment block.
         """
 
-        if self._lines and self._lines[-1].strip():
-            self._lines.append("")
-        self._lines.append(f"[{section}]")
-        self._lines.extend(f"{key} = {value}" for key, value in options)
+        self.append_lines(
+            [f"[{section}]", *(_assignment(key, value) for key, value in options)]
+        )
 
     def remove_section(self, section: str) -> bool:
         """Delete every span named *section*, header included.
