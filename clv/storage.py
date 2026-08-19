@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, ClassVar, Dict, Optional
 
+from .services.refs import parse_ref
 from .services.watch import WatchRule
 
 
@@ -56,6 +57,11 @@ class SavedView:
 
         Returning None rather than raising is the point: one hand-edited record
         must not cost the operator every other view, nor stop the app starting.
+
+        Like :meth:`SessionState.from_dict`, this dispatches on the *text* of a
+        field's annotation, so those strings may not change without a migration.
+        Two separately-coded copies of the same rule, and no schema version
+        between them — worth knowing before touching either.
         """
 
         if not isinstance(raw, dict):
@@ -106,7 +112,7 @@ class SavedView:
         if self.merged:
             parts.append(f"{len(self.merged)} merged sources")
         elif self.source:
-            parts.append(Path(self.source).name)
+            parts.append(parse_ref(self.source).name)
         return " · ".join(parts) if parts else "no filters"
 
 
@@ -130,6 +136,14 @@ class SessionState:
     #: survives a restart; the *selected line* does not, because that would
     #: record which log content someone was reading.
     detail_pane: bool = False
+    #: Whether the severity timeline is shown. Same argument as the detail
+    #: pane: which panes are open is a preference, what was in them is not —
+    #: the *selected bucket* is therefore not persisted either.
+    timeline: bool = False
+    #: Whether repeated lines are collapsed into clusters. A reading
+    #: preference; *which* clusters were expanded is not persisted, for the
+    #: reason marks are not — a cluster key is derived from log content.
+    clustering: bool = False
     # Advanced drawer state
     include_globs: str = ""
     exclude_globs: str = ""
@@ -157,6 +171,11 @@ class SessionState:
     #: keeping it is recording their setup and not their reading — which is
     #: exactly the line marks fall on the other side of.
     watch_rules: tuple[WatchRule, ...] = ()
+    #: The CLV version that last drew the discovery summary. Kept so the
+    #: "new settings are available" line fires once after an upgrade rather than
+    #: on every launch — a notice an operator sees every time is one they learn
+    #: to look past, which is the same failure as not printing it.
+    last_seen_version: str = ""
 
     #: Fields written to disk. Every field on this class — the previous build
     #: persisted only three and dropped every filter on exit.
@@ -175,6 +194,8 @@ class SessionState:
         "pretty_rendering",
         "clipboard_osc52",
         "detail_pane",
+        "timeline",
+        "clustering",
         "include_globs",
         "exclude_globs",
         "follow_symlinks",
@@ -188,11 +209,24 @@ class SessionState:
         "views",
         "merged",
         "watch_rules",
+        "last_seen_version",
     )
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "SessionState":
-        """Build state from stored JSON, ignoring unknown or mistyped values."""
+        """Build state from stored JSON, ignoring unknown or mistyped values.
+
+        **The annotation strings below are load-bearing.** This dispatches on
+        the *text* of a field's type, so renaming ``tuple[str, ...]`` to
+        anything else — including a more accurate type — makes no branch match,
+        the raw JSON value is assigned through unvalidated, and every tuple
+        comparison downstream quietly fails. There is no schema version to
+        detect it. A field's annotation may not change without a migration.
+
+        This is why sources persist as strings even though a source is a
+        ``SourceRef``: ``refs.format_ref`` writes them and ``refs.parse_ref``
+        reads them back at the boundary, and the on-disk type never moves.
+        """
 
         types = {field.name: field.type for field in fields(cls)}
         known: Dict[str, Any] = {}

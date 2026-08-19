@@ -15,6 +15,17 @@ Terms combine with implicit AND, and the leftover text is handed to
 no ``OR``, no parentheses and no precedence: a query DSL is a stated non-goal
 in ``TODO.md`` and this stops one step short of the line.
 
+**Reversed 2026-08-14, and the reversal is narrow enough to state exactly.**
+``PLUGIN_TODO.md`` Phase 8 adds two plugin interfaces — ``QueryOperator``, a new
+comparison token, and ``ComputedField``, a queryable field derived rather than
+parsed. Both add *vocabulary*. Neither adds *structure*: there is still no
+``OR``, still no parentheses, still no precedence, and the three of them remain
+out of scope in ``TODO.md``. The grammar stays implicit-AND and flat, and still
+stops one step short of the line — a plugin can teach it a new word, not a new
+sentence shape. Built-in tokens stay reserved so a plugin cannot redefine ``:``
+or ``=``, and computed fields resolve *after* parsed ones so a plugin can never
+shadow what a line actually said.
+
 Why a key must be *known*
 -------------------------
 
@@ -97,7 +108,17 @@ class QueryError(ValueError):
 #: been read, so ``status>=500`` means the same thing in an empty buffer as in
 #: a full one.
 NORMALISED_FIELD_KEYS: frozenset[str] = frozenset(
-    {"host", "tag", "pid", "msgid", "ident", "user", "request", "status", "size"}
+    {
+        "host", "tag", "pid", "msgid", "ident", "user", "request", "status",
+        "size",
+        # `node` is where CLV *read* a line from; `host` is what the line says
+        # about itself, and it is untouched. Keeping them apart is what lets
+        # `node:web01 status>=500` work on day one without changing what a
+        # single saved query already means — a merged view across a fleet is
+        # the reason this feature exists, and `host` alone could not express it
+        # because every machine's syslog claims a different one.
+        "node",
+    }
 )
 
 #: Outcomes of :func:`match_terms`. Three, not two: "no such field" is a

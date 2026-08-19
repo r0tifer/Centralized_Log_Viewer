@@ -18,6 +18,14 @@ Two deliberate differences from :mod:`clv.services.reader`:
 
 Everything here is stdlib: a document format that needs a third-party parser
 does not belong in a log viewer.
+
+**Reads go through a** :class:`~clv.services.backend.SourceBackend`, split the
+same way :mod:`clv.services.compressed` is: :func:`extract_ods_from` takes an
+open handle and :func:`extract_ods` is the wrapper that obtains one.
+``zipfile.ZipFile`` accepts a file object — but it requires a **seekable** one,
+because the central directory is at the end of the archive. That is a real
+constraint on any future backend rather than a detail, and it is the reason
+``SourceBackend.open`` promises seekability.
 """
 
 from __future__ import annotations
@@ -25,8 +33,10 @@ from __future__ import annotations
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import IO, Callable, Iterator
 from xml.etree.ElementTree import Element, iterparse
+
+from .backend import LOCAL, SourceBackend
 
 #: Cell and row repeat counts are how ODF encodes padding, and the numbers are
 #: enormous by design -- a sheet routinely declares 1024 repeated empty columns
@@ -74,7 +84,9 @@ class DocumentFormat:
     name: str
     #: Lowercase suffixes, including the dot.
     suffixes: tuple[str, ...]
-    extract: Callable[[Path, int], DocumentText]
+    #: ``(path, max_lines, *, backend) -> DocumentText``. Loosely typed because
+    #: the keyword is optional and a format is free to ignore it.
+    extract: Callable[..., DocumentText]
 
 
 def _sheet_banner(name: str) -> str:
@@ -173,24 +185,47 @@ def _iter_sheet_lines(handle) -> Iterator[str]:
             table.clear()
 
 
-def extract_ods(path: Path, max_lines: int) -> DocumentText:
-    """Extract an OpenDocument spreadsheet as tab-separated rows."""
+def extract_ods_from(
+    handle: IO[bytes], max_lines: int, *, name: str = "document"
+) -> DocumentText:
+    """Extract an OpenDocument spreadsheet from an open, **seekable** handle.
+
+    *name* appears in errors only; this function never learns where the handle
+    came from, which is the point of it taking one.
+    """
 
     lines: list[str] = []
     truncated = False
     try:
-        with zipfile.ZipFile(path) as archive:
-            with archive.open("content.xml") as handle:
-                for line in _iter_sheet_lines(handle):
+        with zipfile.ZipFile(handle) as archive:
+            with archive.open("content.xml") as content:
+                for line in _iter_sheet_lines(content):
                     if len(lines) >= max_lines:
                         truncated = True
                         break
                     lines.append(line)
     except (zipfile.BadZipFile, KeyError, OSError) as exc:
-        raise DocumentError(f"{path.name} is not a readable ODF spreadsheet: {exc}") from exc
+        raise DocumentError(f"{name} is not a readable ODF spreadsheet: {exc}") from exc
     except SyntaxError as exc:  # malformed content.xml
-        raise DocumentError(f"{path.name} contains damaged spreadsheet XML: {exc}") from exc
+        raise DocumentError(f"{name} contains damaged spreadsheet XML: {exc}") from exc
     return DocumentText(lines=lines, truncated=truncated)
+
+
+def extract_ods(
+    path: Path, max_lines: int, *, backend: SourceBackend = LOCAL
+) -> DocumentText:
+    """Extract an OpenDocument spreadsheet as tab-separated rows."""
+
+    try:
+        handle = backend.open(path, "rb")
+    except OSError as exc:
+        # The same message the archive itself would produce, because to a
+        # caller "would not open" and "is not an ODF file" are one fact.
+        raise DocumentError(
+            f"{path.name} is not a readable ODF spreadsheet: {exc}"
+        ) from exc
+    with handle:
+        return extract_ods_from(handle, max_lines, name=path.name)
 
 
 ODS = DocumentFormat(name="OpenDocument spreadsheet", suffixes=(".ods",), extract=extract_ods)
@@ -210,10 +245,12 @@ def document_format_for(path: Path) -> DocumentFormat | None:
     return FORMATS.get(path.suffix.lower())
 
 
-def extract_document(path: Path, max_lines: int) -> DocumentText:
+def extract_document(
+    path: Path, max_lines: int, *, backend: SourceBackend = LOCAL
+) -> DocumentText:
     """Extract *path* using its registered format."""
 
     fmt = document_format_for(path)
     if fmt is None:
         raise DocumentError(f"{path.name} is not a supported document format")
-    return fmt.extract(path, max_lines)
+    return fmt.extract(path, max_lines, backend=backend)

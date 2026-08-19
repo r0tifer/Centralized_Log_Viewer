@@ -268,6 +268,22 @@ def _comparable(moment: datetime, reference: Optional[datetime]) -> datetime:
     return moment
 
 
+def sortable_moment(moment: datetime, *, naive: bool) -> datetime:
+    """One comparable form for a timestamp, for ordering or bucketing a *set*.
+
+    :func:`align_moments` answers this pairwise, which is all a comparison
+    needs. A k-way merge and a timeline both need a single key across every
+    entry at once, so the decision is made once for the set: when any member is
+    naive the offsets are dropped — the same rule, applied in bulk — and when
+    every member is aware they are kept, which orders two time zones correctly
+    rather than pretending both are local.
+    """
+
+    if naive and moment.tzinfo is not None:
+        return moment.replace(tzinfo=None)
+    return moment
+
+
 def align_moments(left: datetime, right: datetime) -> tuple[datetime, datetime]:
     """Make two timestamps comparable, whatever their tz-awareness.
 
@@ -351,8 +367,21 @@ def filter_entries(entries: Sequence[LogEntry], spec: FilterSpec) -> FilterResul
     return FilterResult(entries=kept, stats=stats)
 
 
-def describe_empty_result(stats: FilterStats, spec: FilterSpec) -> str:
-    """Explain an empty pane in terms of the filter that emptied it."""
+def describe_empty_result(
+    stats: FilterStats, spec: FilterSpec, *, unreachable: str = ""
+) -> str:
+    """Explain an empty pane in terms of the filter that emptied it.
+
+    *unreachable* is the reason the source cannot be reached, when it cannot.
+    It takes precedence over every filter explanation below, because a filter
+    that hid nothing is not why the pane is empty — and "no entries in the
+    selected source" is a claim about the source that CLV is in no position to
+    make when it cannot see it. An unreachable source reported as an empty one
+    is the failure this parameter exists to prevent.
+    """
+
+    if unreachable:
+        return unreachable
 
     if stats.total == 0:
         return "No log entries in the selected source."

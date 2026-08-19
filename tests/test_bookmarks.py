@@ -11,6 +11,7 @@ from textual.widgets import Checkbox, Input, OptionList, Static
 from clv.app import LogViewerApp
 from clv.services.marks import MarkSet, mark_key
 from clv.services.parsing import parse_lines
+from clv.services.refs import RemoteRef, format_ref, parse_ref
 from clv.storage import SessionState, StateStore
 from clv.widgets.export_dialog import ExportDialog
 from clv.widgets.log_view import MARK_GLYPH
@@ -450,3 +451,80 @@ def test_the_export_dialog_still_fits_eighty_by_twenty_four(tmp_path: Path) -> N
             assert checkbox.region.right <= 80
 
     asyncio.run(scenario())
+
+
+# --- remote sources ---------------------------------------------------------
+#
+# Phase 6's parity sweep. Marks key on `f"{source}\0{digest}"`, and a RemoteRef
+# stringifies host-qualified, so the scoping that keeps two local logs apart
+# keeps two machines apart for free. Verified rather than assumed: "should be
+# free" is how a gap ships, and there was no test here that ever saw a ref that
+# was not a Path.
+
+
+def test_one_line_read_from_two_machines_is_two_marks() -> None:
+    """The same line, byte for byte, on two hosts. Marking it on `web01` must
+    not silently mark it on `db02` — the merged pane shows both rows."""
+
+    entry = _entries(1)[0]
+    web01 = RemoteRef.build("web01", "/var/log/syslog")
+    db02 = RemoteRef.build("db02", "/var/log/syslog")
+
+    marks = MarkSet()
+    assert marks.toggle(web01, entry) is True
+
+    assert marks.contains(web01, entry) is True
+    assert marks.contains(db02, entry) is False
+    assert marks.count_for(web01, db02) == 1
+
+
+def test_a_remote_mark_is_scoped_apart_from_the_local_file_of_that_name() -> None:
+    """`/var/log/syslog` exists on the operator's own machine too. The two are
+    different logs and a mark on one is not a mark on the other."""
+
+    entry = _entries(1)[0]
+    remote = RemoteRef.build("web01", "/var/log/syslog")
+    local = Path("/var/log/syslog")
+
+    marks = MarkSet()
+    marks.toggle(remote, entry)
+
+    assert marks.contains(remote, entry) is True
+    assert marks.contains(local, entry) is False
+    assert mark_key(remote, entry) != mark_key(local, entry)
+
+
+def test_pruning_one_machine_leaves_the_other_machine_s_marks() -> None:
+    """`prune` and `retain` scope by the same string prefix `mark_key` builds,
+    so a source going away must not take another host's marks with it."""
+
+    entries = _entries(3)
+    web01 = RemoteRef.build("web01", "/var/log/syslog")
+    db02 = RemoteRef.build("db02", "/var/log/syslog")
+
+    marks = MarkSet()
+    for entry in entries:
+        marks.toggle(web01, entry)
+        marks.toggle(db02, entry)
+
+    # Only the first line of web01 survives the window.
+    marks.prune(web01, entries[:1])
+
+    assert marks.count_for(web01) == 1
+    assert marks.count_for(db02) == 3
+
+
+def test_a_remote_mark_survives_a_session_round_trip(tmp_path: Path) -> None:
+    """Marks are deliberately not persisted — the digest is derived from log
+    content — but the *sources* are, and one must come back as the same identity
+    the mark was keyed against or every mark on it is orphaned on restore."""
+
+    store = StateStore(tmp_path / "state.json")
+    remote = RemoteRef.build("web01", "/var/log/syslog")
+    store.save(SessionState(starred=(format_ref(remote),)))
+
+    restored = parse_ref(store.load().starred[0])
+
+    assert restored == remote
+    entry = _entries(1)[0]
+    assert mark_key(restored, entry) == mark_key(remote, entry)

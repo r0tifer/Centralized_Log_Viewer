@@ -24,16 +24,27 @@ from __future__ import annotations
 import heapq
 from collections import deque
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Optional, Sequence
 
+from .backend import cheap_only
+from .filtering import sortable_moment
 from .parsing import LogEntry, LogParser
 from .reader import AnyReader, TailRead, open_reader
+from .refs import format_ref, parse_ref
 
 #: Builds the reader for a path. Injectable so a provider-backed source (a
 #: journal unit, say) can supply its own without this module learning about it.
 ReaderFactory = Callable[..., AnyReader]
+
+#: Field name carrying which **machine** a line was read from.
+#:
+#: `host` is taken and means *what the log says about itself* — syslog, access
+#: logs and journald's `_HOSTNAME` all normalise into it. `node` means *where
+#: CLV read it from*. Keeping them apart is what lets `node:web01 status>=500`
+#: work without changing what a single saved query already means.
+NODE_FIELD = "node"
 
 #: Field name carrying which file a line came from, set on entries whose
 #: source is not simply "the open log" — a member of a rotated set, or a
@@ -47,18 +58,36 @@ ReaderFactory = Callable[..., AnyReader]
 ORIGIN_FIELD = "source"
 
 
-def _sortable(moment: datetime, *, naive: bool) -> datetime:
-    """One comparable form for a timestamp, for ordering a whole set.
+#: One comparable form for a timestamp, for ordering a whole set. Defined in
+#: `filtering` alongside the pairwise rule it is the bulk form of, and aliased
+#: here because this module was where it was first needed — the timeline needs
+#: exactly the same decision, and two copies of it would be two places for the
+#: merge and the histogram to disagree about a mixed-timezone source.
+_sortable = sortable_moment
 
-    ``filtering._comparable`` answers this pairwise; a k-way merge needs a
-    single key, so the decision is made once for the set. When any member is
-    naive the offsets are dropped — the same rule, applied in bulk — and when
-    every member is aware they are kept, which orders two time zones correctly
-    rather than pretending both are local.
+
+def _localised(moment: datetime, facts: "SourceFacts") -> datetime:
+    """*moment* as an absolute instant, given the machine it was written on.
+
+    Applied **only to the sort key**, never to the entry. A displayed timestamp
+    is always exactly what the log said — that rule does not bend for ordering,
+    and a stamp that differed from the raw text with no explanation would be a
+    worse failure than the misordering this fixes.
+
+    Two corrections, in order:
+
+    * A **naive** stamp is read in its own machine's zone. This is the fix that
+      matters and it costs the merge nothing: once every stamp is aware, the
+      existing comparison orders them correctly with no further special case.
+    * The measured **skew** is subtracted when the host asked for it. Off by
+      default, because a clock that is four seconds fast is a fact to report
+      rather than one to quietly paper over.
     """
 
-    if naive and moment.tzinfo is not None:
-        return moment.replace(tzinfo=None)
+    if moment.tzinfo is None and facts.zone is not None:
+        moment = moment.replace(tzinfo=facts.zone)
+    if facts.correct_skew and facts.skew:
+        moment = moment - facts.skew
     return moment
 
 
@@ -75,10 +104,51 @@ def tag_origins(
 
     tagged: list[LogEntry] = []
     for entry, origin in zip(entries, origins):
+        # format_ref, so the value here is the same string the source persists
+        # under. For two hosts that is what keeps `source:/var/log/syslog` from
+        # matching both of them at once — the ref string is host-qualified, and
+        # that is a correctness requirement rather than presentation.
         tagged.append(
-            replace(entry, fields={**entry.fields, ORIGIN_FIELD: str(origin)})
+            replace(entry, fields={**entry.fields, ORIGIN_FIELD: format_ref(origin)})
         )
     return tagged
+
+
+@dataclass(frozen=True, slots=True)
+class SourceFacts:
+    """What a source's *machine* contributes to reading and ordering it.
+
+    Empty for a local source, which is why nothing local changes: an all-local
+    set has one zone, no node names, and no skew, and every rule below then
+    reduces to what it did before.
+    """
+
+    #: CLV's name for the machine, or ``None`` for this one. Carried onto every
+    #: entry the source produces so ``node:web01`` is answerable.
+    node: Optional[str] = None
+    #: The zone a **naive** timestamp from this source should be read in. Syslog
+    #: carries no offset at all, so without this a stamp from a UTC host and one
+    #: from an EST host are compared as though both were local.
+    zone: Optional[tzinfo] = None
+    #: Remote clock minus local clock, as measured at connect. Always reported;
+    #: only applied to ordering when the host asked for it.
+    skew: timedelta = timedelta(0)
+    #: Whether to apply :attr:`skew` when ordering. Off by default: skew is
+    #: reported honestly and corrected only on request.
+    correct_skew: bool = False
+
+
+#: The answer for a source on this machine. A callable rather than a constant
+#: because ``SourceSession`` takes it as an injected default.
+def local_facts(ref: object) -> SourceFacts:
+    """Facts for a local source: its zone, and nothing else.
+
+    The zone is filled in even locally, and that is what makes a *mixed* set
+    orderable: with one member local and one on a UTC host, both sides need a
+    zone or there is nothing to compare across.
+    """
+
+    return SourceFacts(zone=datetime.now().astimezone().tzinfo)
 
 
 @dataclass(slots=True)
@@ -93,6 +163,16 @@ class PollOutcome:
     #: The ring buffer dropped older lines to fit these, so the visible window
     #: shifted and an incremental append would render the wrong thing.
     overflowed: bool = False
+    #: Why this source has stopped producing, if it has. Empty on every ordinary
+    #: poll — including one that found nothing, which is the common case and
+    #: emphatically not a problem.
+    #:
+    #: Reported rather than raised, because a source going away is not an error
+    #: worth taking the pane down for and never has been. What Phase 5 adds is
+    #: that it is no longer *silent*: a remote log that stopped because its link
+    #: dropped now looks different from one that stopped because nobody is
+    #: writing to it, which is the whole of Requirement 7.
+    problem: str = ""
 
     @property
     def notice(self) -> str:
@@ -109,7 +189,10 @@ class SourceBuffer:
     timestamp from a line that arrived in another.
     """
 
-    __slots__ = ("path", "reader", "parser", "entries", "max_lines", "tag_origin", "revision")
+    __slots__ = (
+        "path", "reader", "parser", "entries", "max_lines", "tag_origin",
+        "revision", "facts",
+    )
 
     def __init__(
         self,
@@ -118,6 +201,7 @@ class SourceBuffer:
         max_lines: int,
         reader: AnyReader | None = None,
         tag_origin: bool = False,
+        facts: SourceFacts | None = None,
     ) -> None:
         self.path = path
         self.reader = reader
@@ -128,6 +212,10 @@ class SourceBuffer:
         #: buffer is one of several, so a merged view can say where a line came
         #: from — paid once per line as it is read, never per render.
         self.tag_origin = tag_origin
+        #: Which machine this source is on, and what that means for ordering it.
+        #: Empty for a local source, which is what keeps every local path here
+        #: exactly as it was.
+        self.facts = facts or SourceFacts()
         #: Bumped whenever `entries` changes, so a merge can be cached against
         #: it rather than recomputed on every keystroke in the query box.
         self.revision = 0
@@ -161,19 +249,53 @@ class SourceBuffer:
 
         entries = self.parser.feed(result.lines)
         if result.origins:
-            return tag_origins(entries, result.origins)
-        if self.tag_origin and self.path is not None:
-            return tag_origins(entries, [self.path] * len(entries))
-        return entries
+            entries = tag_origins(entries, result.origins)
+        elif self.tag_origin and self.path is not None:
+            entries = tag_origins(entries, [self.path] * len(entries))
+        return self._tag_node(entries)
+
+    def _tag_node(self, entries: list[LogEntry]) -> list[LogEntry]:
+        """Record which machine these lines were read from, when it is not this one.
+
+        Provenance, exactly like :func:`tag_origins` — and applied whether or
+        not the buffer is part of a merge, because ``node:web01`` should answer
+        on a single open remote source too.
+
+        A local source is left completely untouched: no key is added, no entry
+        is copied, and the local path costs nothing it did not cost before.
+        """
+
+        node = self.facts.node
+        if node is None:
+            return entries
+        return [
+            replace(entry, fields={**entry.fields, NODE_FIELD: node})
+            for entry in entries
+        ]
 
     def poll(self) -> PollOutcome:
-        """Read whatever arrived since the last poll."""
+        """Read whatever arrived since the last poll.
+
+        The single funnel every reader's ``poll()`` passes through, which is why
+        the cheap-only guard is entered here rather than in each reader. Inside
+        it a backend method declared blocking raises instead of stalling: this
+        runs on a ``set_interval`` timer at ``refresh_hz``, per member of the
+        set, and a round trip here is a frozen UI twice a second.
+
+        :class:`~clv.services.backend.BlockingCallError` is deliberately **not**
+        caught. It is a design error rather than a source that went away — a
+        reader whose poll needs a blocking read (re-priming a changed archive,
+        say) cannot be driven from here at all, and must follow the source with
+        something drained non-blocking instead. Swallowing it would hide that
+        until the UI froze.
+        """
 
         reader = self.reader
         if reader is None:
             return PollOutcome(self)
         try:
-            result = reader.poll()
+            with cheap_only():
+                result = reader.poll()
         except OSError:
             # A source that vanished mid-session is not an error worth taking
             # the pane down for; the next poll finds it again or it stays quiet.
@@ -187,16 +309,20 @@ class SourceBuffer:
             entries = self._feed(result)
             self.entries.extend(entries)
             self.revision += 1
-            return PollOutcome(self, entries, rotated=True)
+            return PollOutcome(self, entries, rotated=True, problem=result.problem)
 
         if not result.lines:
-            return PollOutcome(self)
+            # The one place a *silent* stop used to be indistinguishable from a
+            # quiet log. Both still return here; only one of them says why.
+            return PollOutcome(self, problem=result.problem)
 
         entries = self._feed(result)
         overflowed = len(self.entries) + len(entries) > (self.entries.maxlen or 0)
         self.entries.extend(entries)
         self.revision += 1
-        return PollOutcome(self, entries, overflowed=overflowed)
+        return PollOutcome(
+            self, entries, overflowed=overflowed, problem=result.problem
+        )
 
     def close(self) -> None:
         """Release whatever the reader holds open.
@@ -227,10 +353,16 @@ class SourceSession:
         *,
         max_lines: int,
         reader_factory: ReaderFactory = open_reader,
+        facts: Callable[[Path], SourceFacts] = local_facts,
     ) -> None:
         self._buffers: list[SourceBuffer] = []
         self._max_lines = max_lines
         self._reader_factory = reader_factory
+        #: What machine a source is on, and what that means for ordering it.
+        #: Injected for the same reason `reader_factory` is: this module may not
+        #: know that SSH exists, and the answer for a remote source comes from
+        #: the host that was probed at connect.
+        self._facts = facts
         #: Stands in for a buffer's deque when nothing is open, so callers can
         #: always treat `entries` as a sized iterable.
         self._empty: deque[LogEntry] = deque(maxlen=max_lines)
@@ -289,7 +421,12 @@ class SourceSession:
         """
 
         reader = self._reader_factory(path, max_lines=self._max_lines)
-        buffer = SourceBuffer(path, max_lines=self._max_lines, reader=reader)
+        buffer = SourceBuffer(
+            path,
+            max_lines=self._max_lines,
+            reader=reader,
+            facts=self._facts(path),
+        )
         buffer.prime()
         self.close()
         self._buffers = [buffer]
@@ -307,8 +444,21 @@ class SourceSession:
 
         from .rotation import RotatedSetReader
 
-        reader = RotatedSetReader(rotated_set, max_lines=self._max_lines)
-        buffer = SourceBuffer(reader.path, max_lines=self._max_lines, reader=reader)
+        reader = RotatedSetReader(
+            rotated_set,
+            max_lines=self._max_lines,
+            # The session's own factory, so a set's live head is opened by
+            # whatever opens every other source. Local behaviour is identical —
+            # the default factory *is* `open_reader` — and it stops this being
+            # the one path that decides for itself.
+            reader_factory=self._reader_factory,
+        )
+        buffer = SourceBuffer(
+            reader.path,
+            max_lines=self._max_lines,
+            reader=reader,
+            facts=self._facts(reader.path),
+        )
         buffer.prime()
         self.close()
         self._buffers = [buffer]
@@ -327,6 +477,24 @@ class SourceSession:
         own rather than the loudest one crowding out the rest.
         """
 
+        opened, failed = self.prepare_many(paths)
+        self.install_many(opened)
+        return opened, failed
+
+    def prepare_many(
+        self, paths: Sequence[Path]
+    ) -> tuple[list[SourceBuffer], list[tuple[Path, str]]]:
+        """Build and prime buffers for *paths* **without** committing them.
+
+        Split out of :meth:`open_many` so the expensive half can run somewhere
+        other than the event loop. Every ``prime()`` below is a bounded read —
+        microseconds locally, a round trip per member remotely — and a merge of
+        five remote logs done inline is five round trips of frozen UI.
+
+        Touches no session state, so a caller may abandon what it gets back if
+        the operator has moved on; :meth:`install_many` is what commits it.
+        """
+
         opened: list[SourceBuffer] = []
         failed: list[tuple[Path, str]] = []
         for path in paths:
@@ -339,18 +507,52 @@ class SourceSession:
                     # Several members means "which source" stops having a
                     # constant answer, so every line records its own.
                     tag_origin=len(paths) > 1,
+                    facts=self._facts(path),
                 )
                 buffer.prime()
             except OSError as exc:
                 failed.append((path, str(exc)))
                 continue
             opened.append(buffer)
-
-        if opened:
-            self.close()
-            self._buffers = opened
-            self._merge_cache = None
         return opened, failed
+
+    def install_many(self, buffers: Sequence[SourceBuffer]) -> list[SourceBuffer]:
+        """Replace the set with several **already primed** buffers.
+
+        :meth:`open_many`'s other half, for the same reason :meth:`install` is
+        :meth:`open_single`'s: priming a remote member is a round trip, so it
+        belongs on a worker, while committing belongs on the event loop where it
+        can be checked against what the operator has selected since.
+
+        An empty *buffers* leaves the current set alone — a merge where nothing
+        opened must not also close the source that was working, which is the
+        rule ``open_many`` already follows.
+        """
+
+        if not buffers:
+            return []
+        self.close()
+        self._buffers = list(buffers)
+        self._merge_cache = None
+        return self._buffers
+
+    def install(self, buffer: SourceBuffer) -> SourceBuffer:
+        """Replace the set with a buffer that has **already** been primed.
+
+        The split :meth:`open_single` cannot offer: priming a remote source is a
+        network round trip and belongs on a worker, but committing it belongs on
+        the event loop, where it can be checked against what the operator has
+        selected *since*. Doing both in the worker would race two opens into one
+        session; doing both on the loop would freeze the UI for a round trip.
+
+        The previous set is closed only once the new buffer is in hand, so a
+        source that would not open still does not cost the one that was working.
+        """
+
+        self.close()
+        self._buffers = [buffer]
+        self._merge_cache = None
+        return buffer
 
     def adopt(self, path: Path, reader) -> SourceBuffer:
         """Replace the set with one buffer over a reader built elsewhere.
@@ -456,6 +658,18 @@ class SourceSession:
             for buffer in self._buffers
             for entry in buffer.entries
         )
+        # ...except when the members are on machines in *different* zones, where
+        # dropping the offset is exactly the bug. Syslog carries no offset at
+        # all, so a naive stamp from a UTC host and one from an EST host are
+        # otherwise compared directly: five hours of confident misordering, with
+        # the error appearing before the request that caused it and nothing on
+        # screen suggesting anything is amiss.
+        #
+        # Engaged **only** when the zones actually disagree. A single-zone set —
+        # every all-local merge, and every merge of hosts that share a zone —
+        # takes the branch above unchanged, which is what keeps local behaviour
+        # identical rather than merely equivalent.
+        spans_zones = self._spans_zones()
 
         anchored = 0
         streams: list[list[tuple[tuple, LogEntry]]] = []
@@ -469,6 +683,8 @@ class SourceSession:
                     # source*, never dropped and never guessed at: the position
                     # tiebreaker keeps it directly after the line it followed.
                     anchored += 1
+                elif spans_zones:
+                    last = _localised(moment, buffer.facts)
                 else:
                     last = _sortable(moment, naive=naive)
                 if last is None:
@@ -489,6 +705,55 @@ class SourceSession:
         self._anchored = anchored
         self._merge_cache = (revisions, merged)
         return merged
+
+    def _spans_zones(self) -> bool:
+        """Whether the members disagree about what a naive stamp means.
+
+        Two things have to be true: more than one member, and more than one
+        distinct UTC offset among them. Either alone is the ordinary case and
+        must keep the ordinary behaviour — which is what makes this safe to add
+        to a merge that has worked for years.
+
+        Skew correction also counts as a disagreement, because a corrected
+        stamp and an uncorrected one are on different clocks even when they are
+        in the same zone.
+        """
+
+        if len(self._buffers) < 2:
+            return False
+        if any(buffer.facts.correct_skew and buffer.facts.skew for buffer in self._buffers):
+            return True
+        offsets = {
+            None if buffer.facts.zone is None else buffer.facts.zone.utcoffset(None)
+            for buffer in self._buffers
+        }
+        return len(offsets) > 1 and None not in offsets
+
+    def skew_spread(self) -> timedelta:
+        """The widest disagreement between the members' clocks.
+
+        Reported **always**, corrected only on request. A set whose hosts agree
+        says nothing; one that disagrees says by how much, so an operator
+        reading causation out of the interleaving knows how much to trust it.
+        """
+
+        if len(self._buffers) < 2:
+            return timedelta(0)
+        skews = [buffer.facts.skew for buffer in self._buffers]
+        return max(skews) - min(skews)
+
+    @property
+    def corrected(self) -> bool:
+        """Whether any member's timestamps are being adjusted for skew.
+
+        The pane says so when this is true: a displayed stamp that differs from
+        the raw log text must never be unexplained.
+        """
+
+        return any(
+            buffer.facts.correct_skew and buffer.facts.skew
+            for buffer in self._buffers
+        )
 
     @property
     def anchored(self) -> int:
@@ -537,10 +802,48 @@ class SourceSession:
 
         tagged = entry.fields.get(ORIGIN_FIELD)
         if tagged:
-            return Path(tagged)
+            return parse_ref(tagged)
         if len(self._buffers) == 1:
             return self._buffers[0].path
         return None
+
+    def moment_mapper(self) -> Optional[Callable[[LogEntry], Optional[datetime]]]:
+        """How the histogram should read a stamp — or ``None`` for "as written".
+
+        The timeline has to key its buckets by the same thing :meth:`_merged`
+        sorts by, or the bar and the pane beneath it describe two different
+        orderings of the same lines. That only diverges when the members
+        disagree about what a naive stamp means, so this returns ``None`` in
+        every other case and the histogram keeps the code path it has always
+        had — the same guard, and the same reason for it, as the merge.
+
+        Returns a **mapper rather than a per-entry method** so the origin
+        lookup is built once for a whole histogram instead of once per line: a
+        filtered set is thousands of entries and the buffer list is single
+        digits, and rebuilding the map inside the loop would put that product
+        on the redraw path. The closure stays valid for as long as the buffers
+        do, which is exactly as long as the grid it is stored on does.
+        """
+
+        if not self._spans_zones():
+            return None
+
+        facts = {format_ref(buffer.path): buffer.facts for buffer in self._buffers}
+        fallback = self._buffers[0].facts
+
+        def mapper(entry: LogEntry) -> Optional[datetime]:
+            moment = entry.timestamp
+            if moment is None:
+                return None
+            # An untagged entry can only be the single-buffer case, which
+            # `_spans_zones` has already excluded — but a member whose origin
+            # is unknown must not be silently placed on another machine's
+            # clock, so it falls back to the first member exactly as the merge
+            # would have read it before any of this existed.
+            origin = entry.fields.get(ORIGIN_FIELD, "")
+            return _localised(moment, facts.get(origin, fallback))
+
+        return mapper
 
     # --- tailing ------------------------------------------------------------
 
@@ -550,12 +853,18 @@ class SourceSession:
         Returns one outcome per buffer that produced something, so the caller
         can decide between an incremental append and a redraw without asking
         each buffer again.
+
+        **A stoppage counts as something produced**, and that is the second
+        place this phase had to fix: filtering on lines alone meant a source
+        that had died reported nothing to report, because a source that has died
+        is precisely one with no lines. The verdict never reached the pane, and
+        the drop stayed as quiet here as it had been a layer below.
         """
 
         outcomes: list[PollOutcome] = []
         for buffer in self._buffers:
             outcome = buffer.poll()
-            if outcome.entries or outcome.rotated:
+            if outcome.entries or outcome.rotated or outcome.problem:
                 outcomes.append(outcome)
         return outcomes
 

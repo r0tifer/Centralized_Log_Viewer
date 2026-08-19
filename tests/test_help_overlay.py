@@ -13,6 +13,7 @@ from textual.widgets import Footer, Input, Static
 from clv.app import BINDING_CATEGORIES, LogViewerApp, build_help_sections
 from clv.widgets.help_overlay import HelpOverlay, HelpSection, format_key
 from clv.widgets.log_view import LogView
+from clv.widgets.timeline import TimelineBar
 
 
 def _rows(sections: list[HelpSection]) -> list[tuple[str, str]]:
@@ -25,13 +26,14 @@ def _rows(sections: list[HelpSection]) -> list[tuple[str, str]]:
 def test_every_binding_has_a_category() -> None:
     """The fallback bucket is a safety net, not somewhere bindings live.
 
-    Covers LogView too: its cursor keys are bound on the widget rather than the
-    app, and a key an operator cannot find is a key that does not exist.
+    Covers LogView and TimelineBar too: their cursor keys are bound on the
+    widget rather than the app, and a key an operator cannot find is a key that
+    does not exist.
     """
 
     uncategorised = {
         binding.action
-        for binding in [*LogViewerApp.BINDINGS, *LogView.BINDINGS]
+        for binding in [*LogViewerApp.BINDINGS, *LogView.BINDINGS, *TimelineBar.BINDINGS]
         if binding.action not in BINDING_CATEGORIES
     }
     assert uncategorised == set()

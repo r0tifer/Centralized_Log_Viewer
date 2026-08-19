@@ -150,6 +150,7 @@ class AdvancedFiltersDrawer(Static):
        plugin line as a second detail of the same block. */
     AdvancedFiltersDrawer #export-status,
     AdvancedFiltersDrawer #journald-status,
+    AdvancedFiltersDrawer #ssh-status,
     AdvancedFiltersDrawer #watch-status {
         color: $text-muted;
         height: auto;
@@ -213,7 +214,10 @@ class AdvancedFiltersDrawer(Static):
         self._clipboard = True
         self._detail_pane = False
         self._watch_rules = True
+        self._timeline = False
+        self._clustering = False
         self._journald = False
+        self._ssh = False
         self.add_class("-hidden")
 
     # --- composition --------------------------------------------------------
@@ -259,6 +263,17 @@ class AdvancedFiltersDrawer(Static):
                 with Vertical(classes="drawer-toggle"):
                     yield Label("Watch rules")
                     yield Switch(value=self._watch_rules, id="drawer-watch-rules")
+                # Items 14 and 15 both asked for the View section above. They
+                # join this row instead, for the two reasons already recorded
+                # here: #view-toggles vanishes above 148 columns and neither
+                # switch has a query-bar copy, and a *new* row is what pushes
+                # "Source discovery" past max-height 16.
+                with Vertical(classes="drawer-toggle"):
+                    yield Label("Timeline")
+                    yield Switch(value=self._timeline, id="drawer-timeline")
+                with Vertical(classes="drawer-toggle"):
+                    yield Label("Collapse repeats")
+                    yield Switch(value=self._clustering, id="drawer-clustering")
 
         yield Label("Source discovery", classes="drawer-heading")
         with Horizontal(classes="drawer-row"):
@@ -298,6 +313,15 @@ class AdvancedFiltersDrawer(Static):
             with Vertical(classes="drawer-toggle"):
                 yield Label("Journal (systemd)")
                 yield Switch(value=self._journald, id="drawer-journald")
+            # `Remote (SSH)` rather than `Remote sources (SSH)`, and the reason
+            # is measurable: `.drawer-toggle` is `width: auto`, so this row's
+            # width is the sum of its label lengths, and `-compact` only stacks
+            # them below 90 columns. The longer label overflows the row between
+            # 90 and 96 — where nothing stacks and the 80-column test cannot see
+            # it — before the Input beside it gets a single cell.
+            with Vertical(classes="drawer-toggle"):
+                yield Label("Remote (SSH)")
+                yield Switch(value=self._ssh, id="drawer-ssh")
             with Vertical(classes="drawer-field"):
                 yield Label("Buffered lines per source")
                 yield Input(
@@ -328,6 +352,7 @@ class AdvancedFiltersDrawer(Static):
         yield Static("", id="export-status")
         yield Static("", id="watch-status")
         yield Static("", id="journald-status")
+        yield Static("", id="ssh-status")
 
         with Container(id="drawer-actions"):
             yield Button("Rescan sources", id="rescan-sources", variant="primary")
@@ -379,6 +404,28 @@ class AdvancedFiltersDrawer(Static):
         except NoMatches:  # not composed yet
             pass
 
+    def set_ssh(self, enabled: bool, *, available: bool = True, reason: str = "") -> None:
+        """Show whether remote sources are on, and summarise the hosts in a line.
+
+        One line for the whole fleet, deliberately. The drawer is capped at
+        `max-height: 16` and every row added here pushes `#drawer-actions` below
+        the fold, where it lays out and paints nothing — so five hosts get
+        "3 hosts · 2 reachable · web03 unreachable" and the per-host detail lives
+        in the dialog `R` opens, which has room for it.
+        """
+
+        self._ssh = enabled
+        try:
+            switch = self.query_one("#drawer-ssh", Switch)
+            with self.prevent(Switch.Changed):
+                switch.value = enabled
+            switch.disabled = not available
+            self.query_one("#ssh-status", Static).update(
+                f"Remote: {reason}" if reason else ""
+            )
+        except NoMatches:  # not composed yet
+            pass
+
     def _emit(self, previous: AdvancedSettings) -> None:
         self.post_message(self.SettingsChanged(self._settings, previous))
 
@@ -414,6 +461,8 @@ class AdvancedFiltersDrawer(Static):
         clipboard: bool | None = None,
         detail_pane: bool | None = None,
         watch_rules: bool | None = None,
+        timeline: bool | None = None,
+        clustering: bool | None = None,
     ) -> None:
         """Mirror the app's view state onto this drawer's switches.
 
@@ -436,6 +485,10 @@ class AdvancedFiltersDrawer(Static):
             self._detail_pane = detail_pane
         if watch_rules is not None:
             self._watch_rules = watch_rules
+        if timeline is not None:
+            self._timeline = timeline
+        if clustering is not None:
+            self._clustering = clustering
         try:
             with self.prevent(Switch.Changed):
                 self.query_one("#drawer-auto-scroll", Switch).value = auto_scroll
@@ -446,6 +499,10 @@ class AdvancedFiltersDrawer(Static):
                     self.query_one("#drawer-detail-pane", Switch).value = detail_pane
                 if watch_rules is not None:
                     self.query_one("#drawer-watch-rules", Switch).value = watch_rules
+                if timeline is not None:
+                    self.query_one("#drawer-timeline", Switch).value = timeline
+                if clustering is not None:
+                    self.query_one("#drawer-clustering", Switch).value = clustering
         except NoMatches:  # not composed yet
             pass
 
@@ -460,11 +517,17 @@ class AdvancedFiltersDrawer(Static):
             "drawer-clipboard": "clipboard",
             "drawer-detail-pane": "detail_pane",
             "drawer-watch-rules": "watch_rules",
+            "drawer-timeline": "timeline",
+            "drawer-clustering": "clustering",
             # A view toggle in mechanism only: the app owns it, acts on it, and
             # syncs it back. What it actually does is grant consent to run a
             # subprocess, which is why it is the app's decision and not this
             # widget's — see LogViewerApp._set_journald.
             "drawer-journald": "journald",
+            # Same mechanism and the same reason as the journal above: consent to
+            # spawn a subprocess is the app's decision, not this widget's. A
+            # *network* subprocess raises that bar rather than lowering it.
+            "drawer-ssh": "ssh",
         }.get(switch_id)
         if view_field is not None:
             event.stop()

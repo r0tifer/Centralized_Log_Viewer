@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
+
+from textual.widgets import Static, Switch
 
 from clv.app import LogTree, LogViewerApp
 from clv.plugins import (
@@ -20,6 +23,7 @@ from clv.plugins import (
     LogSourceProvider,
     PluginRegistry,
     ProviderSource,
+    load_plugins,
 )
 from clv.plugins.sources import journald
 from clv.services import SourceManager, persist_setting
@@ -512,3 +516,239 @@ def test_the_drawer_switch_writes_the_opt_in_back_to_settings() -> None:
             )
 
     asyncio.run(scenario())
+
+
+# --- the loader, where the shipped binary differs from a checkout -----------
+
+
+def test_drop_ins_are_found_without_the_folder_existing_on_disk(monkeypatch) -> None:
+    """A PyInstaller bundle has the modules but not the directories.
+
+    `_load_local` used to gate the subpackage search on `sub_dir.is_dir()`,
+    which is False inside a bundle even though the modules are present and
+    importable. Every drop-in was skipped, and silently — finding no plugins
+    is a valid state, so nothing was reported. The shipped binary therefore
+    offered no journal however the opt-in was set.
+
+    Where a subpackage lives is now asked of the import system, which is the
+    only thing that knows when the answer is "inside an archive". Simulated
+    here by making the filesystem deny the directory exists.
+    """
+
+    from pathlib import Path as RealPath
+
+    monkeypatch.setattr(RealPath, "is_dir", lambda self: False)
+
+    registry = load_plugins(include_entry_points=False)
+
+    assert any(isinstance(plugin, journald.JournaldProvider) for plugin in registry.sources), (
+        "no drop-in was loaded when the plugin folder was not a real directory"
+    )
+    assert not registry.errors
+
+
+def test_the_drawer_says_when_the_plugin_is_missing_from_the_build() -> None:
+    """A switch that writes an opt-in nothing reads is worse than a dead one."""
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            await pilot.pause()
+            app._plugins = PluginRegistry()  # a build that loaded no plugins
+            app._sync_journald_status()
+            await pilot.pause()
+
+            drawer = app.advanced_drawer
+            status = drawer.query_one("#journald-status", Static).render().plain
+            assert "not loaded" in status
+            assert drawer.query_one("#drawer-journald", Switch).disabled is True
+
+    asyncio.run(scenario())
+
+
+def test_the_status_says_what_was_found_not_just_that_it_looked() -> None:
+    """"Two sources and no units" is a failure that looked like success."""
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(journald.shutil, "which", lambda _n: "/usr/bin/journalctl")
+        monkey.setattr(journald, "availability", lambda: (True, ""))
+        persist_setting(user_config_path(), "enable_journald", "true")
+
+        healthy = journald.JournaldProvider(
+            runner=lambda argv: (
+                "-1 a\n 0 b\n" if "--list-boots" in argv else "sshd.service\nnginx.service\n"
+            )
+        )
+        list(healthy.discover())
+        assert "2 unit(s)" in healthy.status
+
+        # journalctl ran and said nothing — a real answer, not a failure.
+        quiet = journald.JournaldProvider(runner=lambda argv: "")
+        list(quiet.discover())
+        assert "no units listed" in quiet.status
+        assert "journalctl reported none" in quiet.status
+
+        # journalctl could not be run — a different fact, and the actionable one.
+        broken = journald.JournaldProvider(
+            runner=lambda argv: ("", "journalctl timed out after 10s")
+        )
+        list(broken.discover())
+        assert "timed out" in broken.status
+    finally:
+        monkey.undo()
+
+
+def test_a_failing_journalctl_reports_why_rather_than_returning_empty() -> None:
+    assert _run_reports("/nonexistent/journalctl") != ""
+
+
+def _run_reports(binary: str) -> str:
+    _out, error = journald._run([binary, "--list-boots"])
+    return error
+
+
+def test_the_drawer_reports_what_the_provider_found() -> None:
+    """The provider knew all along; nothing displayed it."""
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            await pilot.pause()
+
+            provider = journald.JournaldProvider()
+            provider.status = "3 journal source(s), no units listed (journalctl timed out)"
+            app._plugins = PluginRegistry(sources=[provider])
+            app._config = replace(app._config, enable_journald=True)
+            monkey = pytest.MonkeyPatch()
+            monkey.setattr(
+                "clv.plugins.sources.journald.availability", lambda: (True, "")
+            )
+            try:
+                app._sync_journald_status()
+                await pilot.pause()
+                status = app.advanced_drawer.query_one(
+                    "#journald-status", Static
+                ).render().plain
+            finally:
+                monkey.undo()
+
+            assert "no units listed" in status
+            assert "timed out" in status
+
+    asyncio.run(scenario())
+
+
+def test_providers_are_asked_off_the_event_loop(tmp_path: Path) -> None:
+    """A provider shells out; on the UI thread that is a frozen app.
+
+    Enumerating units on a multi-gigabyte journal is seconds of work, and the
+    query has a timeout measured in tens of seconds. Discovery already runs in
+    a worker thread for the filesystem walk; this asserts the providers went
+    with it, because the symptom of getting that wrong is a UI that stops
+    responding and a tree that quietly comes back short.
+    """
+
+    import threading
+
+    root = tmp_path / "logs"
+    root.mkdir()
+    (root / "app.log").write_text("2026-08-12 10:00:00 - INFO - x\n", encoding="utf-8")
+
+    class Slow(LogSourceProvider):
+        name = "slow provider"
+
+        def __init__(self) -> None:
+            self.thread: str | None = None
+
+        def discover(self):
+            self.thread = threading.current_thread().name
+            return [ProviderSource(Path("slow:one"), "One")]
+
+        def open(self, path):
+            return iter(())
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(120, 30)) as pilot:
+            provider = Slow()
+            app._plugins = PluginRegistry(sources=[provider])
+            app._source_manager = SourceManager([root], [])
+            main = threading.current_thread().name
+
+            await app._rescan()
+            await pilot.pause()
+
+            assert provider.thread is not None, "the provider was never asked"
+            assert provider.thread != main, (
+                f"discover() ran on {provider.thread}, the event loop's thread"
+            )
+            assert len(app._provider_sources) == 1
+
+    asyncio.run(scenario())
+
+
+# --- running a system binary from inside a bundle ---------------------------
+
+
+def test_the_bundles_library_path_is_kept_away_from_child_processes(monkeypatch) -> None:
+    """PyInstaller's LD_LIBRARY_PATH makes journalctl load the wrong libcrypto.
+
+    The frozen app needs `_internal` on the path; a system binary must not
+    have it, or it loads the bundle's libraries instead of the system's and
+    dies when the two distributions disagree:
+
+        journalctl: .../libcrypto.so.3: version `OPENSSL_3.4.0' not found
+        (required by /usr/lib64/systemd/libsystemd-shared-258.10-1.fc43.so)
+
+    Exit 1, no unit list, and a tree holding only the two sources that need no
+    subprocess at all.
+    """
+
+    monkeypatch.setattr(journald.sys, "_MEIPASS", "/opt/app/_internal", raising=False)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/app/_internal")
+
+    env = journald.child_environment()
+
+    assert "LD_LIBRARY_PATH" not in env
+
+
+def test_a_path_the_operator_set_themselves_survives(monkeypatch) -> None:
+    """Only the injected entry is ours to remove."""
+
+    monkeypatch.setattr(journald.sys, "_MEIPASS", "/opt/app/_internal", raising=False)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/app/_internal:/usr/local/lib")
+
+    assert journald.child_environment()["LD_LIBRARY_PATH"] == "/usr/local/lib"
+
+
+def test_the_original_path_is_restored_when_pyinstaller_saved_one(monkeypatch) -> None:
+    monkeypatch.setattr(journald.sys, "_MEIPASS", "/opt/app/_internal", raising=False)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/app/_internal")
+    monkeypatch.setenv("LD_LIBRARY_PATH_ORIG", "/usr/lib/mine")
+
+    env = journald.child_environment()
+
+    assert env["LD_LIBRARY_PATH"] == "/usr/lib/mine"
+    assert "LD_LIBRARY_PATH_ORIG" not in env
+
+
+def test_an_unfrozen_run_is_left_exactly_as_it_is(monkeypatch) -> None:
+    monkeypatch.delattr(journald.sys, "_MEIPASS", raising=False)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/usr/local/lib")
+
+    assert journald.child_environment()["LD_LIBRARY_PATH"] == "/usr/local/lib"
+
+
+def test_the_follow_subprocess_gets_the_cleaned_environment() -> None:
+    """stderr is discarded on the follow, so this would fail silently."""
+
+    captured = {}
+
+    def spawn(argv, **kwargs):
+        captured.update(kwargs)
+        return FakeProcess()
+
+    journald.JournalReader(Path("journal:all"), max_lines=10, spawn=spawn).prime()
+
+    assert "env" in captured, "the follow inherited the bundle's library path"

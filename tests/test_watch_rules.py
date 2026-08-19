@@ -14,6 +14,7 @@ from clv.app import LogViewerApp
 from clv.services.config import LogConfig
 from clv.services.discovery import DiscoverySettings
 from clv.services.parsing import LogParser
+from clv.services.refs import RemoteRef, format_ref
 from clv.services.watch import (
     ACTION_HIGHLIGHT,
     ACTION_NOTIFY,
@@ -614,3 +615,79 @@ def test_the_rules_dialog_fits_eighty_columns(tmp_path: Path) -> None:
                 assert region.bottom <= 24, widget_id
 
     _run(scenario)
+
+
+# --- remote sources ---------------------------------------------------------
+#
+# Phase 6's parity sweep. A `WatchRule` binds to no source at all — it is a
+# pattern and an action, applied to whatever is open — so nothing source-shaped
+# is persisted and there is nothing here for a remote ref to corrupt. What does
+# see a source is the hit cache, which keys through `mark_key`; these pin that
+# it scopes by machine, and that the rules themselves stay machine-agnostic.
+
+
+def _watch_entries(*messages: str):
+    parser = LogParser()
+    return parser.feed(
+        [f"2026-08-07 09:25:0{index} - ERROR - {text}" for index, text in enumerate(messages)]
+    )
+
+
+def test_a_rule_fires_on_a_remote_source() -> None:
+    index = WatchIndex([WatchRule(name="refused", pattern="connection refused")])
+    remote = RemoteRef.build("web01", "/var/log/syslog")
+
+    fired = index.evaluate(remote, _watch_entries("connection refused"))
+
+    assert [names for _, names in fired] == [("refused",)]
+    assert index.watched(remote, _watch_entries("connection refused")[0]) is True
+
+
+def test_the_hit_cache_counts_the_same_line_on_two_machines_twice() -> None:
+    """A fleet-wide outage produces one identical line per machine. Folding
+    them into one cached answer would report a single event and lose four."""
+
+    index = WatchIndex([WatchRule(name="refused", pattern="connection refused")])
+    entries = _watch_entries("connection refused")
+
+    hosts = [RemoteRef.build(name, "/var/log/syslog") for name in ("web01", "web02")]
+    for host in hosts:
+        index.evaluate(host, entries)
+
+    # Two distinct cache keys, so two evaluations rather than one and a hit.
+    assert index.evaluations == 2
+    assert all(index.watched(host, entries[0]) for host in hosts)
+
+
+def test_pruning_one_machine_leaves_the_other_machine_s_hits() -> None:
+    index = WatchIndex([WatchRule(name="refused", pattern="connection refused")])
+    entries = _watch_entries("connection refused", "connection refused")
+    web01 = RemoteRef.build("web01", "/var/log/syslog")
+    db02 = RemoteRef.build("db02", "/var/log/syslog")
+
+    index.evaluate(web01, entries)
+    index.evaluate(db02, entries)
+    index.prune(web01, entries[:1])
+
+    assert index.watched(web01, entries[0]) is True
+    assert index.watched(web01, entries[1]) is False
+    # `retain` is global by design, so db02's cache goes with it — the point
+    # here is that the *keys* are distinct, not that pruning is per host.
+    assert index.watched(db02, entries[0]) is False
+
+
+def test_a_rule_persists_unchanged_while_a_remote_source_is_open(
+    tmp_path: Path,
+) -> None:
+    """The proof that a rule carries nothing source-shaped: the same tuple comes
+    back beside a remote `starred` entry, byte for byte."""
+
+    store = StateStore(tmp_path / "state.json")
+    rules = (WatchRule(name="refused", pattern="connection refused"),)
+    remote = format_ref(RemoteRef.build("web01", "/var/log/syslog"))
+
+    store.save(SessionState(watch_rules=rules, starred=(remote,)))
+    restored = store.load()
+
+    assert restored.watch_rules == rules
+    assert restored.starred == (remote,)

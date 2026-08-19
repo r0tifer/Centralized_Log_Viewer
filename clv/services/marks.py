@@ -31,10 +31,10 @@ oversight to be tidied up later.
 from __future__ import annotations
 
 from hashlib import blake2b
-from pathlib import Path
 from typing import Iterable, Optional
 
 from .parsing import LogEntry
+from .refs import SourceRef
 
 #: Digest width. Eight bytes is 2^64 keys; a collision would need two different
 #: lines in one source to land on the same digest, and the cost of one is a
@@ -42,7 +42,7 @@ from .parsing import LogEntry
 _DIGEST_BYTES = 8
 
 
-def mark_key(source: Optional[Path], entry: LogEntry) -> str:
+def mark_key(source: Optional[SourceRef], entry: LogEntry) -> str:
     """Stable identity for *entry* within *source*.
 
     The source is part of the key so marks in one log cannot show up in
@@ -67,10 +67,10 @@ class MarkSet:
     def __bool__(self) -> bool:
         return bool(self._keys)
 
-    def contains(self, source: Optional[Path], entry: LogEntry) -> bool:
+    def contains(self, source: Optional[SourceRef], entry: LogEntry) -> bool:
         return mark_key(source, entry) in self._keys
 
-    def toggle(self, source: Optional[Path], entry: LogEntry) -> bool:
+    def toggle(self, source: Optional[SourceRef], entry: LogEntry) -> bool:
         """Flip *entry*'s mark. Returns True when it is now marked."""
 
         key = mark_key(source, entry)
@@ -83,7 +83,7 @@ class MarkSet:
     def clear(self) -> None:
         self._keys.clear()
 
-    def prune(self, source: Optional[Path], entries: Iterable[LogEntry]) -> int:
+    def prune(self, source: Optional[SourceRef], entries: Iterable[LogEntry]) -> int:
         """Drop marks for *source* whose lines are no longer in *entries*.
 
         Without this the count shown to the operator would keep rising as the
@@ -97,7 +97,7 @@ class MarkSet:
             {mark_key(source, entry) for entry in entries}, sources=[source]
         )
 
-    def retain(self, live: set[str], *, sources: Iterable[Optional[Path]]) -> int:
+    def retain(self, live: set[str], *, sources: Iterable[Optional[SourceRef]]) -> int:
         """Keep only *live* marks among those belonging to *sources*.
 
         The general form, for a pane showing several sources at once: pruning
@@ -117,7 +117,7 @@ class MarkSet:
         self._keys -= stale
         return len(stale)
 
-    def count_for(self, *sources: Optional[Path]) -> int:
+    def count_for(self, *sources: Optional[SourceRef]) -> int:
         """How many marks belong to *sources* — what the status line reports."""
 
         prefixes = tuple(f"{source or ''}\0" for source in sources)

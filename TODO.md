@@ -16,12 +16,20 @@ would mean reworking every feature built on top of them.
 | 2 — The line cursor and what it unlocks | 5, 6, 7 | ✅ **Complete** (`63354f9`, `1c9fd27`, `20e4ffd`) |
 | 3 — Query and view power | 8, 9, 10 | ✅ **Complete** (`b882cfb`, `3fbbf75`, `bd174af`) |
 | 4 — The source layer | 11, 12, 13 | ✅ **Complete** (`24647af`, `eb25ed7`, `ec03023`) |
-| 5 — Analysis | 14, 15 | Not started |
+| 5 — Analysis | 14, 15 | ✅ **Complete** (`c8639ba`, `5ed505e`) |
 
 Completed items are kept in full rather than deleted: the "production ready
 when" lists are what the tests were written against, and the reasoning behind
 each constraint is worth more as a record than as a checkbox. Where what
 shipped differs from what was planned, the item says so under **As shipped**.
+
+**Successor plans.** The five phases above are done; work continues in two files
+that carry their own status tables:
+
+| Plan | Scope | State |
+| --- | --- | --- |
+| [PLUGIN_TODO.md](PLUGIN_TODO.md) | The plugin system — interfaces, loader, distribution, isolation | In progress |
+| [SSH_TODO.md](SSH_TODO.md) | Remote sources over SSH. Reverses a non-goal recorded below | In progress |
 
 ---
 
@@ -45,8 +53,11 @@ has to relitigate them.
   itself through `describe_empty_result`.
 - **Bounded work.** No feature may introduce a whole-file read of a stream
   source, or unbounded memory growth beyond `max_buffer_lines`.
-- **Local only.** No network, no telemetry. Log content never lands in a cache
-  or temp file; session state stores paths and settings only.
+- **No telemetry, no exfiltration, no privilege escalation.** Network access is
+  limited to hosts the operator names, over SSH, with their own credentials, on
+  an explicit action — see [SSH_TODO.md](SSH_TODO.md). Log content never lands
+  in a cache or temp file, local or remote; session state stores source
+  identifiers and settings only.
 - **Every action has a keyboard path.** Mouse is supported, never required.
 
 ### Footer and keybinding policy
@@ -64,7 +75,10 @@ pane navigation stays available as a later option.
 
 Shipped rows are marked ✅. Cursor movement lives on `LogView.BINDINGS` rather
 than the app — see Item 5's **As shipped** — but is listed here because it
-counts against the same key budget and appears in the same help overlay.
+counts against the same key budget and appears in the same help overlay. The
+timeline's bucket keys are on `TimelineBar.BINDINGS` for the same reason, and
+reuse the cursor keys deliberately: they are the same gesture aimed at whatever
+has focus.
 
 | Key | Action | Item | Footer | |
 | --- | --- | --- | --- | --- |
@@ -83,8 +97,9 @@ counts against the same key budget and appears in the same help overlay.
 | `W` | Watch rules manager | 10 | hidden | ✅ |
 | `x` | Toggle source into the merged set | 13 | hidden | ✅ |
 | `u` | Open the merged (unified) view | 13 | hidden | ✅ |
-| `b` | Toggle the severity timeline | 14 | hidden | |
-| `c` | Toggle repeat clustering | 15 | hidden | |
+| `b` | Toggle the severity timeline | 14 | hidden | ✅ |
+| `←` `→` `Home` `End` `Enter` | Select a timeline bucket, filter to it | 14 | hidden | ✅ |
+| `c` | Toggle repeat clustering | 15 | hidden | ✅ |
 
 No collisions with the existing bindings (`/`, `Esc`, `a`, `*`, `t`, `s`, `f`,
 `w`, `o`, `Ctrl+B`, `[`, `]`, `+`, `-`, `Ctrl+L`, `Ctrl+S`, `Ctrl+R`, `q`).
@@ -1010,6 +1025,11 @@ paragraph stating that merging is local-only and that remote aggregation
 remains out of scope, so the non-goal does not have to be relitigated in every
 issue.
 
+> The local-only paragraph is **superseded as of 2026-08-16** — see
+> [SSH_TODO.md](SSH_TODO.md) Phase 6, which merges across hosts, and Phase 8,
+> which rewrites that README paragraph. The requirement is left as written
+> because it is what the shipped tests were built against.
+
 **As shipped.** The acceptance bar — "no feature becomes single-source-only" —
 was met by making the *session* the unit rather than by adding a merged branch
 to each feature, which is why the extraction landed first as its own commit.
@@ -1053,11 +1073,11 @@ set, because its filters were written against all of it.
 
 ---
 
-# Phase 5 — Analysis
+# Phase 5 — Analysis ✅
 
 Both items are what push CLV past the tool it is imitating.
 
-## 14. Severity timeline
+## 14. Severity timeline ✅
 
 **Goal.** Event Viewer's "Summary of Administrative Events", except live and
 one keystroke from the logs. A single-row sparkline of event volume by severity
@@ -1097,9 +1117,48 @@ mirroring `b`, using the established two-homes pattern.
 **README.** New "Timeline" subsection with an ASCII example; shortcuts row for
 `b`.
 
+**As shipped.** Four departures, all of them consequences of the bar being a
+control rather than a picture:
+
+- **The widget is two rows, not one.** The bar is one row — volume is the
+  *height* of the block glyph, so a spike reads on a monochrome terminal — and
+  beneath it is a caption naming the selected bucket. Without it the selection
+  is invisible, which makes a control nobody can aim; the status bar, the only
+  other candidate, is already full at 80 columns. The caption is also where a
+  source with no timestamps explains itself, in `describe_empty_result`'s
+  voice, which is what keeps the bar row from being an empty rectangle.
+- **The switch went into "Output & panes", not the View section.** Item 5
+  recorded that `#view-toggles` is `display: none` above 148 columns, so a
+  single-home control placed there vanishes on a wide terminal; Item 10
+  recorded that a *new row* in the drawer pushes "Source discovery" past
+  `max-height: 16`, where it lays out and paints nothing. A fourth toggle in
+  the existing row is the one placement that avoids both, and
+  `test_the_drawer_still_paints_source_discovery_with_the_new_switch` is the
+  guard.
+- **The bucket count is the width, so a resize is a rebuild.** `TimelineBar`
+  cannot rebuild it — bucketing is a service and the entries belong to the app
+  — so it posts `WidthChanged` and the app re-buckets. That message is also
+  what corrects the *first* histogram: the bar is hidden until `b`, and a
+  hidden widget has no width to bucket against.
+- **"Recomputed incrementally on tail" is a fixed grid plus a fallback.**
+  `Timeline.extend` folds arrivals into the existing origin/step by arithmetic,
+  and returns `None` when one lands outside the grid — at which point the app
+  rebuilds. With buckets minutes wide and a 2 Hz poll, the rebuild is paid
+  about once per bucket rather than twice a second, and
+  `test_extending_matches_a_full_rebuild` is the correctness guard on the
+  cheap branch.
+
+Two smaller notes. Selecting a bucket goes through the *custom range* the query
+bar and `SessionState` already have rather than through a filter of its own, so
+it shows up as an ordinary Time chip and is dismissed like one — and the bar
+then re-buckets over the narrower window, which makes a second `Enter` a
+drill-down. And `SEVERITY_COLORS` moved from `app.py` to
+`clv/widgets/severity.py`: the bar colours buckets with the palette the log
+pane colours lines with, and a widget may not import `clv.app`.
+
 ---
 
-## 15. Repeat clustering / noise collapse
+## 15. Repeat clustering / noise collapse ✅
 
 **Goal.** The single highest-leverage readability feature, and one nothing in
 Event Viewer does. Normalise volatile tokens (numbers, UUIDs, IPs, hex, paths)
@@ -1152,6 +1211,46 @@ in M clusters".
 shortcuts row for `c`; an explicit statement that clustering never hides a line
 and that every clustered line stays selectable and exportable.
 
+**As shipped.** The no-loss requirement is the one this item stands on, and it
+is also the one whose wording did not survive contact:
+
+- **"Expanding a cluster yields exactly the original lines, in order" is a
+  guarantee *per cluster*, not over the pane.** A cluster gathers its members at
+  the position of its first one, so a run with something else interleaved comes
+  back grouped rather than interleaved — which is what collapsing a run *means*,
+  and is the case the feature exists for. Within a cluster the order and the
+  bytes are exactly what was read; nothing is dropped and nothing invented.
+  `expand()`'s docstring says so, and
+  `test_expanding_a_cluster_gives_back_every_original_line` asserts both halves
+  rather than the stronger claim this item made.
+- **The lookback is measured in *entries* and from the cluster's last member.**
+  A steady drip of the same line keeps one cluster alive, which is the shape
+  real noise has; a gap wider than `cluster_lookback` starts a new one. New
+  setting, default 200, clamped like every other.
+- **`m` on a *collapsed* cluster is refused rather than obeyed.** One keystroke
+  marking a hundred and forty-seven lines behind one gutter dot is not what the
+  key means, so it asks for the cluster to be expanded first. Expanded, every
+  member marks exactly as it always did.
+- **The shape carries the level and the source, but never a field value.** A
+  differing request ID is the thing that must not split a cluster; a WARN that
+  reads like an ERROR, and one log's line that reads like another's in a merged
+  view, are things that must not join one.
+- **`normalise` is memoised, and that is not an optimisation but the feature
+  working at all.** Clustering runs on the filtered set, which is rebuilt on
+  every keystroke in the query box: 115 ms per five thousand lines, per
+  character, is unusable. Cached, a re-render is ~6 ms. Measured numbers are in
+  the commit message, and both the cold and warm ceilings have tests.
+- **A cluster row is never a structured panel.** With `o` on, an ordinary row
+  still renders its JSON payload; a bordered panel per repeat group is the noise
+  this item removes.
+
+Two smaller notes. `LogView` gained a third row kind, and a cluster row carries
+**both** its cluster and the group's first entry — so the detail pane, the mark
+gutter, `n`/`N` and the watch highlight all keep working with no branch of their
+own, and only `Enter` differs. And a tailed line that joins an *open* cluster
+costs a redraw rather than an in-place update, because inserting a row into the
+middle of the pane is the one thing that widget deliberately cannot do.
+
 ---
 
 # Deliberately out of scope
@@ -1161,8 +1260,29 @@ Recorded so these do not have to be re-argued each time they are proposed.
 - **Remote collection, multi-node aggregation, remote tailing.** A documented
   non-goal. Item 13 (local merge) is what most requests for this actually want,
   and the README should say so directly.
+
+  **Reversed 2026-08-16** — see [SSH_TODO.md](SSH_TODO.md). The entry is
+  rewritten rather than deleted, per the rule at the head of this file. The
+  objection was to CLV becoming collection infrastructure: an agent to install,
+  a daemon to run, a spool to manage, a privilege to hold. That objection stands
+  and every part of it stays out of scope. What did not survive is the
+  assumption underneath it — that reading a folder on another machine requires
+  any of those things. It requires an `ssh` the operator already has. The
+  narrowed refusal is on-demand reads versus infrastructure, not local versus
+  remote. Also wrong in the original entry: local merge is *not* what most
+  requests wanted. Comparing one path across five web servers is the request,
+  and shipping the logs to one host first is a workaround, not an answer.
 - **A query DSL with boolean operators, parentheses and precedence.** Item 8
   stops deliberately at `key:value` terms with implicit AND.
+
+  **Partially reversed 2026-08-14** — see [PLUGIN_TODO.md](PLUGIN_TODO.md)
+  Phase 8. The entry is rewritten rather than deleted, per the rule at the head
+  of this file. What changed: a plugin may now contribute a `QueryOperator` (a
+  new comparison token) and a `ComputedField` (a queryable field derived rather
+  than parsed). What did **not** change, and stays out of scope: `OR`,
+  parentheses, and precedence. Those three are the DSL; operators and computed
+  fields are vocabulary. The grammar remains implicit-AND and flat, and
+  `query.py`'s module docstring records the same boundary at the point of use.
 - **Schema-aware pipelines and log-format definition files.** The parser
   auto-detects; that is the product.
 - **Background daemons and privileged operations.** Item 10's watch rules run

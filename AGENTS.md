@@ -24,6 +24,15 @@ valid source. Filtering by name is the user's decision (`include_globs` /
 **readability** reasons (binary content, compressed archives), never for
 naming reasons.
 
+**Anywhere includes another machine.** A root may live on a host the operator
+names in `settings.conf`, read over SSH with their own credentials — see
+[SSH_TODO.md](SSH_TODO.md). A remote folder is a root like any other: discovered
+recursively, listed under the same folder hierarchy, starrable, mergeable. It is
+not a second-class source type, and a source is therefore a `SourceRef` rather
+than a `pathlib.Path` — see the identity rule in [clv/AGENTS.md](clv/AGENTS.md).
+What remains refused is stated under Non-Goals, and the line is on-demand reads
+versus collection infrastructure, not local versus remote.
+
 "Readable text" is judged on **characters, not bytes**. UTF-16 encodes ASCII
 with a NUL beside every character, so a byte-level NUL test rejects the
 Windows and PowerShell exports operators most often point CLV at. Encoding is
@@ -66,6 +75,31 @@ this is a log, and its newest content is at the end. A rotated set spends one
 shared budget newest-member-first, so older members are often never opened at
 all, and only the live member is ever polled.
 
+**Distance does not relax any of this**, and adds two clauses of its own.
+
+*Round trips are a bounded resource too.* Discovering a remote root is **one**
+command, not one per file. A per-file round trip is what makes reading 400
+remote files unusable, and it is the specific cost an `sshfs` mount pays. The
+budget is asserted by a test that counts commands, not by review.
+
+*No remote IO on the event loop — ever.* `poll()` runs on a `set_interval`
+timer at `refresh_hz` and must never perform a round trip; a remote source is
+followed by a persistent process whose stdout is drained non-blocking, the way
+`JournalReader._drain` already does. Everything one-shot — opening a source,
+connecting, probing — runs in a worker thread, as discovery already does. A
+frozen UI is the failure mode this clause exists to prevent, and the obvious
+implementation of every remote operation is the blocking one.
+
+**A third exception, and it is a seam rather than a format.** Every read of a
+source goes through a `SourceBackend` (`services/backend.py`). A backend may
+not silently substitute an unbounded read for a bounded one, nor a blocking
+call for a cheap one: it **declares** its costs with `@cheap` / `@blocking`,
+`BackendCapabilities.blocking` is derived from those marks rather than written
+by hand, and `SourceBuffer.poll` runs inside `cheap_only()` so a declared-
+blocking call raises `BlockingCallError` instead of stalling the timer.
+`stat` and `identity` are cheap on every backend — that is what lets tailing ask
+"did this grow?" from the event loop — and everything else belongs in a worker.
+
 ### 4) Nothing off-screen, ever
 Layout must scale cleanly from 80 columns up. Every control stays on screen and
 keyboard-reachable at every supported width. Horizontal groups are built from
@@ -88,9 +122,9 @@ distros.
 | Layer | Location | Owns | Must not |
 | --- | --- | --- | --- |
 | **App shell** | `clv/app.py` | Layout, routing, lifecycle, breakpoints | Parse, filter, read files, or define widget visuals |
-| **Services** | `clv/services/` | Parsing, filtering, discovery, reading, buffering, config, source management | Touch the UI or import Textual |
+| **Services** | `clv/services/` | Source identity (`refs.py`), source IO (`backend.py`), parsing, filtering, discovery, reading, buffering, config, settings-file editing (`settings_file.py`), source management | Touch the UI or import Textual, or reach past `backend.py` to `os` |
 | **Widgets** | `clv/widgets/` | Self-contained UI + own `DEFAULT_CSS` | Depend on other widgets' internals or import `clv.app` |
-| **Plugins** | `clv/plugins/` | Extension interfaces + loader | Break interface contracts |
+| **Plugins** | `clv/plugins/` | Extension interfaces + loader; also the two things that spawn a subprocess and so need consent — `sources/journald.py` and `sources/ssh.py` (the SSH transport and `RemoteBackend`) | Break interface contracts, or spawn anything before the operator opts in |
 | **State** | `clv/storage.py` | JSON session persistence (atomic), including `SavedView` records | Depend on the UI |
 
 ### Services
@@ -100,6 +134,15 @@ distros.
   normalised across formats — `host` means the same thing whether it came from
   syslog or from an access log. Values are strings and are never coerced; a
   continuation inherits timestamp and level but never fields.
+- `session.py` — the readers and buffers behind the pane, and **the two things
+  a source's machine contributes**. `SourceFacts` carries a remote source's node
+  name, its measured timezone and its clock skew. `node` is tagged onto every
+  entry as provenance (`host` is untouched and still means what the log says
+  about itself); the zone and skew are applied **only in the merge sort key**,
+  never to the entry, so a displayed timestamp is always exactly what the log
+  said. The cross-zone branch engages only when the members' offsets actually
+  disagree — a single-zone set, which every all-local merge is, takes the
+  original path unchanged.
 - `query.py` — the grammar behind `host:web01 status>=500`: tokenising,
   operators, and the rule that decides what is a field term at all. A token is
   one only when its key is a name the parser normalises or a key the buffer
@@ -121,8 +164,52 @@ distros.
   back into one "excluded" count is what made the number unactionable. A
   *named* source that is skipped is also listed by path — a file the operator
   typed out must never disappear into a tally.
+- `refs.py` — what a source *is*. `SourceRef` is the surface CLV requires of
+  one, counted from every source-facing call rather than guessed; `Path` is one
+  implementation and no longer the assumed one. Two boundaries live here and
+  are kept apart deliberately: `parse_ref` / `format_ref` are exact inverses
+  that never touch the filesystem, expand `~` or consult the working directory,
+  and are what a *persisted* source goes through; `normalize_ref` expands and
+  absolutises what a *person typed*. Collapsing them is what turns
+  `journal:all` into `$CWD/journal:all` on the next launch. Also owns
+  `identity` / `ref_key` — one canonical form, replacing the two copies that
+  used to live in `app.py` and `sources.py`. Two implementations now: `Path`,
+  and `RemoteRef` (`ssh:web01/var/log/syslog`) for a source on another machine.
+  The remote type lives here rather than in the SSH plugin because `parse_ref`
+  decodes `session.json` before any plugin is imported — a type registered at
+  import time would decode the same file differently depending on load order.
+  It is pure identity and performs no IO; its backend answers instead.
+- `backend.py` — where a source's bytes come from, and **what asking costs**.
+  `refs.py` answered what a source is; this answers who reads it. `walk`,
+  `list_dir`, `kind`, `access`, `open`, `stat`, `identity`, `classify`,
+  `reachability` —
+  `LocalBackend`'s behaviour is what discovery and reading did before, and
+  `RemoteBackend` (`plugins/sources/ssh.py`) is the second implementation. The part that is not a refactor is the blocking contract: every method
+  is marked `@cheap` or `@blocking`, the marks are what
+  `BackendCapabilities.blocking` is derived from, and `cheap_only()` turns a
+  blocking call on the event loop into an exception rather than a freeze. Two
+  members carry reasoning worth knowing: `identity` is an **opaque** comparable
+  whose `None` means "this backend has no stable answer" (rotation then degrades
+  to shrink-only, and says so), and `walk` yields files only, lazily, so
+  `max_files` bounds work rather than merely output. `classify` is the one
+  member that takes a **list**: discovery has to ask "readable? binary? a valid
+  archive?" of every file it found, and asking per file is a round trip per file
+  — locally the same open it always did, remotely one command per batch. It
+  returns *bytes*, never a verdict, so `reader.looks_binary_block` and
+  `compressed.probe_block` stay the only place the rule lives. `reachability`
+  is cheap for a different reason from the others: it is not an operation but a
+  report of what the last one learned, and it must never probe — the status line
+  reads it on every render. It exists because `SourceBuffer.poll` swallows
+  `OSError` on purpose, which is right for a rotated local file and silent for a
+  dropped connection.
 - `reader.py` — BOM-based encoding detection, bounded backwards reads,
-  incremental tailing, rotation and truncation recovery. `open_reader()` picks
+  incremental tailing, rotation and truncation recovery. Tailing verifies that
+  it is reading a **continuation**: metadata alone cannot say so, because
+  `copytruncate` keeps the inode and a deleted-and-recreated log can be handed
+  the same one back. `ANCHOR_SIZE` bytes at the read boundary are re-read as
+  part of the read that was happening anyway, and a mismatch re-primes. Both
+  cases previously showed a fragment of the new file and dropped the rest,
+  silently. `open_reader()` picks
   between `SourceReader` (streams) and `DocumentReader` (container documents);
   both expose `path` / `prime()` / `poll()` and a `RELOAD_NOTICE` template.
 - `documents.py` — stdlib-only text extraction for container formats.
@@ -148,8 +235,27 @@ distros.
   keystroke; `max_buffer_lines` applies per member. An entry with no timestamp
   is anchored after the last timestamped line from **its own source** and
   counted, never dropped — "never silently lose a line" applied to ordering.
-- `config.py` — settings resolution, validation, clamping.
-- `sources.py` — session source management and settings persistence.
+- `config.py` — settings resolution, validation, clamping. Two section kinds:
+  `[log_viewer]` for the session, and one `[ssh:<name>]` per remote host, parsed
+  into a `RemoteHost` whose per-host overrides fall back to the global ones.
+  Nothing here connects to anything — `enable_ssh` (default **false**) is the
+  master switch, and hosts parse whether it is on or not, because a mistake
+  should be reported the launch it is made. Anything CLV cannot honour becomes a
+  `ConfigIssue` rather than a raise or a silence; `app.py` prints them beside the
+  plugin errors. **There is no password option and no sudo option**, and the
+  schema refuses both by name with a pointer to ssh-agent and to group/ACL
+  membership — the one place those requirements cannot be forgotten.
+- `settings_file.py` — editing `settings.conf` in place without losing the
+  operator's comments. `configparser` reads that file and nothing writes it
+  back through `configparser`, whose `write()` discards every comment and
+  blank line. Every operation is scoped to a named section, because an
+  unscoped append lands at end of file — which, once one `[ssh:<name>]`
+  section exists, is *inside the last host*. Editing is key-level and never
+  regenerates a section, so comments, per-host budgets, options this version
+  does not know about, and a refused `password =` still earning its warning
+  all survive an edit untouched. Removal never touches a line above a header.
+- `sources.py` — session source management and settings persistence, both
+  routed through `settings_file.py`.
 - `export.py` — the three built-in output formats (JSON Lines, CSV, plain text)
   and the atomic write behind `Ctrl+E`. Core rather than drop-in plugins so a
   built-in cannot fail to load and the drawer's plugin count keeps meaning
@@ -168,6 +274,25 @@ distros.
   window counted and reported together, because a rule matching every line is
   what makes people switch a feature like this off. Both are driven from the
   existing tail poll — no second clock.
+- `timeline.py` — event volume over time, bucketed to whatever width the bar
+  has. The bucket count *is* the width, so a resize is a different histogram
+  rather than a reflow. Buckets are a fixed grid (an origin and a step) rather
+  than ranges recomputed from the data, which is what lets a tailed line find
+  its bucket by arithmetic; when an arrival falls outside the grid `extend`
+  says so and the caller rebuilds, rather than guessing. An entry with no
+  timestamp is counted in `undated` and reported, never placed.
+- `clustering.py` — what `c` collapses. A line's *shape* is its message with the
+  volatile tokens normalised away, plus its level and its source — so a WARN and
+  an ERROR that read alike stay apart, and a merged view never folds two logs
+  together. Field *values* are deliberately not in the shape: a differing request
+  ID is exactly what must not split a cluster. Clustering is a **display
+  transform, never a filter** — `expand()` gives every line back, and the
+  guarantee is per cluster (its own members, in order, byte-identical) rather
+  than over the whole list, because gathering a run into one row is the feature.
+  `ClusterStream` is one code path for both the full render and the tail, so
+  "incremental" has no second implementation to drift from. `normalise` is
+  memoised: clustering re-runs on every keystroke in the query box, and shaping
+  a full buffer costs ~115 ms cold against ~6 ms warm.
 - `clipboard.py` — assembles and size-caps the payload `y` hands to
   `App.copy_to_clipboard`. OSC 52 has no continuation form, so an oversized
   payload is truncated at a line boundary and reported, never chunked and never
@@ -215,11 +340,14 @@ config.load_config ─→ SourceManager ─→ discovery.discover (thread)
 | `QueryBar` | `CustomRangeRequested` | Open the custom range dialog |
 | `LogView` | `CursorMoved` | The line cursor moved; carries whether it is on the last entry |
 | `LogView` | `EntrySelected` | `Enter` on a line — open the detail pane on it |
+| `TimelineBar` | `BucketSelected` | `Enter` (or a click) on a bucket — narrow the time window to it |
+| `TimelineBar` | `WidthChanged` | The bar has room for a different number of buckets than it holds |
+| `LogView` | `ClusterToggled` | `Enter` on a collapsed (or opened) repeat group — the app owns which are open |
 | `SegmentedButtons` | `ValueChanged` / `Reselected` | Segment activated / re-activated |
 | `FilterChip` | `Dismissed` | Revert the named filter |
 | `AdvancedFiltersDrawer` | `SettingsChanged` | Full before/after snapshot; `needs_rescan` says whether discovery must re-run |
 | `AdvancedFiltersDrawer` | `ViewToggleChanged` | Auto-scroll / structured / clipboard / detail pane / watch rules flipped from a drawer switch |
-| `ExportDialog` | dismiss value | `ExportRequest(key, path, marked_only)`, or `None` when canceled |
+| `ExportDialog` | dismiss value | `ExportRequest(key, path, marked_only, clustered)`, or `None` when canceled |
 | `SaveViewDialog` | dismiss value | The name to save the current filters under, or `None` |
 | `ViewPickerDialog` | dismiss value | `ViewRequest(action, name, new_name)`, or `None` when closed. The dialog never edits state; the app acts and reopens it |
 | `WatchRulesDialog` | dismiss value | The edited rule set, or `None` when nothing changed — so a dialog that was only looked at costs no re-indexing |
@@ -305,14 +433,35 @@ installed" — the trade Item 12 asked for.
 - Layout regressions are caught by asserting widget `region` bounds at a given
   terminal size rather than by eyeballing screenshots.
 
-Run: `python -m pytest` (620 tests).
+- **The default run never touches a network**, and the one suite that does is
+  opt-in: `tests/containers/run.sh alpine` / `gnu`, which builds a throwaway
+  sshd container, runs `pytest -m remote_integration` against it and tears it
+  down. Deselected by `addopts`, never part of a gate. It is the only thing that can catch a BusyBox `find` with no `-printf`
+  or a BSD `stat`, because a fake runner returns whatever fixture it was given.
+- `tests/test_backend.py`'s `BackendContract` is written against the protocol and
+  knows nothing about the local filesystem. Subclass it, override the `backend`
+  and `workspace` fixtures, and every assertion runs against another backend —
+  which is how `RemoteBackend` is held to the same behaviour as `LocalBackend`.
+
+Run: `python -m pytest` (1220 tests, 1 skipped, 11 deselected) on **both** 3.11
+and 3.14 — the local default is 3.14 and a green suite there is not evidence
+that the supported floor still works.
 
 ---
 
 ## Security & Privacy
 
 - Read only what the operator configured or explicitly selected.
-- Local only: no network, no telemetry, no exfiltration.
+- **No telemetry and no exfiltration**, absolutely. Network access is limited to
+  hosts the operator names, over SSH, using their own credentials, initiated
+  only by an explicit action, and never with elevated privilege. CLV reports
+  nothing anywhere, to anyone, ever — that part is not narrowed and will not be.
+- **No privilege escalation, anywhere.** No `sudo`, `doas` or `pkexec`, local or
+  remote, not behind a setting. An unreadable file is reported, with the group
+  or ACL that would fix it; it is never read by becoming someone else.
+- **No credentials.** No password field in the config schema, in any dialog, in
+  `SessionState`, or in memory. A connection that needs interactive input fails
+  as unreachable. Host key verification is never disabled, not even for testing.
 - Treat log contents as sensitive; never copy them into caches or temp files.
   Session state stores paths and filter settings, never log content — which
   is why marks (`services/marks.py`) live for the session only.
@@ -321,9 +470,36 @@ Run: `python -m pytest` (620 tests).
 
 ## Non-Goals (for now)
 
-- Network collection, multi-node aggregation, remote tailing.
+- **Collection infrastructure.** Unattended collection, agents or daemons on a
+  remote host, store-and-forward pipelines and spooling, and privileged
+  operations anywhere. CLV reads on demand, over a connection the operator
+  already has, and installs nothing and leaves nothing running at either end.
+- Transports other than SSH — no syslog receiver, no HTTP log API, no
+  cloud-provider log service. Each of those is a different product.
+- Writing to a remote host, or to any source. Read-only, always.
+- Credential management: no password storage, no key generation, no agent
+  management. CLV uses the SSH setup the operator already has.
 - Heavy parsing DSLs or schema-aware pipelines.
-- Background daemons or privileged operations.
+- Background daemons or privileged operations. The opt-in plugin isolation host
+  planned in [PLUGIN_TODO.md](PLUGIN_TODO.md) Phase 13 is neither: it lives and
+  dies with the viewer, runs at the operator's own privilege and never above it,
+  and exists so a plugin that hangs can be *killed*. It is not a sandbox, and
+  `clv/plugins/AGENTS.md`'s trust model says so in those words.
+
+### Reversed
+
+Kept rather than deleted, so the argument survives rather than being erased —
+the rule stated at the head of [TODO.md](TODO.md).
+
+- **"Network collection, multi-node aggregation, remote tailing."** *Reversed
+  2026-08-16* by [SSH_TODO.md](SSH_TODO.md). The objection was to CLV becoming
+  collection infrastructure — an agent to install, a daemon to run, a spool to
+  manage, a privilege to hold — and that objection stands unchanged; it is the
+  first bullet above. What changed is that none of it is required to read a
+  folder on a machine the operator can already `ssh` into. A viewer called
+  *Centralized* Log Viewer that can only read the machine it runs on has
+  centralised nothing. The narrowed refusal is on-demand reads versus
+  infrastructure, not local versus remote.
 
 ---
 
@@ -335,4 +511,15 @@ Run: `python -m pytest` (620 tests).
   `DetailPane` beside/below it renders whatever that cursor is on.
 - **Keep it fast**: bounded reads, incremental renders, threaded discovery.
 - **Keep it honest**: never drop a line silently; explain every empty pane.
+  - An **unreachable source is reported, never rendered as an empty one**. A
+    pane that goes quiet because a link dropped is indistinguishable from a log
+    that stopped, and the two are not the same fact.
+  - An **ordering across machines is only as trustworthy as their clocks, and
+    says so**. Merging was local-only, so there was one clock and one timezone;
+    across hosts both assumptions fail silently and the operator reads causation
+    out of a wrong interleaving.
+  - **Every view of an ordering uses the same rule.** The pane, the timeline
+    histogram and any future summary order the same lines the same way or they
+    describe two different logs. `SourceSession.moment_mapper` is that one
+    decision; a second copy of it is two places for them to disagree.
 - **Keep it consistent**: identical keyboard and mouse paths everywhere.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -197,3 +198,117 @@ def test_csv_formatter_respects_limits() -> None:
     assert label == "CSV preview"
     assert len(table.columns) == 2
     assert len(table.rows) == 2
+
+
+# --- the pane paints its own background -------------------------------------
+
+
+def _rendered_segments(pane: LogView):
+    """Every segment the pane would actually put on screen."""
+
+    for y in range(pane.size.height):
+        for segment in pane.render_line(y):
+            if segment.text:
+                yield segment
+
+
+def test_the_log_pane_paints_its_own_background() -> None:
+    """Otherwise the terminal's default background shows through.
+
+    `render_line` builds its strips from Rich renderables, and a `Text` with no
+    background of its own produces segments with `bgcolor=None`. Those cells
+    are painted by the terminal rather than by the widget — which is invisible
+    on a dark terminal and turns the whole log pane white on a light one, no
+    matter which Textual theme is selected. Everything else in the app uses
+    stock widgets, which is why only this pane was affected.
+    """
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 24)) as pilot:
+            await pilot.pause()
+            app._selected_source = Path("/tmp/example.log")
+            app._entries = deque(parse_lines(["2026-08-11 10:00:00 - INFO - a line"]))
+            app._render_log()
+            await pilot.pause()
+
+            pane = app.query_one("#log-stream", LogView)
+            unpainted = [
+                segment
+                for segment in _rendered_segments(pane)
+                if segment.style is None or segment.style.bgcolor is None
+            ]
+
+            assert not unpainted, (
+                f"{len(unpainted)} segments carry no background and would be "
+                "painted by the terminal instead of the widget"
+            )
+
+    asyncio.run(scenario())
+
+
+def test_the_pane_background_follows_the_active_theme() -> None:
+    """Hardcoding the colour would just move the bug somewhere else."""
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 24)) as pilot:
+            await pilot.pause()
+            app._selected_source = Path("/tmp/example.log")
+            app._entries = deque(parse_lines(["2026-08-11 10:00:00 - INFO - a line"]))
+
+            seen = {}
+            for theme in ("textual-dark", "textual-light"):
+                app.theme = theme
+                app._render_log()
+                await pilot.pause()
+                pane = app.query_one("#log-stream", LogView)
+                expected = pane.rich_style.bgcolor
+                backgrounds = {
+                    segment.style.bgcolor for segment in _rendered_segments(pane)
+                }
+                assert backgrounds == {expected}, (
+                    f"{theme}: pane painted {backgrounds}, widget style says {expected}"
+                )
+                seen[theme] = expected
+
+            # And the two themes must actually differ, or the assertion above
+            # would pass on a pane that ignored the theme entirely.
+            assert seen["textual-dark"] != seen["textual-light"]
+
+    asyncio.run(scenario())
+
+
+def test_the_cursor_and_watch_highlights_still_win_over_the_background() -> None:
+    """The background goes on underneath, so nothing above it is erased."""
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 24)) as pilot:
+            await pilot.pause()
+            app._selected_source = Path("/tmp/example.log")
+            app._entries = deque(
+                parse_lines([f"2026-08-11 10:00:0{i} - INFO - line {i}" for i in range(3)])
+            )
+            app._render_log()
+            await pilot.pause()
+
+            pane = app.query_one("#log-stream", LogView)
+            plain = pane.rich_style.bgcolor
+
+            pane.move_cursor(1)
+            await pilot.pause()
+            cursor_row = {
+                segment.style.bgcolor for segment in pane.render_line(1) if segment.text
+            }
+            assert cursor_row != {plain}, "the cursor row lost its highlight"
+
+            pane.set_row_watched(2, True)
+            await pilot.pause()
+            watched_row = {
+                segment.style.bgcolor for segment in pane.render_line(2) if segment.text
+            }
+            assert watched_row != {plain}, "the watched row lost its highlight"
+            assert watched_row != cursor_row, "watch and cursor became indistinguishable"
+
+    asyncio.run(scenario())

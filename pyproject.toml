@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "clv"
-version = "2.3.0"
+version = "2.7.6"
 description = "Centralized Log Viewer Textual TUI"
 readme = "README.md"
 authors = ["Centralized Log Viewer Maintainers <maintainers@example.com>"]
@@ -27,6 +27,15 @@ CentralizedLogViewer = "clv.app:run"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = ["error::DeprecationWarning"]
+# The default run never touches a network. `remote_integration` is opt-in, is
+# never part of a phase gate, and is the only thing that can actually catch a
+# BusyBox `find` with no `-printf` or a BSD `stat` -- a fake runner will happily
+# return whatever fixture it was given. Run it with:
+#   pytest -m remote_integration
+addopts = "-m 'not remote_integration'"
+markers = [
+    "remote_integration: needs a reachable SSH host (CLV_TEST_SSH_HOST); opt-in",
+]
 
 [build-system]
 requires = ["poetry-core>=1.7.0"]

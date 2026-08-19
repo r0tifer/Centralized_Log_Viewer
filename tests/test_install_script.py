@@ -43,7 +43,15 @@ def _fake_build(tmp_path: Path) -> Path:
     tree = tmp_path / "dist" / "clv"
     (tree / "_internal").mkdir(parents=True)
     binary = tree / "clv"
-    binary.write_text("#!/usr/bin/env bash\necho fake-clv \"$@\"\n", encoding="utf-8")
+    binary.write_text(
+        "#!/usr/bin/env bash\n"
+        'echo fake-clv "$@"\n'
+        # Records the installer's post-install invocations for the
+        # --upgrade-config tests; a no-op when the variable is unset.
+        'printf \'%s\\n\' "$*" >> "${CLV_ARGV_LOG:-/dev/null}"\n'
+        'exit "${CLV_FAKE_EXIT:-0}"\n',
+        encoding="utf-8",
+    )
     binary.chmod(0o755)
     (tree / "_internal" / "settings.conf").write_text(
         "[log_viewer]\nlog_dirs = /var/log\n", encoding="utf-8"
@@ -370,3 +378,92 @@ def test_archive_validation_rejects_unsafe_and_unexpected_layouts(tmp_path: Path
     rejected = validate(bad)
     assert rejected.returncode != 0
     assert "Unexpected entry" in rejected.stderr
+
+
+# --- the post-install settings upgrade ---------------------------------------
+
+
+def _install_and_capture(tmp_path: Path, *extra: str, **env) -> tuple:
+    """Install a fake build and return (result, the argv the binary saw)."""
+    tree = _fake_build(tmp_path)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    log = tmp_path / "argv.log"
+
+    result = _run(
+        "--from-local",
+        str(tree),
+        "--prefix",
+        str(bindir),
+        "--libdir",
+        str(tmp_path / "lib"),
+        *extra,
+        env={"CLV_ARGV_LOG": str(log), **env},
+    )
+    seen = log.read_text(encoding="utf-8").split() if log.exists() else []
+    return result, seen
+
+
+def test_install_upgrades_an_existing_settings_file(tmp_path: Path) -> None:
+    """The whole point of the feature, from the installer's side.
+
+    The merge itself lives in the application -- re-implementing INI semantics in
+    bash is what made the installed defaults drift out of sync before -- so all
+    the script has to get right is calling it.
+    """
+    result, seen = _install_and_capture(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert seen == ["--upgrade-config"]
+
+
+def test_the_upgrade_runs_the_installed_binary_not_the_launcher(tmp_path: Path) -> None:
+    """The launcher's directory is not necessarily on PATH yet, and on a first
+    install it certainly is not."""
+    tree = _fake_build(tmp_path)
+    bindir = tmp_path / "bin"
+    libdir = tmp_path / "lib"
+    bindir.mkdir()
+
+    # An empty PATH would break the script's own tool lookups, so instead assert
+    # the invocation still happens when the launcher is unreachable by name.
+    result = _run(
+        "--from-local", str(tree), "--prefix", str(bindir), "--libdir", str(libdir),
+        env={"CLV_ARGV_LOG": str(tmp_path / "argv.log")},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "argv.log").read_text(encoding="utf-8").strip() == "--upgrade-config"
+
+
+def test_the_upgrade_can_be_declined(tmp_path: Path) -> None:
+    result, seen = _install_and_capture(tmp_path, "--no-config-upgrade")
+
+    assert result.returncode == 0, result.stderr
+    assert seen == []
+
+
+def test_the_upgrade_can_be_declined_by_environment(tmp_path: Path) -> None:
+    """`curl | bash` has nowhere to put a flag, so the env var is the real opt-out."""
+    result, seen = _install_and_capture(tmp_path, CLV_NO_CONFIG_UPGRADE="1")
+
+    assert result.returncode == 0, result.stderr
+    assert seen == []
+
+
+def test_a_failed_upgrade_does_not_fail_the_install(tmp_path: Path) -> None:
+    """A bundle that cannot start is a real problem, but the tree is already
+    correctly in place; under `set -e` an unguarded call would throw that away."""
+    result, seen = _install_and_capture(tmp_path, CLV_FAKE_EXIT="1")
+
+    assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+    assert seen == ["--upgrade-config"]
+    assert "your existing one is unchanged" in result.stderr
+    assert (tmp_path / "lib" / "clv").is_file(), "the install itself still happened"
+
+
+def test_help_mentions_the_opt_out() -> None:
+    result = _run("--help")
+
+    assert result.returncode == 0
+    assert "--no-config-upgrade" in result.stdout

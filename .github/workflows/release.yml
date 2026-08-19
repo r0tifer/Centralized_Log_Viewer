@@ -24,7 +24,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.11', '3.13']
+        # 3.11 is the floor the release binaries are built against and 3.14 is
+        # the ceiling the project targets; both are stated requirements and
+        # neither was enforced here until now. 3.13 stays because it is what
+        # most contributors have locally. A dataclass default that worked on a
+        # newer interpreter has already failed to import on 3.11 once.
+        python-version: ['3.11', '3.13', '3.14']
     steps:
       - uses: actions/checkout@v4
 
@@ -100,14 +105,13 @@ jobs:
       - name: Install build tooling
         run: |
           set -euo pipefail
+          # Packaging only. PyInstaller and the project itself are installed
+          # inside the manylinux container that does the build, so the runner
+          # needs neither -- installing them here would just be a second,
+          # unused copy whose version nobody checks.
           sudo apt-get update
           sudo apt-get install -y ruby ruby-dev rpm build-essential
           sudo gem install --no-document fpm
-          python -m pip install --upgrade pip
-          pip install pyinstaller
-
-      - name: Install project
-        run: pip install .
 
       - name: Verify the settings template is present
         run: |
@@ -131,15 +135,84 @@ jobs:
             echo "IS_DEV=true" >> "$GITHUB_ENV"
           fi
 
-      - name: Build PyInstaller (onedir)
+      - name: Build PyInstaller (onedir) on AlmaLinux 8
         run: |
           set -euo pipefail
-          pyinstaller -y \
-            --name "${BIN_NAME}" \
-            --onedir \
-            --console \
-            --add-data "settings.conf:." \
-            clv/__main__.py
+          # Built against an old glibc rather than the runner's, because a
+          # binary is only as portable as the oldest glibc it was linked
+          # against. Building on ubuntu-latest produced a bundle that demanded
+          # GLIBC_2.38 -- fine on Ubuntu 24.04 and nowhere else that matters:
+          # not RHEL 9 (2.34), Debian 12 (2.36), or Ubuntu 22.04 (2.35). This
+          # floors it at 2.28: RHEL/Alma/Rocky 8+, Debian 11+, Ubuntu 20.04+.
+          #
+          # AlmaLinux 8 and not a manylinux image, despite manylinux_2_28 being
+          # built from exactly this distribution and offering the same floor:
+          # its /opt/python interpreters are compiled --disable-shared, because
+          # building wheels never needs a shared libpython. PyInstaller does,
+          # and stops with "Python was built without a shared library". The
+          # stock python3.11 package here ships libpython3.11.so, so the plain
+          # base image is the simpler thing that works.
+          #
+          # Only PyInstaller runs in here. fpm, signing and the smoke test stay
+          # on the runner, which has the tooling and can happily execute a
+          # binary built against an older glibc than its own.
+          #
+          # Note this pins the *bundled* libraries to AlmaLinux 8's, which is
+          # harmless for the app and would be fatal for any system binary that
+          # inherited LD_LIBRARY_PATH from it -- see journald.child_environment,
+          # which is what keeps that from happening.
+          docker run --rm \
+            -v "${PWD}:/work" -w /work \
+            -e BIN_NAME="${BIN_NAME}" \
+            almalinux:8 \
+            bash -euo pipefail -c '
+              dnf -y -q install python3.11 python3.11-pip
+              python3.11 -m pip install --quiet --upgrade pip
+              python3.11 -m pip install --quiet pyinstaller .
+              python3.11 -m PyInstaller -y \
+                --name "${BIN_NAME}" \
+                --onedir \
+                --console \
+                --add-data "settings.conf:." \
+                clv/__main__.py
+            '
+          # The container writes as root; the rest of the job is the runner user.
+          sudo chown -R "$(id -u):$(id -g)" build dist
+
+      - name: The bundle must run on more than the machine that built it
+        run: |
+          set -euo pipefail
+          # The guard for the regression this step exists to prevent: drop the
+          # container and the floor silently climbs to whatever the runner
+          # ships, which is how a release stops installing on RHEL. Verified
+          # locally against a real AlmaLinux 8 build, which reports 2.28.
+          MAX_GLIBC="$(
+            # Not every file matching *.so* is an ELF object: AlmaLinux ships
+            # FIPS checksums (.libcrypto.so.1.1.hmac) beside the libraries.
+            # objdump exits 1 on those, xargs turns any such exit into 123, and
+            # pipefail would fail the step over a file that was never going to
+            # be inspected. grep exits 1 on no matches too. This subshell opts
+            # out of that strictness; the emptiness check below is what
+            # actually decides whether the scan found anything.
+            set +o pipefail
+            find "dist/${BIN_NAME}" -type f \( -name '*.so*' -o -name "${BIN_NAME}" \) -print0 \
+              | xargs -0 -r objdump -T 2>/dev/null \
+              | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+          )"
+          echo "highest glibc requirement in the bundle: ${MAX_GLIBC:-none}"
+          if [[ -z "${MAX_GLIBC}" ]]; then
+            # A PyInstaller bundle always links glibc, so finding no reference
+            # to it means nothing was scanned — a moved path, an empty dist —
+            # and passing silently would make this guard decorative.
+            echo "::error::no glibc references under dist/${BIN_NAME}; did the build produce a bundle?" >&2
+            exit 1
+          fi
+          ALLOWED="GLIBC_2.28"
+          HIGHEST="$(printf '%s\n%s\n' "${MAX_GLIBC#GLIBC_}" "${ALLOWED#GLIBC_}" | sort -V | tail -1)"
+          if [[ "${HIGHEST}" != "${ALLOWED#GLIBC_}" ]]; then
+            echo "::error::bundle needs ${MAX_GLIBC}, above the ${ALLOWED} floor — was it built outside the AlmaLinux 8 container?" >&2
+            exit 1
+          fi
 
       - name: Smoke test the built binary
         run: |
@@ -159,6 +232,16 @@ jobs:
           wait "$PID" 2>/dev/null || true
           test -f "${XDG_CONFIG_HOME}/clv/settings.conf" \
             || { echo "::error::binary did not provision its user settings file" >&2; exit 1; }
+          # The file was just written from the bundled template, so the upgrade
+          # pass the installer runs must see it as current. Anything else means
+          # the template's config_version and CURRENT_CONFIG_VERSION have drifted,
+          # and every install would rewrite a file it had only just created.
+          "dist/${BIN_NAME}/${BIN_NAME}" --upgrade-config | tee "${RUNNER_TEMP}/upgrade.txt"
+          grep -q "nothing to do" "${RUNNER_TEMP}/upgrade.txt" \
+            || { echo "::error::a freshly provisioned settings file was not current" >&2; exit 1; }
+          if ls "${XDG_CONFIG_HOME}"/clv/settings.conf.bak-* > /dev/null 2>&1; then
+            echo "::error::the no-op upgrade took a backup" >&2; exit 1
+          fi
           echo "Smoke test passed for ${{ matrix.arch }}"
 
       - name: Stage install tree

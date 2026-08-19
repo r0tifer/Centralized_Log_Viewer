@@ -18,23 +18,28 @@ import csv
 import io
 import itertools
 import json
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from collections import deque
-from dataclasses import replace
-from datetime import datetime
+from dataclasses import dataclass, replace
+from datetime import timedelta
 from time import monotonic
 from pathlib import Path
-from typing import Iterable, Literal, Optional, Sequence
+from typing import Iterable, Iterator, Literal, Optional, Sequence
 from xml.dom import minidom
 
 from rich.console import Group, RenderableType
 from rich.panel import Panel
+from rich.style import Style
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
 from textual.css.query import NoMatches
+from textual.message import Message
 from textual.reactive import reactive
 from textual.timer import Timer
 from textual.widgets import Button, Footer, Input, Label, Static, Switch, Tree
@@ -49,8 +54,31 @@ from .plugins import (
     load_plugins,
 )
 from .services import SourceManager, persist_log_sources, persist_setting
+from .services.backend import LOCAL, RECONNECT_ATTEMPTS, backoff_for
 from .services.clipboard import prepare_payload
-from .services.config import LogConfig, get_config_file, load_config, user_config_path
+from .services.clustering import (
+    COUNT_PREFIX,
+    Cluster,
+    ClusterStream,
+    cluster_entries,
+    describe as describe_clusters,
+    summarise,
+)
+from .services.settings_file import SettingsDocument
+from . import __version__
+from .services.config import (
+    SSH_SECTION_PREFIX,
+    LogConfig,
+    RemoteHost,
+    get_config_file,
+    default_config_text,
+    host_options,
+    load_config,
+    undocumented_settings,
+    user_config_path,
+)
+from .services.config_upgrade import describe as describe_upgrade
+from .services.config_upgrade import upgrade_user_settings
 from .services.discovery import DiscoveredFile, DiscoveryReport, discover
 from .services.export import (
     BUILTIN_FORMATS,
@@ -84,8 +112,37 @@ from .services.query import (
     collect_field_names,
     entry_matches,
 )
-from .services.rotation import RotatedSet, describe_set, group_rotated
-from .services.session import ORIGIN_FIELD, SourceSession
+from .services.refs import (
+    RemoteRef,
+    SourceRef,
+    column_labels,
+    compact_of,
+    format_ref,
+    identity,
+    is_local,
+    is_source_ref,
+    node_of,
+    parse_ref,
+    ref_key,
+    stem_of,
+)
+from .services.rotation import (
+    RotatedSetReader,
+    RotatedSet,
+    describe_set,
+    group_rotated,
+)
+from .services.reader import open_reader
+from .services.session import (
+    ORIGIN_FIELD,
+    PollOutcome,
+    SourceBuffer,
+    SourceFacts,
+    SourceSession,
+    local_facts,
+)
+from .services.timeline import Timeline, build_timeline
+from .services.timeline import EMPTY as EMPTY_TIMELINE
 from .services.watch import (
     WatchIndex,
     WatchNotifier,
@@ -105,6 +162,13 @@ from .widgets.goto_dialog import GotoDialog
 from .widgets.help_overlay import HelpOverlay, HelpSection
 from .widgets.log_view import LogView
 from .widgets.query_bar import QueryBar
+from .widgets.remote_hosts_dialog import (
+    EDITABLE_KEYS,
+    ProbeResult,
+    RemoteHostsDialog,
+)
+from .widgets.severity import SEVERITY_COLORS
+from .widgets.timeline import TimelineBar
 from .widgets.view_dialogs import SaveViewDialog, ViewPickerDialog, ViewRequest
 from .widgets.watch_dialog import WatchRulesDialog
 
@@ -114,15 +178,11 @@ from .widgets.watch_dialog import WatchRulesDialog
 #: warnings are included because they are usually what precedes the failure.
 NOTABLE_LEVELS: frozenset[str] = frozenset({LEVEL_WARN, LEVEL_ERROR, LEVEL_CRITICAL})
 
-SEVERITY_COLORS: dict[str, str] = {
-    "CRITICAL": "#fb7185",
-    "ERROR": "#f87171",
-    "WARN": "#facc15",
-    "NOTICE": "#38bdf8",
-    "INFO": "#22c55e",
-    "DEBUG": "#a855f7",
-    "TRACE": "#94a3b8",
-}
+#: ``SEVERITY_COLORS`` is imported from `clv/widgets/severity.py` rather than
+#: defined here: the timeline colours its buckets with the same palette the log
+#: pane colours its lines with, and a widget may not import `clv.app`. The name
+#: is still reachable as `clv.app.SEVERITY_COLORS`, which is where everything
+#: that already used it looks.
 
 STRUCTURED_PAYLOAD_MAX_CHARS = 8_192
 
@@ -166,6 +226,85 @@ PROVIDERS_GROUP = f"{ICON_PROVIDER} Providers"
 #: for the file icon: membership is a second fact about a log, unlike starring,
 #: which replaces the icon precisely so a row never changes width.
 ICON_MERGED = "⧉"
+#: The merged set, repeated as a group. Below the starred group: a star is a
+#: standing favourite, while membership here is the working set for the next
+#: `u`, and the two are read in that order.
+MERGED_GROUP = f"{ICON_MERGED} Merged"
+
+
+class MergedSetNode:
+    """Marker carried by the tree row that opens the merged view.
+
+    The other groups are headings — selecting "Starred" means nothing, so they
+    carry no data and the selection handler ignores them. This one *is* an
+    action: it is the only way back into a merged set with the mouse, and after
+    a restart the set is the thing an operator is looking for rather than any
+    single member. Its children stay individually selectable, because opening
+    one member on its own is also a reasonable thing to want.
+    """
+
+    __slots__ = ()
+
+
+#: Singleton, so the handler and the tree lookups can both test identity —
+#: sturdier than matching on a label that carries a count.
+MERGED_VIEW = MergedSetNode()
+
+#: Marks a cell of a row that *acts* rather than selects, and says which act.
+#: Carried as segment metadata on the label, which is the same mechanism Tree
+#: uses to tell its own expand chevron from the rest of the line.
+ACTION_META = "clv-action"
+
+#: The verbs a merged row offers, as glyphs narrow enough that three of them
+#: still fit beside the name in a tree panel at its minimum width.
+ICON_NAME_SET = "✎"
+ICON_CLEAR_SET = "✕"
+
+#: How that cell is painted, so it reads as a control rather than decoration.
+ACTION_STYLE = Style(color="#95c8f5", bold=True)
+
+#: Groups that sit above the configured roots, in the order they are built.
+#: Used to place the merged group correctly when it appears mid-session,
+#: without rebuilding the tree around it.
+TREE_GROUP_LABELS: tuple[str, ...] = (VIEWS_GROUP, PROVIDERS_GROUP, STARRED_GROUP)
+
+@dataclass
+class _Reconnect:
+    """One buffer's attempt to get its source back, and how hard it has tried.
+
+    Per buffer rather than per host, because what has to be resumed is a
+    *reader*: two logs on the same machine each hold their own ``tail`` and each
+    has its own byte offset to resume at. The connection they share means the
+    second one's attempt is nearly free, which is what makes this affordable.
+    """
+
+    #: What went wrong, as the pane and the status line report it.
+    reason: str
+    #: Failed attempts so far. Indexes into the backoff schedule.
+    attempts: int = 0
+    #: The pending wake-up, so a source switch can cancel it.
+    timer: Timer | None = None
+    #: True once the schedule is spent: nothing further is tried automatically
+    #: and the pane says so, rather than looking as though it were still working.
+    exhausted: bool = False
+
+
+#: How many hosts are walked at once during discovery.
+#:
+#: Concurrency here buys latency hiding, not throughput: the work is a remote
+#: `find` and the time is spent waiting. Bounded anyway, because a fleet of
+#: fifty would otherwise mean fifty simultaneous handshakes from a viewer whose
+#: whole claim is that it is unobtrusive.
+MAX_HOST_WORKERS = 8
+
+
+#: How far two machines' clocks may disagree before the merged view says so.
+#:
+#: A threshold rather than zero because every measurement carries the link's
+#: own latency, and reporting 40 ms of "skew" on every merge would train the
+#: operator to ignore the line that matters. Two seconds is well inside what
+#: NTP holds and well outside what a round trip explains.
+SKEW_REPORTING_THRESHOLD = timedelta(seconds=2)
 
 #: Width of the source column in a merged view, per breakpoint. Content, not
 #: layout — the column is part of the line the pane renders, so CSS never sees
@@ -217,8 +356,18 @@ BINDING_CATEGORIES: dict[str, str] = {
     "goto_timestamp": "Navigation",
     "toggle_mark": "Navigation",
     "next_mark": "Navigation",
+    # TimelineBar owns the bucket keys, bound on the widget for the reason
+    # LogView's cursor keys are: they only mean anything while the bar has
+    # focus. Folded into the overlay by build_help_sections, like those.
+    "bucket_left": "Navigation",
+    "bucket_right": "Navigation",
+    "bucket_home": "Navigation",
+    "bucket_end": "Navigation",
+    "apply_bucket": "Navigation",
     "toggle_auto_scroll": "View",
     "toggle_structured": "View",
+    "toggle_timeline": "View",
+    "toggle_clustering": "View",
     "watch_rules": "View",
     "export_view": "View",
     "copy_view": "View",
@@ -232,7 +381,10 @@ BINDING_CATEGORIES: dict[str, str] = {
     "toggle_star": "Sources",
     "toggle_merge": "Sources",
     "open_merged": "Sources",
+    "clear_merged": "Sources",
+    "merge_across_hosts": "Sources",
     "reload_sources": "Sources",
+    "remote_hosts": "Sources",
     "save_session": "Session",
     "quit_app": "Session",
 }
@@ -305,11 +457,49 @@ class LogTree(Tree[object]):
     LogTree > .tree--label { color: #eef3ff; }
     """
 
+    class ActionRequested(Message):
+        """An action marker on a row was clicked, and which one."""
+
+        def __init__(self, node: TreeNode[object], action: str) -> None:
+            super().__init__()
+            self.node = node
+            self.action = action
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.show_guides = True
         self.guide_depth = 3
         self.show_root = False
+
+    async def _on_click(self, event: events.Click) -> None:
+        """Let one cell of a row mean "act" while the rest means "select".
+
+        A group row has two jobs — expand its contents, and open what it
+        stands for — and answering both to the same click meant opening the
+        merged view while collapsing the list under it. Splitting them needs a
+        click target narrower than a row, which `Tree` does not offer: it
+        dispatches from segment metadata (that is how the expand chevron is
+        told apart), so a marker carrying metadata of its own is the same
+        mechanism rather than a new one.
+
+        Textual dispatches `_on_click` to every class in the MRO, most-derived
+        first, and stops at the first handler to call `prevent_default()`.
+        That, not `stop()`, is what keeps `Tree` from also selecting the row
+        and toggling it: `stop()` only ends the bubble to parent widgets, so
+        the base class ran anyway and the view opened as the group shut.
+        Anything without the marker falls through untouched, which is how the
+        rest of the row keeps behaving like the group heading it is.
+        """
+
+        action = event.style.meta.get(ACTION_META)
+        if not action:
+            return
+        event.prevent_default()
+        event.stop()
+        line = event.style.meta.get("line")
+        node = self.get_node_at_line(line) if line is not None else None
+        if node is not None:
+            self.post_message(self.ActionRequested(node, action))
 
 
 class LogViewerApp(App[None]):
@@ -411,6 +601,7 @@ class LogViewerApp(App[None]):
     LogViewerApp.-copy-mode #advanced-drawer,
     LogViewerApp.-copy-mode #sources-panel,
     LogViewerApp.-copy-mode #status-bar,
+    LogViewerApp.-copy-mode TimelineBar,
     LogViewerApp.-copy-mode DetailPane,
     LogViewerApp.-copy-mode Footer,
     LogViewerApp.-copy-mode .panel-title {
@@ -447,6 +638,8 @@ class LogViewerApp(App[None]):
         Binding("w", "toggle_auto_scroll", "Follow", show=True),
         Binding("o", "toggle_structured", "Structured", show=False),
         Binding("d", "toggle_detail", "Detail pane", show=False),
+        Binding("b", "toggle_timeline", "Severity timeline", show=False),
+        Binding("c", "toggle_clustering", "Collapse repeated lines", show=False),
         Binding("n", "next_match", "Next match", show=False),
         Binding("N", "previous_match", "Previous match", show=False),
         Binding("g", "goto_timestamp", "Go to timestamp", show=False),
@@ -457,6 +650,17 @@ class LogViewerApp(App[None]):
         Binding("W", "watch_rules", "Watch rules", show=False),
         Binding("x", "toggle_merge", "Add / remove from the merged set", show=False),
         Binding("u", "open_merged", "Open the merged view", show=False),
+        Binding("X", "clear_merged", "Empty the merged set", show=False),
+        # A modifier on the merge gesture rather than a new top-level key, which
+        # keeps the keybinding budget intact. Textual's Input binds ctrl+x to
+        # cut, so this fires everywhere except inside the query input — the same
+        # trade, and the same decision, as ctrl+e below.
+        Binding(
+            "ctrl+x",
+            "merge_across_hosts",
+            "Merge this path across hosts",
+            show=False,
+        ),
         Binding("ctrl+b", "toggle_pane", "Switch pane", show=True),
         Binding("[", "shrink_sources_panel", "Narrower", show=False),
         Binding("]", "expand_sources_panel", "Wider", show=False),
@@ -471,6 +675,7 @@ class LogViewerApp(App[None]):
         Binding("ctrl+e", "export_view", "Export view", show=False),
         Binding("y", "copy_view", "Copy to clipboard", show=False),
         Binding("ctrl+s", "save_session", "Save sources", show=True),
+        Binding("R", "remote_hosts", "Remote hosts", show=False),
         Binding("ctrl+r", "reload_sources", "Reload", show=True),
         Binding("q", "quit_app", "Quit", show=True),
     ]
@@ -491,11 +696,42 @@ class LogViewerApp(App[None]):
         #: the report because these are not files and must not end up anywhere
         #: that assumes they are.
         self._provider_sources: list[ProviderSource] = []
+        #: Filled by every rescan; see `_is_file_node`.
+        self._file_refs: set[SourceRef] = set()
+        #: What the merged pane's source column calls each member. Rebuilt once
+        #: per set by `_sync_column_labels`, never per rendered line.
+        self._column_labels: dict[SourceRef, str] = {}
+        #: The upgrade notice is once per *version*, and a rescan redraws the
+        #: summary — so this keeps a `Ctrl+R` from repeating it within a session.
+        self._upgrade_notice_shown = False
+        #: Which backend answers for which ref. `LOCAL` itself unless remote
+        #: sources are switched on, so nothing about the local path changes.
+        self._backends = build_backends(self._config)
         #: Readers and buffers, owned by a UI-free service. A single open log is
         #: a session of one, so nothing below has a single-source path of its
         #: own to keep in step — see clv/services/session.py.
-        self._session = SourceSession(max_lines=self._config.max_buffer_lines)
+        self._session = SourceSession(
+            max_lines=self._config.max_buffer_lines,
+            reader_factory=self._open_reader,
+            facts=self._source_facts,
+        )
         self._tail_timer: Timer | None = None
+        #: Identifies the in-flight remote open, so a newer selection can
+        #: discard an older one rather than have both install themselves.
+        self._open_token: object | None = None
+        #: In-flight reconnections, one per buffer that lost its source, keyed
+        #: by `ref_key`. Bounded and cancelled on every source change: a timer
+        #: left running against a buffer nobody is looking at would reconnect to
+        #: a host for a pane that no longer exists.
+        self._reconnects: dict[object, _Reconnect] = {}
+        #: Identifies the in-flight rescan, so a second one started while the
+        #: first is still walking hosts wins rather than racing it.
+        self._scan_token: object | None = None
+        #: Reasons the current sources have stopped, keyed the same way. Read by
+        #: the status line and by the empty pane, which is how a drop stays
+        #: visible after its toast has gone rather than only at the instant it
+        #: happened.
+        self._source_problems: dict[object, str] = {}
 
         self._show_lines = self._config.default_show_lines
         self._sources_panel_width = self._config.tree_width
@@ -542,6 +778,22 @@ class LogViewerApp(App[None]):
             max_rows=self._config.max_buffer_lines,
         )
         self.detail_pane = DetailPane(id="detail-pane")
+        self.timeline_bar = TimelineBar(id="timeline-bar")
+        #: The histogram the bar is showing, kept so a tail poll can fold new
+        #: lines into it instead of rebuilding it from the whole buffer.
+        self._timeline: Timeline = EMPTY_TIMELINE
+        #: Clustering of the currently rendered set, or None when `c` is off.
+        #: Kept so a tailed line joins the run it belongs to rather than
+        #: re-clustering the buffer on every poll.
+        self._clusters: ClusterStream | None = None
+        #: Which clusters the operator opened, keyed by content the way marks
+        #: are: the buffer is a bounded deque, so anything positional starts
+        #: pointing at a different cluster as lines are evicted. Session-only
+        #: and never persisted — a cluster key is derived from log content.
+        self._expanded_clusters: set[str] = set()
+        #: Stream row index -> row index in the pane, so a cluster that grew on
+        #: this poll can be redrawn without rebuilding the pane.
+        self._cluster_rows: dict[int, int] = {}
 
     # --- the session, and the three names the app knows it by ---------------
 
@@ -588,6 +840,10 @@ class LogViewerApp(App[None]):
                 yield Vertical(id="tree-panel")
             with Vertical(id="viewer-panel"):
                 yield Label("Log Output", classes="panel-title")
+                # Above #log-area rather than inside it: that container turns
+                # horizontal at -wide so the detail pane can sit beside the log,
+                # and a bar placed in it would become a third column.
+                yield self.timeline_bar
                 with Container(id="log-area"):
                     yield self.log_panel
                     yield self.detail_pane
@@ -601,7 +857,12 @@ class LogViewerApp(App[None]):
         self._sources_panel_width = self.state.tree_width or self._config.tree_width
         self._apply_panel_width()
 
-        self._source_manager = SourceManager(*self._split_roots(self._config.log_dirs))
+        self._source_manager = SourceManager(
+            *self._split_roots(
+                list(self._config.log_dirs) + remote_roots(self._config)
+            ),
+            backends=self._backends,
+        )
         self._apply_state_to_widgets()
         # Nothing is opened implicitly: the viewer starts on the discovery
         # summary rather than resuming whatever happened to be open last.
@@ -612,11 +873,13 @@ class LogViewerApp(App[None]):
         self._refresh_chips()
         self._sync_star_button()
         self._sync_detail_pane()
+        self._sync_timeline()
         self._sync_watch_rules()
         # Filled at mount rather than only when the drawer opens, so the plugin
         # and exporter lines are correct the first time it is seen.
         self._refresh_plugin_status()
         self._sync_journald_status()
+        self._sync_ssh_status()
         self._update_status()
         self._persist_state = True
 
@@ -625,6 +888,15 @@ class LogViewerApp(App[None]):
         directories: list[Path] = []
         files: list[Path] = []
         for entry in roots:
+            if not is_local(entry):
+                # A remote root comes from a host's `log_dirs`, which the config
+                # layer already validated as absolute directories. Asking the
+                # far end to confirm that would be a round trip **on mount**,
+                # before the first frame is drawn — and discovery is about to
+                # walk it anyway, from a worker, where a wrong answer is
+                # reported rather than paid for twice.
+                directories.append(entry)
+                continue
             try:
                 if entry.is_dir():
                     directories.append(entry)
@@ -671,6 +943,8 @@ class LogViewerApp(App[None]):
             clipboard=self.state.clipboard_osc52,
             detail_pane=self.state.detail_pane,
             watch_rules=self._watching,
+            timeline=self.state.timeline,
+            clustering=self.state.clustering,
         )
 
     @property
@@ -730,27 +1004,255 @@ class LogViewerApp(App[None]):
     def _discovery_settings(self):
         return self.advanced_drawer.settings.to_discovery(self._config.discovery)
 
+    def _is_file_node(self, data: object) -> bool:
+        """Whether a tree node holds a log file rather than a folder.
+
+        A local ref answers for itself, as it always has. A remote one **must
+        not** be asked: ``is_file`` on a ``RemoteRef`` is a round trip, and this
+        runs on a tree selection. The answer comes instead from the discovery
+        report that put the node there, which already knew and knew for free.
+        """
+
+        if isinstance(data, RemoteRef):
+            return data in self._file_refs
+        return isinstance(data, Path) and data.is_file()
+
+    def _open_reader(self, path, **kwargs):
+        """Build a reader for *path*, against whichever backend answers for it.
+
+        The session's factory. Dispatch is on the ref rather than on a flag:
+        ``LOCAL`` for a path on this machine, the host's ``RemoteBackend`` for a
+        ``RemoteRef``.
+
+        A remote log gets a **different reader**, and that is the one place
+        where "the same code reads both" stops being true — for a reason.
+        ``SourceReader.poll`` asks "did this grow?" with a ``stat``, which is
+        free locally and a round trip remotely; a remote source is followed by a
+        persistent ``tail -F`` whose output is drained instead, so the poll
+        costs nothing. Everything downstream — the parser, the buffer, the
+        merge — is unchanged, because both readers answer the same
+        ``prime``/``poll`` contract.
+        """
+
+        # `backend` may arrive already resolved — `RotatedSetReader` knows which
+        # one answers for its set and says so. Trusting it rather than
+        # re-resolving keeps one answer per set, and avoids the duplicate
+        # keyword that made this a TypeError.
+        backend = kwargs.pop("backend", None) or self._backends.for_ref(path)
+        if isinstance(path, RemoteRef) and hasattr(backend, "connection"):
+            from .plugins.sources.ssh import RemoteFollowReader
+
+            return RemoteFollowReader(path, backend=backend, **kwargs)
+        return open_reader(path, backend=backend, **kwargs)
+
+    def _source_facts(self, path) -> SourceFacts:
+        """Which machine *path* is on, and what that means for ordering it.
+
+        Local sources get :func:`local_facts` unchanged, so nothing about a
+        local merge moves. A remote one carries its host's name — which becomes
+        the ``node`` field on every line — plus the zone and skew the capability
+        probe measured at connect, which is what lets a merged view across
+        machines be ordered rather than guessed at.
+
+        **Never blocks.** The probe has already happened by the time a source is
+        being opened, and if it somehow has not this reports what it knows
+        rather than reaching for the wire: an unknown zone degrades the merge to
+        the single-zone rule, which is what it did before this existed.
+        """
+
+        if not isinstance(path, RemoteRef):
+            return local_facts(path)
+
+        host = self._config.host(path.node)
+        backend = self._backends.for_ref(path)
+        connection = getattr(backend, "connection", None)
+        if connection is None or not connection.probed:
+            return SourceFacts(node=path.node)
+        facts = connection.facts()
+        return SourceFacts(
+            node=path.node,
+            zone=facts.tzinfo,
+            skew=facts.skew,
+            correct_skew=bool(host is not None and host.correct_clock_skew),
+        )
+
+    def _skew_detail(self) -> str:
+        """What the merged view says about the members' clocks.
+
+        Says nothing when they agree, which is the point: a phrase that appears
+        on every merge is noise, and one that appears only when the ordering is
+        less trustworthy than it looks is information.
+        """
+
+        spread = self._session.skew_spread()
+        parts: list[str] = []
+        if abs(spread) >= SKEW_REPORTING_THRESHOLD:
+            parts.append(f"clocks differ by up to {abs(spread.total_seconds()):.0f}s")
+        if self._session.corrected:
+            parts.append("timestamps adjusted for clock skew")
+        return f" · {' · '.join(parts)}" if parts else ""
+
+    def _discover_local(self, roots, settings) -> DiscoveryReport:
+        """Walk only what is on this machine. Runs in a worker.
+
+        Split from the remote half so a host that is down cannot delay the local
+        tree by so much as a millisecond. It used to be one pass, which meant
+        the tree waited behind every configured machine's connect timeout —
+        three unreachable hosts and the operator watched an empty panel for a
+        minute for logs that were on their own disk the whole time.
+        """
+
+        return discover(
+            [root for root in roots if is_local(root)],
+            settings,
+            backends=self._backends,
+        )
+
+    def _discover_hosts(self, roots, settings) -> DiscoveryReport:
+        """Walk each configured host's roots, concurrently. Runs in a worker.
+
+        **Split per host** because budgets are per host: globally, one noisy
+        machine consumes the whole ``max_files`` allowance and truncates the
+        others silently, and the report cannot say whose files were cut. Each
+        host gets its own ceiling and its own truncation line.
+
+        **Concurrently** because the failure they are most likely to share is
+        waiting. Serially, N unreachable hosts cost N connect timeouts one after
+        another; in parallel they cost one, and a host that is up is not held up
+        behind a host that is down. Each thread has its own connection and its
+        own ``cheap_only`` guard — that flag is thread-local precisely so this
+        is safe.
+
+        A host already known unreachable, whose backoff has not expired, is
+        **skipped rather than attempted**: it is reported from what is already
+        known, at no cost, instead of spending a timeout to learn it again.
+        """
+
+        by_node: dict[str, list[SourceRef]] = {}
+        for root in roots:
+            if isinstance(root, RemoteRef):
+                by_node.setdefault(root.node, []).append(root)
+        if not by_node:
+            return DiscoveryReport()
+
+        def walk_host(item: tuple[str, list[SourceRef]]) -> DiscoveryReport:
+            node, host_roots = item
+            host = self._config.host(node)
+            host_settings = (
+                settings if host is None else host.discovery_settings(settings)
+            )
+            backend = self._backends.for_ref(host_roots[0])
+            state = backend.reachability()
+            if not state.may_attempt(monotonic()) and not state.ok:
+                # Known bad and not yet due for another try. Reported from what
+                # is known rather than paid for again — and reported, because a
+                # host that vanishes from the tree with no line about it is the
+                # one outcome a remote feature may not produce.
+                skipped = DiscoveryReport()
+                for root in host_roots:
+                    skipped.roots.append(root)
+                    skipped.unreadable_roots.append(root)
+                    if state.reason:
+                        skipped.root_reasons[root] = state.reason
+                return skipped
+            return discover(host_roots, host_settings, backends=self._backends)
+
+        report = DiscoveryReport()
+        with ThreadPoolExecutor(
+            max_workers=min(len(by_node), MAX_HOST_WORKERS),
+            thread_name_prefix="clv-host",
+        ) as pool:
+            for found in pool.map(walk_host, by_node.items()):
+                report.extend(found)
+        return report
+
     async def _rescan(self) -> None:
-        """Re-run discovery off the UI thread and rebuild the tree."""
+        """Re-run discovery off the UI thread and rebuild the tree.
+
+        **Two stages, and the split is the point.** The local tree is built and
+        shown from the first one; hosts are folded in by the second. A machine
+        that is down therefore costs the local tree nothing, where one pass made
+        every local log wait behind every configured host's connect timeout.
+
+        The cost is one extra tree build shortly after launch, which re-collapses
+        folders the operator may have opened in the second or so between them.
+        That is the right trade: a folder to re-open is an annoyance, and a
+        panel that sits empty for a minute looks like a broken program.
+        """
 
         roots = self._source_manager.all_sources()
         settings = self._discovery_settings()
+        self._scan_token = token = object()
 
-        # The walk touches the filesystem and can be slow on a large tree, so
-        # it runs in a thread rather than blocking the event loop.
+        # Both halves run in the thread. The walk touches the filesystem and
+        # can be slow on a large tree; a provider may *shell out*, which is
+        # slower still — enumerating units on a multi-gigabyte journal is
+        # seconds of work. Asking providers on the event loop froze the UI for
+        # exactly as long as they took, and when one hit its own timeout the
+        # tree quietly came back short. Neither is discovery's judgement to
+        # make: a provider that raises is still recorded and skipped.
         worker = self.run_worker(
-            lambda: discover(roots, settings), thread=True, name="discover", exit_on_error=False
+            lambda: (
+                self._discover_local(roots, settings),
+                self._plugins.discover_sources(),
+            ),
+            thread=True,
+            name="discover",
+            exit_on_error=False,
         )
-        report = await worker.wait()
+        found = await worker.wait()
+        report, provider_sources = found if found else (None, [])
         if report is None:
             report = DiscoveryReport()
-        self._report = report
-        # Providers are asked on the same pass, but never in the same thread:
-        # a provider may shell out, and a plugin's idea of "quick" is not
-        # something discovery should have to trust. It is guarded instead —
-        # one that raises is recorded and skipped, like a filter stage.
-        self._provider_sources = self._plugins.discover_sources()
+        self._provider_sources = provider_sources
         self._refresh_plugin_status()
+        # After the providers have run, so the drawer reports what they found
+        # rather than what they were about to look for.
+        self._sync_journald_status()
+        self._sync_ssh_status()
+        await self._install_report(report)
+
+        if not any(isinstance(root, RemoteRef) for root in roots):
+            return
+
+        # Stage two. Every call inside is a network round trip, which is exactly
+        # why it is here and not above: doing it on the event loop is the frozen
+        # UI Requirement 3 exists to prevent, and doing it *before* the tree is
+        # the delay this split exists to prevent.
+        self._notify(f"Discovering {self._host_count(roots)} host(s)…")
+        remote_worker = self.run_worker(
+            lambda: self._discover_hosts(roots, settings),
+            thread=True,
+            name="discover-hosts",
+            exit_on_error=False,
+        )
+        try:
+            remote = await remote_worker.wait()
+        except Exception as exc:  # noqa: BLE001 - a remote walk fails many ways
+            self._notify(f"Could not discover remote sources: {exc}", "warning")
+            return
+        if token is not self._scan_token or self._is_shutting_down:
+            # A second rescan started while this was in flight. Its own stage
+            # two will fold in fresher results; installing these over them would
+            # show the older walk.
+            return
+        await self._install_report(report.extend(remote or DiscoveryReport()))
+
+    @staticmethod
+    def _host_count(roots) -> int:
+        return len({root.node for root in roots if isinstance(root, RemoteRef)})
+
+    async def _install_report(self, report: DiscoveryReport) -> None:
+        """Adopt *report* as what discovery found, and rebuild the tree from it.
+
+        One place, because both rescan stages end the same way and a second copy
+        would be a second chance for the tree and `_file_refs` to disagree.
+        """
+
+        self._report = report
+        #: Every ref discovery listed as a *file*, so a tree node can be told
+        #: from a folder without asking a remote host on the event loop.
+        self._file_refs = {item.path for item in report.files}
         await self._build_tree(report)
         if self._selected_source is None:
             self._show_discovery_summary(report)
@@ -770,11 +1272,18 @@ class LogViewerApp(App[None]):
         tree: LogTree = LogTree("Sources", id="source-tree")
         await panel.mount(tree)
 
+        # Every group starts collapsed, like the configured roots below them.
+        # These are shortcuts to things buried deeper in the tree, and a
+        # shortcut that arrives already unfolded is not a shortcut: a hundred
+        # journal units expanded on launch pushes the actual roots off screen,
+        # which is the opposite of what a group at the top is for. One
+        # keystroke opens the one you want.
+        #
         # Saved views first: they are filter bundles rather than files, they
         # are few, and they are the fastest way back into a piece of work.
         # Above the starred group because a view usually names a starred log.
         if self.state.views:
-            group = tree.root.add(VIEWS_GROUP, data=None, expand=True)
+            group = tree.root.add(VIEWS_GROUP, data=None, expand=False)
             for view in self.state.views:
                 group.add_leaf(f"{ICON_VIEW} {view.name}", data=view)
 
@@ -782,7 +1291,7 @@ class LogViewerApp(App[None]):
         # below this point in the tree can hold one — a folder hierarchy is
         # exactly what they do not have.
         if self._provider_sources:
-            group = tree.root.add(PROVIDERS_GROUP, data=None, expand=True)
+            group = tree.root.add(PROVIDERS_GROUP, data=None, expand=False)
             for source in self._provider_sources:
                 group.add_leaf(f"{ICON_PROVIDER} {source.name}", data=source)
 
@@ -791,13 +1300,23 @@ class LogViewerApp(App[None]):
         # the hierarchy on every launch.
         starred = self._starred_paths()
         present = sorted(
-            (item.path for item in report.files if _resolve(item.path) in starred),
+            (item.path for item in report.files if identity(item.path) in starred),
             key=lambda p: str(p).lower(),
         )
         if present:
-            group = tree.root.add(STARRED_GROUP, data=None, expand=True)
+            group = tree.root.add(STARRED_GROUP, data=None, expand=False)
             for path in present:
                 group.add_leaf(f"{ICON_STAR} {_compact_path(path)}", data=path)
+
+        # The merged set, below the stars: a star is a standing favourite, this
+        # is the working set for the next `u`. Listed whether or not discovery
+        # found each member — they were chosen one keystroke at a time, and one
+        # that has since rotated away should be visible enough to press `x` on
+        # rather than silently absent.
+        if self.state.merged:
+            group = tree.root.add(self._merged_label(), data=MERGED_VIEW, expand=False)
+            for path in self._merged_display_paths():
+                group.add_leaf(f"{ICON_MERGED} {_compact_path(path)}", data=path)
 
         # One branch per configured root, then a folder hierarchy beneath it.
         by_root: dict[Path, list] = {}
@@ -842,7 +1361,13 @@ class LogViewerApp(App[None]):
         folders: dict[Path, list[Path]] = {}
         for item in items:
             relative = item.relative.parent
-            folders.setdefault(Path() if relative == Path(".") else relative, []).append(
+            # `not relative.parts` rather than `== Path(".")`: identical for a
+            # local path -- `Path(".").parts` is `()` and nothing else relative
+            # is empty -- and it also holds for the `PurePosixPath` a
+            # `RemoteRef` hands back, which compares unequal to `Path(".")` off
+            # POSIX. The alternative was a ref type whose `relative_to` lied
+            # about being host-qualified.
+            folders.setdefault(Path() if not relative.parts else relative, []).append(
                 item.path
             )
         return folders
@@ -876,13 +1401,13 @@ class LogViewerApp(App[None]):
             parent.add_leaf(self._leaf_label(path, path.name), data=path)
 
     def _starred_paths(self) -> set[Path]:
-        return {_resolve(Path(entry)) for entry in self.state.starred}
+        return {identity(parse_ref(entry)) for entry in self.state.starred}
 
     def _leaf_label(self, path: Path, text: str) -> str:
-        icon = ICON_STAR if _resolve(path) in self._starred_paths() else ICON_FILE
+        icon = ICON_STAR if identity(path) in self._starred_paths() else ICON_FILE
         # Merge membership prefixes rather than replaces: a starred log can be
         # merged too, and the star already owns the icon slot.
-        merged = ICON_MERGED if _resolve(path) in self._merged_paths else ""
+        merged = ICON_MERGED if identity(path) in self._merged_paths else ""
         return f"{merged}{icon} {text}"
 
     def _highlight_source(self, path: Path, *, select: bool = True) -> None:
@@ -897,7 +1422,7 @@ class LogViewerApp(App[None]):
             tree = self.query_one("#source-tree", LogTree)
         except NoMatches:
             return
-        target = _resolve(path)
+        target = identity(path)
         node = _find_node(tree.root, target)
         if node is None:
             return
@@ -928,7 +1453,15 @@ class LogViewerApp(App[None]):
     # --- source selection and tailing --------------------------------------
 
     def _select_source(self, path: Path, *, announce: bool = True) -> bool:
-        resolved = _resolve(path)
+        if not is_local(path):
+            # Everything below — `is_file`, the prime inside `open_single` — is
+            # a round trip for a remote ref, and this method is called straight
+            # off a tree cursor move. Requirement 3 forbids doing that here, so
+            # the remote path becomes a worker with a pending state and this one
+            # is left exactly as it was.
+            return self._begin_remote_open(path, announce=announce)
+
+        resolved = identity(path)
         if not resolved.is_file():
             if announce:
                 self._notify(f"{resolved} is not a readable file.", "error")
@@ -947,13 +1480,145 @@ class LogViewerApp(App[None]):
         self._after_source_change()
         return True
 
+    def _begin_remote_open(self, ref: SourceRef, *, announce: bool) -> bool:
+        """Open a remote source from a worker, saying so while it happens.
+
+        ``_select_rotated_set`` set the precedent: it is "the one path in CLV
+        that is not instant" and it says what it did rather than going quiet.
+        A remote open inherits that treatment, because a pane that sits blank
+        for a round trip and a pane that failed look identical.
+
+        Returns True meaning *accepted*, not *opened* — the worker reports the
+        outcome itself. Every caller uses the result to decide whether to keep
+        going, and an open that is in flight has not failed.
+        """
+
+        self._stop_tail()
+        # A newer selection wins. Without this, switching sources twice while
+        # the first open is still in flight races two primes into one session
+        # and the pane ends up showing whichever finished last.
+        self._open_token = object()
+        node = ref.node if isinstance(ref, RemoteRef) else ""
+        if announce:
+            self._notify(f"Opening {ref.name} on {node}…")
+        self.run_worker(
+            self._finish_remote_open(ref, self._open_token, announce),
+            group="remote-open",
+            exit_on_error=False,
+        )
+        return True
+
+    async def _finish_remote_open(
+        self, ref: SourceRef, token: object, announce: bool
+    ) -> None:
+        """The blocking half, on a thread, committed back on the loop."""
+
+        def work() -> SourceBuffer:
+            backend = self._backends.for_ref(ref)
+            if backend.kind(ref) != "file":
+                raise OSError("not a readable file")
+            buffer = SourceBuffer(
+                ref,
+                max_lines=self._session.max_lines,
+                reader=self._open_reader(ref, max_lines=self._session.max_lines),
+                facts=self._source_facts(ref),
+            )
+            buffer.prime()
+            return buffer
+
+        worker = self.run_worker(
+            work, thread=True, name="remote-open", exit_on_error=False
+        )
+        try:
+            buffer = await worker.wait()
+        except Exception as exc:  # noqa: BLE001 - a remote read fails many ways
+            if token is self._open_token and announce:
+                self._notify(f"Failed to read {ref}: {exc}", "error")
+            return
+
+        if token is not self._open_token or self._is_shutting_down:
+            # The operator moved on while this was in flight. Release what the
+            # worker built rather than installing it over their new choice.
+            buffer.close()
+            return
+
+        self._session.install(buffer)
+        self._show_lines = min(
+            self._config.default_show_lines, self._config.max_buffer_lines
+        )
+        self._after_source_change()
+
+    def _begin_remote_rotated_open(self, rotated_set: RotatedSet) -> bool:
+        """A remote rotated set, primed on a worker and committed on the loop."""
+
+        self._stop_tail()
+        self._open_token = token = object()
+        self._notify(f"Opening {rotated_set.name} on {rotated_set.head.node}…")
+
+        async def finish() -> None:
+            def work() -> SourceBuffer:
+                # Every member of a set lives wherever the set does, so one
+                # backend answers for all of them — the reader says so itself.
+                reader = RotatedSetReader(
+                    rotated_set,
+                    max_lines=self._session.max_lines,
+                    backend=self._backends.for_ref(rotated_set.head),
+                    # Without this the live head gets a `SourceReader`, whose
+                    # poll cannot see a remote file grow — the set would show
+                    # its history and then never update again.
+                    reader_factory=self._open_reader,
+                )
+                buffer = SourceBuffer(
+                    rotated_set.head,
+                    max_lines=self._session.max_lines,
+                    reader=reader,
+                    facts=self._source_facts(rotated_set.head),
+                )
+                buffer.prime()
+                return buffer
+
+            worker = self.run_worker(
+                work, thread=True, name="remote-rotated", exit_on_error=False
+            )
+            try:
+                buffer = await worker.wait()
+            except Exception as exc:  # noqa: BLE001 - a remote read fails many ways
+                if token is self._open_token:
+                    self._notify(
+                        f"Failed to read {rotated_set.name}: {exc}", "error"
+                    )
+                return
+            if token is not self._open_token or self._is_shutting_down:
+                buffer.close()
+                return
+
+            self._session.install(buffer)
+            self._show_lines = min(
+                self._config.default_show_lines, self._config.max_buffer_lines
+            )
+            self._after_source_change()
+            self._notify(
+                describe_set(rotated_set, getattr(buffer.reader, "members_read", 0))
+            )
+
+        self.run_worker(finish(), group="remote-open", exit_on_error=False)
+        return True
+
     def _select_rotated_set(self, rotated_set: RotatedSet) -> bool:
         """Open a whole rotated log as one source.
 
         The one path in CLV that is not instant: older members have to be
         decompressed from the front, so this says what it read rather than
         going quiet for a second and hoping nobody notices.
+
+        A **remote** set is worse than not-instant — every member is a round
+        trip, and a twelve-member set opened inline would be twelve of them on
+        the event loop — so it takes the same worker path a single remote open
+        already does.
         """
+
+        if not is_local(rotated_set.head):
+            return self._begin_remote_rotated_open(rotated_set)
 
         self._stop_tail()
         try:
@@ -970,32 +1635,166 @@ class LogViewerApp(App[None]):
 
     # --- the merged set ------------------------------------------------------
 
+    def _merge_target(self) -> Optional[SourceRef]:
+        """The source a merge gesture acts on, which is not the star target.
+
+        Two differences, both of which are bugs in the shared version rather than
+        preferences:
+
+        **A rotated set is its head.** ``group_rotated`` defaults on, so on any
+        machine with a real ``/var/log`` the thing under the cursor is a
+        ``RotatedSet`` branch, not a file — and ``_star_target`` answers ``None``
+        for it. Merging the canonical ``access.log`` therefore missed on the first
+        press, which is the one workflow this whole feature exists for.
+
+        **A tree ref is taken at its word.** ``_star_target`` filters the cursor
+        through ``_is_file_node`` and, finding nothing, silently falls back to the
+        log on screen. The merged group deliberately lists members discovery did
+        *not* find — a log that has rotated away "should be visible enough to
+        press `x` on rather than silently absent" — so that filter turns a press
+        on one of them into a press on something else entirely. Membership is
+        about the stored key, not about the file existing today.
+
+        ``_star_target`` itself is left alone: whether starring should follow is a
+        separate question with a separate answer.
+        """
+
+        try:
+            tree = self.query_one("#source-tree", LogTree)
+        except NoMatches:
+            tree = None
+
+        if tree is not None and tree.has_focus and tree.cursor_node is not None:
+            data = tree.cursor_node.data
+            if isinstance(data, RotatedSet):
+                return data.head
+            if is_source_ref(data):
+                return data
+        return self._star_target()
+
     def action_toggle_merge(self) -> None:
         """Add or remove the source under the tree cursor from the merged set."""
 
-        target = self._star_target()
+        target = self._merge_target()
         if target is None:
             self._notify("Move to a log in the tree to merge it.", "warning")
             return
 
-        resolved = _resolve(target)
+        stored = ref_key(target)
         current = list(self.state.merged)
-        if str(resolved) in current:
-            current.remove(str(resolved))
+        if stored in current:
+            current.remove(stored)
             action = "Removed from"
         else:
-            current.append(str(resolved))
+            current.append(stored)
             action = "Added to"
+        # Sorted as strings, not as refs: the persisted order is lexicographic
+        # over the stored form, which is stable across a mixed local and remote
+        # set. `SourceRef` deliberately declares no ordering of its own.
         self._update_state(merged=tuple(sorted(current)))
+        # Edited in place rather than rebuilt. Membership says nothing about
+        # what is on disk, so a rescan would be a filesystem walk per keystroke
+        # — and rebuilding the tree collapses every folder the operator had
+        # opened, which is a heavy price for adding one indicator.
+        self._sync_merged_tree()
         self._notify(
             f"{action} the merged set ({len(current)} source(s)). Press u to open it."
         )
-        self.run_worker(self._rescan(), group="discovery", exit_on_error=False)
+
+    def action_merge_across_hosts(self) -> None:
+        """Merge this path on every machine discovery found it on, then open it.
+
+        Comparing one log across a fleet is the reason this product is called
+        *Centralized* Log Viewer, and building that set by pressing `x` on five
+        leaves inside five separately collapsed host trees is tedious enough to
+        stop people doing it at all.
+
+        **No round trip.** ``_file_refs`` is every file the last discovery listed,
+        local and remote, and a ``RemoteRef`` is frozen and hashable — so the
+        whole set is a scan of a set already in memory. Nothing here connects to
+        anything; opening does, and that path was already threaded.
+
+        Three outcomes are reported, because Requirement 7 says they are three
+        different facts: hosts that have the path, hosts that were walked and do
+        not, and hosts that could not be walked at all. A machine inside its
+        reconnect backoff is in the third group with the reason that put it there
+        — reporting it as *not having the file* would be a confident answer CLV
+        has no evidence for.
+        """
+
+        target = self._merge_target()
+        if target is None:
+            self._notify(
+                "Move to a log in the tree to merge it across hosts.", "warning"
+            )
+            return
+
+        wanted = _path_text(target)
+        matches = [ref for ref in self._file_refs if _path_text(ref) == wanted]
+        if not any(identity(ref) == identity(target) for ref in matches):
+            # The target can be something discovery no longer lists — a member of
+            # the merged group, or the open log. It is still the thing the
+            # operator pointed at.
+            matches.append(target)
+        matches.sort(key=lambda ref: (node_of(ref), str(ref)))
+
+        found = {node_of(ref) for ref in matches}
+        walked = {node_of(ref) for ref in self._file_refs}
+        unreachable = self._unreachable_nodes()
+        lacking = sorted(node for node in walked if node and node not in found)
+
+        if len(matches) < 2:
+            self._notify(
+                f"{stem_of(target)} was only found on one source"
+                f"{self._merge_scope_detail(lacking, unreachable)}",
+                "warning",
+            )
+            return
+
+        self._update_state(merged=tuple(sorted(ref_key(ref) for ref in matches)))
+        self._sync_merged_tree()
+        self._notify(
+            f"Merging {target.name} across {len(matches)} sources"
+            f"{self._merge_scope_detail(lacking, unreachable)}"
+        )
+        self.action_open_merged()
+
+    def _unreachable_nodes(self) -> dict[str, str]:
+        """Machines the last discovery could not walk, and why.
+
+        Read off the report rather than asked of the backends: the report is what
+        actually happened on the walk, and it already distinguishes a host that
+        refused from one that was skipped inside its backoff.
+        """
+
+        reasons: dict[str, str] = {}
+        report = self._report
+        if report is None:
+            return reasons
+        for root in report.unreadable_roots:
+            node = node_of(root)
+            if node and node not in reasons:
+                reasons[node] = report.root_reasons.get(root, "")
+        return reasons
+
+    @staticmethod
+    def _merge_scope_detail(lacking: list[str], unreachable: dict[str, str]) -> str:
+        """The two negatives, named. Silence about either would be the bug."""
+
+        parts = []
+        if lacking:
+            parts.append(f"not on {', '.join(lacking)}")
+        if unreachable:
+            parts.append(f"could not reach {', '.join(sorted(unreachable))}")
+        return f" — {'; '.join(parts)}." if parts else "."
 
     def action_open_merged(self) -> None:
         """Open every source in the merged set as one timestamp-ordered stream."""
 
-        paths = [Path(entry) for entry in self.state.merged]
+        # parse_ref, not identity: the stored form is what the set was built
+        # from, and resolving here would open a symlink's target instead of the
+        # member the operator chose.
+        paths = [parse_ref(entry) for entry in self.state.merged]
         if not paths:
             self._notify("No sources merged yet — press x on a log to add one.", "warning")
             return
@@ -1006,9 +1805,61 @@ class LogViewerApp(App[None]):
             return
 
         self._stop_tail()
+
+        if any(not is_local(path) for path in paths):
+            # Every remote member is a round trip, so a five-host merge opened
+            # inline is five of them on the event loop. The local-only path
+            # below is untouched.
+            self._open_token = token = object()
+            self._notify(f"Opening {len(paths)} sources…")
+            self.run_worker(
+                self._finish_merged_open(paths, token),
+                group="remote-open",
+                exit_on_error=False,
+            )
+            return
+
         opened, failed = self._session.open_many(paths)
+        self._report_merge(opened, failed)
+
+    async def _finish_merged_open(self, paths, token: object) -> None:
+        """Prime every member on a worker, commit on the loop."""
+
+        worker = self.run_worker(
+            lambda: self._session.prepare_many(paths),
+            thread=True,
+            name="remote-merge",
+            exit_on_error=False,
+        )
+        try:
+            opened, failed = await worker.wait()
+        except Exception as exc:  # noqa: BLE001 - a remote read fails many ways
+            if token is self._open_token:
+                self._notify(f"Could not open the merged set: {exc}", "error")
+            return
+
+        if token is not self._open_token or self._is_shutting_down:
+            for buffer in opened:
+                buffer.close()
+            return
+
+        self._session.install_many(opened)
+        self._report_merge(opened, failed)
+
+    def _report_merge(self, opened, failed) -> None:
+        """Say what opened and name what did not. One place, both paths.
+
+        A member that has rotated away — or a host that is unreachable — must
+        not stop the others opening, and must not vanish without being
+        mentioned. That is ``open_many``'s contract and it is worth having one
+        implementation of the reporting half.
+        """
+
         for path, reason in failed:
-            self._notify(f"{path.name} could not be opened: {reason}", "warning")
+            # `stem_of`, not `.name`: the canonical cross-host merge is one path
+            # across a fleet, so a failure list keyed on the basename reads as
+            # the same file failing five times.
+            self._notify(f"{stem_of(path)} could not be opened: {reason}", "warning")
         if not opened:
             self._notify("None of the merged sources could be opened.", "error")
             return
@@ -1021,16 +1872,159 @@ class LogViewerApp(App[None]):
             if anchored
             else ""
         )
-        self._notify(f"Merged {len(opened)} sources.{detail}")
+        self._notify(f"Merged {len(opened)} sources.{detail}{self._skew_detail()}")
+
+    def action_clear_merged(self) -> None:
+        """Empty the merged set, so the next one starts from nothing.
+
+        The verb that was missing: naming a set has always been possible
+        through saved views, but building a *second* one meant pressing `x`
+        off every member of the first. What is already saved is untouched —
+        this empties the working set, not the views that recorded it.
+        """
+
+        if not self.state.merged:
+            self._notify("The merged set is already empty.", "warning")
+            return
+        count = len(self.state.merged)
+        self._update_state(merged=())
+        self._sync_merged_tree()
+        self._notify(
+            f"Cleared {_plural(count, 'source', 'sources')} from the merged set. "
+            "Saved views that name a set are unaffected."
+        )
 
     @property
     def _merged_paths(self) -> set[Path]:
-        return {_resolve(Path(entry)) for entry in self.state.merged}
+        return {identity(parse_ref(entry)) for entry in self.state.merged}
+
+    def _merged_label(self) -> Text:
+        """The group's heading: a marker that opens, and a name that expands.
+
+        The leading glyph carries the action metadata and is painted to look
+        like a control; the rest of the row is an ordinary group heading. One
+        row, two jobs, and a click can tell which one it meant — which it could
+        not when the whole row did both and opening the view collapsed the list
+        of what was in it.
+
+        The count is the difference between a heading and a control: "Merged"
+        alone reads as a category, while "2 sources" says there is something
+        assembled here to open.
+        """
+
+        def marker(glyph: str, action: str) -> tuple[str, Style]:
+            return glyph, Style.from_meta({ACTION_META: action}) + ACTION_STYLE
+
+        count = _plural(len(self.state.merged), "source", "sources")
+        return Text.assemble(
+            marker(ICON_MERGED, "open"),
+            f" Merged ({count})  ",
+            marker(ICON_NAME_SET, "save"),
+            " ",
+            marker(ICON_CLEAR_SET, "clear"),
+        )
+
+    def _merged_display_paths(self) -> list[Path]:
+        """The merged set in the order the group lists it."""
+
+        return sorted(
+            (parse_ref(entry) for entry in self.state.merged),
+            key=lambda path: (path.name.lower(), str(path).lower()),
+        )
+
+    def _sync_merged_tree(self) -> None:
+        """Make the tree's merged group and indicators match the current set.
+
+        Reconciles from state rather than applying a delta, so every way the
+        set can change goes through one path: `x` on a source, and applying a
+        saved view that carries a set of its own. A delta cannot express the
+        second — a view replaces the whole set at once — and having two ways
+        to update the same rows is how one of them ends up stale.
+
+        In place, never a rebuild: `_build_tree` creates folders shut, so
+        rebuilding would collapse everything the operator had expanded. The
+        group node itself is kept and only its children are swapped, so a
+        collapsed group stays collapsed.
+        """
+
+        try:
+            tree = self.query_one("#source-tree", LogTree)
+        except NoMatches:
+            return
+
+        merged = self._merged_paths
+        group = self._merged_group(tree)
+
+        if merged:
+            if group is None:
+                # Appearing mid-session, so it has to be placed rather than
+                # appended: below the other groups, above the configured roots.
+                #
+                # Open, unlike the ones built at startup: this one appeared
+                # because the operator just pressed `x`, and seeing the source
+                # land in it is the confirmation that the keystroke worked.
+                group = tree.root.add(
+                    self._merged_label(),
+                    data=MERGED_VIEW,
+                    expand=True,
+                    before=self._group_count(tree),
+                )
+            else:
+                group.remove_children()
+            # The count is part of what makes the row read as a control.
+            group.set_label(self._merged_label())
+            for path in self._merged_display_paths():
+                group.add_leaf(f"{ICON_MERGED} {_compact_path(path)}", data=path)
+        elif group is not None:
+            # An empty group is a row that explains nothing.
+            group.remove()
+            group = None
+
+        # Every other node carrying a path — the file in its folder, and any
+        # copy of it in the starred group — gains or loses the indicator.
+        for node in _walk_nodes(tree.root):
+            if node.parent is group or not is_source_ref(node.data):
+                continue
+            plain = node.label.plain
+            if plain.startswith(ICON_MERGED):
+                plain = plain[len(ICON_MERGED) :]
+            member = identity(node.data) in merged
+            node.set_label(f"{ICON_MERGED}{plain}" if member else plain)
+
+    @staticmethod
+    def _merged_group(tree: LogTree) -> Optional[TreeNode[object]]:
+        return next(
+            (node for node in tree.root.children if node.data is MERGED_VIEW), None
+        )
+
+    @staticmethod
+    def _group_count(tree: LogTree) -> int:
+        """How many group rows lead the tree, so a new one lands after them."""
+
+        count = 0
+        for node in tree.root.children:
+            if node.data is None and node.label.plain in TREE_GROUP_LABELS:
+                count += 1
+            else:
+                break
+        return count
 
     def _merged_name(self) -> str:
-        """What to call the merged set — in the status line and in an export."""
+        """What to call the merged set — in the status line and in an export.
 
-        names = [Path(entry).name for entry in self.state.merged]
+        Members are named through ``stem_of``, so a set built from one path
+        across two machines reads ``web01-syslog+web02-syslog`` rather than
+        ``syslog+syslog`` — a label that named the file twice and neither
+        machine. Local members are unaffected: ``stem_of`` of a ``Path`` *is*
+        its ``.name``.
+
+        Past two members it stays a handle rather than a manifest and the
+        remaining hosts are counted, not listed. Which machines are actually in
+        the file is answered by the ``node`` field on every exported row, which
+        a filename cannot carry and should not try to.
+        """
+
+        names = [stem_of(parse_ref(entry)) for entry in self.state.merged]
         if len(names) <= 2:
             return "+".join(names) or "merged"
         return f"{names[0]}+{len(names) - 1}-more"
@@ -1071,6 +2065,7 @@ class LogViewerApp(App[None]):
     def _after_source_change(self) -> None:
         """Everything that has to be rebuilt when the buffer becomes new."""
 
+        self._sync_column_labels()
         self._sync_field_names()
         self._sync_regex_validation()
         # Rules are recompiled against this source's vocabulary and the primed
@@ -1101,6 +2096,10 @@ class LogViewerApp(App[None]):
         if self._tail_timer is not None:
             self._tail_timer.stop()
             self._tail_timer = None
+        # The source set is about to change, and a pending attempt belongs to
+        # the set it was scheduled against: resuming a reader the session no
+        # longer holds would open a connection for a pane that has gone.
+        self._cancel_reconnects()
 
     def _poll_tail(self) -> None:
         if not self._session or self._is_shutting_down:
@@ -1108,6 +2107,14 @@ class LogViewerApp(App[None]):
         outcomes = self._session.poll()
         if not outcomes:
             return
+
+        # Before every early return below. A source that stopped usually stops
+        # with no lines to show for it, so handling this after the
+        # `if not new_entries` guard would be handling it never — which is
+        # precisely how a dropped link used to render as a quiet log.
+        problems = [outcome for outcome in outcomes if outcome.problem]
+        if problems:
+            self._report_problems(problems)
 
         rotated = [outcome for outcome in outcomes if outcome.rotated]
         if rotated:
@@ -1147,6 +2154,178 @@ class LogViewerApp(App[None]):
             self._append_entries(new_entries)
         self._update_status()
 
+    # --- when a source goes away --------------------------------------------
+
+    def _report_problems(self, outcomes: Sequence[PollOutcome]) -> None:
+        """Say that a source stopped, and start trying to get it back.
+
+        Three channels, and **none of them is a log row**: `_notify` stopped
+        writing into the pane because copy mode copied what it wrote, and a
+        fabricated line saying "connection lost" is exactly the kind of thing
+        CLV promises never to put in a log. So: a toast now, the empty-pane
+        explanation for as long as the pane is empty, and a status-line segment
+        for as long as it lasts.
+        """
+
+        for outcome in outcomes:
+            buffer = outcome.buffer
+            if buffer.path is None:
+                continue
+            key = ref_key(buffer.path)
+            if self._source_problems.get(key) == outcome.problem:
+                # Already said. A reader reports a stoppage once, but a rotated
+                # set can re-report through its head, and a toast twice a second
+                # is a worse failure than the silence this replaces.
+                continue
+            self._source_problems[key] = outcome.problem
+            self._notify(outcome.problem, "warning")
+            self._schedule_reconnect(buffer, outcome.problem)
+
+        # The pane may be showing "no entries in the selected source", which is
+        # a claim CLV cannot make about a source it cannot see.
+        self._render_log()
+        self._update_status()
+
+    def _schedule_reconnect(self, buffer: SourceBuffer, reason: str) -> None:
+        """Queue one bounded attempt at *buffer*'s source, after a backoff.
+
+        Only for readers that can actually resume. A local reader has nothing to
+        reconnect **to** — its file is either there on the next poll or it is
+        not — so the absence of `resume` is the answer rather than a case to
+        special-case on a ref type.
+        """
+
+        if buffer.path is None or not hasattr(buffer.reader, "resume"):
+            return
+        key = ref_key(buffer.path)
+        record = self._reconnects.get(key)
+        if record is None:
+            record = _Reconnect(reason=reason)
+            self._reconnects[key] = record
+        else:
+            record.reason = reason
+        if record.exhausted or record.timer is not None:
+            return
+
+        delay = backoff_for(record.attempts + 1)
+        # A timer rather than a poll-tick check, which is the whole point: at
+        # `refresh_hz` a "should I retry yet" test is twice a second, and the
+        # version of this that reconnects when it is due is the fork bomb with a
+        # nice name that `journald` names in its own poll.
+        record.timer = self.set_timer(
+            delay, lambda: self._attempt_reconnect(key, buffer)
+        )
+
+    def _attempt_reconnect(self, key: object, buffer: SourceBuffer) -> None:
+        """One resume, on a worker. Never on the event loop."""
+
+        record = self._reconnects.get(key)
+        if record is None or self._is_shutting_down:
+            return
+        record.timer = None
+        if buffer not in list(self._session):
+            # The operator moved on. Reconnecting a buffer nothing is showing
+            # would open a connection for a pane that no longer exists.
+            self._reconnects.pop(key, None)
+            return
+        self.run_worker(
+            self._finish_reconnect(key, buffer),
+            group="reconnect",
+            exit_on_error=False,
+        )
+
+    async def _finish_reconnect(self, key: object, buffer: SourceBuffer) -> None:
+        """The blocking half on a thread, the verdict back on the loop."""
+
+        reader = buffer.reader
+        resume = getattr(reader, "resume", None)
+        if resume is None:  # pragma: no cover - guarded at scheduling time
+            return
+
+        worker = self.run_worker(
+            resume, thread=True, name="reconnect", exit_on_error=False
+        )
+        try:
+            await worker.wait()
+        except Exception:  # noqa: BLE001 - a remote read fails many ways
+            record = self._reconnects.get(key)
+            if record is None or self._is_shutting_down:
+                return
+            record.attempts += 1
+            if record.attempts >= RECONNECT_ATTEMPTS:
+                # Bounded on purpose. A host that has been gone this long is not
+                # coming back because CLV asked again, and an endless retry is a
+                # stream of ssh processes at a machine the operator may have
+                # taken down deliberately. Say it has stopped, and say what
+                # resumes it.
+                record.exhausted = True
+                message = (
+                    f"{record.reason} Gave up after {record.attempts} attempts — "
+                    "press Ctrl+R to retry."
+                )
+                self._source_problems[key] = message
+                self._notify(message, "error")
+                self._render_log()
+                self._update_status()
+                return
+            # The original reason, not this attempt's exception appended to it:
+            # six failures would otherwise build a sentence six clauses long
+            # that says the same thing six times.
+            self._schedule_reconnect(buffer, record.reason)
+            return
+
+        if self._is_shutting_down:
+            return
+        self._reconnects.pop(key, None)
+        self._source_problems.pop(key, None)
+        name = buffer.path.name if buffer.path is not None else "the source"
+        self._notify(f"{name}: reconnected.")
+        self._render_log()
+        self._update_status()
+
+    def _cancel_reconnects(self) -> None:
+        """Drop every pending attempt. Called whenever the source set changes."""
+
+        for record in self._reconnects.values():
+            if record.timer is not None:
+                record.timer.stop()
+        self._reconnects.clear()
+        self._source_problems.clear()
+
+    def _unreachable_detail(self) -> str:
+        """What the open source's reachability adds to the pane and status line.
+
+        Reads `backend.reachability`, which is `@cheap` and never probes — the
+        status line renders on every poll, so anything else here would be the
+        round trip on the event loop that the whole design exists to refuse.
+        """
+
+        if not self._session:
+            return ""
+        stopped = [
+            self._source_problems[ref_key(buffer.path)]
+            for buffer in self._session
+            if buffer.path is not None
+            and ref_key(buffer.path) in self._source_problems
+        ]
+        if not stopped:
+            # Nothing has stopped producing, but a host can still be known bad
+            # — a follow that never started, a walk that failed. Ask the
+            # backends rather than inventing a second bookkeeping path.
+            unreachable = [
+                state.reason
+                for buffer in self._session
+                if buffer.path is not None
+                for state in (self._backends.for_ref(buffer.path).reachability(),)
+                if not state.ok and state.reason
+            ]
+            stopped = unreachable
+        if not stopped:
+            return ""
+        if len(stopped) == 1:
+            return stopped[0]
+        return f"{len(stopped)} of {len(self._session)} sources are unreachable."
+
     # --- filtering and rendering -------------------------------------------
 
     def _filter_spec(self) -> FilterSpec:
@@ -1183,6 +2362,19 @@ class LogViewerApp(App[None]):
 
         return self._session.origin_of(entry)
 
+    def _sync_column_labels(self) -> None:
+        """Decide what the merged source column calls each member, once per set.
+
+        Once per set rather than once per line: a filtered view is thousands of
+        entries and the member list is single digits, so deriving the rule inside
+        the render loop would put that product on the redraw path. The same
+        argument ``session.moment_mapper`` makes for the histogram.
+        """
+
+        self._column_labels = column_labels(
+            [buffer.path for buffer in self._session.buffers]
+        )
+
     def _origins(self) -> list[Optional[Path]]:
         """Every source the open session draws from.
 
@@ -1191,12 +2383,17 @@ class LogViewerApp(App[None]):
         than assuming the answer is `_selected_source`.
         """
 
-        sources: list[Optional[Path]] = [buffer.path for buffer in self._session.buffers]
+        sources: list[Optional[SourceRef]] = [
+            buffer.path for buffer in self._session.buffers
+        ]
         if self._session.is_merged or any(
             entry.fields.get(ORIGIN_FIELD) for entry in self._entries
         ):
+            # An ORIGIN_FIELD value is format_ref output that has been living on
+            # an entry, so it comes back the same way anything else persisted
+            # does — and for two hosts it is what keeps their marks apart.
             sources += [
-                Path(value)
+                parse_ref(value)
                 for value in {
                     entry.fields.get(ORIGIN_FIELD)
                     for entry in self._entries
@@ -1228,11 +2425,23 @@ class LogViewerApp(App[None]):
         if self._selected_source is None:
             if self._report is not None:
                 self._show_discovery_summary(self._report)
+            self._clear_timeline()
             self._sync_detail_pane()
             return
 
         if not self._entries:
-            self.log_panel.write(Text("No log entries in the selected source.", style="dim"))
+            # An unreachable source is reported, never rendered as an empty one:
+            # "no log entries in the selected source" is a claim about the
+            # source, and CLV is in no position to make it about one it cannot
+            # currently see.
+            unreachable = self._unreachable_detail()
+            self.log_panel.write(
+                Text(
+                    unreachable or "No log entries in the selected source.",
+                    style="#facc15" if unreachable else "dim",
+                )
+            )
+            self._clear_timeline()
             self._sync_detail_pane()
             return
 
@@ -1240,12 +2449,19 @@ class LogViewerApp(App[None]):
             result = self._visible_entries(self._entries)
         except QueryError as exc:
             self.log_panel.write(Text(f"Invalid query: {exc}", style="bold #f87171"))
+            self._clear_timeline()
             self._sync_detail_pane()
             return
 
         if not result.entries:
-            message = describe_empty_result(result.stats, self._filter_spec())
-            self.log_panel.write(Text(message, style="dim"))
+            unreachable = self._unreachable_detail()
+            message = describe_empty_result(
+                result.stats, self._filter_spec(), unreachable=unreachable
+            )
+            self.log_panel.write(
+                Text(message, style="#facc15" if unreachable else "dim")
+            )
+            self._clear_timeline()
             self._sync_detail_pane()
             return
 
@@ -1259,8 +2475,13 @@ class LogViewerApp(App[None]):
         self._marks.retain(live, sources=self._origins())
         self._watch_index.retain(live)
 
-        for entry in result.entries[-self._show_lines :]:
-            self.log_panel.write_entry(self._renderable_for(entry), entry)
+        # Built from the filtered set and *not* from the `_show_lines` window:
+        # the histogram answers "when did the thing I am looking at happen",
+        # and the answer must not change because the pane is showing fewer
+        # lines than it matched.
+        self._rebuild_timeline(result.entries)
+
+        self._write_rows(result.entries)
         # Rows are created unmarked, so with an empty set there is nothing to do
         # — and an empty set is the overwhelmingly common case.
         if self._marks:
@@ -1272,6 +2493,117 @@ class LogViewerApp(App[None]):
         if scroll_end or self.state.auto_scroll:
             self.log_panel.scroll_end(animate=False)
         self._update_status()
+
+    # --- repeat clustering --------------------------------------------------
+
+    def _write_rows(self, entries: Sequence[LogEntry]) -> None:
+        """Fill the pane from *entries*, collapsing repeats when `c` is on.
+
+        Without clustering this is the loop it has always been. With it, the
+        rows are what the pane shows and the `_show_lines` window applies to
+        *those*: collapsing is worth doing precisely because it buys history on
+        screen, and slicing before it would give that back.
+        """
+
+        if not self.state.clustering:
+            self._clusters = None
+            self._cluster_rows = {}
+            for entry in entries[-self._show_lines :]:
+                self.log_panel.write_entry(self._renderable_for(entry), entry)
+            return
+
+        stream = cluster_entries(entries, lookback=self._config.cluster_lookback)
+        self._clusters = stream
+        self._cluster_rows = {}
+        # Keys that no longer exist are dropped rather than kept forever: the
+        # lines behind them have been filtered away or evicted, and an expansion
+        # set that only grew would be a slow leak keyed on log content.
+        live_keys = {row.key() for row in stream.rows if isinstance(row, Cluster)}
+        self._expanded_clusters &= live_keys
+
+        plan: list[tuple[int, Optional[Cluster], LogEntry]] = []
+        for index, row in enumerate(stream.rows):
+            if isinstance(row, Cluster):
+                plan.append((index, row, row.representative))
+                if row.key() in self._expanded_clusters:
+                    # The members follow their header, which is what "expanded
+                    # in place" means: the lines stay where they were read.
+                    plan.extend((-1, None, member) for member in row.entries)
+            else:
+                plan.append((index, None, row))
+
+        for stream_index, cluster, entry in plan[-self._show_lines :]:
+            if cluster is None:
+                self.log_panel.write_entry(self._renderable_for(entry), entry)
+            else:
+                self.log_panel.write_cluster(
+                    self._cluster_renderable(cluster), cluster, entry
+                )
+            if stream_index >= 0:
+                self._cluster_rows[stream_index] = len(self.log_panel.rows) - 1
+
+    def _cluster_renderable(self, cluster: Cluster) -> RenderableType:
+        """A collapsed (or opened) group, as one line.
+
+        Deliberately never a structured panel, even with `o` on: a bordered
+        payload per repeat group is the noise this feature exists to remove.
+        """
+
+        expanded = cluster.key() in self._expanded_clusters
+        marker = "▾" if expanded else "▸"
+        prefix = f"{marker} {COUNT_PREFIX}{cluster.count} "
+        text = Text(prefix, style="bold #7aa3d1")
+        if self._breakpoint != "-compact":
+            # The span is what makes a count actionable — "147 of these, over
+            # four seconds" is a different event from "147, over an hour". It
+            # gives way first, because at 80 columns the line itself matters
+            # more.
+            span = self._cluster_span(cluster)
+            if span:
+                text.append(f"{span} ", style="#7aa3d1")
+        body = self._colorize(cluster.representative)
+        if self._session.is_merged:
+            body = self._with_source_column(body, cluster.representative)
+        return text.append_text(body)
+
+    @staticmethod
+    def _cluster_span(cluster: Cluster) -> str:
+        first, last = cluster.first, cluster.last
+        if first is None or last is None:
+            return ""
+        if first == last:
+            return f"{first:%H:%M:%S}"
+        return f"{first:%H:%M:%S}→{last:%H:%M:%S}"
+
+    def action_toggle_clustering(self) -> None:
+        self._set_clustering(not self.state.clustering)
+
+    def _set_clustering(self, value: bool) -> None:
+        self._update_state(clustering=value)
+        if not value:
+            # Nothing is remembered across an off/on: what was expanded refers
+            # to clusters that no longer exist.
+            self._expanded_clusters.clear()
+        self._sync_view_toggles()
+        self._render_log()
+        if value and self._clusters is not None:
+            summary = describe_clusters(self._clusters)
+            self._notify(f"Collapsed repeats — {summary}." if summary else "No repeats to collapse.")
+
+    def on_log_view_cluster_toggled(self, message: LogView.ClusterToggled) -> None:
+        """Enter on a cluster row opens it, or closes it again."""
+
+        cluster = message.cluster
+        if not isinstance(cluster, Cluster):  # pragma: no cover - defensive
+            return
+        key = cluster.key()
+        if key in self._expanded_clusters:
+            self._expanded_clusters.discard(key)
+        else:
+            self._expanded_clusters.add(key)
+        # A rebuild rather than an edit: the rows come from the filtered set,
+        # and _restore_cursor puts the cursor back on the row that was toggled.
+        self._render_log()
 
     def _sync_marks(self) -> None:
         """Set every visible row's gutter from the mark set.
@@ -1318,9 +2650,16 @@ class LogViewerApp(App[None]):
         # A tailed line can be one an operator marked earlier and that rotated
         # back in, so the gutter has to be set as it arrives — but only when
         # there are marks at all, keeping the common path a plain append.
+        # Folded into the existing grid rather than rebuilt from the buffer:
+        # this is the tail path, and it must cost what arrived.
+        self._extend_timeline(result.entries)
         marked = bool(self._marks)
         watching = self._watch_index.active
         for entry in result.entries:
+            if self._append_clustered(entry):
+                # Joined a group already on screen: the row was redrawn with a
+                # higher count and there is no new row to decorate.
+                continue
             self.log_panel.write_entry(self._renderable_for(entry), entry)
             if marked and self._marks.contains(self._origin(entry), entry):
                 self.log_panel.set_row_marked(len(self.log_panel.rows) - 1, True)
@@ -1328,6 +2667,187 @@ class LogViewerApp(App[None]):
             # this line before it reached the pane.
             if watching and self._watch_index.watched(self._origin(entry), entry):
                 self.log_panel.set_row_watched(len(self.log_panel.rows) - 1, True)
+
+    def _append_clustered(self, entry: LogEntry) -> bool:
+        """Fold one tailed *entry* into the clustering, if it is on.
+
+        Returns True when the entry was absorbed by a row already on screen, so
+        the caller writes nothing. The stream is the same object a full render
+        builds, fed one entry at a time — there is no second clustering
+        implementation for the tail path to disagree with.
+        """
+
+        stream = self._clusters
+        if not self.state.clustering or stream is None:
+            return False
+
+        growth = stream.add(entry)
+        if growth.appended:
+            # A shape nobody has seen lately: an ordinary row, remembered in
+            # case the next line makes it a cluster.
+            self.log_panel.write_entry(self._renderable_for(entry), entry)
+            self._cluster_rows[growth.index] = len(self.log_panel.rows) - 1
+            return True
+
+        row_index = self._cluster_rows.get(growth.index)
+        cluster = growth.row
+        if row_index is None or not isinstance(cluster, Cluster):
+            # The row scrolled out of the `_show_lines` window, so there is
+            # nothing on screen to update. A redraw is the honest answer.
+            self._render_log()
+            return True
+        if cluster.key() in self._expanded_clusters:
+            # An open cluster gains a *member row*, which means inserting a row
+            # mid-pane — the one thing this widget deliberately cannot do. Rare
+            # enough (a cluster has to be open) to pay a redraw for.
+            self._render_log()
+            return True
+        if not self.log_panel.row_holds(row_index, cluster):
+            # The pane hit its row cap and dropped a batch off the front, so
+            # every index below it moved. Updating by a stale index would
+            # rewrite some unrelated line, which is worse than a redraw.
+            self._render_log()
+            return True
+        self.log_panel.update_row(row_index, self._cluster_renderable(cluster), cluster)
+        return True
+
+    # --- the severity timeline ----------------------------------------------
+
+    def _rebuild_timeline(self, entries: Sequence[LogEntry]) -> None:
+        """Bucket *entries* into the bar, at whatever width it has.
+
+        Skipped entirely while the bar is hidden: an operator who never presses
+        `b` should not pay for a histogram nobody is looking at, and the bar is
+        rebuilt the moment it is shown.
+        """
+
+        if not self.state.timeline:
+            self._timeline = EMPTY_TIMELINE
+            return
+        # The session decides how a stamp is read, so the bar and the pane
+        # cannot disagree about the order of the same lines. It hands back None
+        # for every set that does not span time zones, which is every local one.
+        self._timeline = build_timeline(
+            entries,
+            width=self._timeline_width(),
+            moment_of=self._session.moment_mapper(),
+        )
+        # is_running, not is_mounted: rendering is unit-tested without a screen,
+        # and a widget refresh needs one. Same guard _update_status uses.
+        if self.is_running:
+            self.timeline_bar.set_timeline(self._timeline)
+
+    def _timeline_width(self) -> int:
+        """How many buckets the bar has room for.
+
+        The widget's own width once it is laid out; before that — the first
+        render happens before the first resize — the terminal's, which is the
+        same number minus the panels beside it and is corrected on the next
+        render anyway.
+        """
+
+        width = self.timeline_bar.size.width or self.timeline_bar.container_size.width
+        return max(1, width or self.size.width or 80)
+
+    def _clear_timeline(self) -> None:
+        self._timeline = EMPTY_TIMELINE
+        if self.state.timeline and self.is_running:
+            self.timeline_bar.clear()
+
+    def _extend_timeline(self, entries: Sequence[LogEntry]) -> None:
+        """Fold tailed lines into the existing grid, or rebuild when they miss.
+
+        The incremental half of Item 14. At two polls a second against buckets
+        minutes wide, almost everything lands in the grid; a rebuild costs one
+        pass over the filtered set and happens about once per bucket.
+        """
+
+        if not self.state.timeline:
+            return
+        extended = self._timeline.extend(entries)
+        if extended is None:
+            try:
+                result = self._visible_entries(self._entries)
+            except QueryError:
+                return
+            self._rebuild_timeline(result.entries)
+            return
+        self._timeline = extended
+        if self.is_running:
+            self.timeline_bar.set_timeline(extended)
+
+    def action_toggle_timeline(self) -> None:
+        value = not self.state.timeline
+        self._set_timeline(value)
+        if value:
+            # Only from the key. The drawer switch and a restored session both
+            # go through _set_timeline without this: flipping a switch must not
+            # yank focus out of the drawer, and a session that reopens with the
+            # bar showing should still start on whatever normally has focus.
+            self.timeline_bar.focus()
+
+    def _set_timeline(self, value: bool) -> None:
+        self._update_state(timeline=value)
+        self._sync_view_toggles()
+        self._sync_timeline()
+
+    def _sync_timeline(self) -> None:
+        """Show or hide the bar, and fill it when it appears."""
+
+        if self._is_shutting_down or not self.is_running:
+            return
+        visible = self.state.timeline
+        self.timeline_bar.set_class(visible, "-visible")
+        if not visible:
+            self.timeline_bar.clear()
+            self._timeline = EMPTY_TIMELINE
+            return
+        # Rebuilt rather than restored: it was not being maintained while it
+        # was hidden, which is the point of hiding it.
+        try:
+            result = self._visible_entries(self._entries)
+        except QueryError:
+            self._clear_timeline()
+            return
+        self._rebuild_timeline(result.entries)
+
+    def on_timeline_bar_width_changed(self, message: TimelineBar.WidthChanged) -> None:
+        """Re-bucket to the width the bar actually got.
+
+        The bucket count is the width, so this is a rebuild rather than a
+        reflow. It is also what corrects the first histogram after `b`: the bar
+        is hidden until then, and a hidden widget has no width to bucket to.
+        """
+
+        if not self.state.timeline or self._is_shutting_down:
+            return
+        try:
+            result = self._visible_entries(self._entries)
+        except QueryError:
+            return
+        self._rebuild_timeline(result.entries)
+
+    def on_timeline_bar_bucket_selected(self, message: TimelineBar.BucketSelected) -> None:
+        """A bucket became the time window.
+
+        Routed through the *custom range* the query bar and the state already
+        have rather than through a filter of its own, so the selection shows up
+        as an ordinary Time chip and is dismissed the same way. The bar then
+        re-buckets over the narrower window, which is the drill-down the
+        histogram exists for.
+        """
+
+        window = message.window
+        if window.start is None or window.end is None:  # pragma: no cover - always bounded
+            return
+        start = window.start.isoformat(sep=" ", timespec="seconds")
+        end = window.end.isoformat(sep=" ", timespec="seconds")
+        self._update_state(time_window="range", custom_start=start, custom_end=end)
+        with self.prevent(Input.Changed):
+            self.query_bar.apply_custom_time_range(start, end, emit=False)
+        self._refresh_chips()
+        self._render_log()
+        self._notify(f"Time window set to {start} → {end}.")
 
     def _renderable_for(self, entry: LogEntry) -> RenderableType:
         if self.state.pretty_rendering:
@@ -1350,7 +2870,9 @@ class LogViewerApp(App[None]):
 
         width = MERGED_COLUMN_WIDTHS.get(self._breakpoint, MERGED_COLUMN_WIDTHS["-narrow"])
         origin = self._origin(entry)
-        name = origin.name if origin is not None else "?"
+        name = self._column_labels.get(origin) if origin is not None else None
+        if name is None:
+            name = origin.name if origin is not None else "?"
         if len(name) > width:
             # From the left: rotated members and unit names differ at the end.
             name = "…" + name[-(width - 1) :]
@@ -1439,6 +2961,56 @@ class LogViewerApp(App[None]):
             table.add_row(*(["…"] * column_count))
         return table, "CSV preview"
 
+    def _show_upgrade_notice(self) -> None:
+        """After an upgrade, say once that newer settings exist.
+
+        **Not a `ConfigIssue`.** That type means "something the operator wrote
+        that CLV could not honour", and this is the opposite: nothing is wrong,
+        every absent option is simply taking its default. Borrowing the type
+        would have meant widening its severity to carry a case it was not built
+        for, so this gets its own line in the same place and a colour that does
+        not read as a fault.
+
+        Once per version, not once per launch. A line an operator sees every
+        time is a line they learn to look past, which fails in the same way as
+        never printing it — hence `last_seen_version` on the session state.
+
+        **Still read-only, even now that `clv --upgrade-config` exists.** The
+        launch path does not write the settings file, and a notice that quietly
+        rewrote it while the operator was reading the notice would be the worst
+        possible place to put that write. It reports a difference and points at
+        the command; acting on it stays the operator's decision.
+        """
+
+        if self._upgrade_notice_shown or __version__ == self.state.last_seen_version:
+            return
+        self._upgrade_notice_shown = True
+        previous = self.state.last_seen_version
+        self._update_state(last_seen_version=__version__)
+        if not previous:
+            # A first run, or a state file from before this was recorded. There
+            # is nothing to have upgraded *from*, and greeting a new user with a
+            # migration notice would be nonsense.
+            return
+
+        missing = undocumented_settings(self._settings_path)
+        if not missing:
+            return
+        shown = ", ".join(missing[:4])
+        if len(missing) > 4:
+            shown += f" and {len(missing) - 4} more"
+        self.log_panel.write(Text(""))
+        self.log_panel.write(
+            Text(
+                f"CLV {__version__}: {_plural(len(missing), 'setting', 'settings')} "
+                f"your settings file does not carry — {shown}. "
+                "Each is optional and already using its default; run "
+                "`clv --print-default-config` to read them, or "
+                "`clv --upgrade-config` to fold them into your file.",
+                style="#7aa3d1",
+            )
+        )
+
     def _show_discovery_summary(self, report: DiscoveryReport) -> None:
         self.log_panel.clear()
         for line in report.summary_lines():
@@ -1454,10 +3026,31 @@ class LogViewerApp(App[None]):
                     style="dim",
                 )
             )
+        self._show_upgrade_notice()
         if self._plugins.errors:
             self.log_panel.write(Text(""))
             for error in self._plugins.errors:
                 self.log_panel.write(Text(f"Plugin problem — {error}", style="#facc15"))
+            # The collection deduplicates and caps itself, so this can no longer
+            # bury the discovery summary the operator opened CLV to read — but
+            # it must still say what it is not showing.
+            if self._plugins.errors.overflow_note:
+                self.log_panel.write(
+                    Text(
+                        f"Plugin problems — {self._plugins.errors.overflow_note}",
+                        style="#facc15",
+                    )
+                )
+        # Same channel and the same colour as a plugin problem, because it is
+        # the same kind of fact: something the operator wrote that CLV could not
+        # honour. A host section skipped in silence is a machine that vanishes
+        # from the tree with no explanation, which is the one outcome a remote
+        # feature may not produce.
+        if self._config.issues:
+            self.log_panel.write(Text(""))
+            for issue in self._config.issues:
+                label = "Config warning" if issue.severity == "warning" else "Config problem"
+                self.log_panel.write(Text(f"{label} — {issue}", style="#facc15"))
 
     # --- status and chips ---------------------------------------------------
 
@@ -1509,6 +3102,16 @@ class LogViewerApp(App[None]):
             # One source made of several files: which one the cursor is in is
             # not deducible from anything else on screen.
             parts.append(f"in {member}")
+        if self.state.clustering and self._clusters is not None:
+            # Says what collapsing bought, and — when it bought nothing — that
+            # it is on and found no repeats, rather than looking switched off.
+            parts.append(describe_clusters(self._clusters) or "no repeats collapsed")
+        unreachable = self._unreachable_detail()
+        if unreachable:
+            # Persists for as long as the problem does, which is what the toast
+            # cannot do: a drop the operator was away from must still be visible
+            # when they come back.
+            parts.append(unreachable)
         marks = self._marks.count_for(*self._origins())
         if marks:
             parts.append(f"{marks} marked")
@@ -1773,6 +3376,16 @@ class LogViewerApp(App[None]):
         if entry is None:
             self._notify("Move the cursor to a line to mark it.", "warning")
             return
+        cluster = self.log_panel.cursor_cluster
+        if isinstance(cluster, Cluster) and cluster.key() not in self._expanded_clusters:
+            # A mark is a line. Marking 147 of them from one keystroke — and
+            # drawing one gutter dot for all of them — is not what `m` means,
+            # so the cluster has to be opened first.
+            self._notify(
+                f"Expand this cluster (Enter) to mark one of its {cluster.count} lines.",
+                "warning",
+            )
+            return
         marked = self._marks.toggle(self._origin(entry), entry)
         # Content-keyed, so identical lines share one mark: resync every row
         # rather than only the cursor's, or the copies would disagree.
@@ -1812,6 +3425,153 @@ class LogViewerApp(App[None]):
     def action_watch_rules(self) -> None:
         """Add, edit, enable, disable or delete the live-alert rules."""
         self.run_worker(self._prompt_watch_rules(), group="dialogs", exit_on_error=False)
+
+    def action_remote_hosts(self) -> None:
+        """Add, edit, test and remove the machines CLV reads logs from."""
+        self.run_worker(
+            self._prompt_remote_hosts(), group="dialogs", exit_on_error=False
+        )
+
+    def _host_statuses(self) -> dict[str, str]:
+        """What is already known about each host, without asking any of them.
+
+        ``reachability()`` is in ``GUARANTEED_CHEAP`` because it reports state
+        already held, and ``probed`` says whether anything has been held at all —
+        which matters, because a fresh ``SSHConnection`` reports ``connected``
+        optimistically. Without that distinction a host nobody has contacted
+        looks exactly like one that answered.
+        """
+
+        statuses: dict[str, str] = {}
+        backends = getattr(self._backends, "backends", {}) or {}
+        for name, backend in backends.items():
+            connection = getattr(backend, "connection", None)
+            if connection is not None and not connection.probed:
+                statuses[name] = "not tried"
+                continue
+            state = backend.reachability()
+            statuses[name] = "connected" if state.ok else (state.reason or state.state)
+        return statuses
+
+    def _probe_host(self, host: RemoteHost) -> ProbeResult:
+        """One bounded probe, on a throwaway connection. Runs on a thread.
+
+        **Its own ``socket_dir``**, which is not a detail. ``SSHConnection.socket``
+        is a hash of ``(name, host, user, port)``, so a second connection built
+        from the same record resolves to the *same* ``ControlPath`` — and the
+        ``close()`` below would then run ``ssh -O exit`` on the multiplex master
+        the resolver is actively using, costing a full handshake on the next read
+        every time Test is pressed.
+
+        Throwaway rather than reused for a second reason: ``facts()`` caches, so
+        asking the live connection would answer the second press from memory with
+        no sign that it never tried — and would answer about the *saved* record
+        rather than what the operator just typed.
+        """
+
+        import shutil
+        import tempfile
+
+        from .plugins.sources.ssh import SSHConnection
+
+        directory = tempfile.mkdtemp(prefix="clv-probe-")
+        connection = SSHConnection(host, socket_dir=directory)
+        try:
+            facts = connection.facts()
+            skew = facts.skew.total_seconds()
+            detail = f"connected · {facts.profile.name} · {facts.uname or 'unknown'}"
+            if abs(skew) >= 1:
+                detail += f" · clock {skew:+.0f}s"
+            return ProbeResult(True, detail)
+        except Exception as exc:  # noqa: BLE001 - a connection fails many ways
+            return ProbeResult(False, str(exc))
+        finally:
+            try:
+                connection.close()
+            finally:
+                shutil.rmtree(directory, ignore_errors=True)
+
+    async def _prompt_remote_hosts(self) -> None:
+        skipped = [
+            str(issue)
+            for issue in self._config.issues
+            if issue.origin.startswith("[ssh:")
+        ]
+        hosts = await self.push_screen(
+            RemoteHostsDialog(
+                self._config.hosts,
+                statuses=self._host_statuses(),
+                skipped=skipped,
+                probe=self._probe_host,
+                enabled=bool(getattr(self._config, "enable_ssh", False)),
+            ),
+            wait_for_dismiss=True,
+        )
+        if hosts is None:
+            return
+
+        removed = {host.name for host in self._config.hosts} - {
+            host.name for host in hosts
+        }
+        try:
+            self._write_hosts(hosts)
+        except OSError as exc:
+            self._notify(f"Could not save the host list: {exc}", "error")
+            return
+
+        self._notify(
+            f"Wrote {_plural(len(hosts), 'host', 'hosts')} to {self._settings_path}."
+        )
+        selected = self._selected_source
+        if (
+            removed
+            and isinstance(selected, RemoteRef)
+            and selected.node in removed
+        ):
+            # Reloading would re-select this ref, and with its host gone the
+            # resolver hands it to the local backend — which reports "no such
+            # file" for a path on a machine that was simply removed. Saying so
+            # here is the difference between an answer and a red herring.
+            self._stop_tail()
+            self._selected_source = None
+            self._session.close()
+            self._notify(
+                f"Closed {stem_of(selected)}: {selected.node} is no longer configured.",
+                "warning",
+            )
+        await self.action_reload_sources()
+
+    def _write_hosts(self, hosts: Sequence[RemoteHost]) -> None:
+        """Merge *hosts* into ``settings.conf``, key by key, in one pass.
+
+        **Key-level, never section-level.** Only the six keys the dialog offers
+        are written or cleared; a per-host glob, a budget, a comment beside them,
+        and a refused ``password =`` still earning its warning are all left
+        exactly as the operator left them. Regenerating the section from the
+        record would silently eat every one of them.
+
+        A section the parser *skipped* is in neither list — it never reached
+        ``config.hosts`` — so it is never rewritten and never removed. That falls
+        out of diffing records rather than diffing the file, which is the reason
+        it is done that way.
+        """
+
+        document = SettingsDocument.load(self._settings_path)
+        current = {host.name for host in hosts}
+        for name in sorted({host.name for host in self._config.hosts} - current):
+            document.remove_section(f"{SSH_SECTION_PREFIX}{name}")
+        for host in hosts:
+            section = f"{SSH_SECTION_PREFIX}{host.name}"
+            options = dict(host_options(host))
+            if not document.has_section(section):
+                document.add_section(section, host_options(host))
+                continue
+            for key in EDITABLE_KEYS:
+                if key in options:
+                    document.set(section, key, options[key])
+                else:
+                    document.remove_option(section, key)
+        document.save(self._settings_path)
 
     def _sync_watch_rules(self) -> None:
         """Recompile the rules and re-read the buffer against them.
@@ -1946,7 +3706,10 @@ class LogViewerApp(App[None]):
             invert_match=settings.invert_match,
             include_globs=settings.include_globs,
             exclude_globs=settings.exclude_globs,
-            source=str(self._selected_source) if self._selected_source else "",
+            # format_ref, not ref_key: a view records the source as it was
+            # selected, and resolving it here would silently rewrite a view
+            # saved on a symlink to name its target instead.
+            source=format_ref(self._selected_source) if self._selected_source else "",
             # Item 9 left this out because there was no merged set to capture.
             # Recorded only when a merge is actually open, so a view saved on
             # one log does not quietly carry someone else's set around.
@@ -1978,7 +3741,9 @@ class LogViewerApp(App[None]):
             for part in (
                 self.state.severity if self.state.severity != "all" else "",
                 self.state.time_window if self.state.time_window not in {"", "all"} else "",
-                self._selected_source.name if self._selected_source else "",
+                self._merged_name()
+                if self._session.is_merged
+                else (self._selected_source.name if self._selected_source else ""),
             )
             if part
         ]
@@ -2036,11 +3801,17 @@ class LogViewerApp(App[None]):
             # A merged view reopens the whole set: its filters were written
             # against all of it, and half the set is a different question.
             self._update_state(merged=tuple(view.merged))
+            # The tree has to follow, or the group keeps listing the set that
+            # was open before this one — the same rows, quietly wrong.
+            self._sync_merged_tree()
             self.action_open_merged()
             opened = True
         elif view.source:
-            source = Path(view.source)
-            if source.is_file():
+            source = parse_ref(view.source)
+            # A remote ref cannot answer `is_file` without a round trip on the
+            # event loop; the open below is the thing that finds out, and it
+            # already does so from a worker.
+            if not is_local(source) or source.is_file():
                 # _select_source renders once; nothing below may render again.
                 opened = self._select_source(source, announce=False)
                 if opened:
@@ -2167,7 +3938,9 @@ class LogViewerApp(App[None]):
             if tree is None or tree.cursor_node is None:
                 return None
             data = tree.cursor_node.data
-            return data if isinstance(data, Path) and data.is_file() else None
+            # `_is_file_node`, not `data.is_file()`: a remote ref cannot answer
+            # that without a round trip, and this runs on every cursor move.
+            return data if self._is_file_node(data) else None
 
         if tree is not None and tree.has_focus:
             target = cursor_file()
@@ -2183,7 +3956,7 @@ class LogViewerApp(App[None]):
         if self._is_shutting_down or not self.is_mounted:
             return
         target = self._star_target()
-        starred = None if target is None else str(_resolve(target)) in self.state.starred
+        starred = None if target is None else ref_key(target) in self.state.starred
         self.query_bar.set_star_state(starred)
 
     async def action_toggle_star(self) -> None:
@@ -2194,7 +3967,7 @@ class LogViewerApp(App[None]):
             self._notify("Open a log, or move the tree cursor to one, to star it.", "warning")
             return
 
-        key = str(_resolve(data))
+        key = ref_key(data)
         starred = set(self.state.starred)
         if key in starred:
             starred.discard(key)
@@ -2225,12 +3998,12 @@ class LogViewerApp(App[None]):
         if report is None or not self.state.starred:
             return
 
-        discovered = {_resolve(item.path) for item in report.files}
-        starred = [Path(entry) for entry in self.state.starred]
-        present = [path for path in starred if _resolve(path) in discovered]
+        discovered = {identity(item.path) for item in report.files}
+        starred = [parse_ref(entry) for entry in self.state.starred]
+        present = [path for path in starred if identity(path) in discovered]
 
         for path in starred:
-            if _resolve(path) not in discovered:
+            if identity(path) not in discovered:
                 self._notify(f"Starred log is not available: {path}", "warning")
 
         if len(present) == 1:
@@ -2247,7 +4020,7 @@ class LogViewerApp(App[None]):
         # have to be handed in explicitly — still generated from Binding
         # objects, so a key added there can no more go missing from the overlay
         # than one added here.
-        bindings = list(self.BINDINGS) + list(LogView.BINDINGS)
+        bindings = list(self.BINDINGS) + list(LogView.BINDINGS) + list(TimelineBar.BINDINGS)
         self.push_screen(HelpOverlay(build_help_sections(bindings)))
 
     def action_toggle_advanced(self) -> None:
@@ -2402,24 +4175,77 @@ class LogViewerApp(App[None]):
         self._notify(f"Saved {len(new_paths)} source(s) to {self._settings_path}.")
 
     async def action_reload_sources(self) -> None:
+        """Re-read the configuration and re-walk every root.
+
+        **Per host, rather than from scratch.** Reload used to close every
+        multiplex master and open them again, which is a full handshake per host
+        on every press — over five connections that is most of the wait, and all
+        of it spent on hosts whose settings had not moved. A connection belongs
+        to the configuration that named it, so what has to go is one whose host
+        record *changed* or which the new configuration no longer names.
+
+        A host that was unreachable is reset rather than skipped: pressing
+        reload means "try again now", and the operator may well have just fixed
+        what broke it.
+        """
+
         selected = self._selected_source
         added = list(self._source_manager.added_paths)
 
         self._stop_tail()
         self._config = load_config()
         self._settings_path = get_config_file() or user_config_path()
+        refreshed = self._reconcile_backends()
         # The cap can have changed under us, so the session adopts the new one
         # before anything is read against it.
         self._session.resize(self._config.max_buffer_lines)
         self._entries = deque(maxlen=self._config.max_buffer_lines)
-        self._source_manager = SourceManager(*self._split_roots(self._config.log_dirs))
+        self._source_manager = SourceManager(
+            *self._split_roots(
+                list(self._config.log_dirs) + remote_roots(self._config)
+            ),
+            backends=self._backends,
+        )
         for path in added:
             self._source_manager.add(str(path))
 
         await self._rescan()
-        if selected is not None and selected.is_file():
+        if selected is not None and (not is_local(selected) or selected.is_file()):
             self._select_source(selected, announce=False)
-        self._notify("Sources reloaded.")
+        self._notify(f"Sources reloaded{refreshed}.")
+
+    def _reconcile_backends(self) -> str:
+        """Adopt the re-read configuration, keeping the connections still valid.
+
+        Returns what to add to the reload message, so the operator can see that
+        a reload reused four connections and reopened one rather than having to
+        infer it from how long it took.
+        """
+
+        previous = self._backends
+        reconcile = getattr(previous, "reconcile", None)
+        enabled = bool(getattr(self._config, "enable_ssh", False))
+        if reconcile is None or not enabled:
+            # `LOCAL`, or the operator has just switched remote sources off. In
+            # the second case every open master has to go: a persisted socket is
+            # a live authenticated connection, and "I turned that off" must not
+            # leave one behind.
+            closer = getattr(previous, "close", None)
+            if closer is not None:
+                closer()
+            self._backends = build_backends(self._config)
+            return ""
+
+        kept, closed = reconcile(self._config.hosts)
+        self._backends = previous
+        if not kept and not closed:
+            return ""
+        parts = []
+        if kept:
+            parts.append(f"{len(kept)} host(s) refreshed")
+        if closed:
+            parts.append(f"{len(closed)} reconnected")
+        return " — " + ", ".join(parts)
 
     def action_quit_app(self) -> None:
         self.exit()
@@ -2543,11 +4369,13 @@ class LogViewerApp(App[None]):
             entry_count=len(entries),
             # A merged export is named for the set, not for whichever member
             # happens to be first — "auth.log-20260812" would be a lie about
-            # what is in the file.
+            # what is in the file. The set name is a label rather than a
+            # location, and goes through as one.
             default_name=default_stem(
-                Path(self._merged_name()) if self._session.is_merged else source
+                self._merged_name() if self._session.is_merged else source
             ),
             marked_count=len(marked),
+            cluster_count=self._clusters.clustered if self._clusters is not None else 0,
         )
         request = await self.push_screen(dialog, wait_for_dismiss=True)
         if request is None:
@@ -2559,7 +4387,26 @@ class LogViewerApp(App[None]):
                 self._notify("Nothing marked to export.", "warning")
                 return
             entries = marked
+        if request.clustered:
+            # Expanded output is the default, and clustered output is derived
+            # from it rather than from a second pass: every cluster becomes one
+            # ordinary entry, so the exporters never learn what a cluster is.
+            entries = self._clustered_entries(entries)
         self._run_export(request, entries)
+
+    def _clustered_entries(self, entries: list[LogEntry]) -> list[LogEntry]:
+        """One entry per repeat group, for a clustered export.
+
+        Re-clustered from whatever the export is actually writing rather than
+        read off the pane: "marked lines only" narrows the set first, and a
+        count taken from the pane would then be a count of lines that are not
+        in the file.
+        """
+
+        stream = cluster_entries(entries, lookback=self._config.cluster_lookback)
+        return [
+            summarise(row) if isinstance(row, Cluster) else row for row in stream.rows
+        ]
 
     def _run_export(self, request: ExportRequest, entries: list[LogEntry]) -> None:
         if request.key.startswith("builtin:"):
@@ -2629,7 +4476,7 @@ class LogViewerApp(App[None]):
 
     def on_tree_node_selected(self, event: Tree.NodeSelected[object]) -> None:
         data = event.node.data
-        if isinstance(data, Path) and data.is_file():
+        if self._is_file_node(data):
             self._select_source(data)
         elif isinstance(data, RotatedSet):
             self._select_rotated_set(data)
@@ -2638,6 +4485,18 @@ class LogViewerApp(App[None]):
         elif isinstance(data, SavedView):
             self._apply_view(data)
             self._notify(f"Applied view '{data.name}'.")
+
+    def on_log_tree_action_requested(self, message: LogTree.ActionRequested) -> None:
+        """A marker on a row was clicked. The row says what it stands for."""
+
+        if message.node.data is not MERGED_VIEW:
+            return
+        if message.action == "open":
+            self.action_open_merged()
+        elif message.action == "save":
+            self.action_save_view()
+        elif message.action == "clear":
+            self.action_clear_merged()
 
     def on_tree_node_highlighted(self, _event: Tree.NodeHighlighted[Path]) -> None:
         # The star target follows the cursor while the tree has focus, so the
@@ -2740,8 +4599,14 @@ class LogViewerApp(App[None]):
             self._set_detail_pane(message.value)
         elif message.field == "watch_rules":
             self._set_watch_enabled(message.value)
+        elif message.field == "timeline":
+            self._set_timeline(message.value)
+        elif message.field == "clustering":
+            self._set_clustering(message.value)
         elif message.field == "journald":
             self._set_journald(message.value)
+        elif message.field == "ssh":
+            self._set_enable_ssh(message.value)
         else:
             self._set_structured(message.value)
 
@@ -2832,12 +4697,115 @@ class LogViewerApp(App[None]):
         )
         self.run_worker(self._rescan(), group="discovery", exit_on_error=False)
 
+    def _set_enable_ssh(self, value: bool) -> None:
+        """Turn remote sources on or off, and record the choice in settings.conf.
+
+        **Not a copy of `_set_journald`, and the difference is the whole point.**
+        The journald plugin re-reads the settings file on every scan, so flipping
+        that switch needs nothing but a rescan. `enable_ssh` is read *here*:
+        `build_backends` and `remote_roots` both short-circuit on it, so a rescan
+        alone would re-walk the same local roots through the same local resolver
+        and report that nothing had changed.
+
+        What is needed is everything a configuration change needs — which is what
+        `action_reload_sources` already is, down to closing every multiplex master
+        when the switch goes off. A persisted `ControlMaster` socket is a live
+        authenticated connection any process running as this user can ride, so
+        "I turned that off" may not leave one behind.
+        """
+
+        try:
+            persist_setting(self._settings_path, "enable_ssh", str(value).lower())
+        except OSError as exc:
+            self._notify(f"Could not save the remote-sources setting: {exc}", "error")
+            self._sync_ssh_status()
+            return
+
+        self._notify(
+            f"Remote sources enabled — written to {self._settings_path}."
+            if value
+            else "Remote sources disabled; open connections closed."
+        )
+        self.run_worker(
+            self.action_reload_sources(), group="discovery", exit_on_error=False
+        )
+
+    def _sync_ssh_status(self) -> None:
+        """Summarise the fleet in the drawer's one line.
+
+        Reachability is read from the backends, never probed: `reachability()` is
+        in `GUARANTEED_CHEAP` precisely because it reports state already held. A
+        drawer that opened a connection to draw itself would be the Requirement 3
+        violation this whole plan is built to avoid.
+        """
+
+        import shutil
+
+        enabled = bool(getattr(self._config, "enable_ssh", False))
+        if shutil.which("ssh") is None:
+            # The same treatment the journal gets where `journalctl` is absent,
+            # and for the same reason: a switch that writes an opt-in nothing can
+            # act on is worse than one that is visibly unavailable, and "why is
+            # there no remote here" should be answered on screen.
+            self.advanced_drawer.set_ssh(
+                False, available=False, reason="no ssh client found on this machine"
+            )
+            return
+
+        hosts = [host for host in self._config.hosts if host.enabled]
+        if not hosts:
+            self.advanced_drawer.set_ssh(
+                enabled,
+                available=True,
+                reason=(
+                    "no hosts configured yet — press R to add one"
+                    if enabled
+                    else "off; press R to manage hosts"
+                ),
+            )
+            return
+
+        backends = getattr(self._backends, "backends", {}) or {}
+        unreachable = sorted(
+            name
+            for name, backend in backends.items()
+            if not backend.reachability().ok
+        )
+        detail = f"{_plural(len(hosts), 'host', 'hosts')}"
+        if enabled:
+            detail += f" · {len(hosts) - len(unreachable)} reachable"
+            if unreachable:
+                detail += f" · {', '.join(unreachable)} unreachable"
+        else:
+            detail += " configured, off"
+        self.advanced_drawer.set_ssh(enabled, available=True, reason=detail)
+
     def _sync_journald_status(self) -> None:
         """Show journal state in the drawer, including why it may be off."""
 
-        from .plugins.sources.journald import availability
+        from .plugins.sources.journald import JournaldProvider, availability
 
         available, reason = availability()
+        provider = next(
+            (p for p in self._plugins.sources if isinstance(p, JournaldProvider)), None
+        )
+        if provider is not None and self._config.enable_journald and available:
+            # What the provider actually found, rather than what it is allowed
+            # to look for. "Two sources and no units" is the shape of a failure
+            # and looked exactly like success from out here.
+            self.advanced_drawer.set_journald(
+                True, available=True, reason=provider.status
+            )
+            return
+        if available and not any(
+            isinstance(plugin, JournaldProvider) for plugin in self._plugins.sources
+        ):
+            # The switch would write an opt-in that nothing reads. Loading no
+            # plugins is not an error — it is a valid state — so nothing else
+            # would ever mention it, and a control that quietly does nothing is
+            # worse than one that is visibly unavailable.
+            available = False
+            reason = "the journald plugin is not loaded in this build"
         self.advanced_drawer.set_journald(
             self._config.enable_journald and available,
             available=available,
@@ -2865,6 +4833,8 @@ class LogViewerApp(App[None]):
             clipboard=self.state.clipboard_osc52,
             detail_pane=self.state.detail_pane,
             watch_rules=self._watching,
+            timeline=self.state.timeline,
+            clustering=self.state.clustering,
         )
 
     def _sync_detail_pane(self) -> None:
@@ -2962,10 +4932,60 @@ class LogViewerApp(App[None]):
         # owns a subprocess — so shutdown releases them explicitly rather than
         # leaving it to garbage collection.
         self._session.close()
+        # A multiplex socket is a live authenticated connection any local
+        # process running as this user can ride, so it is torn down explicitly
+        # rather than left to ControlPersist.
+        closer = getattr(self._backends, "close", None)
+        if closer is not None:
+            closer()
         if self._persist_state:
             # Persist as-is: the selected source is deliberately kept so the
             # next launch reopens it.
             self._store.save(self.state)
+
+
+def build_backends(config: LogConfig):
+    """The resolver discovery and reading route every ref through.
+
+    Returns ``LOCAL`` **itself** when remote sources are switched off, which is
+    Requirements 8 and 13 in one line: nothing is constructed, nothing connects,
+    no ``ssh`` is spawned, and the local path is the same object it has always
+    been. A build with the transport module removed entirely takes the same
+    branch rather than failing to start.
+    """
+
+    if not getattr(config, "enable_ssh", False):
+        return LOCAL
+    hosts = [host for host in config.hosts if host.enabled]
+    if not hosts:
+        return LOCAL
+    try:
+        from .plugins.sources.ssh import RemoteResolver
+    except Exception:  # noqa: BLE001 - a build that shipped without it
+        return LOCAL
+    return RemoteResolver(
+        hosts, local=LOCAL, include_globs=config.discovery.include_globs
+    )
+
+
+def remote_roots(config: LogConfig) -> list[RemoteRef]:
+    """One ref per configured directory on each enabled host.
+
+    Built here rather than in ``config.py`` because ``RemoteHost.log_dirs`` is
+    deliberately a tuple of **strings**: those are paths on another machine, and
+    ``normalize_ref`` would resolve them against this one's working directory.
+    They become refs at the point where there is a host to qualify them with,
+    which is here.
+    """
+
+    if not getattr(config, "enable_ssh", False):
+        return []
+    return [
+        RemoteRef.build(host.name, directory)
+        for host in config.hosts
+        if host.enabled
+        for directory in host.log_dirs
+    ]
 
 
 def _plugin_name(plugin: object) -> str:
@@ -2978,21 +4998,39 @@ def _plural(count: int, singular: str, plural: str) -> str:
     return f"{count} {singular if count == 1 else plural}"
 
 
-def _compact_path(path: Path) -> str:
-    """``deeper/a.log`` — enough to tell identically named logs apart."""
-    parent = path.parent.name
-    return f"{parent}/{path.name}" if parent else path.name
+def _path_text(ref: SourceRef) -> str:
+    """The path *ref* names, with the machine stripped off.
+
+    ``/var/log/nginx/access.log`` for both a local ref and a remote one, which is
+    exactly what a cross-host merge matches on: the whole premise is that the
+    same path means the same role on every machine in a fleet.
+    """
+
+    return str(ref.path) if isinstance(ref, RemoteRef) else str(ref)
 
 
-def _resolve(path: Path) -> Path:
-    try:
-        return path.resolve()
-    except OSError:
-        return path
+def _compact_path(path: SourceRef) -> str:
+    """``deeper/a.log`` — enough to tell identically named logs apart.
+
+    Delegates, because "enough" stopped being true the moment two machines could
+    be in the tree at once: the starred and merged groups list refs from any host
+    and this is the label they get. ``refs.compact_of`` puts the machine in front
+    of a remote one and leaves a local one exactly as it was.
+    """
+
+    return compact_of(path)
+
+
+def _walk_nodes(node: TreeNode[object]) -> Iterator[TreeNode[object]]:
+    """Every node under *node*, itself included."""
+
+    yield node
+    for child in node.children:
+        yield from _walk_nodes(child)
 
 
 def _find_node(node: TreeNode[Path], target: Path) -> Optional[TreeNode[Path]]:
-    if isinstance(node.data, Path) and _resolve(node.data) == target:
+    if is_source_ref(node.data) and identity(node.data) == target:
         return node
     for child in node.children:
         found = _find_node(child, target)
@@ -3001,5 +5039,66 @@ def _find_node(node: TreeNode[Path], target: Path) -> Optional[TreeNode[Path]]:
     return None
 
 
-def run() -> None:  # pragma: no cover - script entry point
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Parse the command line and either print something or run the viewer.
+
+    Split out from :func:`run` so it is testable: ``run`` is the console-script
+    entry point and cannot be called from a test without taking the terminal.
+
+    Both flags exist for the operator who has just upgraded.
+    ``--print-default-config`` is read-only and always has been: it prints the
+    reference so they can read what a newer build documents.
+    ``--upgrade-config`` is the one place in CLV that rewrites their settings
+    file, and it does so only because they asked -- the launch path still never
+    touches it. A plain ``diff`` between the two files is mostly noise, since
+    they are ordered and commented differently, which is why the merge is a
+    command rather than a suggestion.
+    """
+
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="clv",
+        description="Centralized Log Viewer — a terminal log viewer.",
+    )
+    # Not decoration: an operator running a stale bundle has no way to tell, and
+    # "the feature is missing" and "the build is old" look identical from the UI.
+    parser.add_argument(
+        "--version", action="version", version=f"clv {__version__}"
+    )
+    parser.add_argument(
+        "--print-default-config",
+        action="store_true",
+        help=(
+            "print the shipped, fully commented settings file and exit. This is "
+            "the reference a newer version documents; --upgrade-config is how to "
+            "fold it into the file you already have."
+        ),
+    )
+    parser.add_argument(
+        "--upgrade-config",
+        action="store_true",
+        help=(
+            "rewrite your settings file from the shipped template, keeping your "
+            "values and hosts, after saving the previous one alongside it. Does "
+            "nothing if it is already current. The installer runs this for you."
+        ),
+    )
+    args = parser.parse_args(argv)
+
+    if args.print_default_config:
+        sys.stdout.write(default_config_text())
+        return 0
+
+    if args.upgrade_config:
+        result = upgrade_user_settings()
+        stream = sys.stdout if result.ok else sys.stderr
+        print(describe_upgrade(result), file=stream)
+        return 0 if result.ok else 1
+
     LogViewerApp().run()
+    return 0
+
+
+def run() -> None:  # pragma: no cover - script entry point
+    raise SystemExit(main())

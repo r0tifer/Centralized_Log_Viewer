@@ -29,8 +29,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from .backend import LOCAL, SourceBackend
 from .compressed import is_compressed, read_compressed_tail, strip_compression_suffix
 from .reader import AnyReader, TailRead, open_reader, read_last_lines
+from .refs import is_source_ref
 
 #: ``app.log.1`` — the classic logrotate name. Higher is older.
 _NUMERIC_RE = re.compile(r"^(?P<base>.+)\.(?P<index>\d+)$")
@@ -86,7 +88,7 @@ class RotatedSet:
         return len(self.members)
 
     def __contains__(self, path: object) -> bool:
-        return isinstance(path, Path) and path in self.paths
+        return is_source_ref(path) and path in self.paths
 
 
 def _rank(path: Path) -> tuple[Path, tuple[int, int]] | None:
@@ -171,6 +173,8 @@ class RotatedSetReader:
         rotated_set: RotatedSet,
         *,
         max_lines: int,
+        backend: SourceBackend = LOCAL,
+        reader_factory=None,
         **kwargs,
     ) -> None:
         self.rotated_set = rotated_set
@@ -178,7 +182,26 @@ class RotatedSetReader:
         #: member) keeps naming a real file.
         self.path = rotated_set.head
         self._max_lines = max_lines
-        self._live: AnyReader = open_reader(rotated_set.head, max_lines=max_lines, **kwargs)
+        #: Every member of a set lives wherever the set does, so one backend
+        #: answers for all of them -- unlike a merged view, which is the case
+        #: that needs a resolver.
+        self._backend = backend
+        #: How the **live head** is opened, injectable for the same reason
+        #: ``SourceSession`` takes one: which reader a source needs is not
+        #: decided by this module.
+        #:
+        #: Calling ``open_reader`` directly here was a real defect rather than a
+        #: tidiness one. It always produced a ``SourceReader``, whose ``poll``
+        #: asks the backend "did this grow?" — free locally, and a round trip
+        #: remotely, which the poll guard therefore answers from a cache that
+        #: only a *follow* reader refreshes. A remote rotated set consequently
+        #: opened, showed its history, and then went silent for ever. Rotated
+        #: sets are the ordinary shape of ``/var/log``, so that was most of the
+        #: feature.
+        self._reader_factory = reader_factory or open_reader
+        self._live: AnyReader = self._reader_factory(
+            rotated_set.head, max_lines=max_lines, backend=backend, **kwargs
+        )
         #: How many members the last prime actually opened, and how many it
         #: could have. Opening a set is the one path that is not instant, so it
         #: has to be able to say what it did.
@@ -241,9 +264,9 @@ class RotatedSetReader:
 
         try:
             if is_compressed(path):
-                text = read_compressed_tail(path, budget)
+                text = read_compressed_tail(path, budget, backend=self._backend)
                 return text.lines, text.truncated
-            result = read_last_lines(path, budget)
+            result = read_last_lines(path, budget, backend=self._backend)
             return result.lines, result.truncated
         except OSError:
             # One damaged member must not cost the rest of the history. The
@@ -256,6 +279,9 @@ class RotatedSetReader:
 
         result = self._live.poll()
         if not result.lines:
+            # Returned whole, so a `problem` the live head reported reaches the
+            # session unchanged. That is the usual shape of a dropped link: the
+            # verdict arrives with no lines beside it.
             return result
         return TailRead(
             lines=result.lines,
@@ -263,7 +289,27 @@ class RotatedSetReader:
             truncated=result.truncated,
             rotated=result.rotated,
             origins=(self.path,) * len(result.lines),
+            problem=result.problem,
         )
+
+    def resume(self) -> None:
+        """Follow the live head again after a drop. **Blocks**; worker-driven.
+
+        The rotated-out members are finished by definition — they are files that
+        will not change again — so reconnecting a set is reconnecting its head
+        and nothing else.
+
+        A **local** set's head cannot be resumed and does not need to be: its
+        file is either there on the next poll or it is not. It never reaches
+        here, because only a reader that can resume ever reports a `problem` and
+        only a reported problem schedules a reconnection. The raise is the
+        backstop for that invariant rather than a path the app takes.
+        """
+
+        resume = getattr(self._live, "resume", None)
+        if resume is None:
+            raise OSError(f"{self.path.name} cannot be resumed")
+        resume()
 
     def close(self) -> None:
         closer = getattr(self._live, "close", None)

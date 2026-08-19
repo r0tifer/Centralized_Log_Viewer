@@ -40,10 +40,19 @@ desktop terminal and on a headless 80-column SSH session.
 - 📐 **Responsive layout.** Breakpoints at 90 and 130 columns reflow the
   controls; every control stays on screen and keyboard-reachable down to 80
   columns.
+- 📊 **See when it started.** `b` draws a one-row histogram of the filtered set
+  above the log, coloured by the worst severity in each bucket. It is a control
+  rather than a picture: `←`/`→` and `Enter` narrow the time window to the spike
+  you are pointing at, which is an ordinary custom range you can dismiss like
+  any other filter.
 - 🔖 **Mark the lines that matter.** `m` bookmarks the line under the cursor,
   `M` steps between the marks, and `Ctrl+E` can export just those. Marks are
   keyed by content rather than position, so they survive filtering and tailing —
   and they are session-only, never written to disk.
+- 🧹 **Collapse the noise.** `c` folds repeated lines into one `×147` row by
+  normalising the volatile tokens — IDs, IPs, durations, paths — out of them.
+  Nothing is hidden: `Enter` expands a cluster in place and every line inside
+  is still selectable, markable and exportable.
 - 📤 **Get the view out.** `Ctrl+E` writes the filtered entries as JSON Lines,
   CSV or raw text — the whole filtered set, not just the lines on screen. `y`
   copies the selected line — or the whole visible view — to your local clipboard
@@ -52,10 +61,15 @@ desktop terminal and on a headless 80-column SSH session.
 - ⧉ **Merge several logs into one stream.** `x` adds a log to the merged set,
   `u` opens the set as one timestamp-ordered pane with a source column. Filters,
   navigation, marks, the detail pane and export all work there exactly as they
-  do on a single file. Local only — remote aggregation stays a non-goal.
+  do on a single file. A set may span machines: with SSH configured, local and
+  remote logs interleave in one pane, and `node:` says which machine each line
+  came from.
 - 🧩 **Plugins.** `LogSourceProvider`, `FilterStage` and `Exporter` interfaces,
   loaded from `clv/plugins/` or from installed packages via the `clv.plugins`
-  entry point group. A broken plugin is reported, never fatal.
+  entry point group. A broken plugin is reported, never fatal. A plugin is
+  **trusted code** — it runs with your privileges, in CLV's process, and can
+  read every log CLV can open; install one the way you would install any other
+  program. `clv/plugins/AGENTS.md` has the trust model in full.
 - ⭐ **Starred logs.** Press `*` on any log to star it. Starred logs are
   repeated in a group at the top of the tree, so a favourite buried several
   folders deep is one keystroke away. Star exactly one and CLV opens it on
@@ -105,6 +119,12 @@ Both install the PyInstaller tree under `/opt/centralized-log-viewer` with a
 `centralized-log-viewer-linux-<arch>.tar.gz` tarball also ships with every
 release as a universal fallback.
 
+The binaries are built on AlmaLinux 8, so they need **glibc 2.28 or newer** — RHEL/Rocky/Alma 8+, Debian 11+, Ubuntu 20.04+, and anything more
+recent. The build fails rather than ships if that floor creeps upward. Nothing
+is bundled that a system tool will be made to load: CLV strips its own library
+path before running `journalctl`, so a bundle built on one distribution cannot
+break a binary belonging to another.
+
 ### From source (developers)
 
 ```bash
@@ -143,6 +163,7 @@ use.
 | `clipboard_max_bytes` | Most log text one `y` clipboard copy may carry. Oversized copies are truncated at a line boundary and say so. | `65536` |
 | `watch_rate_limit` | Seconds a watch rule waits before notifying again; matches inside the window are counted and reported together. | `60` |
 | `watch_bell` | Ring the terminal bell when a watch rule notifies. | `false` |
+| `cluster_lookback` | How far back, in entries, `c` may reach to fold a repeated line into a cluster. A bound, not a taste: it keeps one cluster from spanning a session. | `200` |
 | `enable_journald` | Offer the systemd journal as a source. Off by default: reading it runs `journalctl`, and CLV spawns no subprocess unasked. The drawer's switch writes this line for you. | `false` |
 
 Invalid values fall back to safe defaults; the app never fails to start because
@@ -150,6 +171,60 @@ of a malformed settings file. Most discovery options are also editable at
 runtime in the **Advanced** drawer.
 
 ---
+
+### Upgrading
+
+Your settings file is created once, from the template shipped with whichever
+build you first installed. That template is two thirds prose — every option is
+introduced by the comment block explaining what it does — so a file created two
+years ago is still handing you two-year-old documentation, even though every
+release since may have added options.
+
+Nothing on the **launch path** ever rewrites that file. CLV does not edit your
+configuration behind your back while starting up. What it does instead is tell
+you, once per version, which settings your file does not carry, in the discovery
+summary.
+
+Closing the gap is an explicit action:
+
+```bash
+clv --upgrade-config            # fold your settings into the newer template
+clv --print-default-config      # or just read the newer template
+clv --version                   # which build you are actually running
+```
+
+`--upgrade-config` rewrites `~/.config/clv/settings.conf` from the shipped
+template and:
+
+- **keeps every value you set** — written into the new template, so it arrives
+  surrounded by the current prose rather than the old;
+- **keeps every `[ssh:<name>]` host**, copied across byte for byte, including a
+  host CLV itself cannot parse;
+- **keeps options this version no longer documents**, under a
+  `# --- Carried over from your previous settings file` banner, rather than
+  silently dropping them;
+- **does not keep comments you wrote yourself** inside `[log_viewer]`. The new
+  template is the base, and there is nowhere sensible to reattach a note about
+  an option whose surrounding prose has been rewritten.
+
+Because of that last point it always saves the previous file first, as
+`~/.config/clv/settings.conf.bak-<timestamp>`. It is also a no-op when there is
+nothing to do: the file carries a `config_version` marker, and a file already at
+the current version is not even touched.
+
+`install.sh` runs `--upgrade-config` for you after installing, so an upgrade
+picks this up without a second command. Skip it with:
+
+```bash
+./install.sh --no-config-upgrade      # or CLV_NO_CONFIG_UPGRADE=1
+```
+
+Under `sudo`, the installer runs the upgrade as the invoking user rather than as
+root, so it updates your settings file and not `/root`'s.
+
+None of this is required. Every setting your file does not carry is already in
+effect at its default, and remote hosts are managed from `R` and the Advanced
+drawer without touching the file at all.
 
 ## Usage
 
@@ -176,15 +251,36 @@ The name promises centralized logs, and until now it delivered centralized
 it to the **merged set**; `u` opens the set as one timestamp-ordered stream:
 
 ```
-⧉📄 alpha.log        alpha.log   2026-08-11 10:00:00 INFO  request accepted
-⧉📄 beta.log         beta.log    2026-08-11 10:00:01 INFO  upstream connect
- 📄 auth.log         alpha.log   2026-08-11 10:00:02 ERROR upstream timeout
-                     beta.log    2026-08-11 10:00:03 WARN  retrying
+⭐ Starred
+  ⭐ logs/auth.log            alpha.log   2026-08-11 10:00:00 INFO  request accepted
+⧉ Merged (2 sources)   ←     beta.log    2026-08-11 10:00:01 INFO  upstream connect
+  ⧉ logs/alpha.log     click alpha.log   2026-08-11 10:00:02 ERROR upstream timeout
+  ⧉ logs/beta.log      to open beta.log  2026-08-11 10:00:03 WARN  retrying
+📂 /var/log
+   ⧉📄 alpha.log
+   ⧉📄 beta.log
+    📄 auth.log
 ```
 
-Members are marked with `⧉` in the tree, a source column names the origin of
-every row (abbreviated as the terminal narrows), and the status line names the
-set. **Every other feature works exactly as it does on a single log** — filters,
+The set is repeated as a group below the starred logs, so it is one keystroke
+away however deep its members are buried; each member also carries a `⧉` where
+it sits in the folder tree. The row carries its verbs as separate click
+targets, so a click can say which one it meant:
+
+| On the `⧉ Merged` row | | Keyboard |
+| --- | --- | --- |
+| `⧉` | Open the set as one stream | `u` |
+| `✎` | Save the set under a name | `V` |
+| `✕` | Empty the set, to start another | `X` |
+| the name | Expand / collapse its members | `Enter` |
+
+Selecting one member below it opens just that log, which is also sometimes what
+you want. Every group in the tree — Views, Providers, Starred, Merged — arrives
+collapsed, because a shortcut that unfolds itself pushes the rest of the tree
+off screen. A source column names the origin of every row
+(abbreviated as the terminal narrows), and the status line names the set.
+Adding or removing a source edits those rows in place — it never re-runs
+discovery, and it never collapses folders you had opened. **Every other feature works exactly as it does on a single log** — filters,
 `n`/`N` navigation, `g`, marks, the detail pane and `Ctrl+E`. That is the point:
 merging is not a mode with its own reduced feature set. The origin travels as a
 field, so `source:beta.log` is a query you can write, and it shows up in the
@@ -208,10 +304,59 @@ Some specifics worth knowing:
 - A member that disappears from disk is reported and the rest keep going.
 - The set persists in `session.json` and can be captured in a saved view.
 
-**Merging is local only.** Remote collection and multi-node aggregation are a
-documented non-goal and are not coming: CLV reads what the machine it runs on
-can read. If you want several machines in one pane, ship their logs to one host
-by whatever means you already use and merge them here.
+**Naming a set.** A merged set is not limited to one: `✎` on the row (or `V`)
+saves it as a named view, `✕` empties the working set so you can build the
+next one, and `v` (or the **Views** group at the top of the tree) switches
+between them. Renaming and deleting a saved set live in that picker — `r` and
+`d`. Clearing the working set never touches what you saved. So `web tier` and `db tier` can be two different
+groups of logs, each one keystroke away, and applying one moves the merged
+group in the tree to match.
+
+The set has to be **open** when you save — press `u` first. A view saved while
+a single log is on screen deliberately records no set, so a view about one file
+never drags someone else's merged group around with it. Note also that a view
+is a filter bundle first: it captures your query, severity and time window
+alongside the set, so save it with the filters you want to come back to.
+
+**A merged set can span machines.** With remote sources configured, a local log
+and a log on another host open in the same timestamp-ordered pane — comparing
+one path across a fleet is what the feature is for.
+
+**`Ctrl+X` builds that set in one press.** On any log, it gathers the same path
+from every machine the last scan found it on and opens the result, rather than
+making you press `x` on five leaves inside five separately collapsed host trees.
+It reports what it did: how many sources it merged, which walked hosts do not
+have that path, and which hosts it could not reach at all — three different
+facts, kept apart, because a host that was unreachable has told CLV nothing
+about its files and saying "not on web03" would be a confident answer with no
+evidence behind it. When the members share a basename, the pane's source column
+switches to naming the *machine*, since that is the part that differs.
+
+Two things are worth knowing before you read causation out of the interleaving:
+
+- **Ordering across machines is only as trustworthy as their clocks**, and CLV
+  says so rather than hiding it. Clock skew between hosts is measured and
+  reported beside the merged view's `anchored` count; correcting for it is
+  opt-in per host, and when it is on the pane states that timestamps are being
+  adjusted. The raw line is never rewritten either way.
+- **`node:` is the machine CLV read a line from; `host:` is what the line says
+  about itself.** Syslog, access logs and journald all normalise into `host`,
+  so it keeps meaning exactly what it always did and no saved query changes
+  meaning. `node:web01 status>=500` is the query you want across a fleet.
+
+**Managing hosts.** `R` opens the host dialog: add, edit, enable, disable and
+remove machines, with a **Test connection** that makes one bounded probe and
+reports what it found — the reason verbatim if it failed, and the shell profile
+and measured clock skew if it worked. Changes are written back into
+`settings.conf` in place, so the comments, per-host budgets and glob overrides
+you have written there survive an edit untouched. There is no password field and
+no sudo toggle, because there is no password option and no sudo option: CLV
+connects with ssh-agent and key files, and reads as the configured user.
+
+The remaining setup detail, the authentication model in full and what degrades on
+a non-GNU remote are not documented here yet — that section lands with the
+release. Shipping logs to one host and merging them locally still works and
+always will.
 
 ### Compressed and rotated logs
 
@@ -333,6 +478,36 @@ the view out from under the line you just pointed at. The status bar says so —
 *"paused — cursor moved, End resumes"* — and `End` or `w` starts following
 again.
 
+### The severity timeline
+
+`b` opens a one-row histogram above the log: event volume over the time your
+filtered lines cover, each column coloured by the **worst** severity in it.
+
+```
+▁▁▂▁▁▃▂▁▁▁█▆▃▁▁▁▂▁▁·······▁▂▁▁▁▂▁▁▃▁▁▁▂▁▁▁▁▂▁▁▁▁▁▁▂▁▁▃▂▁▁▁▁▁
+2026-08-07 09:14:20–09:14:30 · 61 events · ERROR
+```
+
+Volume is the height of the block, not the colour, so the shape of a spike
+reads on a monochrome terminal. A column where nothing happened is a `·` rather
+than a gap, so the axis does not look like it stopped.
+
+It is a **control, not a picture**. `←`/`→` move the selection, `Home`/`End`
+jump to either end, and `Enter` narrows the time window to the selected bucket
+— which is an ordinary custom range, so it appears as a `Time:` chip and is
+dismissed like any other filter. Clicking a column does both at once. The bar
+then re-buckets over the narrower window, so pressing `Enter` again drills in
+further.
+
+The histogram is built from the **filtered** set, so it answers "when did the
+thing I am looking at happen" rather than "when did anything happen". It is
+built from the buffer only — no second read of the file — and while it is
+hidden it is not maintained at all. A source whose lines carry no timestamp
+says so in the caption instead of drawing an empty rectangle.
+
+Whether the bar is open is remembered between runs, along with a **Timeline**
+switch in the Advanced drawer. Which bucket you had selected is not.
+
 ### Marking lines
 
 `m` marks the line under the cursor and `M` steps between the marks, wrapping
@@ -352,6 +527,47 @@ out of the buffer entirely its mark is dropped.
 way on purpose: the digest is derived from log content, and `session.json`
 records paths and settings, never anything about what a log contained. Closing
 CLV forgets them.
+
+### Noise reduction
+
+`c` collapses repeated lines into one row with a count:
+
+```
+  2026-08-07 09:25:01 - ERROR - connection refused for 10.0.0.5:5432 after 1.25s
+  2026-08-07 09:25:01 - ERROR - connection refused for 10.0.0.6:5433 after 0.90s
+  2026-08-07 09:25:02 - ERROR - connection refused for 10.0.0.7:5433 after 2.10s
+  … 144 more like it …
+  2026-08-07 09:27:14 - WARN  - disk almost full
+
+  ▸ ×147 09:25:01→09:27:09  2026-08-07 09:25:01 - ERROR - connection refused …
+  2026-08-07 09:27:14 - WARN  - disk almost full
+```
+
+Two lines collapse together when they look the same once the volatile tokens
+are normalised away — quoted strings, timestamps, UUIDs, IPv6 and IPv4
+addresses (with ports), hex, paths, floats and integers, applied in that order.
+So `request 8821 took 12ms` and `request 8822 took 47ms` are one event, and the
+line that is genuinely different stays on its own. Severity is part of the
+match: a WARN and an ERROR that read alike stay apart, as do identical lines
+from two different logs in a merged view.
+
+**Collapsing never hides a line.** It is a display transform, not a filter.
+`Enter` on a cluster row expands it in place and gives back exactly the lines
+that went into it, byte-identical and in order; every one of them is then
+selectable, markable and exportable like any other. `Enter` again closes it.
+Marking a *collapsed* cluster is refused with a note asking you to expand it
+first — one keystroke should not mark a hundred and forty-seven lines behind a
+single gutter dot.
+
+The row shows the count, the span from first to last, and the cluster's
+severity in its colour. `Ctrl+E` gains a **Clustered** option that writes one
+row per group with `cluster.count`, `cluster.first` and `cluster.last` as
+fields; expanded output remains the default.
+
+Clusters only form within `cluster_lookback` entries (200 by default, see
+[Configuration](#configuration)), so one cluster cannot quietly span a whole
+session and swallow an event from an hour ago. Whether clustering is on is
+remembered between runs; which clusters you had open is not.
 
 ### Saved views
 
@@ -419,14 +635,19 @@ subprocess.
 | Format | What it contains |
 | --- | --- |
 | JSON Lines | One object per entry — raw line, timestamp, level, message, detected format, continuation flag and every parsed field. The only lossless option. |
-| CSV | A fixed, rectangular table of the same columns, with the parsed fields as one JSON column. |
+| CSV | A fixed, rectangular table of the same columns, plus a `node` column, with the remaining parsed fields as one JSON column. |
 | Plain text | The raw lines, byte-identical to what is on screen. |
 
-Two things worth knowing:
+Three things worth knowing:
 
 - It exports the **whole filtered set**, not just the lines that fit on screen.
   The dialog states the count before it writes, so `+`/`-` never changes what an
   export contains.
+- **A merged export names its machines.** The `node` column (CSV) and the `node`
+  field (JSON Lines) carry the machine each line was read from, and the default
+  filename names one of them — `web01-syslog-20260817-142530`. `node` is empty
+  for a local source, which has no machine to name. Plain text is left alone:
+  it is the raw lines and nothing CLV added.
 - Writing is atomic (a sibling temp file, then a rename), and overwriting an
   existing file takes a second press of Export. A permission error is reported
   as a notification, not a traceback.
@@ -473,7 +694,9 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `f` | Toggle the Advanced drawer |
 | `*` | Star / unstar the log under the cursor |
 | `x` | Add / remove the log under the cursor from the merged set |
+| `Ctrl+X` | Merge this path across every host that has it, then open it |
 | `u` | Open the merged set as one timestamp-ordered stream |
+| `X` | Empty the merged set |
 | `↑` / `↓` | Move the line cursor |
 | `PgUp` / `PgDn` | Move the line cursor a screen at a time |
 | `Home` / `End` | First / last line (`End` also resumes following) |
@@ -483,6 +706,8 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `v` / `V` | Open saved views / save the current filters as a view |
 | `W` | Manage watch rules (live highlights and alerts) |
 | `d` | Show / hide the event detail pane |
+| `b` | Show / hide the severity timeline (then `←` `→` `Enter` to filter to a bucket) |
+| `c` | Collapse / expand repeated lines (then `Enter` on a cluster row) |
 | `w` | Follow new lines (auto-scroll) on/off |
 | `o` | Structured output on/off |
 | `Ctrl+B` | Switch between tree and log pane (compact widths) |
@@ -491,6 +716,7 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `Ctrl+E` | Export the filtered entries to a file |
 | `y` | Copy the selected line, or the visible lines, to the clipboard (OSC 52) |
 | `Ctrl+L` | Copy mode (hides all chrome) |
+| `R` | Add, edit, test and remove remote hosts (SSH) |
 | `Ctrl+S` | Save added sources to `settings.conf` |
 | `Ctrl+R` | Reload configuration and rescan |
 | `q` | Quit |
@@ -640,6 +866,6 @@ your `session.json` would be a path that does not exist.
 ```bash
 python -m pip install -e .
 python -m pip install pytest
-python -m pytest            # 290 tests
+python -m pytest            # 791 tests
 python -m textual run clv/app.py --dev
 ```
