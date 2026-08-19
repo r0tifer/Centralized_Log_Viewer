@@ -15,15 +15,25 @@ set -euo pipefail
 #     _internal/    <- runtime, including the bundled settings.conf template
 #
 # CLV creates its own ~/.config/clv/settings.conf on first run from that
-# bundled template, so this script deliberately does not write one. Duplicating
-# the template here is how the installed defaults previously drifted out of
-# sync with the application's.
+# bundled template, so this script never writes one itself. Duplicating the
+# template here is how the installed defaults previously drifted out of sync
+# with the application's.
+#
+# What this script does do, once the new tree is in place, is run
+# `clv --upgrade-config`, which folds an existing settings file into the newer
+# template -- keeping its values and its [ssh:*] hosts, and saving the previous
+# file alongside it -- so that an upgraded install gets the documentation for
+# options added since the file was created. Pass --no-config-upgrade to skip it.
+# The merge itself lives in the application (clv/services/config_upgrade.py);
+# re-implementing INI semantics in bash is exactly the drift described above.
 
 REPO="${CLV_REPO:-r0tifer/Centralized_Log_Viewer}"
 APP_NAME="centralized-log-viewer"
 BIN_NAME="clv"
 # Optional: require SHA256SUMS to be signed by this GPG fingerprint.
 GPG_FPR="${CLV_GPG_FPR:-}"
+# Optional: skip the post-install `clv --upgrade-config` pass.
+NO_CONFIG_UPGRADE="${CLV_NO_CONFIG_UPGRADE:-}"
 
 PREFIX=""
 LIBDIR=""
@@ -43,6 +53,8 @@ Options:
   --gpg-fpr <fpr>       Require SHA256SUMS to be signed by this GPG fingerprint
   --from-local <dir>    Install from a local build (the 'dist/clv' directory
                         produced by PyInstaller)
+  --no-config-upgrade   Do not update an existing ~/.config/clv/settings.conf
+                        to the newer template after installing
   -h, --help            Show this help
 EOF
 }
@@ -55,6 +67,7 @@ while [[ $# -gt 0 ]]; do
     --libdir) LIBDIR="$2"; shift 2;;
     --version) VERSION="$2"; shift 2;;
     --from-local) FROM_LOCAL="$2"; shift 2;;
+    --no-config-upgrade) NO_CONFIG_UPGRADE=1; shift;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown arg: $1" >&2; usage; exit 1;;
   esac
@@ -275,6 +288,54 @@ install_from_local() {
   install_tree "$FROM_LOCAL" "$libdir" "$bindir"
 }
 
+# Fold an existing settings file into the newly installed template.
+#
+# Runs the binary out of $libdir rather than the launcher: the launcher's
+# directory may not be on PATH yet, and on a first install it certainly is not.
+#
+# Never fatal. A bundle that cannot start on this host (glibc too old, wrong
+# arch slipped through) is a real problem, but it is not one this step should
+# turn into a failed install of a tree that is already correctly in place --
+# hence the explicit `|| true` guards under `set -e`.
+upgrade_user_config() {
+  local libdir="$1" binary runner=()
+  binary="${libdir}/${BIN_NAME}"
+
+  [[ -n "$NO_CONFIG_UPGRADE" ]] && return 0
+  [[ -x "$binary" ]] || return 0
+
+  # Installing into /opt and /usr/local/bin normally means sudo, and under sudo
+  # $HOME is root's. Upgrading that would edit /root/.config/clv/settings.conf
+  # -- a file nobody reads -- and leave the operator's untouched, which is the
+  # exact failure this feature exists to prevent. So drop back to the invoking
+  # user when there is one.
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" && "$(id -u)" -eq 0 ]]; then
+    if command -v runuser >/dev/null 2>&1; then
+      runner=(runuser -u "$SUDO_USER" --)
+    elif command -v sudo >/dev/null 2>&1; then
+      runner=(sudo -u "$SUDO_USER" --)
+    else
+      warn "Running as root with no runuser or sudo; skipping the settings upgrade for ${SUDO_USER}."
+      warn "Run '${BIN_NAME} --upgrade-config' as that user to update their settings file."
+      return 0
+    fi
+    # XDG_CONFIG_HOME points at root's config when it is set at all; unset it so
+    # the path resolves from the target user's own HOME. `env -u` rather than
+    # `--unset`, which is GNU-only.
+    runner+=(env -u XDG_CONFIG_HOME)
+  fi
+
+  # Appended rather than expanded beside the array, so the array is never empty:
+  # `"${runner[@]}"` on an empty array aborts under `set -u` before bash 4.4.
+  runner+=("$binary" --upgrade-config)
+
+  if ! "${runner[@]}"; then
+    warn "Could not update the settings file; your existing one is unchanged."
+    warn "Run '${BIN_NAME} --upgrade-config' by hand to see why."
+  fi
+  return 0
+}
+
 main() {
   command -v curl >/dev/null 2>&1 || die "curl is required"
   command -v tar  >/dev/null 2>&1 || die "tar is required"
@@ -285,8 +346,12 @@ main() {
     download_and_install
   fi
 
-  local bindir
+  local bindir libdir
   bindir="$(resolve_bindir)"
+  libdir="$(resolve_libdir)"
+
+  upgrade_user_config "$libdir" || true
+
   if ! command -v "$BIN_NAME" >/dev/null 2>&1; then
     warn "${bindir} is not on your PATH. Add it with:"
     # shellcheck disable=SC2016  # $PATH is literal here: it is a line to copy
@@ -294,7 +359,7 @@ main() {
   fi
 
   log "Done. Run: ${BIN_NAME}"
-  log "CLV will create ~/.config/clv/settings.conf on first run."
+  log "Settings live in ~/.config/clv/settings.conf; CLV creates it on first run."
 }
 
 main "$@"
