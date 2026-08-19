@@ -4,6 +4,6 @@
 #: tests/test_version.py fails the build if the two disagree.
 #: A literal rather than importlib.metadata, because the PyInstaller bundle has
 #: no distribution metadata to read.
-__version__ = "2.7.4"
+__version__ = "2.7.5"
 
 __all__ = ["__version__"]
