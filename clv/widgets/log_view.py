@@ -22,9 +22,10 @@ of rows rather than one per append, so the rebuild is amortised across
 ``max_rows // 10`` writes rather than paid every time.
 
 Rows are entry-indexed, never line-indexed. One entry can occupy several screen
-lines: raw lines wrap, and in structured mode an entry renders as a whole
-bordered panel. A cursor counting screen rows would land in the middle of one
-event and call it another.
+lines: raw lines wrap, in structured mode an entry renders as a columnar row
+that wraps under its own message cell, and a payload that is itself a document
+carries a whole bordered panel beneath it. A cursor counting screen rows would
+land in the middle of one event and call it another.
 
 Three kinds of row
 ------------------
@@ -67,6 +68,7 @@ from textual.scroll_view import ScrollView
 from textual.strip import Strip
 
 from ..services.parsing import LogEntry
+from .columns import ColumnarLine
 
 #: Cells reserved to the left of every row for the mark indicator.
 GUTTER_WIDTH = 2
@@ -370,7 +372,10 @@ class LogView(ScrollView, can_focus=True):
         width = max(1, self._layout_width - GUTTER_WIDTH)
         console = self.app.console
         options = console.options.update_width(width)
-        if isinstance(row.renderable, Text) and not self.wrap:
+        if isinstance(row.renderable, (Text, ColumnarLine)) and not self.wrap:
+            # A structured row honours the pane's wrap flag the same way a
+            # plain line does: with wrapping off it clips rather than folding
+            # under its own message cell.
             options = options.update(overflow="ignore", no_wrap=True)
         lines = list(Segment.split_lines(console.render(row.renderable, options)))
         if not lines:
