@@ -32,7 +32,7 @@ from typing import Iterable, Sequence
 from .backend import LOCAL, SourceBackend
 from .compressed import is_compressed, read_compressed_tail, strip_compression_suffix
 from .reader import AnyReader, TailRead, open_reader, read_last_lines
-from .refs import is_source_ref
+from .refs import JournalRef, is_source_ref
 
 #: ``app.log.1`` — the classic logrotate name. Higher is older.
 _NUMERIC_RE = re.compile(r"^(?P<base>.+)\.(?P<index>\d+)$")
@@ -133,7 +133,16 @@ def group_rotated(paths: Iterable[Path]) -> tuple[list[RotatedSet], list[Path]]:
     """
 
     groups: dict[Path, list[RotatedMember]] = {}
+    singles: list[Path] = []
     for path in paths:
+        if isinstance(path, JournalRef):
+            # Nothing rotates a journal -- journald owns its own retention, and
+            # there are no `.1` and `.2.gz` siblings to gather. Explicit now
+            # that it is a ref: this used to hold because a journal source was
+            # not a `Path` and never reached here, and `_rank` would otherwise
+            # be doing name arithmetic on `sshd.service` looking for a suffix.
+            singles.append(path)
+            continue
         ranked = _rank(path)
         if ranked is None:
             # The live head of whatever it may turn out to be the head of.
@@ -143,7 +152,6 @@ def group_rotated(paths: Iterable[Path]) -> tuple[list[RotatedSet], list[Path]]:
         groups.setdefault(base, []).append(RotatedMember(path, rank))
 
     sets: list[RotatedSet] = []
-    singles: list[Path] = []
     for base, members in groups.items():
         if len(members) < 2:
             singles.append(members[0].path)

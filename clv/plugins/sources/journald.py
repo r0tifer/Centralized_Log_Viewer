@@ -39,12 +39,21 @@ from typing import Any, Iterable, Iterator, Optional
 from ...services.config import load_config
 from ...services.parsing import normalize_level
 from ...services.reader import TailRead
-from ...services.refs import split_scheme
+from ...services.refs import JournalRef, SourceRef, parse_ref
 from .. import LogSourceProvider, ProviderSource
 
 #: The identifier scheme. Not a real path, and deliberately not one: nothing on
-#: disk answers to it, which is what keeps these out of starring, glob
-#: filtering and anything else that assumes a file.
+#: disk answers to it.
+#:
+#: What it *is* now is a :class:`~clv.services.refs.JournalRef`, where it used
+#: to be a ``Path`` holding this prefix. The string form is unchanged, so a
+#: ``session.json`` written by an older build still means what it meant; what
+#: changed is that the type says so. Glob filtering and rotated-set grouping
+#: still refuse one — a journal has no directory and nothing to rotate — but
+#: they now refuse it *by name* rather than by it happening not to be a file.
+#: Starring and merging no longer do, which is the point: a unit is exactly the
+#: source an operator wants starred, and comparing one across a fleet is the
+#: workflow remote sources exist for.
 SCHEME = "journal:"
 
 #: How many records the initial read asks for. The backwards-seek guarantee
@@ -226,13 +235,23 @@ class JournalReader:
 
     def __init__(
         self,
-        path: Path,
+        path: SourceRef,
         *,
         max_lines: int = DEFAULT_LINES,
         severity: str = "all",
         spawn=subprocess.Popen,
     ) -> None:
-        self.path = path
+        #: Normalised on the way in, so exactly one shape reaches `command()`.
+        #:
+        #: The provider hands a `JournalRef`, but this constructor is reachable
+        #: with the string form too -- `open_reader` takes whatever its caller
+        #: holds, and a stored `journal:unit/sshd.service` is a legal thing to
+        #: hold. Parsing here rather than branching there is what stops the
+        #: failure that shape would otherwise cause: a selector silently
+        #: dropped, and `journalctl` asked for the *whole journal* when one unit
+        #: was meant. That reads as a working source with far too much in it,
+        #: which is worse than an error.
+        self.path = path if isinstance(path, JournalRef) else parse_ref(str(path))
         self._max_lines = max_lines
         self._severity = severity
         self._spawn = spawn
@@ -256,15 +275,16 @@ class JournalReader:
             f"--lines={self._max_lines}",
             "--follow",
         ]
-        # Through refs rather than a local slice, so the knowledge that
-        # `journal:` is an identifier and not a path lives in one place. It is
-        # also what stops `normalize_ref` absolutising one of these.
-        scheme, selector = split_scheme(self.path)
-        kind, _, value = (selector if scheme == "journal" else "").partition("/")
-        if kind == "unit" and value:
-            argv.append(f"--unit={value}")
-        elif kind == "boot" and value:
-            argv.append(f"--boot={value}")
+        # Read off the ref rather than re-parsed out of its string form. The
+        # ref already did that parsing once, at the persistence boundary, and
+        # doing it again here is how the two spellings drift apart -- which is
+        # exactly what a node between the scheme and the colon would have
+        # exposed.
+        if isinstance(self.path, JournalRef):
+            if self.path.kind == "unit":
+                argv.append(f"--unit={self.path.value}")
+            elif self.path.kind == "boot":
+                argv.append(f"--boot={self.path.value}")
         priority = PRIORITY_PUSHDOWN.get(self._severity)
         if priority is not None:
             argv.append(f"--priority={priority}")
@@ -446,15 +466,15 @@ class JournaldProvider(LogSourceProvider):
             return []
 
         sources = [
-            ProviderSource(Path(f"{SCHEME}all"), "System journal", self.name),
-            ProviderSource(Path(f"{SCHEME}boot/0"), "This boot", self.name),
+            ProviderSource(JournalRef("", "all"), "System journal", self.name),
+            ProviderSource(JournalRef("", "boot", "0"), "This boot", self.name),
         ]
         sources += [
-            ProviderSource(Path(f"{SCHEME}boot/-1"), "Previous boot", self.name)
+            ProviderSource(JournalRef("", "boot", "-1"), "Previous boot", self.name)
         ] if self._has_previous_boot() else []
         units = self._units()
         sources += [
-            ProviderSource(Path(f"{SCHEME}unit/{unit.name}"), unit.name, self.name)
+            ProviderSource(JournalRef("", "unit", unit.name), unit.name, self.name)
             for unit in units
         ]
         # Says what it found *and* what it could not, because "two sources and
@@ -505,7 +525,7 @@ class JournaldProvider(LogSourceProvider):
 
     # --- opening -------------------------------------------------------------
 
-    def open(self, path: Path) -> Iterator[str]:
+    def open(self, path: SourceRef) -> Iterator[str]:
         """The simple contract, for completeness.
 
         Never called while :meth:`open_reader` returns a reader, which it
@@ -519,7 +539,7 @@ class JournaldProvider(LogSourceProvider):
         finally:
             reader.close()
 
-    def open_reader(self, path: Path, *, max_lines: int, **kwargs):
+    def open_reader(self, path: SourceRef, *, max_lines: int, **kwargs):
         return JournalReader(path, max_lines=min(max_lines, self._max_lines), **kwargs)
 
 
