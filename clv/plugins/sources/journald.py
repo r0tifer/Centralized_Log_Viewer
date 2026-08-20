@@ -39,7 +39,7 @@ from typing import Any, Iterable, Iterator, Optional
 from ...services.config import load_config
 from ...services.parsing import normalize_level
 from ...services.reader import TailRead
-from ...services.refs import JournalRef, SourceRef, parse_ref
+from ...services.refs import JournalRef, RemoteRef, SourceRef, parse_ref
 from .. import LogSourceProvider, ProviderSource
 
 #: The identifier scheme. Not a real path, and deliberately not one: nothing on
@@ -252,6 +252,11 @@ class JournalReader:
         #: was meant. That reads as a working source with far too much in it,
         #: which is worse than an error.
         self.path = path if isinstance(path, JournalRef) else parse_ref(str(path))
+        #: Which `journalctl` to run. Resolved through `shutil.which` locally,
+        #: because a PyInstaller bundle's PATH is not the shell's. A *remote*
+        #: reader overrides it with the bare name: `which` here would answer for
+        #: this machine, and the other machine's layout is its own business.
+        self.binary = journalctl_path() or "journalctl"
         self._max_lines = max_lines
         self._severity = severity
         self._spawn = spawn
@@ -269,7 +274,7 @@ class JournalReader:
         """The argv this reader would run."""
 
         argv = [
-            journalctl_path() or "journalctl",
+            self.binary,
             "--output=json",
             "--no-pager",
             f"--lines={self._max_lines}",
@@ -312,10 +317,18 @@ class JournalReader:
 
     # --- the contract --------------------------------------------------------
 
-    def prime(self) -> TailRead:
-        self.close()
+    def _start(self):
+        """Spawn the follow. The **only** part of this reader that is local.
+
+        Split out so a remote journal can reuse everything else — the argv, the
+        record translation, the non-blocking drain, the severity push-down and
+        the teardown are all transport-independent, and proving that is easier
+        than claiming it: `tests/test_ssh_source.py` runs one captured
+        `journalctl -o json` fixture through both paths and asserts one result.
+        """
+
         try:
-            self._process = self._spawn(
+            return self._spawn(
                 self.command(),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -326,6 +339,10 @@ class JournalReader:
             )
         except OSError as exc:
             raise OSError(f"could not run journalctl: {exc}") from exc
+
+    def prime(self) -> TailRead:
+        self.close()
+        self._process = self._start()
 
         self._remainder = ""
         self._offset = 0
@@ -366,6 +383,18 @@ class JournalReader:
             return []
         if isinstance(chunk, bytes):
             chunk = chunk.decode("utf-8", errors="replace")
+
+        return self._records(chunk)
+
+    def _records(self, chunk: str) -> list[str]:
+        """Complete JSON records in *chunk*, translated. Partial ones held back.
+
+        Separate from :meth:`_drain` because the drain is where the transport
+        lives — a local pipe here, a framed `ssh` stream for a remote host — and
+        this is where the *journal* lives. A remote reader reuses this verbatim,
+        which is what makes "the same fixture translates identically either way"
+        a fact about the code rather than a hope.
+        """
 
         text = self._remainder + chunk
         raw_lines = text.splitlines()
@@ -446,6 +475,31 @@ class JournaldProvider(LogSourceProvider):
         #: Why the last unit enumeration came back empty, when it did. Empty
         #: for "it worked", which is not the same as "it returned nothing".
         self.unit_error = ""
+        #: The app's connection resolver, or ``None`` when remote journals are
+        #: not wired up. **Injected, never constructed here**, and that is a
+        #: correctness requirement rather than a layering preference:
+        #: ``SSHConnection.socket`` hashes ``(name, host, user, port)``, so a
+        #: connection this module built for itself would resolve to the *same*
+        #: multiplex socket the resolver is using — and its ``close()`` would
+        #: run ``ssh -O exit`` on a master the rest of CLV is actively reading
+        #: through. One owner per connection, and it is not this one.
+        self._resolver = None
+        #: The configured hosts, in file order.
+        self._hosts: tuple = ()
+        #: Per host, why it offers no journal — a missing `journalctl`, an
+        #: unreachable machine, a failed enumeration. Reported, never raised.
+        self.host_notes: dict[str, str] = {}
+
+    def use_remote(self, resolver, hosts) -> None:
+        """Adopt the app's connection resolver and host list.
+
+        Called after the plugin registry has loaded, because a provider is
+        constructed by ``register()`` and knows nothing about the app. Passing
+        ``None`` unwires it, which is what happens when ``enable_ssh`` goes off.
+        """
+
+        self._resolver = resolver
+        self._hosts = tuple(hosts or ())
 
     # --- discovery -----------------------------------------------------------
 
@@ -457,13 +511,54 @@ class JournaldProvider(LogSourceProvider):
         for the journal in the first place.
         """
 
+        self.host_notes = {}
         if not enabled():
             self.status = "disabled (set enable_journald to turn it on)"
             return []
+
+        sources: list[ProviderSource] = []
+        notes: list[str] = []
+
+        # **Local availability no longer gates the whole provider.** A laptop
+        # with no systemd reading the journals of a systemd fleet is an ordinary
+        # thing to want, and returning early here would have refused it — the
+        # machine CLV runs on has no bearing on what another machine offers.
         available, reason = availability()
-        if not available:
-            self.status = reason
+        if available:
+            sources += self._local_sources()
+            notes.append(self._local_note(sources))
+        else:
+            notes.append(f"local: {reason}")
+
+        self.status = "; ".join(note for note in notes if note)
+        return sources
+
+    def discover_remote(self) -> list[ProviderSource]:
+        """Every configured host's journal. **Called from the host stage.**
+
+        Deliberately not part of :meth:`discover`, and the reason is a timing
+        one that a test caught rather than a design one that was foreseen.
+        Discovery runs in two stages: the local tree is built first so that a
+        machine which is down costs the local tree nothing, and hosts are folded
+        in by a second worker afterwards. Enumerating remote journals from the
+        *first* stage meant paying a connect timeout per configured host before
+        anything appeared — and paying it a second time on ``Ctrl+R``, which
+        resets the backoff, so a reload with one dead machine took twice as long
+        as it had any reason to.
+
+        Run from the second stage instead, every host is already in a known
+        state: a live one has a probed, multiplexed connection so this costs one
+        round trip, and a dead one is already marked unreachable so it costs
+        nothing at all.
+        """
+
+        self.host_notes = {}
+        if not enabled():
             return []
+        return self._remote_sources()
+
+    def _local_sources(self) -> list[ProviderSource]:
+        """This machine's journal, its boots and its units."""
 
         sources = [
             ProviderSource(JournalRef("", "all"), "System journal", self.name),
@@ -472,22 +567,134 @@ class JournaldProvider(LogSourceProvider):
         sources += [
             ProviderSource(JournalRef("", "boot", "-1"), "Previous boot", self.name)
         ] if self._has_previous_boot() else []
-        units = self._units()
         sources += [
             ProviderSource(JournalRef("", "unit", unit.name), unit.name, self.name)
-            for unit in units
+            for unit in self._units()
         ]
-        # Says what it found *and* what it could not, because "two sources and
-        # no units" is the shape of a failure and looked identical to success.
-        detail = f"{len(units)} unit(s)"
-        if not units:
-            detail = (
-                f"no units listed ({self.unit_error})"
-                if self.unit_error
-                else "no units listed — journalctl reported none"
-            )
-        self.status = f"{len(sources)} journal source(s), {detail}"
         return sources
+
+    def _local_note(self, sources: list[ProviderSource]) -> str:
+        """Says what it found *and* what it could not.
+
+        "Two sources and no units" is the shape of a failure and looked
+        identical to success.
+        """
+
+        units = [
+            source
+            for source in sources
+            if isinstance(source.path, JournalRef) and source.path.kind == "unit"
+        ]
+        if units:
+            return f"{len(sources)} journal source(s), {len(units)} unit(s)"
+        return (
+            f"{len(sources)} journal source(s), no units listed ({self.unit_error})"
+            if self.unit_error
+            else f"{len(sources)} journal source(s), no units listed — journalctl reported none"
+        )
+
+    def _remote_sources(self) -> list[ProviderSource]:
+        """Every configured host's journal, when both opt-ins are on.
+
+        **Two consents, and neither implies the other.** ``enable_journald``
+        says CLV may run ``journalctl``; ``enable_ssh`` says it may open a
+        network connection. A remote journal needs both, and asking for one does
+        not quietly grant the other.
+
+        A host that cannot offer a journal is *noted*, never raised: no
+        `journalctl` on the far side is a capability, an unreachable machine is
+        a Phase 5 fact already reported elsewhere, and neither is a reason for
+        the other hosts — or the local journal — to come back empty.
+        """
+
+        if self._resolver is None or not self._hosts:
+            return []
+
+        # Imported here rather than at module scope because `ssh.py` imports
+        # *this* module; the dependency runs one way and a deferred import is
+        # how the reader and the opt-in are reached without inverting it.
+        from . import ssh
+
+        if not ssh.enabled():
+            return []
+
+        sources: list[ProviderSource] = []
+        for host in self._hosts:
+            if not host.enabled:
+                continue
+            try:
+                connection = self._connection_for(host)
+                if connection is None:
+                    continue
+                # **A host inside its backoff is skipped, not retried**, and is
+                # still reported from what is already known. Phase 5's rule, and
+                # it applies with force here: `facts()` probes, and spending a
+                # connect timeout per configured host on every rescan to learn
+                # again what CLV was told a second ago is what makes a reload
+                # with one dead machine feel broken. An *untried* host reports
+                # `connected` optimistically, so a first scan still asks.
+                reach = connection.reachability()
+                if not reach.ok:
+                    self.host_notes[host.name] = reach.reason or "unreachable"
+                    continue
+                if not connection.facts().journalctl:
+                    self.host_notes[host.name] = "no journalctl on that host"
+                    continue
+                units = self._remote_units(host, connection)
+            except OSError as exc:
+                # Unreachable, refused, timed out. Phase 5 owns saying so about
+                # the *host*; here it costs that host's journal and nothing else.
+                first = str(exc).strip().splitlines()
+                self.host_notes[host.name] = first[0] if first else "unreachable"
+                continue
+            sources.append(
+                ProviderSource(
+                    JournalRef(host.name, "all"), f"{host.name}: System journal", self.name
+                )
+            )
+            sources += [
+                ProviderSource(
+                    JournalRef(host.name, "unit", unit),
+                    f"{host.name}: {unit}",
+                    self.name,
+                )
+                for unit in units
+            ]
+        return sources
+
+    def _connection_for(self, host):
+        """The resolver's live connection for *host*, or ``None``.
+
+        Reached through a ref so the resolver's own caching and reconciliation
+        apply — building one here is the duplicate-master hazard `use_remote`
+        exists to avoid.
+        """
+
+        backend = self._resolver.for_ref(RemoteRef.build(host.name, "/"))
+        return getattr(backend, "connection", None)
+
+    def _remote_units(self, host, connection) -> list[str]:
+        """`.service` units with journal entries on *host*.
+
+        One command per host, in the worker discovery already runs on. The
+        enumeration walks the remote journal, so it is the slow call here and
+        `QUERY_TIMEOUT` bounds it — generous, because several gigabytes with a
+        cold page cache is well past ten seconds and timing out costs the whole
+        unit list.
+        """
+
+        from .ssh import quote_all
+
+        script = quote_all("journalctl", "--no-pager", "--field=_SYSTEMD_UNIT")
+        body = connection.run(f"{script} 2>/dev/null", timeout=QUERY_TIMEOUT)
+        units = sorted(
+            {
+                line.strip()
+                for line in body.splitlines()
+                if line.strip().endswith(".service")
+            }
+        )
+        return units[:200]
 
     def _query(self, argv: list[str]) -> tuple[str, str]:
         """Run a journalctl query as ``(stdout, why it failed)``.
@@ -533,14 +740,46 @@ class JournaldProvider(LogSourceProvider):
         asked to stop.
         """
 
-        reader = JournalReader(path, max_lines=self._max_lines)
+        reader = self.open_reader(path, max_lines=self._max_lines)
         try:
             yield from reader.prime().lines
         finally:
             reader.close()
 
     def open_reader(self, path: SourceRef, *, max_lines: int, **kwargs):
-        return JournalReader(path, max_lines=min(max_lines, self._max_lines), **kwargs)
+        """A local follow, or a remote one when the ref names a machine.
+
+        Dispatch is on the ref, as everywhere else in CLV: `journal:unit/x` is
+        this machine and `journal@web01:unit/x` is not. The import is deferred
+        for the reason `_remote_sources`'s is — `ssh.py` imports this module,
+        so the dependency runs one way.
+        """
+
+        bound = min(max_lines, self._max_lines)
+        node = path.node if isinstance(path, JournalRef) else ""
+        if node:
+            connection = self._connection_for_node(node)
+            if connection is None:
+                raise OSError(
+                    f"No connection is configured for '{node}'. Add it with R, "
+                    "or turn on Remote (SSH)."
+                )
+            from .ssh import RemoteJournalReader
+
+            return RemoteJournalReader(
+                path, connection=connection, max_lines=bound, **kwargs
+            )
+        return JournalReader(path, max_lines=bound, **kwargs)
+
+    def _connection_for_node(self, node: str):
+        """The live connection for a host *name*, or ``None`` if there is none."""
+
+        if self._resolver is None:
+            return None
+        host = next((entry for entry in self._hosts if entry.name == node), None)
+        if host is None:
+            return None
+        return self._connection_for(host)
 
 
 def _run(argv: list[str]) -> tuple[str, str]:

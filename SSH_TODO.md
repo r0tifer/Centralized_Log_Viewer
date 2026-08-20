@@ -24,7 +24,7 @@ filesystem assumption that had already spread further.
 | 7 — Remote UI | Host dialog, cross-host merge, `node` in the chrome | ✅ **Complete** |
 | 8 — Documentation & release | README, `settings.conf`, help overlay, version | ✅ **Complete** (2.8.0) |
 | 9a — Journal identity | `JournalRef`: the journal becomes a real source | ✅ **Complete** (2.9.0) |
-| 9b — The remote journal | `journalctl` over the same transport | ⬜ Not started |
+| 9b — The remote journal | `journalctl` over the same transport | ✅ **Complete** (2.10.0) |
 
 ---
 
@@ -1782,6 +1782,99 @@ contradiction in the plan above rather than chosen for size.
 
 **Commit.** `feat(journal): make a journal source a first-class ref`, then
 `release: 2.9.0`.
+
+### As built — 9b, the transport half
+
+The plan's estimate was right about this half: the transport really is close to
+free, and almost all of the work was making "almost nothing is new" *true*
+rather than merely claimed.
+
+- **`JournalReader` was already transport-independent except for two lines.**
+  It builds the argv, translates records, drains non-blocking, pushes severity
+  down to `--priority` and tears the process down — none of which cares where
+  the process runs. Two things were extracted: `_start()`, which spawns, and
+  `_records()`, which is the JSON translation split away from the reading.
+  `RemoteJournalReader` overrides `_start` and `_drain` and inherits the rest,
+  which is what makes `test_one_fixture_translates_identically_read_locally_and_remotely`
+  a fact about the code rather than a hope: one captured fixture, both paths,
+  one assertion.
+
+- **The frame is why a subclass could not simply inherit `_drain`.** A followed
+  remote command's stdout carries an opening sentinel that separates shell noise
+  from output. Without it a login shell's MOTD is handed to `json.loads`, fails,
+  and is then **kept** — because never silently losing a line is the rule — so a
+  welcome message appears in the pane as a journal record.
+
+- **`_Deframer` is shared, not copied.** `RemoteFollowReader` had the same
+  three-line state machine inline; it now uses the same class. That refactor is
+  the riskiest edit in the phase and it is behaviour-neutral by construction —
+  all 165 existing SSH assertions passed unedited after it. It also surfaced a
+  real constraint: `RemoteFollowReader` must be **constructible without a
+  connection**, because `command()` is pure and tests build one over a bare
+  `object()`. The frame is therefore `None` until a follow starts, rather than a
+  blank-marker stand-in that would find its empty marker at offset zero and pass
+  banner text through as log.
+
+- **`journalctl` presence is one more line in the probe that was already being
+  made**, so it costs no round trip. It reads as a **capability**, never an
+  error: an Alpine container in a fleet offers no journal and that must not put
+  a red line in the drawer.
+
+- **Remote enumeration runs in the host stage, not in `discover()`, and a test
+  caught that rather than a design foreseeing it.** Discovery is two stages so a
+  machine that is down costs the local tree nothing. Enumerating remote journals
+  in the first stage meant paying a connect timeout per configured host before
+  anything appeared — and paying it *twice* on `Ctrl+R`, which resets the
+  backoff. `test_a_reload_with_a_host_down_completes_and_refreshes_the_rest`
+  failed on its 1.6 s bound and was right to. Run from the second stage instead,
+  a live host answers over its existing multiplexed connection and a dead one is
+  already marked unreachable and costs nothing.
+
+- **`app._discover_remote_providers` loops over providers rather than naming the
+  journald one.** "Core knows which plugin is special" is the coupling the
+  plugin interfaces exist to avoid, and a second provider that grows the same
+  capability needs no change there.
+
+- **The provider never constructs a connection, and a test asserts the class
+  names appear nowhere in the module.** `SSHConnection.socket` hashes
+  `(name, host, user, port)`, so one built here would resolve to the *same*
+  multiplex socket the resolver uses, and its `close()` would run `ssh -O exit`
+  on a master CLV is actively reading through. Phase 7 recorded the identical
+  trap for the host dialog's Test connection button; this is it reached from a
+  different direction, which is the argument for asserting it structurally
+  rather than trusting the next author to know.
+
+- **Local availability no longer gates the whole provider.** `discover()`
+  returned early when *this* machine had no systemd, which would have refused
+  every remote journal too. A laptop with no systemd reading a systemd fleet is
+  an ordinary thing to want, and the machine CLV runs on has no bearing on what
+  another machine offers.
+
+- **The watchdog is 4b's, unchanged, and it had to be.** `journalctl --follow`
+  on an idle unit never writes, so it never learns its pipe closed — the same
+  shape as `tail` on an idle log, and the same consequence: one left running per
+  source switch on the operator's server. `cat` stays in the foreground for the
+  same one-character reason.
+
+- **`session.adopt` now passes `facts`.** It did not, so a remote journal buffer
+  carried no `node` — `node:web01` would not have answered for a unit, and a
+  cross-host merge would have ordered it by this machine's clock. `_source_facts`
+  resolves a `JournalRef` through a path-shaped ref on the same node, because the
+  resolver keys on the machine rather than on what is read from it.
+
+- **A hostile unit name is checked through a real `sh`**, as the hostile-path
+  table already is. The first attempt asserted that the quoted form did not
+  appear literally in the script, which was simply wrong — `quote_all` had
+  quoted it correctly, and "contains a quote character" is not the property that
+  matters. What matters is the far side receiving the argument back byte for
+  byte and executing none of it.
+
+- **1442 + 27 = 1469 passed, 1 skipped, 11 deselected** on 3.11 and 3.14. No
+  existing assertion edited: `git diff -- tests/` removes exactly four lines,
+  all of them imports replaced by longer versions of themselves.
+
+**Commit.** `feat(ssh): read the systemd journal on remote hosts`, then
+`release: 2.10.0`.
 
 ---
 

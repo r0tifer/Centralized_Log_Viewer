@@ -189,7 +189,7 @@ from ...services.reader import (
     read_last_lines,
 )
 from ...services.refs import RemoteRef, SourceRef
-from .journald import child_environment
+from .journald import JournalReader, child_environment
 
 __all__ = [
     "CONTROL_PERSIST",
@@ -360,6 +360,14 @@ class HostFacts:
     skew: timedelta = timedelta(0)
     #: The remote's UTC offset, so a naive stamp from it can be made aware.
     utc_offset: timedelta = timedelta(0)
+    #: Whether ``journalctl`` is on the remote's PATH.
+    #:
+    #: A **capability**, not an error, which is the whole reason it is measured
+    #: here: a host with no systemd is an ordinary host that offers no journal,
+    #: and reporting that as a failure would put a red line in the drawer for
+    #: every Alpine container in a fleet. Measured in the probe that was already
+    #: being made, so it costs no extra round trip.
+    journalctl: bool = False
 
     @property
     def tzinfo(self) -> timezone:
@@ -786,6 +794,11 @@ class SSHConnection:
             "(stat -f '%d' . >/dev/null 2>&1 && echo statf=yes) || echo statf=no; "
             "(dd if=/dev/null iflag=skip_bytes >/dev/null 2>&1 && echo dd=yes) "
             "|| echo dd=no; "
+            # One more line in the round trip that was already happening. See
+            # `HostFacts.journalctl` for why absence is a capability rather
+            # than a failure.
+            "(command -v journalctl >/dev/null 2>&1 && echo journalctl=yes) "
+            "|| echo journalctl=no; "
             "date +'date=%s'"
         )
         before = time.time()
@@ -805,7 +818,11 @@ class SSHConnection:
         profile = _select_profile(uname, values)
         skew, offset = _measure_clock(values.get("date", ""), before, after)
         return HostFacts(
-            profile=profile, uname=uname, skew=skew, utc_offset=offset
+            profile=profile,
+            uname=uname,
+            skew=skew,
+            utc_offset=offset,
+            journalctl=values.get("journalctl") == "yes",
         )
 
     # --- teardown -----------------------------------------------------------
@@ -2095,6 +2112,76 @@ _ROTATION_NOTICES: tuple[str, ...] = (
 )
 
 
+class _Deframer:
+    """Strips the frame around a *followed* remote command's stdout.
+
+    Every command CLV issues is wrapped in sentinels so that shell noise — a
+    login shell's MOTD, a legal banner, a ``.bashrc`` echo — can be told from
+    output. For a one-shot command :func:`_unframe` does that over the whole
+    body. A follow never completes, so it has to be done incrementally, and
+    both remote readers need it: a phantom log line and a phantom *journal
+    record* are the same defect.
+
+    Shared rather than copied. The alternative is two implementations of the
+    same three-line state machine, and the one that is not exercised by the
+    common path is the one that rots.
+    """
+
+    __slots__ = ("_start_marker", "_end_marker", "_banner", "started", "finished")
+
+    def __init__(self, start_marker: bytes, end_marker: str) -> None:
+        self._start_marker = start_marker
+        self._end_marker = end_marker
+        self._banner = b""
+        #: Latches once the opening sentinel has been seen: everything after it
+        #: is data, and re-scanning would risk a log line that happens to
+        #: contain the token.
+        self.started = False
+        #: Latches when the closing sentinel arrives, which is how a follow
+        #: learns the far end is done.
+        self.finished = False
+
+    def past_the_banner(self, chunk: bytes) -> bytes:
+        """Drop everything up to and including the opening sentinel.
+
+        **This matters more for a follow than for a one-shot command.** Without
+        it, a welcome message arrives on the same pipe as the log and is parsed
+        and displayed as log lines, with whatever timestamp and level the parser
+        managed to read out of it.
+        """
+
+        if self.started:
+            return chunk
+
+        self._banner += chunk
+        position = self._banner.find(self._start_marker)
+        if position < 0:
+            # Keep only enough to match a marker split across two reads.
+            self._banner = self._banner[-len(self._start_marker) :]
+            return b""
+        newline = self._banner.find(b"\n", position)
+        if newline < 0:
+            return b""
+
+        remainder = self._banner[newline + 1 :]
+        self._banner = b""
+        self.started = True
+        return remainder
+
+    def strip_end(self, lines: list[str]) -> list[str]:
+        """Remove the closing sentinel, latching :attr:`finished` if it is there.
+
+        Showing it to the operator as a log line would be a small lie in the one
+        place CLV promises never to tell one. The token is a random 16 hex
+        digits, so a real log line cannot collide with it.
+        """
+
+        if not any(line.startswith(self._end_marker) for line in lines):
+            return lines
+        self.finished = True
+        return [line for line in lines if not line.startswith(self._end_marker)]
+
+
 class RemoteFollowReader:
     """A remote log, followed by a persistent ``tail -F``.
 
@@ -2144,15 +2231,20 @@ class RemoteFollowReader:
         #: Set by a drain that saw `tail` report the file was replaced, and
         #: consumed by the next `poll()` so the pane redraws once.
         self._rotated = False
-        #: Whether the opening sentinel has been seen, after which every byte
-        #: is log. Latches; see `_past_the_banner`.
-        self._started = False
-        #: Bytes seen before it, held only long enough to match a marker split
-        #: across two reads.
-        self._banner = b""
-        #: Set when the closing sentinel arrives: the remote command has ended,
-        #: whether because `tail` exited or because the link went.
-        self._finished = False
+        #: The frame around this follow's stdout: the opening sentinel that
+        #: separates shell noise from log, and the closing one that says the
+        #: remote command has ended — whether because `tail` exited or because
+        #: the link went. Shared with the remote journal reader, which has the
+        #: same frame around a different payload.
+        #:
+        #: ``None`` until a follow actually starts, and deliberately not a
+        #: blank-marker stand-in: this reader is constructible **without a
+        #: connection** — ``command()`` is pure, and tests build one over a bare
+        #: object to assert the argv — while a ``_Deframer(b"", ...)`` would
+        #: find its empty marker at offset zero and pass banner text through as
+        #: log. Unreachable while `None`, because `poll()` returns early until
+        #: `prime()` has set `_process`.
+        self._frame: Optional[_Deframer] = None
         #: What `tail` and `ssh` said on stderr, kept rather than only scanned
         #: for rotation wording. When the follow dies this is the only evidence
         #: of *why*, and "why" is the difference between a message an operator
@@ -2233,9 +2325,10 @@ class RemoteFollowReader:
         self._remainder = ""
         self._byte_remainder = b""
         self._rotated = False
-        self._started = False
-        self._banner = b""
-        self._finished = False
+        self._frame = _Deframer(
+            self._backend.connection.start_marker,
+            self._backend.connection.end_marker,
+        )
         self._stderr = ""
         self._reported = False
 
@@ -2255,7 +2348,7 @@ class RemoteFollowReader:
 
         if self._process is None:
             return TailRead(lines=[], offset=self._offset)
-        if self._finished or self._process.poll() is not None:
+        if (self._frame is not None and self._frame.finished) or self._process.poll() is not None:
             # `tail` exited. Draining once more catches what it wrote on the
             # way out; re-running it every tick would be the fork bomb with a
             # nice name that `journald` names in its own poll.
@@ -2305,7 +2398,7 @@ class RemoteFollowReader:
         """
 
         host = self._backend.connection.host
-        if self._finished:
+        if self._frame.finished:
             reason = (
                 f"{host.name}: the remote tail stopped following {self.path.name}. "
                 "The file may have been removed."
@@ -2340,9 +2433,10 @@ class RemoteFollowReader:
 
         self.close()
         self._rotated = False
-        self._started = False
-        self._banner = b""
-        self._finished = False
+        self._frame = _Deframer(
+            self._backend.connection.start_marker,
+            self._backend.connection.end_marker,
+        )
         self._stderr = ""
         self._reported = False
         self._process = self._backend.connection.follow(self.command())
@@ -2373,7 +2467,7 @@ class RemoteFollowReader:
         if isinstance(chunk, str):  # pragma: no cover - a text-mode fake
             chunk = chunk.encode("utf-8")
 
-        chunk = self._past_the_banner(chunk)
+        chunk = self._frame.past_the_banner(chunk)
         if not chunk:
             return []
 
@@ -2397,49 +2491,11 @@ class RemoteFollowReader:
             self._remainder = ""
 
         # The frame's closing sentinel, which arrives when the remote shell
-        # finally exits. Showing it to the operator as a log line would be a
-        # small lie in the one place CLV promises never to tell one; the token
-        # is a random 16 hex digits, so a real log line cannot collide with it.
-        end = self._backend.connection.end_marker
-        if any(line.startswith(end) for line in lines):
-            self._finished = True
-            lines = [line for line in lines if not line.startswith(end)]
+        # finally exits.
+        lines = self._frame.strip_end(lines)
 
         self._backend.note_followed_size(self.path, self._offset)
         return lines
-
-    def _past_the_banner(self, chunk: bytes) -> bytes:
-        """Drop everything up to and including the opening sentinel.
-
-        **This matters more for a follow than for a one-shot command.** A login
-        shell's MOTD, legal banner or ``.bashrc`` echo arrives on the same pipe
-        as the log, and without this it would be *parsed and displayed as log
-        lines* — phantom entries in the pane, with whatever timestamp and level
-        the parser managed to read out of a welcome message.
-
-        Done incrementally rather than by :func:`_unframe`, because a follow
-        never completes and so can never be unframed whole. Once the marker has
-        been seen everything after it is data, which is why the flag latches.
-        """
-
-        if self._started:
-            return chunk
-
-        self._banner += chunk
-        marker = self._backend.connection.start_marker
-        position = self._banner.find(marker)
-        if position < 0:
-            # Keep only enough to match a marker split across two reads.
-            self._banner = self._banner[-len(marker) :]
-            return b""
-        newline = self._banner.find(b"\n", position)
-        if newline < 0:
-            return b""
-
-        remainder = self._banner[newline + 1 :]
-        self._banner = b""
-        self._started = True
-        return remainder
 
     def _check_stderr(self) -> None:
         """Look for ``tail``'s own rotation diagnostic, and keep the rest.
@@ -2498,6 +2554,136 @@ class RemoteFollowReader:
             self.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+class RemoteJournalReader(JournalReader):
+    """``journalctl --follow`` on another machine, over the same connection.
+
+    **Almost nothing here is new, and that is the point.** ``JournalReader``
+    already builds the argv, translates records, drains non-blocking, pushes a
+    severity bucket down to ``--priority`` and tears the process down; all of it
+    is transport-independent. What this overrides is the two places that are
+    not: how the process is started, and how the frame around its output is
+    stripped.
+
+    That the rest is genuinely shared is asserted rather than claimed —
+    ``tests/test_ssh_source.py`` runs one captured ``journalctl -o json``
+    fixture through the local reader and this one and compares the results.
+
+    **Two consents, and neither implies the other.** Reading the journal runs a
+    subprocess; reading it *here* runs a network subprocess. ``enable_journald``
+    and ``enable_ssh`` must both be true before one of these exists, which is
+    checked by the provider that builds it rather than here.
+
+    **The severity push-down matters more over a link than over a pipe.** It is
+    the difference between discarding debug records on the far side and carrying
+    them across the network to discard them locally.
+    """
+
+    def __init__(
+        self,
+        path: SourceRef,
+        *,
+        connection: SSHConnection,
+        max_lines: int = 2_000,
+        severity: str = "all",
+    ) -> None:
+        super().__init__(path, max_lines=max_lines, severity=severity)
+        self._connection = connection
+        # `shutil.which` answers for *this* machine. The other machine's layout
+        # is its own business, and `command -v` in the probe has already
+        # established that the bare name resolves there.
+        self.binary = "journalctl"
+        self._frame: Optional[_Deframer] = None
+
+    # --- the transport -------------------------------------------------------
+
+    def remote_script(self) -> str:
+        """The shell script the follow runs, argv quoted into it.
+
+        Everything after the first term is the watchdog, and it is the same one
+        ``RemoteFollowReader`` needs for the same reason: **killing the local
+        ``ssh`` does not stop the remote command.** A process only learns its
+        pipe is closed when it next writes, and ``journalctl --follow`` on an
+        idle unit never writes again — so without this, every source switch
+        would leave one running on the operator's server. CLV's whole claim is
+        that it installs nothing and leaves nothing running, and a stranded
+        follow on someone's production box is the most direct contradiction of
+        it available.
+
+        ``cat`` is in the **foreground** deliberately: POSIX reassigns a
+        backgrounded command's stdin to ``/dev/null`` in a non-interactive
+        shell, so ``{ cat …; } &`` reads EOF immediately and kills the follow
+        before it produces a line.
+        """
+
+        argv = quote_all(*self.command())
+        return (
+            f"{argv} & __clv_j=$!; "
+            "{ while kill -0 $__clv_j 2>/dev/null; do sleep 5; done; "
+            "kill $$ 2>/dev/null; } & "
+            "cat >/dev/null 2>&1; kill $__clv_j 2>/dev/null"
+        )
+
+    def _start(self):
+        """Follow over the multiplexed connection instead of a local pipe."""
+
+        self._frame = _Deframer(
+            self._connection.start_marker, self._connection.end_marker
+        )
+        return self._connection.follow(self.remote_script())
+
+    # --- the frame -----------------------------------------------------------
+
+    def _drain(self) -> list[str]:
+        """Strip the frame, then translate records exactly as the local reader does.
+
+        The frame is why this cannot simply inherit: a login shell's MOTD or a
+        legal banner arrives on the same pipe as the journal, and without the
+        opening sentinel it would be handed to `json.loads`, fail, and be *kept*
+        as a line — because never silently losing a line is the rule. A welcome
+        message would appear in the pane as a journal record.
+        """
+
+        stdout = getattr(self._process, "stdout", None)
+        if stdout is None or self._frame is None:
+            return []
+        try:
+            chunk = stdout.read()
+        except (BlockingIOError, ValueError):
+            return []
+        if not chunk:
+            return []
+        if isinstance(chunk, str):  # pragma: no cover - a text-mode fake
+            chunk = chunk.encode("utf-8")
+
+        chunk = self._frame.past_the_banner(chunk)
+        if not chunk:
+            return []
+
+        # `_records` holds a partial record back, so a JSON object split across
+        # two reads is not decoded as two broken ones.
+        lines = self._records(chunk.decode("utf-8", errors="replace"))
+        return self._frame.strip_end(lines)
+
+    def poll(self) -> TailRead:
+        """As the local reader's, plus the frame's own end-of-stream signal.
+
+        The closing sentinel arrives when the remote shell exits, which is
+        *before* the local `ssh` process is reaped — so waiting only on
+        `process.poll()` would keep polling a stream that will never produce
+        anything again.
+        """
+
+        if self._frame is not None and self._frame.finished and self._process is not None:
+            lines = self._drain()
+            self.close()
+            return TailRead(lines=lines, offset=self._offset)
+        return super().poll()
+
+    def close(self) -> None:
+        super().close()
+        self._frame = None
 
 
 class RemoteResolver:

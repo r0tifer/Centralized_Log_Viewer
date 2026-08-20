@@ -857,6 +857,7 @@ class LogViewerApp(App[None]):
     async def on_mount(self) -> None:
         self.state = self._store.load()
         self._plugins = load_plugins()
+        self._wire_remote_providers()
         self._apply_breakpoint(self.size.width)
         self._sources_panel_width = self.state.tree_width or self._config.tree_width
         self._apply_panel_width()
@@ -1085,6 +1086,15 @@ class LogViewerApp(App[None]):
         the single-zone rule, which is what it did before this existed.
         """
 
+        # A remote journal ref names a machine the same way a remote file ref
+        # does, and wants the same answer: `node:` should say which host a line
+        # came from, and a merge across two hosts should be ordered by their
+        # measured clocks. The ref types differ; the question does not. Resolved
+        # through a path-shaped ref on the same node, because the resolver keys
+        # on the machine rather than on what is being read from it.
+        if isinstance(path, JournalRef) and path.node:
+            path = RemoteRef.build(path.node, "/")
+
         if not isinstance(path, RemoteRef):
             return local_facts(path)
 
@@ -1246,13 +1256,22 @@ class LogViewerApp(App[None]):
         # the delay this split exists to prevent.
         self._notify(f"Discovering {self._host_count(roots)} host(s)…")
         remote_worker = self.run_worker(
-            lambda: self._discover_hosts(roots, settings),
+            # The remote journal is enumerated here for the same reason the
+            # remote walk is: both are round trips, and both must happen after
+            # the local tree is on screen. It runs *after* the walk on purpose —
+            # by then every host is in a known state, so a live one answers over
+            # its existing multiplexed connection and a dead one is already
+            # marked unreachable and costs nothing.
+            lambda: (
+                self._discover_hosts(roots, settings),
+                self._discover_remote_providers(),
+            ),
             thread=True,
             name="discover-hosts",
             exit_on_error=False,
         )
         try:
-            remote = await remote_worker.wait()
+            remote, remote_providers = await remote_worker.wait()
         except Exception as exc:  # noqa: BLE001 - a remote walk fails many ways
             self._notify(f"Could not discover remote sources: {exc}", "warning")
             return
@@ -1261,7 +1280,62 @@ class LogViewerApp(App[None]):
             # two will fold in fresher results; installing these over them would
             # show the older walk.
             return
+        if remote_providers:
+            self._provider_sources = list(self._provider_sources) + list(remote_providers)
         await self._install_report(report.extend(remote or DiscoveryReport()))
+
+    def _wire_remote_providers(self) -> None:
+        """Hand every provider that wants one the app's connection resolver.
+
+        **Not a resolver of its own**, and that is a correctness requirement
+        rather than tidiness. `SSHConnection.socket` hashes
+        `(name, host, user, port)`, so a connection a provider built for itself
+        would resolve to the *same* multiplex socket this one is using — and its
+        `close()` would run `ssh -O exit` on a master CLV is actively reading
+        through, costing a full handshake on the next read. Phase 7 recorded
+        exactly that trap for the host dialog's Test connection button; this is
+        the same hazard reached from a different direction.
+
+        Called wherever the resolver or the host list changes, so a provider
+        never holds a resolver the app has replaced.
+        """
+
+        hosts = self._config.hosts if getattr(self._config, "enable_ssh", False) else ()
+        for provider in self._plugins.sources:
+            hook = getattr(provider, "use_remote", None)
+            if hook is None:
+                continue
+            try:
+                hook(self._backends if hosts else None, hosts)
+            except Exception as exc:  # noqa: BLE001 - third-party code
+                self._plugins.errors.append(
+                    PluginError(getattr(provider, "name", "provider"), f"raised: {exc}")
+                )
+
+    def _discover_remote_providers(self) -> list:
+        """Ask every provider that can read a remote host what it found there.
+
+        Only the journal does today. Kept as a loop over providers rather than a
+        call to the journald one by name, because "core knows which plugin is
+        special" is the coupling the plugin interfaces exist to avoid — a
+        provider that grows the same capability needs no change here.
+
+        Never raises: a provider that throws costs its own sources and nothing
+        else, which is the contract `discover_sources` already keeps.
+        """
+
+        found: list = []
+        for provider in self._plugins.sources:
+            hook = getattr(provider, "discover_remote", None)
+            if hook is None:
+                continue
+            try:
+                found.extend(hook())
+            except Exception as exc:  # noqa: BLE001 - third-party code
+                self._plugins.errors.append(
+                    PluginError(getattr(provider, "name", "provider"), f"raised: {exc}")
+                )
+        return found
 
     @staticmethod
     def _host_count(roots) -> int:
@@ -4377,10 +4451,12 @@ class LogViewerApp(App[None]):
             if closer is not None:
                 closer()
             self._backends = build_backends(self._config)
+            self._wire_remote_providers()
             return ""
 
         kept, closed = reconcile(self._config.hosts)
         self._backends = previous
+        self._wire_remote_providers()
         if not kept and not closed:
             return ""
         parts = []

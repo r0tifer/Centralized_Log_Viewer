@@ -25,9 +25,9 @@ from clv.plugins import (
     ProviderSource,
     load_plugins,
 )
-from clv.plugins.sources import journald
+from clv.plugins.sources import journald, ssh
 from clv.services import SourceManager, persist_setting
-from clv.services.config import load_config, user_config_path
+from clv.services.config import RemoteHost, load_config, user_config_path
 from clv.services.discovery import matched_glob
 from clv.services.parsing import parse_line
 from clv.services.refs import JournalRef, format_ref, parse_ref
@@ -996,3 +996,215 @@ def test_check_access_does_not_crash_on_a_journal_ref() -> None:
     allowed, reason = check_access(JournalRef("", "unit", "sshd.service"))
     assert isinstance(allowed, bool)
     assert allowed or reason
+
+
+# --- the remote journal -----------------------------------------------------
+
+
+class _Resolver:
+    """Stands in for the app's RemoteResolver, handing back one connection."""
+
+    def __init__(self, connection) -> None:
+        self._connection = connection
+        self.closed = False
+
+    def for_ref(self, ref):
+        return type("B", (), {"connection": self._connection})()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _Connection:
+    """A connection whose probe and enumeration are canned."""
+
+    def __init__(self, *, journalctl=True, units="", reachable=True, fails=False) -> None:
+        from clv.services.backend import Reachability
+
+        self._facts = type("F", (), {"journalctl": journalctl})()
+        self._units = units
+        self._reach = Reachability() if reachable else Reachability(
+            state="unreachable", reason="web01: the host did not answer."
+        )
+        self._fails = fails
+        self.runs: list[str] = []
+        self.probes = 0
+
+    def reachability(self):
+        return self._reach
+
+    def facts(self):
+        self.probes += 1
+        return self._facts
+
+    def run(self, script, timeout=None):
+        self.runs.append(script)
+        if self._fails:
+            raise OSError("web01: the SSH user cannot read that path.")
+        return self._units
+
+
+def _remote_provider(connection, *, hosts=None):
+    provider = journald.JournaldProvider(runner=lambda argv: ("", ""))
+    provider.use_remote(
+        _Resolver(connection),
+        hosts if hosts is not None else [RemoteHost(name="web01", host="web01.internal")],
+    )
+    return provider
+
+
+def test_neither_opt_in_alone_offers_a_remote_journal(monkeypatch) -> None:
+    """Two consents, and neither implies the other.
+
+    Reading the journal runs a subprocess; reading it on another machine runs a
+    *network* subprocess. Asking for one must not quietly grant the other.
+    """
+
+    connection = _Connection(units="app.service\n")
+    provider = _remote_provider(connection)
+
+    monkeypatch.setattr(journald, "enabled", lambda: False)
+    monkeypatch.setattr(ssh, "enabled", lambda: True)
+    assert provider.discover_remote() == []
+
+    monkeypatch.setattr(journald, "enabled", lambda: True)
+    monkeypatch.setattr(ssh, "enabled", lambda: False)
+    assert provider.discover_remote() == []
+
+    assert connection.runs == [], "nothing was asked of the host without both opt-ins"
+    assert connection.probes == 0
+
+
+def test_both_opt_ins_offer_the_hosts_journal(monkeypatch) -> None:
+    monkeypatch.setattr(journald, "enabled", lambda: True)
+    monkeypatch.setattr(ssh, "enabled", lambda: True)
+    connection = _Connection(units="app.service\nnginx.service\nnot-a-unit\n")
+
+    sources = _remote_provider(connection).discover_remote()
+
+    assert [str(source.path) for source in sources] == [
+        "journal@web01:all",
+        "journal@web01:unit/app.service",
+        "journal@web01:unit/nginx.service",
+    ]
+    # The labels name the machine, since a fleet has one `app.service` per host.
+    assert sources[1].label == "web01: app.service"
+    assert len(connection.runs) == 1, "one command per host, not one per unit"
+
+
+def test_a_host_without_journalctl_is_a_capability_not_an_error(monkeypatch) -> None:
+    """An Alpine container in a fleet must not put a red line in the drawer."""
+
+    monkeypatch.setattr(journald, "enabled", lambda: True)
+    monkeypatch.setattr(ssh, "enabled", lambda: True)
+    connection = _Connection(journalctl=False)
+    provider = _remote_provider(connection)
+
+    assert provider.discover_remote() == []
+    assert provider.host_notes == {"web01": "no journalctl on that host"}
+    assert connection.runs == [], "no enumeration was attempted"
+
+
+def test_a_host_inside_its_backoff_is_not_probed(monkeypatch) -> None:
+    """Phase 5's rule, and the reason this runs in the host stage.
+
+    Spending a connect timeout per configured host on every rescan to learn
+    again what CLV was told a second ago is what makes a reload with one dead
+    machine feel broken.
+    """
+
+    monkeypatch.setattr(journald, "enabled", lambda: True)
+    monkeypatch.setattr(ssh, "enabled", lambda: True)
+    connection = _Connection(reachable=False)
+    provider = _remote_provider(connection)
+
+    assert provider.discover_remote() == []
+    assert connection.probes == 0, "an unreachable host must not be probed again"
+    assert "did not answer" in provider.host_notes["web01"]
+
+
+def test_a_failed_enumeration_costs_that_host_only(monkeypatch) -> None:
+    monkeypatch.setattr(journald, "enabled", lambda: True)
+    monkeypatch.setattr(ssh, "enabled", lambda: True)
+    provider = _remote_provider(_Connection(fails=True))
+
+    assert provider.discover_remote() == []
+    assert provider.host_notes["web01"]
+
+
+def test_a_disabled_host_is_skipped(monkeypatch) -> None:
+    monkeypatch.setattr(journald, "enabled", lambda: True)
+    monkeypatch.setattr(ssh, "enabled", lambda: True)
+    connection = _Connection(units="app.service\n")
+    provider = _remote_provider(
+        connection, hosts=[RemoteHost(name="web01", host="w", enabled=False)]
+    )
+
+    assert provider.discover_remote() == []
+    assert connection.probes == 0
+
+
+def test_the_local_journal_survives_a_machine_with_no_systemd(monkeypatch) -> None:
+    """A laptop with no systemd reading a systemd fleet is an ordinary want.
+
+    `discover` used to return early when this machine had no journal, which
+    would have refused every remote one too — the machine CLV runs on has no
+    bearing on what another machine offers.
+    """
+
+    monkeypatch.setattr(journald, "enabled", lambda: True)
+    monkeypatch.setattr(ssh, "enabled", lambda: True)
+    monkeypatch.setattr(journald, "availability", lambda: (False, "systemd is not running here"))
+    provider = _remote_provider(_Connection(units="app.service\n"))
+
+    assert provider.discover() == []
+    assert "systemd is not running here" in provider.status
+    # ...and the host's journal is still offered, from the host stage.
+    assert [str(s.path) for s in provider.discover_remote()] == [
+        "journal@web01:all",
+        "journal@web01:unit/app.service",
+    ]
+
+
+def test_a_remote_ref_opens_a_remote_reader(monkeypatch) -> None:
+    """Dispatch is on the ref, as everywhere else in CLV."""
+
+    monkeypatch.setattr(journald, "enabled", lambda: True)
+    monkeypatch.setattr(ssh, "enabled", lambda: True)
+    provider = _remote_provider(_Connection())
+
+    remote = provider.open_reader(parse_ref("journal@web01:unit/app.service"), max_lines=10)
+    local = provider.open_reader(parse_ref("journal:unit/app.service"), max_lines=10)
+
+    assert isinstance(remote, ssh.RemoteJournalReader)
+    assert isinstance(local, journald.JournalReader)
+    assert not isinstance(local, ssh.RemoteJournalReader)
+
+
+def test_a_ref_naming_an_unconfigured_host_says_so(monkeypatch) -> None:
+    """Never a connection invented for a machine the operator did not name."""
+
+    monkeypatch.setattr(journald, "enabled", lambda: True)
+    monkeypatch.setattr(ssh, "enabled", lambda: True)
+    provider = _remote_provider(_Connection())
+
+    with pytest.raises(OSError) as excinfo:
+        provider.open_reader(parse_ref("journal@db02:all"), max_lines=10)
+
+    assert "db02" in str(excinfo.value)
+
+
+def test_the_provider_never_builds_its_own_connection() -> None:
+    """The duplicate-master hazard, asserted structurally.
+
+    `SSHConnection.socket` hashes (name, host, user, port), so a connection this
+    module built for itself would resolve to the *same* multiplex socket the
+    resolver is using — and its `close()` would run `ssh -O exit` on a master
+    CLV is actively reading through. Phase 7 recorded the same trap for the host
+    dialog's Test connection button.
+    """
+
+    source = Path(journald.__file__).read_text(encoding="utf-8")
+
+    assert "SSHConnection(" not in source
+    assert "RemoteResolver(" not in source
