@@ -634,7 +634,9 @@ drawer, which turns it on and writes that line back to your settings file so the
 choice is made once rather than every launch.
 
 On a machine without systemd — or without `journalctl` on `PATH` — CLV runs
-normally, the switch is disabled, and the drawer says why.
+normally, the switch is disabled, and the drawer says why. That is a statement
+about *this* machine only: a laptop with no systemd can still read the journals
+of a systemd fleet, which is covered below.
 
 Two details worth knowing. A severity bucket is pushed down to
 `journalctl --priority` where that actually filters something (`error`, `warn`,
@@ -661,6 +663,30 @@ describe filenames and never hide a unit — `*.service` does not match
 `sshd.service` here, because the unit is not a file with that name. And nothing
 groups units into rotated sets: journald manages its own retention, so there is
 no `.1` or `.2.gz` to gather.
+
+**The journal on another machine.** With remote hosts configured, each one
+offers its own journal and its own units, listed as `web01: sshd.service` and
+readable exactly like the local ones — starred, merged, filtered, tailed. The
+canonical use is the one the merge exists for: the same unit across a fleet in a
+single timestamp-ordered pane, with `node:` saying which machine each line came
+from and the hosts' measured clock offsets applied to the ordering.
+
+**It needs both switches on, and neither implies the other.** Reading the
+journal runs a subprocess; reading it on another machine runs a *network*
+subprocess, so `enable_journald` and `enable_ssh` are two separate consents.
+With either off, nothing is enumerated and nothing is spawned.
+
+A host with no `journalctl` — an Alpine container, say — simply offers no
+journal and says so in the drawer. That is a capability, not a failure: it puts
+no error anywhere, and the rest of the fleet is unaffected. A host that is
+unreachable is likewise skipped rather than retried, because it has already
+reported that fact to the rest of CLV and spending a connection timeout to
+rediscover it is what makes a reload feel broken.
+
+Nothing is left running on the far side. A remote `journalctl --follow` on an
+idle unit would never notice its connection had gone — a process only learns its
+pipe is closed when it next writes — so the follow watches its own input and
+stops when CLV does.
 
 ### Inspecting an event
 

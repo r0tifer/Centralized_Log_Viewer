@@ -539,6 +539,24 @@ So the module supplies a **`SourceBackend`** instead. A remote root reaches
 `SourceManager` as an ordinary root, builds the same nested folder tree, and is
 read by the same `SourceReader`; `app.build_backends` wires the resolver in.
 
+The journal reaches the same hosts through the same connections, and the import
+direction is why that is a paragraph rather than a diagram: `ssh.py` imports
+`journald.py` (for `child_environment` and `JournalReader`), so `journald.py`
+reaches back only through **injection** — `use_remote(resolver, hosts)`, called
+by the app — and one deferred import for the reader itself. It never constructs
+an `SSHConnection`. That is a correctness requirement rather than a layering
+preference: `SSHConnection.socket` hashes `(name, host, user, port)`, so a
+connection built here would resolve to the *same* multiplex socket the resolver
+is using, and closing it would tear down a master CLV is actively reading
+through. A test asserts the class names appear nowhere in that module.
+
+Remote journal enumeration runs in the app's **host** stage rather than in
+`discover()`, and that is a timing decision a test caught rather than a design
+one that was foreseen. Discovery is two stages so a machine that is down costs
+the local tree nothing; enumerating remote journals in the first stage meant
+paying a connect timeout per host before anything appeared, and paying it twice
+on `Ctrl+R`, which resets the backoff.
+
 What keeps it in this package is consent, not layering — the same reason the
 journal is here. Reading a remote source spawns `ssh`, a plugin may not spawn a
 subprocess without the operator asking, and `enable_ssh` is read fresh on every
