@@ -54,10 +54,13 @@ from pathlib import Path, PurePosixPath
 from typing import IO, Any, NoReturn, Protocol, Sequence
 
 __all__ = [
+    "JOURNAL_SCHEME",
     "KNOWN_SCHEMES",
     "PROTOCOL_MEMBERS",
     "SOURCE_REF_TYPES",
     "SSH_SCHEME",
+    "JournalRef",
+    "JournalRefIOError",
     "RemoteRef",
     "RemoteRefIOError",
     "SourceRef",
@@ -65,6 +68,7 @@ __all__ = [
     "identity",
     "is_local",
     "is_source_ref",
+    "node_of_scheme",
     "normalize_ref",
     "parse_ref",
     "ref_key",
@@ -197,13 +201,23 @@ PROTOCOL_MEMBERS: tuple[str, ...] = (
 #: missing source is a legible failure; an invented local path is not.
 KNOWN_SCHEMES: frozenset[str] = frozenset({"journal", "ssh"})
 
-#: A scheme is a lowercase token, one colon, and something that is not a slash.
+#: A scheme is a lowercase token, an optional ``@machine``, one colon, and
+#: something that is not a slash.
 #:
 #: ``ssh://web01/...`` is deliberately **not** matched. ``Path`` collapses the
 #: double slash to ``ssh:/web01/...``, so that shape cannot round trip and must
 #: never be accepted — CLV should not take in a string it would then corrupt.
 #: The journald scheme (``journal:unit/sshd.service``) is the shape that can.
-_SCHEME_RE = re.compile(r"^([a-z][a-z0-9+.\-]*):(?!/)")
+#:
+#: **The node goes before the colon, and that is load-bearing.** A journal
+#: source on another machine has to say which machine, and the obvious place
+#: for it — inside the selector — cannot work: templated unit names contain
+#: ``@`` (``getty@tty1.service``, ``user@1000.service``), so splitting
+#: ``unit/getty@tty1.service`` on its first ``@`` yields a machine called
+#: ``unit/getty``. A scheme token can contain neither ``@`` nor ``:``, so
+#: ``journal@web01:unit/getty@tty1.service`` splits exactly once, in the only
+#: place it could. Every un-suffixed string keeps its existing meaning.
+_SCHEME_RE = re.compile(r"^([a-z][a-z0-9+.\-]*)(?:@([a-z0-9][a-z0-9._\-]*))?:(?!/)")
 
 
 def scheme_of(ref: "SourceRef | str") -> str | None:
@@ -242,11 +256,34 @@ def scheme_of(ref: "SourceRef | str") -> str | None:
 
 
 def split_scheme(ref: "SourceRef | str") -> tuple[str | None, str]:
-    """``("journal", "unit/sshd.service")`` — the scheme, and what follows it."""
+    """``("journal", "unit/sshd.service")`` — the scheme, and what follows it.
+
+    The remainder is taken from where the match actually **ended**, not from the
+    scheme's own length: ``journal@web01:unit/x`` has a node between the two, and
+    slicing by ``len(scheme) + 1`` would hand back ``web01:unit/x``. Callers use
+    this to reach the selector, so that arithmetic being wrong is a selector
+    silently containing a machine name.
+    """
 
     text = ref if isinstance(ref, str) else str(ref)
-    scheme = scheme_of(text)
-    return (None, text) if scheme is None else (scheme, text[len(scheme) + 1 :])
+    match = _SCHEME_RE.match(text)
+    if match is None or match.group(1) not in KNOWN_SCHEMES:
+        return None, text
+    return match.group(1), text[match.end() :]
+
+
+def node_of_scheme(ref: "SourceRef | str") -> str:
+    """The machine a scheme ref names, or ``""`` for one on this one.
+
+    ``journal@web01:unit/sshd.service`` → ``"web01"``; ``journal:all`` → ``""``.
+    Separate from :func:`node_of`, which answers the same question for a ref
+    object that already knows; this is for the string form, before parsing.
+    """
+
+    match = _SCHEME_RE.match(ref if isinstance(ref, str) else str(ref))
+    if match is None or match.group(1) not in KNOWN_SCHEMES:
+        return ""
+    return match.group(2) or ""
 
 
 def is_local(ref: "SourceRef") -> bool:
@@ -444,9 +481,199 @@ class RemoteRef:
         self._no_io("open")
 
 
+# ---------------------------------------------------------------------------
+# The journal implementation
+# ---------------------------------------------------------------------------
+
+
+#: The scheme prefix, spelled once. Single-colon, like ``ssh:``.
+JOURNAL_SCHEME = "journal:"
+
+#: The selector kinds a journal source can have. Closed, because these are the
+#: three things ``journalctl`` is asked for and an unrecognised fourth would be
+#: a ref that parses and then cannot be opened.
+JOURNAL_KINDS: frozenset[str] = frozenset({"all", "unit", "boot"})
+
+#: What to call the whole-journal source. Not derived from the ref, because
+#: ``journal:all``'s last component is ``all``, which names nothing.
+SYSTEM_JOURNAL_LABEL = "System journal"
+
+
+class JournalRefIOError(TypeError):
+    """A journal ref was asked to perform IO, or to have a hierarchy.
+
+    A ``TypeError`` for the same reason :class:`RemoteRefIOError` is: this is
+    not a read that failed but a call that should never have been made, and the
+    ``except OSError`` guards through discovery and the session would otherwise
+    swallow it into a plausible-looking "source unavailable".
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class JournalRef:
+    """The systemd journal, or one unit or boot of it: ``journal:unit/sshd.service``.
+
+    Identity only, like :class:`RemoteRef`. Holding one has spawned nothing;
+    every line comes from the journald provider, which is where the ``journalctl``
+    subprocess — and therefore the operator's consent — lives.
+
+    **Why this is a ref at all, when it was deliberately not one.**
+    ``ProviderSource`` exists to keep a journal source out of starring, glob
+    filtering and rotated-set grouping, and it did that by *not being a ref*.
+    Two of those three exclusions are still right and are now enforced directly:
+    a journal has no directory to walk and nothing to rotate. The third was
+    never right, only cheap — a unit is exactly the kind of source someone wants
+    starred and merged across a fleet, and "compare this unit on five machines"
+    is the same workflow ``ssh:`` refs exist to serve.
+
+    **The node goes before the colon.** ``journal@web01:unit/sshd.service``. See
+    :data:`_SCHEME_RE` for why the obvious alternative cannot work: templated
+    unit names contain ``@``.
+
+    **A local journal ref's string form is byte-identical to what the provider
+    used to build with ``Path``**, which is what lets an existing
+    ``session.json`` and every journald assertion survive this unedited.
+    """
+
+    #: CLV's name for the machine, or ``""`` for this one — the convention
+    #: :func:`node_of` already returns for a local path.
+    node: str
+    #: One of :data:`JOURNAL_KINDS`.
+    kind: str
+    #: The unit name or boot offset; empty for ``all``.
+    value: str = ""
+
+    # --- construction --------------------------------------------------------
+
+    @classmethod
+    def parse(cls, text: str) -> "JournalRef | None":
+        """``"journal@web01:unit/sshd.service"`` → a ref, or ``None``.
+
+        ``None`` rather than an exception because the caller is
+        :func:`parse_ref`, which sits on the persistence path: a malformed entry
+        degrades to a visibly-wrong scheme ref instead of taking a session
+        restore down with it.
+        """
+
+        match = _SCHEME_RE.match(text)
+        if match is None or match.group(1) != "journal":
+            return None
+        selector = text[match.end() :]
+        kind, _, value = selector.partition("/")
+        if kind not in JOURNAL_KINDS:
+            return None
+        # `all` takes no value and the other two require one. Enforced so the
+        # round trip is exact: `journal:all/x` would otherwise format back as
+        # `journal:all` and quietly become a different source.
+        if (kind == "all") != (not value):
+            return None
+        return cls(node=match.group(2) or "", kind=kind, value=value)
+
+    # --- identity ------------------------------------------------------------
+
+    def __str__(self) -> str:
+        machine = f"@{self.node}" if self.node else ""
+        selector = self.kind if self.kind == "all" else f"{self.kind}/{self.value}"
+        return f"journal{machine}:{selector}"
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"JournalRef({str(self)!r})"
+
+    # --- naming --------------------------------------------------------------
+
+    @property
+    def name(self) -> str:
+        """What to call this in a tree row or a status line.
+
+        The unit name, the boot offset, or :data:`SYSTEM_JOURNAL_LABEL` — never
+        the raw selector, because ``all`` is not a name anyone would recognise.
+        """
+
+        if self.kind == "all":
+            return SYSTEM_JOURNAL_LABEL
+        if self.kind == "boot":
+            return "This boot" if self.value == "0" else f"Boot {self.value}"
+        return self.value
+
+    @property
+    def parts(self) -> tuple[str, ...]:
+        """The selector's components. The machine is deliberately absent.
+
+        Same rule as :attr:`RemoteRef.parts`: these describe the source within
+        its machine, and a caller that wants the machine asks :attr:`node`.
+        """
+
+        return (self.kind,) if self.kind == "all" else (self.kind, self.value)
+
+    @property
+    def suffix(self) -> str:
+        """Always empty.
+
+        ``sshd.service`` ends in something that looks like one, and returning
+        ``.service`` would make ``exclude_globs = *.service`` hide a unit — a
+        glob written about filenames silently filtering something that is not a
+        file. Rotated-set grouping strips suffixes too. Neither should see one.
+        """
+
+        return ""
+
+    def with_name(self, name: str) -> "JournalRef":
+        """The same kind of source, named differently. Only ``unit`` has a name."""
+
+        if self.kind != "unit":
+            self._no_hierarchy("with_name")
+        return JournalRef(node=self.node, kind="unit", value=name)
+
+    # --- no hierarchy, and no IO ---------------------------------------------
+    #
+    # Present and raising rather than absent, the rule ``RemoteRef`` sets: a
+    # caller reaching one of these is a seam that rotted, and an ``AttributeError``
+    # from deep in a call chain says far less than this does.
+
+    def _no_hierarchy(self, operation: str) -> NoReturn:
+        raise JournalRefIOError(
+            f"{operation}() has no meaning for a journal source ({self!s}): "
+            "the journal is not a filesystem and has no enclosing directory."
+        )
+
+    def _no_io(self, operation: str) -> NoReturn:
+        raise JournalRefIOError(
+            f"{operation}() is not answerable by a journal ref ({self!s}); "
+            "the journald provider reads it."
+        )
+
+    @property
+    def parent(self) -> NoReturn:
+        self._no_hierarchy("parent")
+
+    def relative_to(self, other: Any) -> NoReturn:
+        self._no_hierarchy("relative_to")
+
+    def with_suffix(self, suffix: str) -> NoReturn:
+        self._no_hierarchy("with_suffix")
+
+    def __truediv__(self, other: str) -> NoReturn:
+        self._no_hierarchy("__truediv__")
+
+    def exists(self) -> bool:
+        self._no_io("exists")
+
+    def is_file(self) -> bool:
+        self._no_io("is_file")
+
+    def is_dir(self) -> bool:
+        self._no_io("is_dir")
+
+    def stat(self) -> os.stat_result:
+        self._no_io("stat")
+
+    def open(self, mode: str = "r", **kwargs: Any) -> IO[Any]:
+        self._no_io("open")
+
+
 #: Every concrete :class:`SourceRef`. One tuple, so the union has a single
 #: definition rather than one per call site.
-SOURCE_REF_TYPES: tuple[type, ...] = (Path, RemoteRef)
+SOURCE_REF_TYPES: tuple[type, ...] = (Path, RemoteRef, JournalRef)
 
 
 def is_source_ref(value: object) -> bool:
@@ -458,12 +685,21 @@ def is_source_ref(value: object) -> bool:
     to spell that ``isinstance(data, Path)``, which was correct for exactly as
     long as ``Path`` was the only implementation.
 
-    **A provider source is still excluded, and by the same mechanism.** A
-    journal node carries a ``ProviderSource``, not a ref — it is a different
-    kind of thing, with no directory to walk and no file to persist — so the
-    union being over *ref types* rather than over "anything source-shaped" is
-    what keeps ``journal:unit/sshd.service`` out of the starred set. That was
-    the point of the original narrowing and it survives this widening intact.
+    **A journal source is no longer excluded, and that is deliberate.** It used
+    to be, by this very mechanism: a journal node carried a ``ProviderSource``
+    and nothing else, so starring and grouping could not see it. Two thirds of
+    that exclusion were right and are now enforced where they belong —
+    ``rotation.group_rotated`` and discovery's glob filtering reject a
+    :class:`JournalRef` by name, because a journal has no directory to walk and
+    nothing to rotate. The third, starring and merging, was never right: a unit
+    is the clearest case of a source someone wants starred, and comparing one
+    unit across a fleet is the workflow remote sources exist for.
+
+    ``ProviderSource`` still exists and is still not a ref. It is the *tree
+    node's* payload, carrying the label and the provider name that error
+    attribution needs; its ``path`` is the ref. So a provider that offers
+    something which genuinely is not a source identity still cannot reach the
+    starred set, which is the part of the original guarantee worth keeping.
     """
 
     return isinstance(value, SOURCE_REF_TYPES)
@@ -484,23 +720,34 @@ def parse_ref(text: str) -> SourceRef:
     persistence needs. :class:`RemoteRef` normalises the same shapes and gives
     the same guarantee.
 
-    ``journal:`` is **not** given a type of its own and still comes back as a
-    ``Path``. The journald plugin builds its identifiers as ``Path`` and reads
-    them back through :func:`split_scheme`, and there is no backend behind one —
-    a provider answers for it instead, which is the distinction
-    ``ProviderSource`` exists to draw.
+    ``journal:`` **is** given a type of its own, and used not to be. The reason
+    it did not is recorded here rather than deleted, because the reason it now
+    does is the same argument turned around: a provider answers for a journal
+    source, so there is no backend behind one — but "no backend" was taken to
+    mean "not a source identity", and that was the mistake. A unit is exactly
+    what an operator wants starred, and comparing one unit across a fleet is the
+    workflow the whole remote feature exists for. What a journal ref still is
+    not is a *file*, and :class:`JournalRef` enforces that far more directly
+    than being a ``Path`` that happens not to exist ever did.
 
-    A malformed ``ssh:`` string falls through to ``Path``. There is nowhere to
-    report from here: this function is on the restore path, and one bad entry in
-    ``session.json`` must not cost the session. It degrades to a scheme ref that
-    resolves to nothing and is reported as missing — which is legible, where an
-    invented local path is not.
+    The string form is unchanged for a local journal, which is what lets a
+    ``session.json`` written by an older build come back meaning the same thing.
+
+    A malformed ``ssh:`` or ``journal:`` string falls through to ``Path``. There
+    is nowhere to report from here: this function is on the restore path, and one
+    bad entry in ``session.json`` must not cost the session. It degrades to a
+    scheme ref that resolves to nothing and is reported as missing — which is
+    legible, where an invented local path is not.
     """
 
     if text.startswith(SSH_SCHEME) and scheme_of(text) == "ssh":
         remote = RemoteRef.parse(text)
         if remote is not None:
             return remote
+    if scheme_of(text) == "journal":
+        journal = JournalRef.parse(text)
+        if journal is not None:
+            return journal
     return Path(text)
 
 
@@ -562,6 +809,19 @@ def stem_of(ref: SourceRef) -> str:
 
     if isinstance(ref, RemoteRef):
         return f"{ref.node}-{ref.path.name}"
+    if isinstance(ref, JournalRef):
+        # A unit keeps exactly the name it exported under before this type
+        # existed -- `Path("journal:unit/sshd.service").name` was already
+        # `sshd.service`, and it is the name an operator recognises.
+        #
+        # The other two are *changed*, because what they produced was not a
+        # usable filename: the whole journal exported as `journal:all`, colon
+        # included, and a boot exported as the bare offset -- `0`, or `-1`,
+        # which a shell reads as an option rather than a file. `.name` cannot
+        # be reused for them either, since "System journal" and "This boot"
+        # both carry a space.
+        stem = {"all": "journal", "boot": f"boot{ref.value}"}.get(ref.kind, ref.value)
+        return f"{ref.node}-{stem}" if ref.node else stem
     return ref.name
 
 
@@ -589,6 +849,10 @@ def compact_of(ref: SourceRef) -> str:
         parent = ref.path.parent.name
         tail = f"{parent}/{ref.path.name}" if parent else ref.path.name
         return f"{ref.node}:{tail}"
+    if isinstance(ref, JournalRef):
+        # No parent to borrow, so the label stands alone -- qualified by the
+        # machine when there is one, exactly as a remote path is.
+        return f"{ref.node}:{ref.name}" if ref.node else ref.name
     parent = ref.parent.name
     return f"{parent}/{ref.name}" if parent else ref.name
 
@@ -596,7 +860,7 @@ def compact_of(ref: SourceRef) -> str:
 def node_of(ref: SourceRef) -> str:
     """CLV's name for the machine *ref* was read from; ``""`` for this one."""
 
-    return ref.node if isinstance(ref, RemoteRef) else ""
+    return ref.node if isinstance(ref, (RemoteRef, JournalRef)) else ""
 
 
 def column_labels(origins: Sequence[SourceRef]) -> dict[SourceRef, str]:

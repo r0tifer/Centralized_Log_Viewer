@@ -175,12 +175,20 @@ distros.
   absolutises what a *person typed*. Collapsing them is what turns
   `journal:all` into `$CWD/journal:all` on the next launch. Also owns
   `identity` / `ref_key` — one canonical form, replacing the two copies that
-  used to live in `app.py` and `sources.py`. Two implementations now: `Path`,
-  and `RemoteRef` (`ssh:web01/var/log/syslog`) for a source on another machine.
-  The remote type lives here rather than in the SSH plugin because `parse_ref`
-  decodes `session.json` before any plugin is imported — a type registered at
-  import time would decode the same file differently depending on load order.
-  It is pure identity and performs no IO; its backend answers instead.
+  used to live in `app.py` and `sources.py`. Three implementations now:
+  `Path`, `RemoteRef` (`ssh:web01/var/log/syslog`) for a source on another
+  machine, and `JournalRef` (`journal:unit/sshd.service`) for the systemd
+  journal. Neither scheme type lives in the plugin that reads it, because
+  `parse_ref` decodes `session.json` before any plugin is imported — a type
+  registered at import time would decode the same file differently depending on
+  load order. Both are pure identity and perform no IO; a backend answers for a
+  remote ref and a *provider* answers for a journal one, which is the one
+  asymmetry worth knowing. `JournalRef` carries its machine **before** the colon
+  (`journal@web01:unit/sshd.service`), and that is not cosmetic: templated unit
+  names contain `@`, so a node inside the selector would read `unit/getty` as a
+  machine. Every local journal string is byte-identical to what the provider
+  built with `Path` before the type existed, which is what lets an older
+  `session.json` still mean what it meant.
 - `backend.py` — where a source's bytes come from, and **what asking costs**.
   `refs.py` answered what a source is; this answers who reads it. `walk`,
   `list_dir`, `kind`, `access`, `open`, `stat`, `identity`, `classify`,
@@ -429,12 +437,16 @@ holds something. A provider that only implements `open()` still works — core
 wraps it in `IteratorReader` — which is what let this be added without breaking
 anything already written against the interface.
 
-**A provider source is not a path.** `ProviderSource` is its own type, and
-starring, glob filtering and rotated-set grouping all test `isinstance(data,
-Path)` and therefore cannot see one. None of those were generalised to
-accommodate them, deliberately: a journal unit has no directory to walk and no
-file to persist, and putting one in `session.json` would record a path that
-does not exist.
+**A provider source is not a path, but it now carries a ref.**
+`ProviderSource` is its own type — the tree node's payload, holding the label
+and the provider name error attribution needs — and its `path` is the identity.
+For the journal that is a `JournalRef`, which is why a unit can be starred,
+merged with a file, and restored. Glob filtering and rotated-set grouping still
+refuse one and now do so **by name**: a journal has no directory to walk and
+nothing that rotates, and both used to hold only because a provider source was
+not a ref at all. What still cannot reach the starred set is a provider source
+whose `path` is not a concrete ref type — `refs.SOURCE_REF_TYPES` is a closed
+union of types rather than a duck test, precisely so that stays true.
 
 **The journal is a plugin because of consent, not because of layering.**
 Reading it runs `journalctl`, and a plugin may not spawn a subprocess without
@@ -466,7 +478,7 @@ installed" — the trade Item 12 asked for.
   and `workspace` fixtures, and every assertion runs against another backend —
   which is how `RemoteBackend` is held to the same behaviour as `LocalBackend`.
 
-Run: `python -m pytest` (1384 passed, 1 skipped, 11 deselected) on **both** 3.11
+Run: `python -m pytest` (1442 passed, 1 skipped, 11 deselected) on **both** 3.11
 and 3.14 — the local default is 3.14 and a green suite there is not evidence
 that the supported floor still works.
 

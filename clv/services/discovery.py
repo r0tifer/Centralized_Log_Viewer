@@ -28,7 +28,7 @@ from .backend import (
 from .compressed import PROBE_SIZE, is_compressed, probe_block
 from .documents import document_format_for
 from .reader import SNIFF_SIZE, looks_binary_block
-from .refs import SourceRef
+from .refs import JournalRef, SourceRef
 
 #: Skipped unless the user opts in. These are readable files that are not
 #: usefully viewable as text: archives and binary journals. Rotated plain-text
@@ -258,6 +258,15 @@ def matched_glob(path: SourceRef, root: SourceRef, globs: Sequence[str]) -> str 
     """
 
     if not globs:
+        return None
+    if isinstance(path, JournalRef):
+        # A journal source is never glob-filtered, and this is where that is
+        # enforced now that it is a ref. It used to be enforced by accident --
+        # a journal source was not a `Path`, so it never reached discovery at
+        # all. Two reasons it must be explicit: `relative_to` *raises* on one of
+        # these (and raises a `TypeError`, which the `except ValueError` below
+        # does not catch), and globs describe filenames, so `*.service` would
+        # otherwise hide every unit on the machine.
         return None
     name = path.name
     try:

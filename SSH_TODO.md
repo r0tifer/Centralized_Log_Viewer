@@ -23,7 +23,8 @@ filesystem assumption that had already spread further.
 | 6 — Parity | Star, merge, rotation, hierarchy, time, session | ✅ **Complete** |
 | 7 — Remote UI | Host dialog, cross-host merge, `node` in the chrome | ✅ **Complete** |
 | 8 — Documentation & release | README, `settings.conf`, help overlay, version | ✅ **Complete** (2.8.0) |
-| 9 — The remote journal | `journalctl` over the same transport | ⬜ Not started |
+| 9a — Journal identity | `JournalRef`: the journal becomes a real source | ✅ **Complete** (2.9.0) |
+| 9b — The remote journal | `journalctl` over the same transport | ⬜ Not started |
 
 ---
 
@@ -1682,6 +1683,105 @@ and filters, and a merged view of one unit across two hosts orders correctly.
 Both Python versions.
 
 **Commit.** `feat(ssh): read the systemd journal on remote hosts`
+
+### As built — 9a, the identity half
+
+The phase is **two** commits, not one, and the split was forced by a
+contradiction in the plan above rather than chosen for size.
+
+- **"Almost nothing new is needed" was wrong, and the bullet that proves it is
+  in this very section.** The transport really is close to free — `command()`
+  already returns an argv and `translate()` already converts records, both
+  transport-independent. But this phase also promises *"a merged view of the
+  same unit across a fleet"*, and merging takes a **ref**, while a journal
+  source was a `ProviderSource` — a type whose entire purpose was to be
+  invisible to starring and merging. The promise was unbuildable as written.
+  9a is the identity work that makes it buildable; 9b is the transport.
+
+- **9a ships a user-visible feature on its own**, which is why it is `feat` and
+  has its own release. The moment `refs.is_source_ref` admits `JournalRef`, a
+  **local** journal unit can be starred and merged. Landing that silently and
+  announcing it with 9b would have been a shipped document understating the
+  build — Phase 0's lie in reverse.
+
+- **The machine goes before the colon, and one input decided it.**
+  `journal@web01:unit/sshd.service`, not `journal:web01/unit/...` or an
+  `@`-separated selector. Templated unit names **contain `@`** —
+  `getty@tty1.service`, `user@1000.service` — so splitting the selector on its
+  first `@` yields a machine called `unit/getty`. A scheme token can contain
+  neither `@` nor `:`, so the split before the colon happens exactly once and in
+  the only place it could. `_SCHEME_RE` grew an optional group; every existing
+  `ssh:` and `journal:` string is untouched, which is what let the whole suite
+  pass unedited.
+
+- **The local string form is byte-identical to what `Path` produced**, and that
+  is the entire back-compatibility story. `journal:unit/sshd.service` is what is
+  in the field's `session.json` files today, and it parses to a `JournalRef`
+  that formats back to the same bytes.
+
+- **Two thirds of the old exclusion were right and are now enforced by name.**
+  Glob filtering and rotated-set grouping still refuse a journal source —
+  `discovery.matched_glob` and `rotation.group_rotated` reject one explicitly —
+  because a journal has no directory to walk and nothing that rotates. They used
+  to hold only because a journal source was not a `Path` and never reached
+  either function. `JournalRef.suffix` returns `""` for the same reason:
+  `sshd.service` ends in something that reads like a suffix and is not, and
+  `exclude_globs = *.service` hiding every unit on the machine would be a glob
+  about filenames silently filtering something that is not a file.
+
+- **`check_access` was a crash, not a wrong answer**, and this is the phase's
+  most useful finding. It dispatches on `backend.kind(ref)`; `LocalBackend.kind`
+  asks `ref.is_dir()` inside `except (PermissionError, OSError)`; and
+  `JournalRefIOError` is a **`TypeError`**, which that does not catch. The
+  journal branch therefore goes *before* the backend call, not into a backend.
+  Pinned by a test that asserts the raise directly, so the ordering cannot be
+  tidied away by someone who assumes the guard is defensive.
+
+- **`_open_reader` is the seam, and it is one branch.** The session's reader
+  factory already dispatched `RemoteRef` → `RemoteFollowReader`; a `JournalRef`
+  branch beside it routes to the provider. That single edit is what makes a
+  journal ref *mergeable and restorable* rather than merely clickable, because
+  `open_single`, `prepare_many` and `open_rotated` all build through that
+  factory. `PluginRegistry.reader_for_ref` is its other half: `open_source`
+  takes the record the operator clicked, and a restored source has only a string.
+
+- **The starred group would have silently not worked.** It is built from
+  `report.files`, and nothing *walks* to a journal unit — so a star would have
+  been taken, persisted, and then shown nothing. Provider sources are folded
+  into that group and into `_open_starred_on_launch`'s availability set.
+
+- **An unavailable unit is reported and the star is kept.** "The journal is off"
+  and "that unit is gone" are different facts and neither is *"does not exist"*,
+  which is what the filesystem answer would have been. Keeping the star means
+  toggling `enable_journald` off and on does not cost the operator their
+  favourites.
+
+- **`JournalReader` normalises its own `path`.** It is reachable with the string
+  form — `open_reader` takes whatever its caller holds — and a `Path` reaching
+  `command()` would have dropped the selector and asked `journalctl` for the
+  **whole journal** when one unit was meant. That reads as a working source with
+  far too much in it, which is worse than an error. Two existing tests construct
+  it with a `Path` and pass unedited because of this.
+
+- **`hasattr` lies about a raising property.** `parent` raises, so
+  `hasattr(ref, "parent")` invokes it, swallows the exception and answers
+  `False` — which broke the protocol-coverage test until it was asked of the
+  *class* instead. Nothing in `clv/` does `hasattr` on a ref, checked rather
+  than assumed, so no caller is misled; the test says so in its docstring
+  because a `hasattr` guard added later would silently take the wrong branch.
+
+- **`stem_of` moved for two shapes and deliberately not for the third.** A unit
+  still exports as `sshd.service`, which an existing assertion pins and which
+  passes unedited. The whole journal used to export as `journal:all` — a colon
+  in a filename — and a boot as the bare offset `-1`, which a shell reads as an
+  option rather than a file. Those two are now `journal` and `boot-1`.
+
+- **1384 + 58 = 1442 passed, 1 skipped, 11 deselected** on 3.11 and 3.14. No
+  existing assertion edited: `git diff -- tests/` removes exactly one line, an
+  import replaced by a longer version of itself.
+
+**Commit.** `feat(journal): make a journal source a first-class ref`, then
+`release: 2.9.0`.
 
 ---
 

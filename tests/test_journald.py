@@ -28,8 +28,13 @@ from clv.plugins import (
 from clv.plugins.sources import journald
 from clv.services import SourceManager, persist_setting
 from clv.services.config import load_config, user_config_path
+from clv.services.discovery import matched_glob
 from clv.services.parsing import parse_line
-from clv.services.session import SourceSession
+from clv.services.refs import JournalRef, format_ref, parse_ref
+from clv.services.rotation import group_rotated
+from clv.services.session import ORIGIN_FIELD, SourceSession
+from clv.services.sources import check_access
+from clv.storage import SessionState, StateStore
 
 # One captured `journalctl -o json` record per line, trimmed to the fields that
 # matter. Real output has ~30 keys; the shape is what is being tested.
@@ -752,3 +757,242 @@ def test_the_follow_subprocess_gets_the_cleaned_environment() -> None:
     journald.JournalReader(Path("journal:all"), max_lines=10, spawn=spawn).prime()
 
     assert "env" in captured, "the follow inherited the bundle's library path"
+
+
+# --- the journal as a first-class source ------------------------------------
+#
+# A journal source used to be a `ProviderSource` holding a `Path`, and both
+# halves of that mattered: the record kept it out of starring and merging, and
+# the `Path` was an identifier nothing on disk answered to. The record is still
+# there, but its `path` is a `JournalRef` now — so a unit can be starred,
+# merged with a file, and restored on the next launch.
+#
+# What must *not* have changed is the string form, because that is what an
+# existing `session.json` contains. `tests/test_refs.py` pins that; these pin
+# what it buys.
+
+
+class _Journal(LogSourceProvider):
+    """A journald provider with no journald: the same refs, canned lines.
+
+    The real provider shells out to `journalctl`, which the suite may not have
+    and must not need. What is under test here is what the *app* does with a
+    journal ref, so the transport is exactly the part to fake away.
+    """
+
+    name = "systemd journal"
+
+    def __init__(self) -> None:
+        self.opened: list[object] = []
+
+    def discover(self):
+        return [
+            ProviderSource(JournalRef("", "all"), "System journal", self.name),
+            ProviderSource(JournalRef("", "unit", "sshd.service"), "sshd.service", self.name),
+        ]
+
+    def open(self, path):
+        self.opened.append(path)
+        return iter(["2026-08-11 10:00:30 - INFO - from the journal"])
+
+
+def test_a_journal_source_carries_a_ref_not_a_path() -> None:
+    """The type change, at the point it is produced."""
+
+    found = PluginRegistry(sources=[_Journal()]).discover_sources()
+
+    assert [type(source.path) for source in found] == [JournalRef, JournalRef]
+    assert [str(source.path) for source in found] == [
+        "journal:all",
+        "journal:unit/sshd.service",
+    ]
+
+
+def test_a_journal_ref_can_be_opened_from_its_identity_alone() -> None:
+    """What a *restored* source is: a string, with no tree node behind it.
+
+    `open_source` takes the record the operator clicked. Starring, merging and
+    session restore have only the ref, which is why `reader_for_ref` exists —
+    without it a starred unit could be persisted and never reopened.
+    """
+
+    registry = PluginRegistry(sources=[_Journal()])
+    registry.discover_sources()
+
+    reader = registry.reader_for_ref(JournalRef("", "unit", "sshd.service"), max_lines=10)
+
+    assert reader is not None
+    assert registry.offers(JournalRef("", "unit", "sshd.service"))
+    assert not registry.offers(JournalRef("", "unit", "nginx.service"))
+
+
+def test_an_unoffered_journal_ref_reads_as_absent_rather_than_broken() -> None:
+    """The journal being off is the ordinary case, not a plugin failure."""
+
+    registry = PluginRegistry(sources=[_Journal()])
+    registry.discover_sources()
+
+    assert registry.reader_for_ref(JournalRef("", "unit", "gone.service"), max_lines=10) is None
+    assert registry.errors == [], "an absent source is not an error to report"
+
+
+def test_a_journal_unit_can_be_starred_and_comes_back(tmp_path: Path) -> None:
+    """Star, persist, restore — the whole point of the type change.
+
+    Also asserts it reaches the **starred group**, which is the part that would
+    silently not work: that group is built from `report.files`, and nothing
+    walks to a journal unit.
+    """
+
+    unit = JournalRef("", "unit", "sshd.service")
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            app._plugins = PluginRegistry(sources=[_Journal()])
+            app._source_manager = SourceManager([], [])
+            await app._rescan()
+            await pilot.pause()
+
+            tree = app.query_one("#source-tree", LogTree)
+            node = next(
+                node
+                for node in _walk(tree.root)
+                if isinstance(node.data, ProviderSource) and node.data.path == unit
+            )
+            # The Providers group ships collapsed, so the cursor cannot reach a
+            # child until it is opened -- `move_cursor` would land on the group.
+            node.parent.expand()
+            await pilot.pause()
+            tree.focus()
+            tree.move_cursor(node)
+            await pilot.pause()
+            assert tree.cursor_node is node
+
+            # The tree cursor is on a provider node; the star target is its ref.
+            assert app._star_target() == unit
+            # And the merge gesture unwraps the same way, so `x` works here too.
+            assert app._merge_target() == unit
+
+            await app.action_toggle_star()
+            await pilot.pause()
+
+            assert format_ref(unit) in app.state.starred
+
+            # And it is listed under Starred, not only under Providers.
+            await app._rescan()
+            await pilot.pause()
+            tree = app.query_one("#source-tree", LogTree)
+            starred_group = next(
+                node for node in _walk(tree.root) if "Starred" in str(node.label)
+            )
+            assert unit in [child.data for child in starred_group.children]
+
+    asyncio.run(scenario())
+
+
+def test_a_starred_unit_survives_a_restart(tmp_path: Path) -> None:
+    """`session.json` holds the string; `parse_ref` has to give the ref back."""
+
+    unit = JournalRef("", "unit", "sshd.service")
+    state = SessionState(starred=(format_ref(unit),))
+
+    store = StateStore(tmp_path / "session.json")
+    store.save(state)
+
+    restored = store.load()
+
+    assert restored.starred == (format_ref(unit),)
+    assert parse_ref(restored.starred[0]) == unit
+
+
+def test_a_journal_unit_merges_with_a_file(tmp_path: Path) -> None:
+    """The capability the ref type exists for, in its local form.
+
+    `prepare_many` builds every member through the session's reader factory, so
+    a journal ref that the factory cannot answer for is one that can be added to
+    a merged set and then fail to open it.
+    """
+
+    log = tmp_path / "app.log"
+    log.write_text("2026-08-11 10:00:00 - INFO - a file\n", encoding="utf-8")
+    unit = JournalRef("", "unit", "sshd.service")
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            app._plugins = PluginRegistry(sources=[_Journal()])
+            app._source_manager = SourceManager([], [log])
+            await app._rescan()
+            await pilot.pause()
+
+            buffers, failed = app._session.open_many([log, unit])
+
+            assert failed == [], f"a member would not open: {failed}"
+            assert [buffer.path for buffer in buffers] == [log, unit]
+
+            messages = sorted(entry.message for entry in app._entries)
+            assert messages == ["a file", "from the journal"]
+
+            # Provenance: which machine, and which source, each line came from.
+            origins = {entry.fields.get(ORIGIN_FIELD) for entry in app._entries}
+            assert origins == {str(log), "journal:unit/sshd.service"}
+
+    asyncio.run(scenario())
+
+
+def test_a_journal_ref_is_never_rotated_or_glob_filtered() -> None:
+    """Two thirds of the old exclusion, now enforced by name rather than by luck.
+
+    Before the type change these held because a journal source was not a `Path`
+    and so never reached either function. It reaches both now.
+    """
+
+    unit = JournalRef("", "unit", "sshd.service")
+
+    sets, singles = group_rotated([unit, Path("/var/log/a.log"), Path("/var/log/a.log.1")])
+
+    assert unit in singles
+    assert all(unit not in rotated.members for rotated in sets)
+    # `*.service` describes filenames. A unit is not one, however it reads.
+    assert matched_glob(unit, Path("/"), ["*.service", "*"]) is None
+
+
+def test_the_journal_being_off_is_reported_as_a_switch_not_a_missing_file(
+    monkeypatch,
+) -> None:
+    """Requirement 7 applied to the journal: three facts, three messages.
+
+    Reporting this as *"does not exist"* — the filesystem answer, and what
+    `check_access` produced before it learned about journal refs — sends the
+    operator looking for a file that was never there.
+    """
+
+    monkeypatch.setattr(journald, "enabled", lambda: False)
+
+    allowed, reason = check_access(JournalRef("", "unit", "sshd.service"))
+
+    assert allowed is False
+    assert "does not exist" not in reason
+    assert "enable_journald" in reason
+
+
+def test_check_access_does_not_crash_on_a_journal_ref() -> None:
+    """The branch exists because the backend *raises* on one of these.
+
+    `LocalBackend.kind` asks `ref.is_dir()`, a journal ref answers with
+    `JournalRefIOError`, and that is a `TypeError` — which the
+    `except (PermissionError, OSError)` around it does not catch. Without the
+    branch this is a crash rather than a wrong answer, so the crash is asserted
+    directly rather than trusted to stay prevented.
+    """
+
+    from clv.services.backend import LOCAL
+
+    with pytest.raises(TypeError):
+        LOCAL.kind(JournalRef("", "unit", "sshd.service"))
+
+    # And with the branch, it is a clean verdict.
+    allowed, reason = check_access(JournalRef("", "unit", "sshd.service"))
+    assert isinstance(allowed, bool)
+    assert allowed or reason

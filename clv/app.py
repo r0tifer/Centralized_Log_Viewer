@@ -54,6 +54,7 @@ from .plugins import (
     load_plugins,
 )
 from .services import SourceManager, persist_log_sources, persist_setting
+from .services.sources import check_access
 from .services.backend import LOCAL, RECONNECT_ATTEMPTS, backoff_for
 from .services.clipboard import prepare_payload
 from .services.clustering import (
@@ -114,6 +115,7 @@ from .services.query import (
     entry_matches,
 )
 from .services.refs import (
+    JournalRef,
     RemoteRef,
     SourceRef,
     column_labels,
@@ -1040,6 +1042,27 @@ class LogViewerApp(App[None]):
         # one answers for its set and says so. Trusting it rather than
         # re-resolving keeps one answer per set, and avoids the duplicate
         # keyword that made this a TypeError.
+        # A journal source has no backend at all -- a *provider* reads it -- so
+        # it is answered before one is resolved. This branch is what makes a
+        # journal unit mergeable and restorable rather than only clickable:
+        # `open_single`, `prepare_many` and `open_rotated` all build their
+        # readers through this factory, so a ref that cannot be built here is a
+        # ref that can only ever be opened by selecting it in the tree.
+        if isinstance(path, JournalRef):
+            reader = self._plugins.reader_for_ref(
+                path, max_lines=kwargs.get("max_lines", self._config.max_buffer_lines)
+            )
+            if reader is None:
+                # An `OSError`, because that is what every caller of this
+                # factory already handles: `prepare_many` collects it per member
+                # so one dead journal source cannot cost a merge the others,
+                # and `open_single` lets it through to be reported. The message
+                # comes from `check_access`, so "the journal is off" reads the
+                # same here as it does when adding a source by hand.
+                _allowed, reason = check_access(path)
+                raise OSError(reason or f"No provider offers {path}.")
+            return reader
+
         backend = kwargs.pop("backend", None) or self._backends.for_ref(path)
         if isinstance(path, RemoteRef) and hasattr(backend, "connection"):
             from .plugins.sources.ssh import RemoteFollowReader
@@ -1304,6 +1327,19 @@ class LogViewerApp(App[None]):
         present = sorted(
             (item.path for item in report.files if identity(item.path) in starred),
             key=lambda p: str(p).lower(),
+        )
+        # Provider sources are eligible too, and were not until journal sources
+        # became refs. Starring one used to be impossible; now that it is not,
+        # leaving them out here would be worse than the old refusal — the star
+        # would take, persist, and then show nothing, because `report.files`
+        # holds what discovery *walked* and nothing walks to a journal unit.
+        present += sorted(
+            (
+                source.path
+                for source in self._provider_sources
+                if is_source_ref(source.path) and identity(source.path) in starred
+            ),
+            key=lambda ref: str(ref).lower(),
         )
         if present:
             group = tree.root.add(STARRED_GROUP, data=None, expand=False)
@@ -1670,6 +1706,8 @@ class LogViewerApp(App[None]):
             data = tree.cursor_node.data
             if isinstance(data, RotatedSet):
                 return data.head
+            if isinstance(data, ProviderSource) and is_source_ref(data.path):
+                return data.path
             if is_source_ref(data):
                 return data
         return self._star_target()
@@ -4019,6 +4057,12 @@ class LogViewerApp(App[None]):
             if tree is None or tree.cursor_node is None:
                 return None
             data = tree.cursor_node.data
+            # A provider node carries the record, not the ref; the ref is what
+            # gets starred. Unwrapped here rather than in `_is_file_node`,
+            # because a journal unit is emphatically not a *file* and widening
+            # that predicate would let one into the folder hierarchy.
+            if isinstance(data, ProviderSource):
+                return data.path if is_source_ref(data.path) else None
             # `_is_file_node`, not `data.is_file()`: a remote ref cannot answer
             # that without a round trip, and this runs on every cursor move.
             return data if self._is_file_node(data) else None
@@ -4079,12 +4123,30 @@ class LogViewerApp(App[None]):
         if report is None or not self.state.starred:
             return
 
+        # A journal unit is discoverable without having been *walked*, so
+        # availability is the union of what the walk found and what the
+        # providers offered. Leaving the second half out would report every
+        # starred unit as unavailable on every launch, while the tree showed it
+        # sitting there.
         discovered = {identity(item.path) for item in report.files}
+        discovered |= {
+            identity(source.path)
+            for source in self._provider_sources
+            if is_source_ref(source.path)
+        }
         starred = [parse_ref(entry) for entry in self.state.starred]
         present = [path for path in starred if identity(path) in discovered]
 
         for path in starred:
-            if identity(path) not in discovered:
+            if identity(path) in discovered:
+                continue
+            # Why it is unavailable is worth saying for a journal source, where
+            # the usual answer is a switch rather than a missing file. The star
+            # is kept either way — flipping the switch should bring it back.
+            if isinstance(path, JournalRef):
+                _allowed, reason = check_access(path)
+                self._notify(reason or f"Starred journal source is not available: {path}", "warning")
+            else:
                 self._notify(f"Starred log is not available: {path}", "warning")
 
         if len(present) == 1:

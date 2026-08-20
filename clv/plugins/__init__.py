@@ -33,6 +33,7 @@ from typing import Any, Iterable, Iterator, Optional, Sequence
 
 from ..services.filtering import FilterSpec
 from ..services.parsing import LogEntry
+from ..services.refs import SourceRef
 
 #: Entry point group installed packages use to advertise CLV plugins.
 ENTRY_POINT_GROUP = "clv.plugins"
@@ -62,27 +63,34 @@ class Plugin(ABC):
 class ProviderSource:
     """One source a provider offers, and who offered it.
 
-    A provider's sources are **not** filesystem paths, even though they are
-    identified by one: nothing on disk answers to ``journal:unit/sshd.service``.
-    That is deliberate and is what keeps them out of every operation that
-    assumes a real file — starring (which persists a path), include/exclude
-    globs (which describe a directory walk), and the rotated-set grouping. A
-    provider source is a different kind of thing, and pretending otherwise is
-    how it would end up in someone's ``session.json`` as a path that does not
-    exist.
+    A provider's sources are **not** filesystem paths, even though they look
+    like one: nothing on disk answers to ``journal:unit/sshd.service``. That is
+    still true and still matters — it is what keeps them out of include/exclude
+    globs (which describe a directory walk) and out of rotated-set grouping
+    (which is name arithmetic over files that rotate).
 
-    **What excludes one is the type, and it still does.** Those operations test
-    ``refs.is_source_ref`` — a closed union of the concrete ``SourceRef``
-    implementations — and a tree node offering a provider source carries *this
-    record*, not a ref, so none of them can see it. The test used to be spelled
-    ``isinstance(data, Path)``, which meant the same thing for exactly as long
-    as ``Path`` was the only implementation; ``RemoteRef`` made it two, and the
-    union is what kept this guarantee intact while the set of ref types grew.
-    Widening it to "anything source-shaped" is what would let one of these
-    through, which is why it is a union of types rather than a duck test.
+    **What that exclusion used to cover, and no longer does.** Starring and
+    merging were on the list, and they were on it for a reason that did not
+    survive examination: a provider source was not a ``SourceRef``, so
+    ``refs.is_source_ref`` could not see it, so it could not be starred. That
+    was cheap rather than right. A journal unit is the clearest case of a source
+    someone wants starred, and comparing one unit across a fleet is the workflow
+    remote sources exist for. :class:`~clv.services.refs.JournalRef` is now a
+    ref, so both work.
+
+    **This record is still not a ref, and that is what keeps the rest honest.**
+    It is the *tree node's* payload: :attr:`path` carries the identity and this
+    carries the label and the provider name that error attribution needs. A
+    provider offering something that genuinely is not a source identity still
+    cannot reach the starred set, because the union is over concrete ref types
+    rather than over "anything source-shaped" — which is why it is a union of
+    types and not a duck test.
     """
 
-    path: Path
+    #: The source's identity. A ``JournalRef`` for the journal; a provider that
+    #: has no ref type of its own may still hand back a ``Path``, which is what
+    #: ``LogSourceProvider.discover``'s bare-identifier contract allows.
+    path: SourceRef
     label: str
     #: The provider's own name, for the tree group and for error attribution.
     provider: str = ""
@@ -774,6 +782,55 @@ class PluginRegistry:
         except Exception as exc:  # noqa: BLE001 - third-party code
             self.errors.append(PluginError(name, f"open() raised: {exc}"))
             return None
+
+    def reader_for_ref(self, ref: SourceRef, *, max_lines: int) -> Optional[Any]:
+        """Build a reader for a **ref** a provider offers, or ``None``.
+
+        :meth:`open_source` takes the tree node's record, which is what the
+        operator clicked. This takes the identity alone, which is what a
+        *restored* source is: ``session.json`` stores ``journal:unit/sshd.service``
+        and nothing else, so opening a starred unit at launch, or merging one
+        with a file, has no ``ProviderSource`` to hand.
+
+        Resolution is by ref rather than by ``(provider, path)`` because a
+        stored ref names no provider — the same fallback ``_resolve_owner``
+        already makes for a record built by hand, and it refuses an ambiguous
+        answer for the same reason: resolving by luck is the defect that key was
+        widened to fix.
+
+        ``None`` when nothing offers it, which is the ordinary case rather than
+        an error: the journal is off, or the unit no longer exists.
+        ``sources.check_access`` is where that becomes a message.
+        """
+
+        candidates = {
+            owner: holder
+            for (owner, path), holder in self._owners.items()
+            if path == ref
+        }
+        if len(candidates) != 1:
+            return None
+        provider = next(iter(candidates.values()))
+        if self.is_disabled(provider):
+            return None
+        name = _plugin_name(provider)
+        try:
+            reader = provider.open_reader(ref, max_lines=max_lines)
+            if reader is not None:
+                return reader
+            return IteratorReader(ref, iter(provider.open(ref)), max_lines=max_lines)
+        except Exception as exc:  # noqa: BLE001 - third-party code
+            self.errors.append(PluginError(name, f"open() raised: {exc}"))
+            return None
+
+    def offers(self, ref: SourceRef) -> bool:
+        """Whether any loaded provider currently offers *ref*.
+
+        Cheap and side-effect free, so the tree and ``check_access`` can ask on
+        every render without opening anything.
+        """
+
+        return any(path == ref for _owner, path in self._owners)
 
     def _resolve_owner(self, source: ProviderSource) -> Optional[LogSourceProvider]:
         """Find the provider that offered *source*.

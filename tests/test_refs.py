@@ -915,3 +915,263 @@ def test_stem_of_leaves_a_scheme_ref_alone() -> None:
     `stem_of` must not invent a machine for one."""
 
     assert stem_of(parse_ref("journal:unit/sshd.service")) == "sshd.service"
+
+
+# --- the journal, which is a ref now ----------------------------------------
+#
+# It used to be a `Path` holding an identifier, and the type change is what
+# lets a unit be starred and merged. The string form is deliberately unchanged
+# for a local journal: that is what makes an existing `session.json` still mean
+# what it meant, and it is why the tests above needed no edits.
+
+
+JOURNAL_SHAPES = [
+    "journal:all",
+    "journal:boot/0",
+    "journal:boot/-1",
+    "journal:unit/sshd.service",
+    # Templated units. `getty@tty1.service` is the input that breaks any design
+    # putting the machine name inside the selector, which is the whole reason
+    # the node sits before the colon instead.
+    "journal:unit/getty@tty1.service",
+    "journal:unit/user@1000.service",
+    "journal@web01:all",
+    "journal@web01:unit/sshd.service",
+    "journal@db02:boot/-1",
+    "journal@web01:unit/getty@tty1.service",
+]
+
+
+@pytest.mark.parametrize("text", JOURNAL_SHAPES)
+def test_a_journal_ref_round_trips_exactly(text: str) -> None:
+    """`parse_ref` and `format_ref` are inverses on every journal shape."""
+
+    ref = parse_ref(text)
+
+    assert isinstance(ref, refs.JournalRef)
+    assert format_ref(ref) == text
+
+
+@pytest.mark.parametrize("text", JOURNAL_SHAPES)
+def test_a_journal_ref_survives_a_state_round_trip(text: str) -> None:
+    """The regression the string form exists for.
+
+    A ref string containing a colon, and now sometimes an `@`, has to come back
+    out of `StateStore` unchanged — and must carry neither of the two characters
+    that would corrupt something else on the way: `log_dirs` is comma-separated
+    and a mark key separates on NUL.
+    """
+
+    ref = parse_ref(text)
+
+    assert parse_ref(format_ref(ref)) == ref
+    assert "," not in format_ref(ref), "log_dirs is comma-separated"
+    assert "\0" not in format_ref(ref), "mark_key separates on NUL"
+
+
+def test_a_templated_unit_is_not_mistaken_for_a_machine() -> None:
+    """The single input a naive `@` split gets wrong.
+
+    `unit/getty@tty1.service` partitioned on its first `@` yields a machine
+    called `unit/getty`. The node goes before the colon precisely so that this
+    cannot happen, and this is the assertion that says so.
+    """
+
+    local = parse_ref("journal:unit/getty@tty1.service")
+    remote = parse_ref("journal@web01:unit/getty@tty1.service")
+
+    assert local.node == ""
+    assert local.value == "getty@tty1.service"
+    assert remote.node == "web01"
+    assert remote.value == "getty@tty1.service"
+    assert local != remote
+
+
+def test_the_local_journal_spelling_is_byte_for_byte_what_it_always_was() -> None:
+    """What a `session.json` written before this type existed contains.
+
+    The provider used to build `Path(f"journal:{selector}")`, so these exact
+    strings are on disk in the field. They must parse, and they must come back
+    out identical — anything else silently orphans a starred unit.
+    """
+
+    for text in ("journal:all", "journal:boot/0", "journal:unit/sshd.service"):
+        assert str(parse_ref(text)) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "journal:",             # no selector
+        "journal:nonsense",     # not one of the three kinds
+        "journal:all/extra",    # `all` takes no value
+        "journal:unit",         # `unit` requires one
+        "journal:boot",
+        "journal@:all",         # an empty machine name
+    ],
+)
+def test_a_malformed_journal_string_degrades_to_a_path(text: str) -> None:
+    """`parse_ref` is on the restore path and has nowhere to report to.
+
+    One bad entry must cost that entry, not the session — so it falls through
+    to a `Path`, which resolves to nothing and is reported as missing. Legible,
+    where an invented local path is not.
+    """
+
+    assert isinstance(parse_ref(text), Path)
+
+
+def test_a_journal_ref_is_a_source_ref() -> None:
+    """The change that makes starring and merging work at all."""
+
+    assert refs.is_source_ref(parse_ref("journal:unit/sshd.service"))
+    assert refs.JournalRef in refs.SOURCE_REF_TYPES
+
+
+def test_a_journal_ref_covers_the_protocol() -> None:
+    """Every member, even the ones it answers by raising.
+
+    Asked of the **class**, not of an instance, and the difference is not
+    pedantry: `parent` is a property that raises, so `hasattr(ref, "parent")`
+    invokes it, swallows the exception and answers False. Conformance is a
+    property of the type, and asking the type is also what stops this test
+    passing for the wrong reason.
+
+    Nothing in `clv/` does `hasattr` on a ref, so the instance-level answer
+    misleads no caller — checked rather than assumed, because a `hasattr` guard
+    added later would silently take the wrong branch for a journal source.
+    """
+
+    missing = [
+        member
+        for member in refs.PROTOCOL_MEMBERS
+        if not hasattr(refs.JournalRef, member)
+    ]
+
+    assert not missing, f"JournalRef is missing {missing}"
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["exists", "is_file", "is_dir", "stat", "open"],
+)
+def test_a_journal_ref_refuses_io(operation: str) -> None:
+    """A provider reads it. A caller reaching for IO here is a rotted seam.
+
+    `JournalRefIOError` is a `TypeError` rather than an `OSError` on purpose:
+    the `except OSError` guards through discovery and the session would
+    otherwise swallow it into a plausible-looking "source unavailable".
+    """
+
+    ref = parse_ref("journal:unit/sshd.service")
+
+    with pytest.raises(refs.JournalRefIOError):
+        getattr(ref, operation)()
+    assert issubclass(refs.JournalRefIOError, TypeError)
+    assert not issubclass(refs.JournalRefIOError, OSError)
+
+
+@pytest.mark.parametrize("operation", ["parent", "relative_to", "with_suffix", "__truediv__"])
+def test_a_journal_ref_has_no_hierarchy(operation: str) -> None:
+    """It is not in a directory, so it has no parent and no relative form."""
+
+    ref = parse_ref("journal:unit/sshd.service")
+
+    with pytest.raises(refs.JournalRefIOError):
+        if operation == "parent":
+            ref.parent
+        elif operation == "relative_to":
+            ref.relative_to(Path("/"))
+        elif operation == "with_suffix":
+            ref.with_suffix(".txt")
+        else:
+            ref / "x"
+
+
+def test_a_journal_ref_reports_no_suffix() -> None:
+    """`sshd.service` ends in something that looks like one, and is not.
+
+    Returning `.service` would let `exclude_globs = *.service` hide every unit
+    — a glob written about filenames silently filtering something that is not a
+    file — and would give rotated-set grouping a suffix to strip.
+    """
+
+    assert parse_ref("journal:unit/sshd.service").suffix == ""
+
+
+def test_the_machine_is_readable_off_a_journal_ref() -> None:
+    assert refs.node_of(parse_ref("journal@web01:unit/sshd.service")) == "web01"
+    assert refs.node_of(parse_ref("journal:unit/sshd.service")) == ""
+
+
+def test_two_machines_running_one_unit_are_two_identities() -> None:
+    """The `source:` disambiguation, applied to units.
+
+    `ORIGIN_FIELD` is `str(ref)`, so an unqualified unit name would make
+    `source:sshd.service` match every machine in a fleet merge at once.
+    """
+
+    web01 = parse_ref("journal@web01:unit/sshd.service")
+    db02 = parse_ref("journal@db02:unit/sshd.service")
+
+    assert web01 != db02
+    assert ref_key(web01) != ref_key(db02)
+    assert stem_of(web01) != stem_of(db02)
+    assert refs.compact_of(web01) != refs.compact_of(db02)
+
+
+def test_a_journal_ref_is_its_own_identity() -> None:
+    """Resolving one would invent a working-directory path for a non-location."""
+
+    ref = parse_ref("journal:unit/sshd.service")
+
+    assert identity(ref) is ref
+    assert normalize_ref("journal:unit/sshd.service") == ref
+
+
+def test_the_export_stem_keeps_the_name_a_unit_always_had() -> None:
+    """A unit exported as `sshd.service` before this type existed. Still does.
+
+    The other two shapes are deliberately *changed*, because what they produced
+    was not a usable filename: the whole journal exported as `journal:all`,
+    colon included, and a boot exported as the bare offset — `-1`, which a
+    shell reads as an option rather than a file.
+    """
+
+    assert stem_of(parse_ref("journal:unit/sshd.service")) == "sshd.service"
+    assert stem_of(parse_ref("journal:all")) == "journal"
+    assert stem_of(parse_ref("journal:boot/-1")) == "boot-1"
+    assert stem_of(parse_ref("journal@web01:unit/sshd.service")) == "web01-sshd.service"
+
+
+def test_the_label_is_not_the_selector() -> None:
+    """`all` names nothing an operator would recognise."""
+
+    assert parse_ref("journal:all").name == "System journal"
+    assert parse_ref("journal:boot/0").name == "This boot"
+    assert parse_ref("journal:unit/sshd.service").name == "sshd.service"
+
+
+def test_the_ssh_scheme_is_unaffected_by_the_widened_pattern() -> None:
+    """The node group is optional, so every existing shape still parses.
+
+    Guarding the regex change itself: `ssh:` refs carry their machine *after*
+    the colon and must not start being read the new way.
+    """
+
+    ref = parse_ref("ssh:web01/var/log/syslog")
+
+    assert isinstance(ref, RemoteRef)
+    assert ref.node == "web01"
+    assert scheme_of("ssh:web01/var/log/syslog") == "ssh"
+    assert refs.node_of_scheme("ssh:web01/var/log/syslog") == ""
+
+
+def test_split_scheme_does_not_hand_back_the_machine() -> None:
+    """The arithmetic that a node between scheme and colon would have broken."""
+
+    assert split_scheme("journal:unit/sshd.service") == ("journal", "unit/sshd.service")
+    assert split_scheme("journal@web01:unit/sshd.service") == (
+        "journal",
+        "unit/sshd.service",
+    )

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Iterable, Literal, Sequence
 
 from .backend import LOCAL, LOCAL_ACCESS_HINT, BackendResolver, SourceBackend
-from .refs import SourceRef, identity, normalize_ref, ref_key
+from .refs import JournalRef, SourceRef, identity, normalize_ref, ref_key
 from .settings_file import DEFAULT_SECTION, SettingsDocument
 
 
@@ -66,6 +66,9 @@ def check_access(
     ``SourceBackend.list_dir`` exists and *raises*, where ``walk`` skips.
     """
 
+    if isinstance(path, JournalRef):
+        return _check_journal(path)
+
     hint = backend.capabilities.access_hint
     kind = backend.kind(path)
 
@@ -92,6 +95,54 @@ def check_access(
         return True, None
 
     return False, f"Path '{path}' is neither a file nor a directory."
+
+
+#: What to tell an operator whose journal source cannot be reached.
+#:
+#: Three different facts, and they must not collapse into one. "The switch is
+#: off" is fixed by flipping it; "this machine has no journal" is not fixable at
+#: all; "that unit is gone" means the source was real and has stopped being so.
+#: Reporting any of them as *"does not exist"* -- which is what the filesystem
+#: answer would have been -- sends the operator looking for a missing file.
+JOURNAL_DISABLED_HINT = (
+    "The systemd journal is off. Turn on the Journal (systemd) switch in the "
+    "Advanced drawer, or set enable_journald = true."
+)
+
+
+def _check_journal(ref: JournalRef) -> tuple[bool, str | None]:
+    """Whether the journal can answer for *ref*, and why not when it cannot.
+
+    Kept ahead of the backend call in :func:`check_access` rather than folded
+    into a backend, and that ordering is load-bearing rather than stylistic:
+    ``LocalBackend.kind`` asks ``ref.is_dir()``, a ``JournalRef`` raises
+    ``JournalRefIOError`` for that, and ``JournalRefIOError`` is a ``TypeError``
+    -- which the ``except (PermissionError, OSError)`` around it does not catch.
+    Reaching the backend with one of these is a crash, not a wrong answer.
+
+    Imported inside the function because ``services`` may not import ``plugins``
+    at module scope; this is the one place the layering has to be crossed, and
+    it is crossed to *ask a question*, never to spawn anything.
+    """
+
+    try:
+        from ..plugins.sources import journald
+    except Exception:  # noqa: BLE001 - a broken plugin must not break adding a source
+        return False, f"The journal is not available here, so '{ref}' cannot be read."
+
+    if not journald.enabled():
+        return False, f"'{ref.name}' is a journal source. {JOURNAL_DISABLED_HINT}"
+
+    available, reason = journald.availability()
+    if not available:
+        return False, f"'{ref.name}' is a journal source, but {reason}."
+
+    # Enabled and available, so the journal itself answers. Whether this
+    # particular unit still exists is the provider's question at open time, not
+    # this one's: `journalctl --unit=` on a unit with no records is empty rather
+    # than an error, and reporting "gone" from here would need an enumeration
+    # round trip that this function has no business making.
+    return True, None
 
 
 class SourceManager:
