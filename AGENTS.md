@@ -125,7 +125,7 @@ distros.
 | --- | --- | --- | --- |
 | **App shell** | `clv/app.py` | Layout, routing, lifecycle, breakpoints | Parse, filter, read files, or define widget visuals |
 | **Services** | `clv/services/` | Source identity (`refs.py`), source IO (`backend.py`), parsing, filtering, discovery, reading, buffering, config, settings-file editing (`settings_file.py`), source management | Touch the UI or import Textual, or reach past `backend.py` to `os` |
-| **Widgets** | `clv/widgets/` | Self-contained UI + own `DEFAULT_CSS` | Depend on other widgets' internals or import `clv.app` |
+| **Widgets** | `clv/widgets/` | Self-contained UI + own `DEFAULT_CSS`; also the shared, Textual-free renderable vocabulary the pane is built from — `severity.py` (the palette), `columns.py` (the structured row), `payloads.py` (the JSON/XML/HTML/CSS/CSV preview) | Depend on other widgets' internals or import `clv.app` |
 | **Plugins** | `clv/plugins/` | Extension interfaces + loader; also the two things that spawn a subprocess and so need consent — `sources/journald.py` and `sources/ssh.py` (the SSH transport and `RemoteBackend`) | Break interface contracts, or spawn anything before the operator opts in |
 | **State** | `clv/storage.py` | JSON session persistence (atomic), including `SavedView` records | Depend on the UI |
 
@@ -355,6 +355,13 @@ config.load_config ─→ SourceManager ─→ discovery.discover (thread)
   rules therefore key off a breakpoint class the app **mirrors onto the
   widget** (`QueryBar.-compact`, not `LogViewerApp.-compact QueryBar`).
 - Breakpoints: `-compact` (<90 cols), `-narrow` (<130), `-wide` (≥130).
+- **A line's interior is content, not layout.** CSS decides where the pane goes;
+  it never sees inside a row. So the widths that divide one line into cells live
+  in Python — `MERGED_COLUMN_WIDTHS` in `clv/app.py`, `_BANDS` in
+  `clv/widgets/columns.py` — and they are keyed off a width band, never measured
+  from the text. Measuring the text would make a row's shape depend on its
+  content, and rows are built on the tail-append path where that costs an
+  O(rows) relayout per arriving line.
 
 ---
 
@@ -478,7 +485,7 @@ installed" — the trade Item 12 asked for.
   and `workspace` fixtures, and every assertion runs against another backend —
   which is how `RemoteBackend` is held to the same behaviour as `LocalBackend`.
 
-Run: `python -m pytest` (1479 passed, 1 skipped, 11 deselected) on **both** 3.11
+Run: `python -m pytest` (1532 passed, 1 skipped, 11 deselected) on **both** 3.11
 and 3.14 — the local default is 3.14 and a green suite there is not evidence
 that the supported floor still works.
 
