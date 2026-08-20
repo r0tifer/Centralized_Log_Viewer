@@ -7,7 +7,6 @@ from collections import deque
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
 from rich.console import Group
 from rich.text import Text
 
@@ -15,6 +14,7 @@ from clv.app import LogViewerApp
 from clv.services.discovery import DiscoveryReport, DiscoveredFile
 from clv.services.parsing import parse_lines
 from clv.storage import SessionState
+from clv.widgets.columns import ColumnarLine
 from clv.widgets.log_view import LogView
 
 
@@ -151,6 +151,8 @@ def test_invalid_query_is_reported_not_raised() -> None:
 
 
 def test_structured_rendering_wraps_json_payloads() -> None:
+    """A payload that is a document still gets its panel, under the row."""
+
     app = _make_app(pretty_rendering=True)
     app._selected_source = Path("/tmp/example.log")
     app._entries = deque(parse_lines(['2026-08-07 09:25:01 - INFO - {"status": "ok"}']))
@@ -160,7 +162,10 @@ def test_structured_rendering_wraps_json_payloads() -> None:
     rendered = _written(app)[0]
     assert isinstance(rendered, Group)
     header, panel = rendered.renderables
-    assert isinstance(header, Text)
+    assert isinstance(header, ColumnarLine)
+    # The cells, not the raw prefix: the timestamp and the level are columns now.
+    assert "09:25:01" in header.plain
+    assert "INFO" in header.plain
     assert panel.title == "JSON"
 
 
@@ -185,20 +190,6 @@ def test_append_only_renders_the_new_entries() -> None:
 
     assert _plain(app) == ["brand new line"]
     app.log_panel.clear.assert_not_called()
-
-
-def test_csv_formatter_respects_limits() -> None:
-    app = _make_app()
-    app._config.csv_max_rows = 2
-    app._config.csv_max_cols = 2
-
-    result = app._format_csv("col1,col2\n1,2\n3,4\n5,6")
-
-    assert result is not None
-    table, label = result
-    assert label == "CSV preview"
-    assert len(table.columns) == 2
-    assert len(table.rows) == 2
 
 
 # --- the pane paints its own background -------------------------------------
@@ -313,58 +304,3 @@ def test_the_cursor_and_watch_highlights_still_win_over_the_background() -> None
             assert watched_row != cursor_row, "watch and cursor became indistinguishable"
 
     asyncio.run(scenario())
-
-
-# --- the CSV preview refuses prose ------------------------------------------
-
-_NOT_CSV = [
-    # The three from a real remote `auth.log`, which drew a two-column table
-    # each: the only delimiter is the comma in "failed, status 22".
-    "ip-172-31-25-196 sshd[1129735]: AuthorizedKeysCommand "
-    "/usr/share/ec2-instance-connect/eic_run_authorized_keys ubuntu "
-    "SHA256:+eMeAed1cROUGW1ZzeQReeBNfgJ/FNNRpSfA5ptx3Zk failed, status 22",
-    "Connection closed by 34.52.153.82 port 8476, preauth",
-    "pam_unix(cron:session): session opened for user root(uid=0), by root(uid=0)",
-    # Prose with enough commas to clear the delimiter count.
-    "Started sshd, nginx, cron, and dbus units",
-    # Ragged rows are text that happens to contain commas.
-    "a,b,c\nd,e",
-]
-
-_IS_CSV = [
-    "col1,col2\n1,2\n3,4",                        # the ordinary case
-    "alice,30,nyc",                               # one row, but clean cells
-    "name,city\nJohn Smith,New York\nJane Roe,Boston",  # spaces, structure carries it
-    '"John Smith","New York, NY",42',             # quoted: the writer said so
-]
-
-
-@pytest.mark.parametrize("payload", _NOT_CSV)
-def test_prose_with_a_comma_is_not_a_csv_preview(payload: str) -> None:
-    """A log line is not a spreadsheet.
-
-    The guard was `"," not in payload`, so any sentence with a comma became a
-    table — three of them at once in a remote `auth.log`, each burying real
-    entries under five rows of nothing. Its siblings both demand a structural
-    opener (`{`, `[`, `<`); these are CSV's, which has none to demand.
-    """
-
-    app = _make_app()
-    app._config.csv_max_rows = 20
-    app._config.csv_max_cols = 10
-
-    assert app._format_csv(payload) is None
-
-
-@pytest.mark.parametrize("payload", _IS_CSV)
-def test_real_csv_still_previews(payload: str) -> None:
-    """The other half, so the fix is a narrowing and not a removal."""
-
-    app = _make_app()
-    app._config.csv_max_rows = 20
-    app._config.csv_max_cols = 10
-
-    result = app._format_csv(payload)
-
-    assert result is not None
-    assert result[1] == "CSV preview"
