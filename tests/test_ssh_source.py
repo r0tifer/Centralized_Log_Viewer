@@ -37,7 +37,7 @@ from typing import Optional
 
 import pytest
 
-from clv.plugins.sources import ssh
+from clv.plugins.sources import journald, ssh
 from clv.plugins.sources.ssh import (
     PROFILES,
     Profile,
@@ -60,7 +60,7 @@ from clv.services.backend import (
 from clv.services.config import RemoteHost
 from clv.services.discovery import DiscoverySettings, discover
 from clv.services.reader import SourceReader, open_reader
-from clv.services.refs import RemoteRef, ref_key
+from clv.services.refs import JournalRef, RemoteRef, parse_ref, ref_key
 from clv.services.session import SourceBuffer
 
 from test_backend import BackendContract, Workspace
@@ -3085,3 +3085,296 @@ def test_no_mapper_exists_for_a_set_that_does_not_span_zones() -> None:
         ),
     )
     assert alone.moment_mapper() is None
+
+
+# ==========================================================================
+# The remote journal
+# ==========================================================================
+#
+# Almost none of this is new code, which is the claim these tests exist to
+# check rather than repeat. `JournalReader` already built the argv, translated
+# the records, drained non-blocking and pushed the severity bucket down; the
+# remote reader overrides how the process starts and how the frame around its
+# output is stripped, and inherits the rest. The strongest assertion here is
+# the one that runs a single captured fixture through both paths.
+
+
+JOURNAL_HOST = RemoteHost(name="web01", host="web01.internal", user="ops", port=22)
+
+#: Two real-shaped `journalctl -o json` records. Reused by both readers.
+JOURNAL_FIXTURE = (
+    '{"__REALTIME_TIMESTAMP":"1760000000000000","PRIORITY":"3",'
+    '"MESSAGE":"disk full","_SYSTEMD_UNIT":"app.service","_HOSTNAME":"web01"}\n'
+    '{"__REALTIME_TIMESTAMP":"1760000001000000","PRIORITY":"6",'
+    '"MESSAGE":"recovered","_SYSTEMD_UNIT":"app.service","_HOSTNAME":"web01"}\n'
+)
+
+
+def _journal_connection(output: str = ""):
+    """A connection whose probe reports a GNU host that has `journalctl`."""
+
+    run = fixture_runner(
+        output
+        or "Linux\nprintf=yes\nstatc=yes\nstatf=no\ndd=yes\njournalctl=yes\n"
+        "date=4000000000 -0000\n"
+    )
+    return SSHConnection(JOURNAL_HOST, runner=run, socket_dir="/tmp"), run
+
+
+def test_the_probe_reports_journalctl_as_a_capability() -> None:
+    """One more line in the round trip that was already being made.
+
+    A host with no systemd is an ordinary host that offers no journal, not a
+    failure — reporting it as one would put a red line in the drawer for every
+    Alpine container in a fleet.
+    """
+
+    connection, run = _journal_connection()
+
+    assert connection.facts().journalctl is True
+    assert len(run.calls) == 1, "the journal probe must not cost a second round trip"  # type: ignore[attr-defined]
+
+    without = SSHConnection(
+        JOURNAL_HOST,
+        runner=fixture_runner("Linux\nprintf=yes\nstatc=yes\ndd=yes\njournalctl=no\n"),
+        socket_dir="/tmp",
+    )
+    assert without.facts().journalctl is False
+
+
+def test_the_probe_asks_for_journalctl_without_running_it() -> None:
+    """`command -v`, not `journalctl --version`: a probe may not read a journal."""
+
+    connection, run = _journal_connection()
+    connection.facts()
+
+    script = _script_of(run.calls[0])  # type: ignore[attr-defined]
+    assert "command -v journalctl" in script
+    assert "--field" not in script and "--output=json" not in script
+
+
+@pytest.mark.parametrize(
+    ("ref", "expected"),
+    [
+        ("journal@web01:all", None),
+        ("journal@web01:unit/sshd.service", "--unit=sshd.service"),
+        ("journal@web01:boot/-1", "--boot=-1"),
+        ("journal@web01:unit/getty@tty1.service", "--unit=getty@tty1.service"),
+    ],
+)
+def test_the_remote_journal_argv_carries_the_selector(ref: str, expected) -> None:
+    """Asserted as a string, so a change to an argv is visible in review."""
+
+    connection, _run = _journal_connection()
+    reader = ssh.RemoteJournalReader(parse_ref(ref), connection=connection, max_lines=50)
+
+    argv = reader.command()
+
+    assert argv[0] == "journalctl", "the remote binary is not this machine's which()"
+    assert "--output=json" in argv and "--follow" in argv and "--lines=50" in argv
+    if expected is None:
+        assert not any(item.startswith(("--unit", "--boot")) for item in argv)
+    else:
+        assert expected in argv
+
+
+def test_the_severity_bucket_is_pushed_down_over_the_link() -> None:
+    """It matters more here than over a pipe.
+
+    The difference is discarding debug records on the far side versus carrying
+    them across the network in order to discard them locally.
+    """
+
+    connection, _run = _journal_connection()
+    reader = ssh.RemoteJournalReader(
+        parse_ref("journal@web01:all"), connection=connection, severity="error"
+    )
+
+    assert "--priority=3" in reader.command()
+
+
+def test_the_remote_follow_kills_its_own_journalctl() -> None:
+    """4b's finding, which applies unchanged to a different command.
+
+    Killing the local `ssh` does not stop the remote process: a process only
+    learns its pipe is closed when it next writes, and `journalctl --follow` on
+    an idle unit never writes again. Without the watchdog every source switch
+    leaves one running on the operator's server.
+    """
+
+    connection, _run = _journal_connection()
+    reader = ssh.RemoteJournalReader(parse_ref("journal@web01:all"), connection=connection)
+
+    script = reader.remote_script()
+
+    assert "journalctl" in script
+    # Watches its own stdin, which sshd closes promptly, and kills the follow.
+    assert "cat >/dev/null" in script
+    assert "kill $__clv_j" in script
+    # And the other direction: journalctl dying takes the shell with it, so
+    # poll() sees a dead process rather than waiting on a stream forever.
+    assert "kill -0 $__clv_j" in script
+    # `cat` in the foreground. Backgrounded, POSIX reassigns its stdin to
+    # /dev/null in a non-interactive shell and the follow dies before it
+    # produces a line -- a one-character difference between working and useless.
+    assert "cat >/dev/null 2>&1 &" not in script
+
+
+@needs_shell
+@pytest.mark.parametrize(
+    "hostile",
+    ["$(reboot).service", "a;reboot.service", "it's.service", "a b.service", "`id`.service"],
+)
+def test_a_hostile_unit_name_is_data_and_never_code(hostile: str) -> None:
+    """A unit name reaches a remote shell, so it is the same risk as a path.
+
+    Checked the way the path table is checked — through a **real** `sh` — rather
+    than by looking for quotes in the script, because "it contains a quote
+    character" is not the property that matters. What matters is that the far
+    side receives the argument back byte for byte and executes none of it.
+    """
+
+    connection, _run = _journal_connection()
+    reader = ssh.RemoteJournalReader(
+        JournalRef("web01", "unit", hostile), connection=connection
+    )
+
+    script = reader.remote_script()
+    # Everything up to the watchdog is the journalctl invocation.
+    invocation = script.split(" & __clv_j=")[0]
+
+    completed = subprocess.run(
+        ["/bin/sh", "-c", f"for a in {invocation.removeprefix('journalctl ')}; do printf '%s\n' \"$a\"; done"],
+        capture_output=True,
+        check=True,
+    )
+    produced = completed.stdout.decode().splitlines()
+
+    assert f"--unit={hostile}" in produced, produced
+    assert not Path("/tmp/clv-pwned").exists()
+
+
+def _drain_through(reader, chunk: bytes) -> list[str]:
+    """Feed *chunk* to a reader's process and return what the drain produced."""
+
+    class _Process:
+        def __init__(self, data: bytes) -> None:
+            self.stdout = io.BytesIO(data)
+            self.stderr = io.BytesIO(b"")
+
+        def poll(self):
+            return None
+
+    reader._process = _Process(chunk)
+    return reader.poll().lines
+
+
+def test_one_fixture_translates_identically_read_locally_and_remotely() -> None:
+    """The assertion that makes "the transport is the only difference" a fact.
+
+    Same captured `journalctl -o json` records, one through `JournalReader` and
+    one through `RemoteJournalReader`. If translation ever forks, this fails —
+    and a fork is exactly what would happen the first time someone "fixes" the
+    remote path in isolation.
+    """
+
+    local = journald.JournalReader(parse_ref("journal:all"), max_lines=50)
+    local._process = type(
+        "P", (), {"stdout": io.BytesIO(JOURNAL_FIXTURE.encode()), "poll": lambda self: None}
+    )()
+    local_lines = local.poll().lines
+
+    connection, _run = _journal_connection()
+    remote = ssh.RemoteJournalReader(
+        parse_ref("journal@web01:all"), connection=connection, max_lines=50
+    )
+    remote._frame = ssh._Deframer(connection.start_marker, connection.end_marker)
+    framed = connection.start_marker + b" ...\n" + JOURNAL_FIXTURE.encode()
+    remote_lines = _drain_through(remote, framed)
+
+    assert local_lines == remote_lines
+    assert len(remote_lines) == 2
+    assert "disk full" in remote_lines[0]
+
+
+def test_a_banner_is_not_delivered_as_a_journal_record() -> None:
+    """A login shell's MOTD arrives on the same pipe as the journal.
+
+    Without the opening sentinel it would be handed to `json.loads`, fail, and
+    then be *kept* as a line -- because never silently losing a line is the rule
+    -- so a welcome message would appear in the pane as a journal record.
+    """
+
+    connection, _run = _journal_connection()
+    reader = ssh.RemoteJournalReader(parse_ref("journal@web01:all"), connection=connection)
+    reader._frame = ssh._Deframer(connection.start_marker, connection.end_marker)
+
+    noisy = (
+        b"Welcome to Ubuntu 24.04\n"
+        b"Last login: Tue Aug 19\n"
+        + connection.start_marker
+        + b" ...\n"
+        + JOURNAL_FIXTURE.encode()
+    )
+    lines = _drain_through(reader, noisy)
+
+    assert len(lines) == 2
+    assert not any("Welcome" in line or "Last login" in line for line in lines)
+
+
+def test_the_closing_sentinel_is_never_shown_as_a_record() -> None:
+    """It arrives when the remote shell exits, and it is not a journal entry."""
+
+    connection, _run = _journal_connection()
+    reader = ssh.RemoteJournalReader(parse_ref("journal@web01:all"), connection=connection)
+    reader._frame = ssh._Deframer(connection.start_marker, connection.end_marker)
+
+    framed = (
+        connection.start_marker
+        + b" ...\n"
+        + JOURNAL_FIXTURE.encode()
+        + connection.end_marker.encode()
+        + b" 0\n"
+    )
+    lines = _drain_through(reader, framed)
+
+    assert len(lines) == 2
+    assert not any(line.startswith("__clv_") for line in lines)
+    assert reader._frame.finished is True
+
+
+def test_a_remote_journal_follow_is_closed_on_a_source_switch() -> None:
+    """The local half of the leak. The remote half is the watchdog script.
+
+    `session.close()` runs on every source switch and again at shutdown, so a
+    reader that does not terminate its process leaks one `ssh` per switch. The
+    script kills the far side; this asserts the near side.
+    """
+
+    class _Process:
+        def __init__(self) -> None:
+            self.stdout = io.BytesIO(b"")
+            self.stderr = io.BytesIO(b"")
+            self.terminated = False
+
+        def poll(self):
+            return None if not self.terminated else 0
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            return 0
+
+    connection, _run = _journal_connection()
+    reader = ssh.RemoteJournalReader(parse_ref("journal@web01:all"), connection=connection)
+    process = _Process()
+    reader._process = process
+    reader._frame = ssh._Deframer(connection.start_marker, connection.end_marker)
+
+    reader.close()
+
+    assert process.terminated is True
+    assert reader._process is None
+    assert reader._frame is None, "a new follow gets a new frame, not a spent one"
+    reader.close()  # safe twice, as every other reader's close is
