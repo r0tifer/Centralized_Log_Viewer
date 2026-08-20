@@ -14,6 +14,7 @@ from clv.app import LogViewerApp
 from clv.services.discovery import DiscoveryReport, DiscoveredFile
 from clv.services.parsing import parse_lines
 from clv.storage import SessionState
+from clv.widgets.columns import ColumnarLine
 from clv.widgets.log_view import LogView
 
 
@@ -150,6 +151,8 @@ def test_invalid_query_is_reported_not_raised() -> None:
 
 
 def test_structured_rendering_wraps_json_payloads() -> None:
+    """A payload that is a document still gets its panel, under the row."""
+
     app = _make_app(pretty_rendering=True)
     app._selected_source = Path("/tmp/example.log")
     app._entries = deque(parse_lines(['2026-08-07 09:25:01 - INFO - {"status": "ok"}']))
@@ -159,7 +162,10 @@ def test_structured_rendering_wraps_json_payloads() -> None:
     rendered = _written(app)[0]
     assert isinstance(rendered, Group)
     header, panel = rendered.renderables
-    assert isinstance(header, Text)
+    assert isinstance(header, ColumnarLine)
+    # The cells, not the raw prefix: the timestamp and the level are columns now.
+    assert "09:25:01" in header.plain
+    assert "INFO" in header.plain
     assert panel.title == "JSON"
 
 
@@ -184,20 +190,6 @@ def test_append_only_renders_the_new_entries() -> None:
 
     assert _plain(app) == ["brand new line"]
     app.log_panel.clear.assert_not_called()
-
-
-def test_csv_formatter_respects_limits() -> None:
-    app = _make_app()
-    app._config.csv_max_rows = 2
-    app._config.csv_max_cols = 2
-
-    result = app._format_csv("col1,col2\n1,2\n3,4\n5,6")
-
-    assert result is not None
-    table, label = result
-    assert label == "CSV preview"
-    assert len(table.columns) == 2
-    assert len(table.rows) == 2
 
 
 # --- the pane paints its own background -------------------------------------

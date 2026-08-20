@@ -1876,6 +1876,34 @@ rather than merely claimed.
 **Commit.** `feat(ssh): read the systemd journal on remote hosts`, then
 `release: 2.10.0`.
 
+### Found after release — 2.10.0 shipped no remote journal at all
+
+Recorded here rather than quietly fixed, because the gate above says "suite
+green" and the suite was green while the feature had never once worked.
+
+- **`connection.reachability()` called a property.** It is a `@property` on
+  `SSHConnection` and a *method* on `RemoteBackend`; `discover_remote` holds a
+  connection and used the backend's spelling, so the frozen `Reachability` it
+  returned was then called — `TypeError: 'Reachability' object is not callable`.
+  It is the first statement in the per-host loop, so it threw on the first
+  enabled host and no host ever produced a journal source.
+- **The suite could not see it, and that is the part worth keeping.** The
+  `_Connection` double in `tests/test_journald.py` declared `reachability` as a
+  method, so every remote-journal test exercised a shape no real connection has.
+  "Per-host unit enumeration, including a host where `journalctl` is absent" was
+  listed as tested above and was testing only itself. Correcting the double
+  alone fails four existing tests — that, not the production edit, is the fix.
+  `test_the_connection_double_matches_the_real_connection` now asserts the
+  double against `SSHConnection` member by member, so the next member
+  `discover_remote` reaches for fails in CI rather than on a host.
+- **`except OSError` was too narrow for what its own comment promised.** It said
+  a bad host "costs that host's journal and nothing else"; a non-`OSError`
+  escaped to `_discover_remote_providers` and cost every host's. Now `Exception`,
+  which would have degraded this bug to one noisy host instead of a dead feature.
+- **The lesson is Phase 6's, one level up.** That phase found a gap where every
+  rotated-set test was local and every remote test was unrotated. This one sat
+  where every remote test used a double and no test used the real class.
+
 ---
 
 ## Risks, recorded up front

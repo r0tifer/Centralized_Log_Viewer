@@ -14,10 +14,6 @@ supported Textual range.
 
 from __future__ import annotations
 
-import csv
-import io
-import itertools
-import json
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
@@ -26,13 +22,10 @@ from datetime import timedelta
 from time import monotonic
 from pathlib import Path
 from typing import Iterable, Iterator, Literal, Optional, Sequence
-from xml.dom import minidom
 
 from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.style import Style
-from rich.syntax import Syntax
-from rich.table import Table
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
@@ -170,6 +163,14 @@ from .widgets.remote_hosts_dialog import (
     ProbeResult,
     RemoteHostsDialog,
 )
+from .widgets import payloads
+from .widgets.columns import (
+    ColumnLayout,
+    EMPTY_LAYOUT,
+    NOTHING_PARSED_NOTE,
+    plan_columns,
+    render_row,
+)
 from .widgets.severity import SEVERITY_COLORS
 from .widgets.ssh_config_dialog import SSHConfigImportDialog
 from .widgets.timeline import TimelineBar
@@ -187,8 +188,6 @@ NOTABLE_LEVELS: frozenset[str] = frozenset({LEVEL_WARN, LEVEL_ERROR, LEVEL_CRITI
 #: pane colours its lines with, and a widget may not import `clv.app`. The name
 #: is still reachable as `clv.app.SEVERITY_COLORS`, which is where everything
 #: that already used it looks.
-
-STRUCTURED_PAYLOAD_MAX_CHARS = 8_192
 
 #: Terminal widths at which the layout changes shape.
 BREAKPOINT_COMPACT = 90
@@ -705,6 +704,10 @@ class LogViewerApp(App[None]):
         #: What the merged pane's source column calls each member. Rebuilt once
         #: per set by `_sync_column_labels`, never per rendered line.
         self._column_labels: dict[SourceRef, str] = {}
+        #: The structured columns' shape, decided once per full render by
+        #: `plan_columns` and then read unchanged by the tail-append path —
+        #: which is what keeps appending proportional to what arrived.
+        self._column_layout: ColumnLayout = EMPTY_LAYOUT
         #: The upgrade notice is once per *version*, and a rescan redraws the
         #: summary — so this keeps a `Ctrl+R` from repeating it within a session.
         self._upgrade_notice_shown = False
@@ -2595,6 +2598,19 @@ class LogViewerApp(App[None]):
         # lines than it matched.
         self._rebuild_timeline(result.entries)
 
+        # Over the window `_write_rows` is about to render, not the whole
+        # filtered set: the columns describe what is on screen.
+        self._column_layout = plan_columns(
+            result.entries[-self._show_lines :],
+            merged=self._session.is_merged,
+            clustering=self.state.clustering,
+        )
+        if self.state.pretty_rendering and self._column_layout.all_raw:
+            # Said once, above the lines, rather than left as a pane of blank
+            # cells that reads as a bug. A `write` row is one the cursor skips,
+            # so it costs no navigation.
+            self.log_panel.write(Text(NOTHING_PARSED_NOTE, style="dim"))
+
         self._write_rows(result.entries)
         # Rows are created unmarked, so with an empty set there is nothing to do
         # — and an empty set is the overwhelmingly common case.
@@ -2659,19 +2675,33 @@ class LogViewerApp(App[None]):
     def _cluster_renderable(self, cluster: Cluster) -> RenderableType:
         """A collapsed (or opened) group, as one line.
 
-        Deliberately never a structured panel, even with `o` on: a bordered
-        payload per repeat group is the noise this feature exists to remove.
+        **Never a structured panel, even with `o` on**: a bordered payload per
+        repeat group is the noise this feature exists to remove.
+
+        The *columns* are a different matter and it does get those. The
+        prohibition above is about a border and five rows of pane per group;
+        alignment is the opposite thing, and it is what makes forty collapsed
+        groups scannable. The count goes in the marker cell every row reserves
+        while `c` is on, and the span goes in the time cell when the width can
+        hold one — "147 of these, over four seconds" is a different event from
+        "147, over an hour".
         """
 
         expanded = cluster.key() in self._expanded_clusters
         marker = "▾" if expanded else "▸"
+        if self.state.pretty_rendering:
+            return render_row(
+                cluster.representative,
+                self._column_layout,
+                source_label=self._source_cell_label(cluster.representative),
+                marker=f"{marker} {COUNT_PREFIX}{cluster.count}",
+                time_override=self._cluster_span(cluster),
+            )
         prefix = f"{marker} {COUNT_PREFIX}{cluster.count} "
         text = Text(prefix, style="bold #7aa3d1")
         if self._breakpoint != "-compact":
-            # The span is what makes a count actionable — "147 of these, over
-            # four seconds" is a different event from "147, over an hour". It
-            # gives way first, because at 80 columns the line itself matters
-            # more.
+            # The span is what makes a count actionable. It gives way first,
+            # because at 80 columns the line itself matters more.
             span = self._cluster_span(cluster)
             if span:
                 text.append(f"{span} ", style="#7aa3d1")
@@ -2964,14 +2994,30 @@ class LogViewerApp(App[None]):
         self._notify(f"Time window set to {start} → {end}.")
 
     def _renderable_for(self, entry: LogEntry) -> RenderableType:
-        if self.state.pretty_rendering:
-            structured = self._structured_renderable(entry)
-            if structured is not None:
-                return structured
-        text = self._colorize(entry)
-        if self._session.is_merged:
-            return self._with_source_column(text, entry)
-        return text
+        if not self.state.pretty_rendering:
+            text = self._colorize(entry)
+            if self._session.is_merged:
+                return self._with_source_column(text, entry)
+            return text
+        row = render_row(
+            entry, self._column_layout, source_label=self._source_cell_label(entry)
+        )
+        panel = self._payload_panel(entry)
+        return Group(row, panel) if panel is not None else row
+
+    def _source_cell_label(self, entry: LogEntry) -> str:
+        """Which source a line came from, as the merged views name it.
+
+        Empty outside a merged view, where the question has no answer worth a
+        column. Shared by both render paths so they can never disagree.
+        """
+
+        if not self._session.is_merged:
+            return ""
+        origin = self._origin(entry)
+        if origin is None:
+            return "?"
+        return self._column_labels.get(origin) or origin.name
 
     def _with_source_column(self, text: Text, entry: LogEntry) -> Text:
         """Prefix a line with the source it came from.
@@ -2980,6 +3026,10 @@ class LogViewerApp(App[None]):
         be. The width follows the breakpoint so the column gives way before the
         log text does — this is line *content*, which is why it is composed
         here and not in CSS.
+
+        Plain mode only. With `o` on, the same answer becomes the structured
+        row's source cell — see `_source_cell_label` — because a merged view cannot
+        afford this column *and* the format's own one.
         """
 
         width = MERGED_COLUMN_WIDTHS.get(self._breakpoint, MERGED_COLUMN_WIDTHS["-narrow"])
@@ -3002,78 +3052,39 @@ class LogViewerApp(App[None]):
             text.stylize(f"dim {color}" if entry.continuation else color)
         return text
 
-    def _structured_renderable(self, entry: LogEntry) -> RenderableType | None:
-        payload = (entry.message or "").strip()
-        if not payload or len(payload) > STRUCTURED_PAYLOAD_MAX_CHARS:
-            return None
-        formatted = (
-            self._format_json(payload) or self._format_xml(payload) or self._format_csv(payload)
+    def _payload_panel(self, entry: LogEntry) -> Panel | None:
+        """The pretty-print under a row whose message is itself a document.
+
+        Only for the payloads `payloads.preview` will vouch for — JSON, XML,
+        HTML, CSS or CSV. Everything else is a row and nothing more, which is
+        what keeps a structured pane denser than the one it replaced.
+        """
+
+        formatted = payloads.preview(
+            entry.message or "",
+            theme=self._syntax_theme(),
+            csv_max_rows=self._config.csv_max_rows,
+            csv_max_cols=self._config.csv_max_cols,
         )
         if formatted is None:
             return None
         renderable, label = formatted
-        return Group(
-            self._colorize(entry),
-            Panel(
-                renderable,
-                title=label,
-                border_style=SEVERITY_COLORS.get(entry.level or "", "#94a3b8"),
-                padding=(0, 1),
-            ),
+        return Panel(
+            renderable,
+            title=label,
+            border_style=SEVERITY_COLORS.get(entry.level or "", "#94a3b8"),
+            padding=(0, 1),
         )
 
-    @staticmethod
-    def _format_json(payload: str) -> tuple[RenderableType, str] | None:
-        if not payload.startswith(("{", "[")):
-            return None
-        try:
-            parsed = json.loads(payload)
-        except ValueError:
-            return None
-        pretty = json.dumps(parsed, indent=2, ensure_ascii=False)
-        return Syntax(pretty, "json", theme="ansi_dark"), "JSON"
+    def _syntax_theme(self) -> str:
+        """The Pygments theme that suits the terminal's palette.
 
-    @staticmethod
-    def _format_xml(payload: str) -> tuple[RenderableType, str] | None:
-        if not payload.startswith("<"):
-            return None
-        try:
-            dom = minidom.parseString(payload)
-        except Exception:  # noqa: BLE001 - minidom raises broadly
-            return None
-        pretty = "\n".join(
-            line for line in dom.toprettyxml(indent="  ").splitlines() if line.strip()
-        )
-        return Syntax(pretty, "xml", theme="ansi_dark"), "XML"
+        A `Syntax` bakes its theme in at construction, so this is read per
+        render rather than once: see `watch_theme`, which redraws when the
+        answer changes.
+        """
 
-    def _format_csv(self, payload: str) -> tuple[RenderableType, str] | None:
-        if "," not in payload:
-            return None
-        max_rows = self._config.csv_max_rows
-        max_cols = self._config.csv_max_cols
-        try:
-            rows = list(itertools.islice(csv.reader(io.StringIO(payload)), max_rows))
-        except csv.Error:
-            return None
-        if not rows:
-            return None
-        column_count = min(max((len(row) for row in rows), default=0), max_cols)
-        if column_count == 0:
-            return None
-
-        table = Table(box=None, show_header=True, show_edge=False, pad_edge=False)
-        for index in range(column_count):
-            table.add_column(f"Col {index + 1}", overflow="fold")
-        truncated = False
-        for row in rows:
-            if len(row) > column_count:
-                truncated = True
-            padded = list(row[:column_count])
-            padded.extend([""] * (column_count - len(padded)))
-            table.add_row(*padded)
-        if truncated:
-            table.add_row(*(["…"] * column_count))
-        return table, "CSV preview"
+        return "ansi_dark" if self.current_theme.dark else "ansi_light"
 
     def _show_upgrade_notice(self) -> None:
         """After an upgrade, say once that newer settings exist.
@@ -3324,6 +3335,19 @@ class LogViewerApp(App[None]):
         if self._is_shutting_down or not self.is_mounted:
             return
         self._refresh_chips()
+
+    def watch_theme(self, old: str, new: str) -> None:  # type: ignore[override]
+        """Redraw when the palette changes, because a `Syntax` cannot.
+
+        A payload panel bakes its Pygments theme in at construction, and
+        `LogView` re-renders a row from the stored renderable rather than asking
+        for a new one — so without this a light theme keeps the dark panel it
+        was built with. Only structured mode builds panels, so only structured
+        mode pays for the redraw.
+        """
+
+        if self.state.pretty_rendering:
+            self._render_log()
 
     def watch_state(self, old: SessionState, new: SessionState) -> None:  # type: ignore[override]
         if not self._persist_state:
@@ -4105,12 +4129,12 @@ class LogViewerApp(App[None]):
         )
 
     def action_toggle_structured(self) -> None:
-        """Flip structured rendering of JSON/XML/CSV payloads."""
+        """Flip the structured columns on the log pane."""
         self._set_structured(not self.state.pretty_rendering)
         self._notify(
-            "Structured output on."
+            "Structured columns on."
             if self.state.pretty_rendering
-            else "Structured output off."
+            else "Structured columns off."
         )
 
     def _star_target(self) -> Optional[Path]:

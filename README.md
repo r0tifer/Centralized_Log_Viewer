@@ -45,6 +45,9 @@ desktop terminal and on a headless 80-column SSH session.
   and `app.log` + `app.log.1` + `app.log.2.gz` are presented as **one source**
   spanning all three, oldest lines first. Only the live member is tailed; the
   rotated-out ones are read once, and only as far back as your buffer needs.
+- 🧱 **Structured columns.** `o` turns a dense log into aligned time, level and
+  source cells with the message starting at the same column on every row, and
+  pretty-prints JSON, XML, HTML, CSS and CSV payloads.
 - 📐 **Responsive layout.** Breakpoints at 90 and 130 columns reflow the
   controls; every control stays on screen and keyboard-reachable down to 80
   columns.
@@ -167,7 +170,7 @@ use.
 | `default_show_lines` / `min_show_lines` / `show_step` | Visible-line window and its `+`/`-` step. | `500 / 10 / 50` |
 | `refresh_hz` | Poll frequency for new content. | `2` |
 | `tree_width` | Starting width of the source tree, in columns. | `38` |
-| `csv_max_rows` / `csv_max_cols` | Structured payload preview limits. | `20 / 10` |
+| `csv_max_rows` / `csv_max_cols` | Bound the **CSV** payload preview only. The structured switch previews JSON, XML, HTML, CSS and CSV; the other four need no limits. | `20 / 10` |
 | `clipboard_max_bytes` | Most log text one `y` clipboard copy may carry. Oversized copies are truncated at a line boundary and say so. | `65536` |
 | `watch_rate_limit` | Seconds a watch rule waits before notifying again; matches inside the window are counted and reported together. | `60` |
 | `watch_bell` | Ring the terminal bell when a watch rule notifies. | `false` |
@@ -722,6 +725,64 @@ the view out from under the line you just pointed at. The status bar says so —
 *"paused — cursor moved, End resumes"* — and `End` or `w` starts following
 again.
 
+### Structured columns
+
+Press `o` to turn a dense log into columns. CLV already recovers a timestamp, a
+severity and a set of named fields from every line it can parse; with the switch
+off, all of that is thrown away at render time and you read the raw text. With
+it on, the recovered structure becomes fixed cells and the message starts at the
+same screen column on every row:
+
+```
+Aug  7 09:25:01 web01 sshd[1123]: Failed password for root from 10.0.0.5 port 22
+Aug  7 09:25:01 web01 CRON[9021]: (root) CMD (/usr/bin/backup.sh)
+Aug  7 09:25:02 web01 kernel: TCP: dropping request, ratelimit exceeded
+```
+
+becomes
+
+```
+09:25:01 sshd[1123]  Failed password for root from 10.0.0.5 port 22
+09:25:01 CRON[9021]  (root) CMD (/usr/bin/backup.sh)
+09:25:02 kernel      TCP: dropping request, ratelimit exceeded
+```
+
+**The cells replace the prefix they came from.** A row that showed both would be
+wider than the line it replaced, which is the opposite of the point. Nothing is
+lost: the raw line is untouched in the detail pane, in what `y` copies, and in
+every export.
+
+What you get depends on what the set actually contains, decided once per redraw:
+
+| Cell | Shown when |
+| --- | --- |
+| Time | Anything in view carries a timestamp. Gains a `MM-DD` prefix when the lines span more than one day, and milliseconds only when the log records them — a column of `.000` is four cells of nothing. |
+| Level | Anything in view declares a severity. |
+| Source | The program, unit or client varies across the lines in view. A column repeating one value is width taken from the message. In a merged view this cell names the *source* instead, and the program moves to a chip. |
+| Message | Always. It is the last thing to give way as the terminal narrows, and a line that wraps hangs under this cell rather than restarting at column zero. |
+
+Fields the cells did not use appear after the message as dim `key=value` chips,
+chosen per format rather than swept up — a journal line carries around forty
+fields, and showing them all is the density problem this feature exists to fix.
+Access logs are the case that matters: an entry's message is only its request
+line, so `status` is always shown and a `500` never disappears off the row.
+
+Everything gives way in order as the terminal narrows — the source cell, then
+the date, then the level — so the message keeps its room down to 80 columns.
+
+**Payloads that are whole documents still get pretty-printed.** When a line's
+message is JSON, XML, HTML, CSS or CSV, it renders in a bordered panel beneath
+the row, syntax-highlighted in a palette that follows your terminal theme. The
+detectors are deliberately hard to convince: prose with commas in it is not a
+CSV table, `<stdin>: line 3` is not HTML, and `Java{name:bob}` is not a
+stylesheet. A missed preview costs you one glance at a line that was already
+readable; a false one buries three real entries.
+
+Repeat clustering (`c`) and the columns work together — a collapsed group keeps
+its `▸ ×147` count and states its time span in the time cell where there is room
+for one. A cluster never gets a payload panel, because a border per repeat group
+is exactly the noise clustering removes.
+
 ### The severity timeline
 
 `b` opens a one-row histogram above the log: event volume over the time your
@@ -953,7 +1014,7 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `b` | Show / hide the severity timeline (then `←` `→` `Enter` to filter to a bucket) |
 | `c` | Collapse / expand repeated lines (then `Enter` on a cluster row) |
 | `w` | Follow new lines (auto-scroll) on/off |
-| `o` | Structured output on/off |
+| `o` | Structured columns (time · level · source · message) on/off |
 | `Ctrl+B` | Switch between tree and log pane (compact widths) |
 | `[` / `]` | Narrow / widen the source tree |
 | `+` / `-` | Show more / fewer lines |

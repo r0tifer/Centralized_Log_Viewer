@@ -29,7 +29,7 @@ that carry their own status tables:
 | Plan | Scope | State |
 | --- | --- | --- |
 | [PLUGIN_TODO.md](PLUGIN_TODO.md) | The plugin system — interfaces, loader, distribution, isolation | In progress |
-| [SSH_TODO.md](SSH_TODO.md) | Remote sources over SSH. Reverses a non-goal recorded below | Phases 0–8 done (shipped 2.8.0); Phase 9, the remote journal, remains |
+| [SSH_TODO.md](SSH_TODO.md) | Remote sources over SSH. Reverses a non-goal recorded below | All phases done (0–8 shipped 2.8.0; 9a 2.9.0; 9b 2.10.0). Outstanding: a frozen-build check across distributions |
 
 ---
 
