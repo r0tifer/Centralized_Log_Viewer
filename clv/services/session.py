@@ -561,7 +561,16 @@ class SourceSession:
         journal unit, and this is where what it built joins everything else.
         """
 
-        buffer = SourceBuffer(path, max_lines=self._max_lines, reader=reader)
+        buffer = SourceBuffer(
+            path,
+            max_lines=self._max_lines,
+            reader=reader,
+            # A provider source has a machine too, now that one can be on
+            # another host: without this a remote journal unit carried no
+            # `node`, so `node:web01` would not answer for it and a cross-host
+            # merge would order it by this machine's clock.
+            facts=self._facts(path),
+        )
         buffer.prime()
         self.close()
         self._buffers = [buffer]
