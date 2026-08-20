@@ -13,6 +13,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from rich.console import Group
 from textual.widgets import Button, Checkbox, Input, OptionList, Static, Switch
 
 from clv.app import LogViewerApp
@@ -664,7 +665,12 @@ def test_clustering_runs_on_the_filtered_set(tmp_path: Path) -> None:
 
 
 def test_a_cluster_row_is_never_a_structured_panel(tmp_path: Path) -> None:
-    """`o` renders payloads; a bordered panel per repeat group is the noise."""
+    """`o` renders payloads; a bordered panel per repeat group is the noise.
+
+    The *columns* are a different matter and a cluster row does get those —
+    see `test_a_cluster_row_gets_the_columns`. What stays forbidden is the
+    border and the five rows of pane that come with it.
+    """
 
     async def scenario() -> None:
         path = tmp_path / "json.log"
@@ -689,9 +695,41 @@ def test_a_cluster_row_is_never_a_structured_panel(tmp_path: Path) -> None:
 
             row = app.log_panel.rows[0]
             assert row.cluster is not None
-            # A Text, not a Group wrapping a Panel.
-            assert hasattr(row.renderable, "plain")
+            # One row, not a Group wrapping a Panel.
+            assert not isinstance(row.renderable, Group)
             assert "×6" in row.renderable.plain
+
+    asyncio.run(scenario())
+
+
+def test_a_cluster_row_gets_the_columns(tmp_path: Path) -> None:
+    """Alignment is what makes forty collapsed groups scannable."""
+
+    async def scenario() -> None:
+        path = tmp_path / "json.log"
+        path.write_text(
+            "\n".join(
+                f'{{"ts":"2026-08-07T09:25:{index:02d}Z","level":"error","msg":"boom"}}'
+                for index in range(6)
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        app = LogViewerApp()
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._select_source(path, announce=False)
+            app.set_focus(app.log_panel)
+            await pilot.pause()
+            app._set_structured(True)
+            await pilot.pause()
+            await pilot.press("c")
+            await pilot.pause()
+
+            plain = app.log_panel.rows[0].renderable.plain
+            assert "×6" in plain, "the count still leads the row"
+            assert "ERROR" in plain, "the level cell is filled"
+            assert "09:25:00" in plain, "the time cell is filled"
 
     asyncio.run(scenario())
 
