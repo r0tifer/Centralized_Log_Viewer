@@ -135,7 +135,8 @@ refresh_hz = 2
 # Starting width of the source tree, in columns.
 tree_width = 38
 
-# Structured payload preview limits.
+# How much of a CSV payload the Structured switch previews. JSON, XML,
+# HTML and CSS need no limits of their own.
 csv_max_rows = 20
 csv_max_cols = 10
 
