@@ -3046,8 +3046,42 @@ class LogViewerApp(App[None]):
         )
         return Syntax(pretty, "xml", theme="ansi_dark"), "XML"
 
+    #: A field of this many words reads as prose, not as a cell. `"New York"`
+    #: and `"John Smith"` stay well under it; a sentence fragment does not.
+    _CSV_MAX_FIELD_WORDS = 4
+
     def _format_csv(self, payload: str) -> tuple[RenderableType, str] | None:
-        if "," not in payload:
+        """A table, but only when the payload is actually tabular.
+
+        **The guard used to be `"," not in payload`, and prose has commas.**
+        `sshd[...]: AuthorizedKeysCommand ... failed, status 22` split on the one
+        comma in `failed, status 22` and drew a two-column table over an ordinary
+        syslog line — several per screen, each eating five rows of the pane.
+
+        The siblings show what was missing: `_format_json` demands a leading `{`
+        or `[` and `_format_xml` a leading `<`. Both require a *structural*
+        signal before they commit. These rules are that signal for CSV, which
+        has no opening character to look for:
+
+        * **A consistent field count** across every row, and at least two.
+          Ragged rows are text that happens to contain commas.
+        * **Two delimiters at least**, so one comma can never make a table.
+        * **Three fields when there is only one row.** A single line split in
+          two is the overwhelmingly common false positive and almost never real
+          CSV; a genuine one-line record has more columns than that.
+        * **No prose-shaped field**, and stricter for a single row than for
+          many, because one row is the least evidence there is: alone, any
+          space in a cell is disqualifying; among several rows of consistent
+          width, only a sentence-length one is. Skipped entirely when the
+          payload quotes anything, since quoting is a writer declaring its own
+          field boundaries and that declaration outranks this heuristic.
+
+        Deliberately biased toward refusing: a missed preview costs a reader one
+        glance at a line that is already legible, and a false one buries three
+        real entries behind a table of nothing.
+        """
+
+        if payload.count(",") < 2:
             return None
         max_rows = self._config.csv_max_rows
         max_cols = self._config.csv_max_cols
@@ -3057,7 +3091,27 @@ class LogViewerApp(App[None]):
             return None
         if not rows:
             return None
-        column_count = min(max((len(row) for row in rows), default=0), max_cols)
+        widths = {len(row) for row in rows}
+        if len(widths) != 1:
+            return None
+        (width,) = widths
+        if width < 2 or (len(rows) == 1 and width < 3):
+            return None
+        if '"' not in payload:
+            # Quoting is a writer declaring its own field boundaries, and that
+            # declaration outranks everything below.
+            fields = [field.strip() for row in rows for field in row]
+            # **One row is judged hardest, because one row is the least
+            # evidence there is.** With several rows the consistent width is
+            # itself the structure, so a spacey cell is credible; with one, the
+            # only signal is the commas — and `Started sshd, nginx, and dbus`
+            # has those too. A lone record with a space in a cell is prose.
+            if len(rows) == 1:
+                if any(" " in field for field in fields):
+                    return None
+            elif any(len(field.split()) >= self._CSV_MAX_FIELD_WORDS for field in fields):
+                return None
+        column_count = min(width, max_cols)
         if column_count == 0:
             return None
 

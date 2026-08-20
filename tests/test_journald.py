@@ -1030,7 +1030,13 @@ class _Connection:
         self.runs: list[str] = []
         self.probes = 0
 
+    @property
     def reachability(self):
+        # A *property*, because that is what `SSHConnection.reachability` is.
+        # As a method this double accepted `connection.reachability()`, which
+        # every real connection raises `TypeError` on — the remote journal was
+        # green here and dead in 2.10.0. A double that does not match the shape
+        # of the class it stands in for tests only itself.
         return self._reach
 
     def facts(self):
@@ -1208,3 +1214,24 @@ def test_the_provider_never_builds_its_own_connection() -> None:
 
     assert "SSHConnection(" not in source
     assert "RemoteResolver(" not in source
+
+
+def test_the_connection_double_matches_the_real_connection() -> None:
+    """The double's shape, asserted against the class it stands in for.
+
+    `SSHConnection.reachability` is a property and `RemoteBackend.reachability`
+    is a method. `discover_remote` holds a *connection* and shipped 2.10.0
+    calling the backend's spelling on it, so every remote journal raised
+    `TypeError: 'Reachability' object is not callable` — while this file stayed
+    green, because `_Connection` declared `reachability` as a method.
+
+    Asserting the members rather than the one field that broke: a double whose
+    shape drifts from the real class tests only itself, and the next member
+    `discover_remote` reaches for deserves to fail here rather than on a host.
+    """
+
+    real = ssh.SSHConnection
+    for name in ("reachability", "facts", "run"):
+        assert isinstance(getattr(real, name, None), property) == isinstance(
+            getattr(_Connection, name, None), property
+        ), f"_Connection.{name} does not match SSHConnection.{name}"

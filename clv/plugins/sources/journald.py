@@ -633,7 +633,11 @@ class JournaldProvider(LogSourceProvider):
                 # again what CLV was told a second ago is what makes a reload
                 # with one dead machine feel broken. An *untried* host reports
                 # `connected` optimistically, so a first scan still asks.
-                reach = connection.reachability()
+                # **Property here, method on `RemoteBackend`.** Calling the
+                # backend's spelling on a connection called the frozen dataclass
+                # the property returned, and 2.10.0 shipped with no remote
+                # journal at all. The two shapes still differ; this is the warning.
+                reach = connection.reachability
                 if not reach.ok:
                     self.host_notes[host.name] = reach.reason or "unreachable"
                     continue
@@ -641,9 +645,15 @@ class JournaldProvider(LogSourceProvider):
                     self.host_notes[host.name] = "no journalctl on that host"
                     continue
                 units = self._remote_units(host, connection)
-            except OSError as exc:
+            except Exception as exc:  # noqa: BLE001 - one host must not cost the rest
                 # Unreachable, refused, timed out. Phase 5 owns saying so about
                 # the *host*; here it costs that host's journal and nothing else.
+                #
+                # **Broader than `OSError` on purpose.** The comment above always
+                # claimed per-host containment, but a non-`OSError` bug in this
+                # loop escaped to `_discover_remote_providers` and cost *every*
+                # host's journal — which is exactly how the `reachability` call
+                # above shipped as a dead feature rather than one noisy host.
                 first = str(exc).strip().splitlines()
                 self.host_notes[host.name] = first[0] if first else "unreachable"
                 continue
