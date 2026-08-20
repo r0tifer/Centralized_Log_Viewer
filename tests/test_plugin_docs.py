@@ -103,3 +103,36 @@ def test_a_reversed_non_goal_still_carries_its_record(
         "decision that reversed it"
     )
     assert "Reversed 2026-08-14" in text
+
+
+def test_the_starring_reversal_carries_its_record() -> None:
+    """Phase 9 narrowed what a `ProviderSource` is excluded from. Say so.
+
+    The old text is the tempting thing to delete, because it now reads as
+    describing behaviour the code does not have. Deleting it is what would
+    destroy the argument: two thirds of that exclusion are still in force and
+    are now enforced *by name* rather than by a provider source happening not to
+    be a ref, and a reader who cannot see which two will assume all three or
+    none.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+
+    assert "Reversed 2026-08-19" in text
+    assert "SSH_TODO.md" in text
+    # The part that survived has to be named, or the record says nothing useful.
+    assert "glob filtering and rotated-set grouping" in text
+
+
+def test_the_plugin_contract_does_not_claim_a_provider_source_cannot_be_starred() -> None:
+    """The specific sentence that stopped being true.
+
+    `isinstance(data, Path)` was the spelling of the exclusion for years; it
+    became `refs.is_source_ref` when remote refs landed, and a journal ref is
+    now inside that union. A contract still describing the old test would send a
+    plugin author looking for a guarantee that is gone.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+
+    assert "starring, glob filtering and rotated-set grouping all test" not in text
