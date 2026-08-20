@@ -492,6 +492,18 @@ the rule stated at the head of [TODO.md](../../TODO.md).
   stands and **no index is planned**. What is planned is a user plugin
   directory, an explicit enable-list, and manifests a `clv plugin install` can
   verify from a path, a tarball or a URL that anyone may host.
+- **"A provider source cannot be starred or merged."** *Reversed 2026-08-19* by
+  [SSH_TODO.md](../../SSH_TODO.md) Phase 9. The objection was that a provider
+  source is not a file — nothing on disk answers to `journal:unit/sshd.service`
+  — so putting one in `session.json` would record a path that does not exist.
+  Two thirds of that stands and is now enforced by name rather than by accident:
+  glob filtering and rotated-set grouping both refuse a `JournalRef` explicitly,
+  because a journal has no directory and nothing that rotates. The third was
+  never an argument, only an implementation: a persisted **identifier** is not a
+  persisted path, and a journal unit is exactly the source an operator wants
+  starred and compared across a fleet. `ProviderSource` is still not a ref — it
+  is the tree node's payload, and its `path` carries the identity.
+
 - **"Network aggregation or remote log collection."** *Reversed 2026-08-16* by
   [SSH_TODO.md](../../SSH_TODO.md). The objection was to CLV becoming collection
   infrastructure, and it stands — it is the first bullet above. What changed is
@@ -509,11 +521,19 @@ the rule stated at the head of [TODO.md](../../TODO.md).
 is not a stub — it is the point.
 
 A `LogSourceProvider` hands back a `ProviderSource`, which is deliberately *not*
-a path: starring, glob filtering and rotated-set grouping all test
-`isinstance(data, Path)` and therefore cannot see one. That is exactly right for
-a journal unit, which has no directory to walk and no file to persist. It is
-exactly wrong for `/var/log/syslog` on `web01`, which has both — and a remote
+a path: glob filtering and rotated-set grouping cannot see one. That is right
+for a journal unit, which has no directory to walk and nothing that rotates. It
+is exactly wrong for `/var/log/syslog` on `web01`, which has both — and a remote
 log that cannot be starred or merged has not met the goal `SSH_TODO.md` sets.
+
+**Starring and merging used to be on that list and no longer are.** The
+exclusion was enforced by a provider source not being a `SourceRef` at all,
+which was cheap rather than right: a journal unit is the clearest case of a
+source someone wants starred, and comparing one unit across a fleet is the
+workflow remote sources exist for. `JournalRef` is a ref, so both work. What
+still cannot reach the starred set is a provider source whose `path` is not a
+concrete ref type — the union in `refs.SOURCE_REF_TYPES` is closed, and it is a
+union of types rather than a duck test precisely so that stays true.
 
 So the module supplies a **`SourceBackend`** instead. A remote root reaches
 `SourceManager` as an ordinary root, builds the same nested folder tree, and is

@@ -643,6 +643,25 @@ Two details worth knowing. A severity bucket is pushed down to
 down and CLV does not pretend otherwise. And the initial read is bounded by
 `--lines`, the journal's equivalent of the backwards seek CLV does on a file.
 
+**Journal sources behave like any other source, including the parts that used
+to be missing.** A unit can be starred with `*`, so `sshd.service` sits at the
+top of the tree instead of several rows down the Providers group. It can be
+added to the merged set with `x` and opened with `u` alongside ordinary log
+files, so an application's own log and the journal of the unit running it
+interleave in one timestamp-ordered pane — which is usually the pair you
+actually want. And a starred unit comes back on the next launch.
+
+If the journal is off, or the machine has no systemd, a starred unit says so in
+those words rather than reporting a missing file, and the star is **kept**:
+turning the switch back on brings it back rather than making you find the unit
+again.
+
+What a journal source still is not is a *file*. Include and exclude globs
+describe filenames and never hide a unit — `*.service` does not match
+`sshd.service` here, because the unit is not a file with that name. And nothing
+groups units into rotated sets: journald manages its own retention, so there is
+no `.1` or `.2.gz` to gather.
+
 ### Inspecting an event
 
 The log pane has a cursor. Arrow keys move it a line at a time, `PgUp`/`PgDn` a
