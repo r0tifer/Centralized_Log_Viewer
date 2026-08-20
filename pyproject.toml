@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "clv"
-version = "2.10.0"
+version = "2.11.0"
 description = "Centralized Log Viewer Textual TUI"
 readme = "README.md"
 authors = ["Centralized Log Viewer Maintainers <maintainers@example.com>"]
