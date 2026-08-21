@@ -258,10 +258,41 @@ MERGED_VIEW = MergedSetNode()
 #: uses to tell its own expand chevron from the rest of the line.
 ACTION_META = "clv-action"
 
-#: The verbs a merged row offers, as glyphs narrow enough that three of them
-#: still fit beside the name in a tree panel at its minimum width.
+#: The verbs a row offers, as glyphs narrow enough that three of them fit on a
+#: row without crowding the name.
+#:
+#: **On a leaf they sit between the icon and the name, never after it.** That
+#: was measured rather than chosen: trailing verbs put the control behind a
+#: variable-length path, and at the default `tree_width` of 38 a dated filename
+#: already pushed the `✕` past the rendered width — the tree scrolls
+#: horizontally, so it was still *there* and no longer an affordance. Eliding
+#: the name to make room needed a budget of 14 characters to survive a narrowed
+#: panel, which is not a name any more. A width-dependent label was the third
+#: option and the worst: every resize would invalidate every label, which means
+#: rebuilding the tree on resize — the one thing `_sync_merged_tree` exists to
+#: avoid.
+#:
+#: The *icon* still leads, so the left edge of a row stays inert and a click
+#: aimed at selecting cannot land on a control. The merged group's heading is
+#: the exception and stays as it is: it has no name to hide behind, it sits at
+#: indent zero, and its leading `⧉` is itself the verb that opens the set.
 ICON_NAME_SET = "✎"
 ICON_CLEAR_SET = "✕"
+
+#: Every verb a marker can carry, namespaced `<row>-<verb>`.
+#:
+#: A flat verb was enough while exactly one row type carried markers. Three of
+#: them share the namespace now, and "delete" would mean something on a view row
+#: and nothing on a merged one — leaving the row type as the only thing telling
+#: them apart, which is a discriminator rather than a check. The prefix lets the
+#: handler *verify* the pairing instead of deriving it, so a click whose line
+#: metadata resolves to the wrong node does nothing rather than the wrong thing.
+ACTION_MERGED_OPEN = "merged-open"
+ACTION_MERGED_SAVE = "merged-save"
+ACTION_MERGED_CLEAR = "merged-clear"
+ACTION_VIEW_RENAME = "view-rename"
+ACTION_VIEW_DELETE = "view-delete"
+ACTION_STAR_REMOVE = "star-remove"
 
 #: How that cell is painted, so it reads as a control rather than decoration.
 ACTION_STYLE = Style(color="#95c8f5", bold=True)
@@ -648,9 +679,15 @@ class LogViewerApp(App[None]):
         Binding("g", "goto_timestamp", "Go to timestamp", show=False),
         Binding("m", "toggle_mark", "Mark / unmark this line", show=False),
         Binding("M", "next_mark", "Jump to next mark", show=False),
-        Binding("v", "open_views", "Saved views", show=False),
+        # "then" is doing real work in these two descriptions. `d` is
+        # `toggle_detail` globally, and the overlay lists both rows; without a
+        # word scoping the second one to the modal that `v` or `W` opens, the
+        # help reads as two contradictory claims about the same key. Carrying
+        # the sub-keys in the *description* is also why neither the overlay nor
+        # the README key table needed a second mechanism to learn them.
+        Binding("v", "open_views", "Saved views (then r renames, d deletes)", show=False),
         Binding("V", "save_view", "Save current filters as a view", show=False),
-        Binding("W", "watch_rules", "Watch rules", show=False),
+        Binding("W", "watch_rules", "Watch rules (then a adds, d deletes)", show=False),
         Binding("x", "toggle_merge", "Add / remove from the merged set", show=False),
         Binding("u", "open_merged", "Open the merged view", show=False),
         Binding("X", "clear_merged", "Empty the merged set", show=False),
@@ -1367,7 +1404,16 @@ class LogViewerApp(App[None]):
         # first one left registered.
         await panel.remove_children()
 
-        if not report.files and not self.state.views and not self._provider_sources:
+        # `state.starred` counts too, and did not have to before: the starred
+        # group lists what state holds rather than what the walk found, so a
+        # machine whose logs have all rotated away still has rows to show — and
+        # they are exactly the rows an operator needs in order to remove them.
+        if not (
+            report.files
+            or self.state.views
+            or self.state.starred
+            or self._provider_sources
+        ):
             await panel.mount(Static("No log sources found.", classes="empty-tree"))
             return
 
@@ -1387,7 +1433,7 @@ class LogViewerApp(App[None]):
         if self.state.views:
             group = tree.root.add(VIEWS_GROUP, data=None, expand=False)
             for view in self.state.views:
-                group.add_leaf(f"{ICON_VIEW} {view.name}", data=view)
+                group.add_leaf(self._view_label(view), data=view)
 
         # Provider sources next: few, named rather than pathed, and nothing
         # below this point in the tree can hold one — a folder hierarchy is
@@ -1400,28 +1446,22 @@ class LogViewerApp(App[None]):
         # Starred logs are repeated in a group at the top. With the tree
         # collapsed by default, a favourite would otherwise cost a walk down
         # the hierarchy on every launch.
-        starred = self._starred_paths()
-        present = sorted(
-            (item.path for item in report.files if identity(item.path) in starred),
-            key=lambda p: str(p).lower(),
-        )
-        # Provider sources are eligible too, and were not until journal sources
-        # became refs. Starring one used to be impossible; now that it is not,
-        # leaving them out here would be worse than the old refusal — the star
-        # would take, persist, and then show nothing, because `report.files`
-        # holds what discovery *walked* and nothing walks to a journal unit.
-        present += sorted(
-            (
-                source.path
-                for source in self._provider_sources
-                if is_source_ref(source.path) and identity(source.path) in starred
-            ),
-            key=lambda ref: str(ref).lower(),
-        )
-        if present:
+        #
+        # Listed from state, and marked where the scan came back empty. This
+        # used to be two comprehensions filtering discovery by membership — one
+        # over `report.files`, a second over the provider sources, because
+        # nothing *walks* to a journal unit. Both collapse into "list what state
+        # says, mark what the scan did not find", and the star that has rotated
+        # away gains the row it needs to be removable from.
+        starred = self._starred_display_refs()
+        if starred:
+            found = self._discovered_refs()
             group = tree.root.add(STARRED_GROUP, data=None, expand=False)
-            for path in present:
-                group.add_leaf(f"{ICON_STAR} {_compact_path(path)}", data=path)
+            for ref in starred:
+                group.add_leaf(
+                    self._starred_label(ref, missing=identity(ref) not in found),
+                    data=ref,
+                )
 
         # The merged set, below the stars: a star is a standing favourite, this
         # is the working set for the next `u`. Listed whether or not discovery
@@ -1515,8 +1555,133 @@ class LogViewerApp(App[None]):
         for path in singles:
             parent.add_leaf(self._leaf_label(path, path.name), data=path)
 
+    def _provider_source_for(self, data: object) -> Optional[ProviderSource]:
+        """The provider record for a bare ref, when one still offers it.
+
+        A row can carry the ref without the record — the starred group lists
+        what state holds, and state holds `journal:unit/sshd.service`, not the
+        `ProviderSource` that was built around it. Matching on identity rather
+        than on the record keeps the two in step across a rescan, which hands
+        back new record objects for the same units.
+        """
+
+        if not is_source_ref(data):
+            return None
+        target = identity(data)
+        return next(
+            (
+                source
+                for source in self._provider_sources
+                if is_source_ref(source.path) and identity(source.path) == target
+            ),
+            None,
+        )
+
     def _starred_paths(self) -> set[Path]:
         return {identity(parse_ref(entry)) for entry in self.state.starred}
+
+    def _discovered_refs(self) -> dict[SourceRef, SourceRef]:
+        """Every source the last scan can account for, keyed by identity.
+
+        A journal unit is discoverable without having been *walked*, so this is
+        the union of what the walk found and what the providers offered — the
+        same union `_open_starred_on_launch` needs, which is why it lives here
+        rather than inline in one of them. The tree's notion of "missing" and
+        the launch warning's "not available" have to be the same set, or the
+        tree dims a row the startup message just said was fine.
+
+        The answer comes from the report rather than a fresh `is_file()`: no
+        new IO on the event loop, and a remote ref cannot be asked at all
+        without a round trip — the reason `_is_file_node` exists.
+
+        Values are the ref instances discovery produced, not just their keys;
+        see `_starred_display_refs` for why that matters.
+        """
+
+        report = self._report
+        found: dict[SourceRef, SourceRef] = {}
+        if report is not None:
+            for item in report.files:
+                found[identity(item.path)] = item.path
+        for source in self._provider_sources:
+            if is_source_ref(source.path):
+                found.setdefault(identity(source.path), source.path)
+        return found
+
+    def _starred_display_refs(self) -> list[SourceRef]:
+        """The starred set in the order the group lists it.
+
+        Driven by state, not by discovery — the change that makes a star
+        removable. The group used to be built by filtering `report.files` by
+        membership, so a star whose log had rotated away contributed no row at
+        all: nothing to put the cursor on, and therefore no way to press `*` on
+        it. The merged group settled this argument first ("visible enough to
+        press `x` on rather than silently absent"); a favourite deserves the
+        same answer.
+
+        Where discovery *did* find the source, the node carries the instance
+        discovery produced rather than the one parsed back from disk. The
+        stored string is a `ref_key` — resolved — while the walk yields the
+        unresolved path, and on a machine whose scanned root sits under a
+        symlink those are two different objects for one log. Everything that
+        matches nodes by identity or by `_file_refs` membership then agrees
+        with the rest of the tree. The parsed form is the fallback, and the
+        fallback case is exactly the missing one.
+        """
+
+        found = self._discovered_refs()
+        refs: dict[SourceRef, SourceRef] = {}
+        for entry in self.state.starred:
+            ref = parse_ref(entry)
+            # Keyed by identity, so a hand-edited `session.json` naming both a
+            # symlink and its target lists one log rather than two.
+            refs.setdefault(identity(ref), found.get(identity(ref), ref))
+        return sorted(refs.values(), key=lambda ref: str(ref).lower())
+
+    def _starred_label(self, ref: SourceRef, *, missing: bool) -> Text:
+        """A starred row: the star, the verb that removes it, then the log.
+
+        `✕` is on every row rather than only the broken ones. Every row in this
+        group is starred, so the verb is true of all of them — and "how do I
+        unstar this" is then answered by looking at any row rather than only at
+        the ones that have gone. It precedes the name for the reason
+        `ICON_CLEAR_SET` gives, which is what makes it reachable on the row this
+        whole feature exists for: a dated filename is exactly the kind of long
+        name that used to hide it.
+
+        **Missing is dimmed, and costs no cells.** A `(missing)` suffix would
+        take seven columns the panel does not have at its minimum width, so the
+        words live instead in the toast the row gives when selected and in the
+        warning `_open_starred_on_launch` already prints. A different glyph in
+        the star slot was rejected for saying the wrong thing: a missing star is
+        still a star, and swapping it reads as "no longer starred", which is the
+        opposite of the promise that rotated logs come back. `dim` over a colour
+        because it is an SGR attribute and survives a monochrome terminal — and
+        because the row has to stay legible to be worth clicking.
+
+        Note this does not weaken the rule that starring never changes a row's
+        width: that rule is about `_leaf_label` in the folder hierarchy, where
+        the same row exists before and after the star. Inside this group there
+        is no before and after.
+        """
+
+        def marker(glyph: str, action: str) -> tuple[str, Style]:
+            return glyph, Style.from_meta({ACTION_META: action}) + ACTION_STYLE
+
+        # The merge indicator prefixes this copy of the row exactly as it
+        # prefixes the one in the folder hierarchy. It is built in here rather
+        # than bolted on afterwards because `_relabel_sources` deliberately
+        # leaves group rows alone — a rich label carrying click metadata cannot
+        # survive being rewritten as a plain string.
+        merged = ICON_MERGED if identity(ref) in self._merged_paths else ""
+        icon = f"{merged}{ICON_STAR} "
+        name = f" {_compact_path(ref)}"
+        dim = Style(dim=True)
+        return Text.assemble(
+            (icon, dim) if missing else icon,
+            marker(ICON_CLEAR_SET, ACTION_STAR_REMOVE),
+            (name, dim) if missing else name,
+        )
 
     def _leaf_label(self, path: Path, text: str) -> str:
         icon = ICON_STAR if identity(path) in self._starred_paths() else ICON_FILE
@@ -1770,8 +1935,11 @@ class LogViewerApp(App[None]):
         on one of them into a press on something else entirely. Membership is
         about the stored key, not about the file existing today.
 
-        ``_star_target`` itself is left alone: whether starring should follow is a
-        separate question with a separate answer.
+        ``_star_target`` has since been given the *narrow* half of this: a row in
+        the starred group is taken at its word, because that group now lists what
+        state holds rather than what discovery found. It is deliberately not
+        given the blanket rule above — that one also matches a folder node, which
+        is why `x` on a folder merges a directory and why `*` must not follow.
         """
 
         try:
@@ -2034,11 +2202,38 @@ class LogViewerApp(App[None]):
 
         count = _plural(len(self.state.merged), "source", "sources")
         return Text.assemble(
-            marker(ICON_MERGED, "open"),
+            marker(ICON_MERGED, ACTION_MERGED_OPEN),
             f" Merged ({count})  ",
-            marker(ICON_NAME_SET, "save"),
+            marker(ICON_NAME_SET, ACTION_MERGED_SAVE),
             " ",
-            marker(ICON_CLEAR_SET, "clear"),
+            marker(ICON_CLEAR_SET, ACTION_MERGED_CLEAR),
+        )
+
+    def _view_label(self, view: SavedView) -> Text:
+        """A saved view's row: its icon, the verbs it offers, then its name.
+
+        The same recipe as `_merged_label` — a cell carrying action metadata
+        reads as a control, the rest of the row stays an ordinary selectable
+        leaf that applies the view. The verbs precede the name for the reason
+        `ICON_CLEAR_SET` gives: an operator names a view whatever they like, and
+        a control that a long name can push off the panel is not a control.
+
+        `Text.assemble` rather than an f-string is the second reason for this
+        method: a `str` label goes through `Text.from_markup`, so a view an
+        operator named `[bold]prod` would render as markup and lose its name.
+        `ViewPickerDialog.compose` guards the same value for the same reason;
+        the two move together.
+        """
+
+        def marker(glyph: str, action: str) -> tuple[str, Style]:
+            return glyph, Style.from_meta({ACTION_META: action}) + ACTION_STYLE
+
+        return Text.assemble(
+            f"{ICON_VIEW} ",
+            marker(ICON_NAME_SET, ACTION_VIEW_RENAME),
+            " ",
+            marker(ICON_CLEAR_SET, ACTION_VIEW_DELETE),
+            f" {view.name}",
         )
 
     def _merged_display_paths(self) -> list[Path]:
@@ -2094,25 +2289,262 @@ class LogViewerApp(App[None]):
                 group.add_leaf(f"{ICON_MERGED} {_compact_path(path)}", data=path)
         elif group is not None:
             # An empty group is a row that explains nothing.
+            self._retreat_cursor(tree, group)
             group.remove()
-            group = None
 
-        # Every other node carrying a path — the file in its folder, and any
-        # copy of it in the starred group — gains or loses the indicator.
+        # The starred group holds its own copy of any merged row, and its
+        # labels are rich text this cannot rewrite — so it is rebuilt rather
+        # than patched.
+        self._sync_starred_tree()
+
+    def _relabel_sources(self, tree: LogTree) -> None:
+        """Re-apply the star and merge indicators to the folder hierarchy.
+
+        Only the hierarchy. A row inside one of the three groups is owned by
+        that group's reconciler and is rebuilt wholesale, and its label is a
+        rich `Text` carrying click metadata — flattening one to a `str` here
+        would silently strip the `✕` off a starred row and leave a control that
+        renders but does nothing.
+
+        The display text is recovered by stripping the leading icons rather than
+        remembered. They are a closed set, they always lead, and each is
+        followed by exactly one space, so the strip is exact. The alternative is
+        a parallel map of node to base text — a second structure to keep in step
+        with the tree, which is the failure this method exists to repair.
+
+        The star is re-applied to **leaves only**. A folder carries a `Path` too
+        and is therefore a source ref by this predicate, but its icon is a
+        folder and always was; recomputing one for it would hand `📂 nested` a
+        file icon it never had.
+        """
+
+        groups = {
+            self._merged_group(tree),
+            self._starred_group(tree),
+            self._views_group(tree),
+        }
+        merged = self._merged_paths
+        starred = self._starred_paths()
         for node in _walk_nodes(tree.root):
-            if node.parent is group or not is_source_ref(node.data):
+            if node.parent in groups or not is_source_ref(node.data):
                 continue
             plain = node.label.plain
             if plain.startswith(ICON_MERGED):
                 plain = plain[len(ICON_MERGED) :]
-            member = identity(node.data) in merged
-            node.set_label(f"{ICON_MERGED}{plain}" if member else plain)
+            key = identity(node.data)
+            if not node.allow_expand:
+                for icon in (ICON_STAR, ICON_FILE):
+                    if plain.startswith(icon):
+                        plain = f"{ICON_STAR if key in starred else ICON_FILE}" + plain[
+                            len(icon) :
+                        ]
+                        break
+            node.set_label(f"{ICON_MERGED}{plain}" if key in merged else plain)
+
+    async def _ensure_tree_panel(self) -> bool:
+        """Put a tree back, or take it away, when the panel's shape must change.
+
+        `_build_tree` swaps the whole panel for a "No log sources found." notice
+        when there is nothing at all to list. Creating the first view — or the
+        first star — while that notice is up has to put a tree back, and
+        destroying the last one has to take it away again. Neither is something
+        the in-place reconcilers can do: they begin by looking for a tree, and
+        finding none they return, so the view was saved and stayed invisible.
+
+        Rebuilding is safe **here and nowhere else**. This runs only on the
+        transition into or out of the empty panel, where the tree either does
+        not exist or holds nothing but the group that is being emptied — so
+        there is no expanded hierarchy to collapse, which is the whole reason
+        the reconcilers exist.
+
+        Returns whether it rebuilt, so the caller can skip reconciling rows
+        `_build_tree` has just written.
+        """
+
+        report = self._report
+        if report is None:
+            return False
+        try:
+            self.query_one("#source-tree", LogTree)
+            has_tree = True
+        except NoMatches:
+            has_tree = False
+        wants_tree = bool(
+            report.files
+            or self.state.views
+            or self.state.starred
+            or self._provider_sources
+        )
+        if has_tree == wants_tree:
+            return False
+        await self._build_tree(report)
+        return True
+
+    def _sync_group_rows(self) -> None:
+        """Reconcile both state-driven groups at once.
+
+        Views and starred are each a pure function of `SessionState`, and the
+        two together are a handful of rows. Reconciling both on any change to
+        either costs one cheap pass and removes the class of bug where a
+        gesture updates one group and leaves the other showing what state used
+        to say — which is what the full rebuild used to hide.
+        """
+
+        self._sync_views_tree()
+        self._sync_starred_tree()
+
+    def _sync_starred_tree(self) -> None:
+        """Make the tree's starred group match the current set, in place.
+
+        `_build_tree` creates every folder shut, so the full rebuild this
+        replaces collapsed the whole hierarchy on every `*`. That was survivable
+        while starring was keyboard-only; the `✕` on the row is a *click*, and a
+        click that collapses the tree under the cursor and destroys the row it
+        landed on is not one.
+        """
+
+        found = self._discovered_refs()
+        self._sync_group_tree(
+            self._starred_group,
+            STARRED_GROUP,
+            lambda: [
+                (self._starred_label(ref, missing=identity(ref) not in found), ref)
+                for ref in self._starred_display_refs()
+            ],
+        )
+        # The star also replaces the file icon on the log's own row down in the
+        # hierarchy, so that copy has to follow.
+        try:
+            self._relabel_sources(self.query_one("#source-tree", LogTree))
+        except NoMatches:
+            return
+
+    def _sync_views_tree(self) -> None:
+        """Make the tree's views group match the saved set, in place.
+
+        No `_relabel_sources`: a `SavedView` is not a source ref, so nothing
+        outside this group carries an indicator that saving or deleting one
+        could change.
+        """
+
+        self._sync_group_tree(
+            self._views_group,
+            VIEWS_GROUP,
+            lambda: [(self._view_label(view), view) for view in self.state.views],
+        )
+
+    def _sync_group_tree(self, find, label: str, rows) -> None:
+        """The shared half of reconciling a heading group from state.
+
+        Create it in the right slot when it appears, swap its children when it
+        is already there, remove it when the set empties — the shape
+        `_sync_merged_tree` established. That one is not folded in here: it also
+        maintains a count in its own label and opens itself on arrival, and
+        parameterising those would cost more than the twenty lines it saves.
+        """
+
+        try:
+            tree = self.query_one("#source-tree", LogTree)
+        except NoMatches:
+            return
+
+        group = find(tree)
+        children = rows()
+        if children:
+            if group is None:
+                group = tree.root.add(
+                    label, data=None, expand=True, before=self._group_slot(tree, label)
+                )
+            else:
+                group.remove_children()
+            for row_label, data in children:
+                group.add_leaf(row_label, data=data)
+        elif group is not None:
+            # An empty group is a row that explains nothing. Move the cursor off
+            # it first: the gesture that emptied it may well have been a click
+            # on one of its own rows, and removing the node the cursor sits on
+            # strands it on nothing.
+            self._retreat_cursor(tree, group)
+            group.remove()
+
+    @staticmethod
+    def _retreat_cursor(tree: LogTree, doomed: TreeNode[object]) -> None:
+        """Move the cursor out of *doomed* before it is removed.
+
+        Walks up from the cursor rather than comparing it to *doomed* directly,
+        because the cursor is usually on one of the group's children — the row
+        that was just clicked — rather than on the heading itself.
+
+        The root is hidden, so retreating to it lands on the first row below it
+        instead of on nothing. That is the right destination anyway: the group
+        was at the top of the tree, and what replaces it is whatever is now.
+        """
+
+        node = tree.cursor_node
+        while node is not None:
+            if node is doomed:
+                tree.move_cursor(tree.root)
+                return
+            node = node.parent
 
     @staticmethod
     def _merged_group(tree: LogTree) -> Optional[TreeNode[object]]:
         return next(
             (node for node in tree.root.children if node.data is MERGED_VIEW), None
         )
+
+    @staticmethod
+    def _starred_group(tree: LogTree) -> Optional[TreeNode[object]]:
+        """The starred heading, matched the way `_merged_group` matches its own.
+
+        By label rather than by a marker object, because this heading carries no
+        data: selecting "Starred" means nothing, and giving it data purely to be
+        findable would make it selectable too.
+        """
+
+        return next(
+            (
+                node
+                for node in tree.root.children
+                if node.data is None and node.label.plain == STARRED_GROUP
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _views_group(tree: LogTree) -> Optional[TreeNode[object]]:
+        return next(
+            (
+                node
+                for node in tree.root.children
+                if node.data is None and node.label.plain == VIEWS_GROUP
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _group_slot(tree: LogTree, label: str) -> int:
+        """Where a group appearing mid-session belongs among the others.
+
+        Not `_group_count`, which counts the leading headings and stops. That
+        is the right answer only for the group that sorts last — inserting the
+        views group at that index would drop it below providers and starred,
+        which is the one ordering the tree promises. Counting only the siblings
+        that outrank the target puts each group where `_build_tree` would have.
+        """
+
+        rank = TREE_GROUP_LABELS.index(label)
+        slot = 0
+        for node in tree.root.children:
+            if node.data is not None or node.label.plain not in TREE_GROUP_LABELS:
+                break
+            if TREE_GROUP_LABELS.index(node.label.plain) < rank:
+                slot += 1
+        return slot
+
+    def _in_starred_group(self, tree: LogTree, node: TreeNode[object]) -> bool:
+        group = self._starred_group(tree)
+        return group is not None and node.parent is group
 
     @staticmethod
     def _group_count(tree: LogTree) -> int:
@@ -3902,6 +4334,25 @@ class LogViewerApp(App[None]):
         """Apply, rename or delete a saved view."""
         self.run_worker(self._prompt_views(), group="dialogs", exit_on_error=False)
 
+    def _edit_view(self, view: SavedView, mode: str) -> None:
+        """Open the picker on one view, already in the middle of *mode*.
+
+        Why the tree's markers open the picker rather than acting where they
+        are: the merged row's `✕` empties on one click because a merged set is
+        a *working* set, three keystrokes from being rebuilt and explicitly not
+        the saved thing. A view is named work and CLV has no undo anywhere. The
+        picker already owns arm-then-confirm, and routing the marker into it
+        leaves one implementation of "are you sure" rather than a second one
+        living on a tree row. `✎` follows for symmetry, and because a rename
+        needs a text input the tree has nowhere to put.
+        """
+
+        self.run_worker(
+            self._prompt_views(focus=view.name, mode=mode),
+            group="dialogs",
+            exit_on_error=False,
+        )
+
     def _capture_view(self, name: str) -> SavedView:
         """Everything the current filter state consists of, under *name*.
 
@@ -3937,15 +4388,16 @@ class LogViewerApp(App[None]):
         return next((view for view in self.state.views if view.name == name), None)
 
     async def _store_views(self, views: Iterable[SavedView]) -> None:
-        """Persist *views* sorted by name, and rebuild the tree group.
+        """Persist *views* sorted by name, and reconcile the tree group.
 
-        Rebuilt from the report already in hand rather than by re-walking the
-        filesystem, the same way starring does it.
+        In place rather than a rebuild, the same way starring does it: the row
+        markers make saving and deleting a mouse gesture, and a rebuild would
+        collapse the hierarchy under the pointer.
         """
 
         self._update_state(views=tuple(sorted(views, key=lambda view: view.name.lower())))
-        if self._report is not None:
-            await self._build_tree(self._report)
+        if not await self._ensure_tree_panel():
+            self._sync_group_rows()
 
     def _default_view_name(self) -> str:
         """A name worth pressing Enter on, derived from what is filtered."""
@@ -4068,12 +4520,17 @@ class LogViewerApp(App[None]):
             f"Replaced view '{name}'." if replaced else f"Saved view '{name}'."
         )
 
-    async def _prompt_views(self) -> None:
+    async def _prompt_views(self, *, focus: str = "", mode: str = "") -> None:
         """Show the picker until the operator applies one or closes it.
 
         Rename and delete reopen it: the list the modal is holding is stale the
         moment either lands, and reopening is cheaper — in code and in
         surprises — than teaching the dialog to edit its own copy.
+
+        *focus* and *mode* are how a tree marker arrives mid-gesture, and they
+        apply to the **first** push only. A reopen is the tail of a rename or a
+        delete that already happened; landing back in the same mode would be a
+        loop rather than a confirmation.
         """
 
         while True:
@@ -4084,8 +4541,10 @@ class LogViewerApp(App[None]):
                 return
 
             request = await self.push_screen(
-                ViewPickerDialog(self.state.views), wait_for_dismiss=True
+                ViewPickerDialog(self.state.views, focus=focus, mode=mode),
+                wait_for_dismiss=True,
             )
+            focus = mode = ""
             if request is None:
                 return
             if not await self._handle_view_request(request):
@@ -4161,6 +4620,18 @@ class LogViewerApp(App[None]):
             # that predicate would let one into the folder hierarchy.
             if isinstance(data, ProviderSource):
                 return data.path if is_source_ref(data.path) else None
+            # A row the starred group put there is taken at its word. It is
+            # listed *because* it is starred, so the only gesture it can mean
+            # is un-starring — and the `_is_file_node` filter below would
+            # otherwise answer None for a log that has gone, handing the
+            # keystroke to whatever is on screen and toggling a star nobody
+            # pointed at. This is the question `_merge_target` deferred.
+            #
+            # Narrow on purpose. `_merge_target` takes *any* ref in the tree at
+            # its word, and a folder node carries a `Path` too, so that shape
+            # would let `*` star a directory.
+            if self._in_starred_group(tree, tree.cursor_node) and is_source_ref(data):
+                return data
             # `_is_file_node`, not `data.is_file()`: a remote ref cannot answer
             # that without a round trip, and this runs on every cursor move.
             return data if self._is_file_node(data) else None
@@ -4179,7 +4650,11 @@ class LogViewerApp(App[None]):
         if self._is_shutting_down or not self.is_mounted:
             return
         target = self._star_target()
-        starred = None if target is None else ref_key(target) in self.state.starred
+        # By identity, not by an exact match against the stored string. Those
+        # agree only while every write goes through `ref_key`; an older or
+        # hand-edited `session.json` would otherwise light the tree's star and
+        # leave the button saying the log is not starred.
+        starred = None if target is None else identity(target) in self._starred_paths()
         self.query_bar.set_star_state(starred)
 
     async def action_toggle_star(self) -> None:
@@ -4191,20 +4666,28 @@ class LogViewerApp(App[None]):
             return
 
         key = ref_key(data)
+        target = identity(data)
         starred = set(self.state.starred)
-        if key in starred:
-            starred.discard(key)
+        # Removal is by identity, addition by key. An entry written by an older
+        # build — or by hand, which is what an operator had to do before the
+        # row carried a `✕` — need not be spelled the way `ref_key` spells it,
+        # and discarding the exact string would leave the star in place while
+        # reporting it gone.
+        stale = {entry for entry in starred if identity(parse_ref(entry)) == target}
+        if stale:
+            starred -= stale
             message = f"Unstarred {data.name}."
         else:
             starred.add(key)
             message = f"Starred {data.name}."
         self._update_state(starred=tuple(sorted(starred)))
 
-        # Rebuild from the report already in hand rather than re-walking the
-        # filesystem, then put the cursor back where the operator left it.
-        if self._report is not None:
-            await self._build_tree(self._report)
-            self._highlight_source(data, select=False)
+        # In place rather than a rebuild: the `✕` on a starred row is a click,
+        # and rebuilding would collapse every folder the operator had opened
+        # and destroy the row underneath the pointer. The exception is the panel
+        # having no tree to reconcile at all, which `_ensure_tree_panel` owns.
+        if not await self._ensure_tree_panel():
+            self._sync_group_rows()
         self._sync_star_button()
         self._notify(message)
 
@@ -4221,34 +4704,44 @@ class LogViewerApp(App[None]):
         if report is None or not self.state.starred:
             return
 
-        # A journal unit is discoverable without having been *walked*, so
-        # availability is the union of what the walk found and what the
-        # providers offered. Leaving the second half out would report every
-        # starred unit as unavailable on every launch, while the tree showed it
-        # sitting there.
-        discovered = {identity(item.path) for item in report.files}
-        discovered |= {
-            identity(source.path)
-            for source in self._provider_sources
-            if is_source_ref(source.path)
-        }
+        discovered = self._discovered_refs()
         starred = [parse_ref(entry) for entry in self.state.starred]
         present = [path for path in starred if identity(path) in discovered]
 
         for path in starred:
             if identity(path) in discovered:
                 continue
-            # Why it is unavailable is worth saying for a journal source, where
-            # the usual answer is a switch rather than a missing file. The star
-            # is kept either way — flipping the switch should bring it back.
-            if isinstance(path, JournalRef):
-                _allowed, reason = check_access(path)
-                self._notify(reason or f"Starred journal source is not available: {path}", "warning")
-            else:
-                self._notify(f"Starred log is not available: {path}", "warning")
+            # The star is kept either way — flipping a switch or bringing a
+            # host back should restore it. It is now also *removable*, from the
+            # row the tree keeps for it.
+            self._notify(self._unavailable_reason(path), "warning")
 
         if len(present) == 1:
             self._select_source(present[0], announce=False)
+
+    def _unavailable_reason(self, ref: SourceRef) -> str:
+        """Why the last scan could not account for *ref*.
+
+        One sentence, two callers: the warning at launch and the toast a dead
+        row gives when it is selected. Said twice in two wordings, an operator
+        would reasonably read them as two different problems.
+
+        The three cases are genuinely different diagnoses, and collapsing them
+        into "not available" is how a good log gets unstarred. A journal source
+        is usually a switch rather than a deletion. A remote one is usually a
+        host that was down when the scan ran — naming the host is what stops
+        the VPN being mistaken for a missing file.
+        """
+
+        if isinstance(ref, JournalRef):
+            _allowed, reason = check_access(ref)
+            return reason or f"Starred journal source is not available: {ref}"
+        if isinstance(ref, RemoteRef):
+            return (
+                f"{ref.path} was not found on {ref.node} in the last scan — "
+                "the host may have been unreachable."
+            )
+        return f"Starred log is not available: {ref}"
 
     def action_show_help(self) -> None:
         """Open the binding list. Tailing continues behind it."""
@@ -4738,18 +5231,57 @@ class LogViewerApp(App[None]):
         elif isinstance(data, SavedView):
             self._apply_view(data)
             self._notify(f"Applied view '{data.name}'.")
+        elif (source := self._provider_source_for(data)) is not None:
+            # The starred group lists a journal unit as the bare ref rather
+            # than the provider record, so the branch above never matched one
+            # and the row was simply inert. It is still a source a provider
+            # offers; selecting it should open it, wherever the row lives.
+            self._select_provider_source(source)
+        elif is_source_ref(data) and not event.node.allow_expand:
+            # A leaf that named a source and matched nothing above is a source
+            # the last scan could not account for — the starred group lists
+            # those on purpose. Saying so beats the silent nothing this used to
+            # do, and the `✕` on the row is the way out.
+            #
+            # `allow_expand` is the guard that makes this safe: a folder node
+            # carries a `Path` too, so an unqualified `is_source_ref` here would
+            # toast on every folder click. `add_leaf` sets it False; folders and
+            # rotated sets are added with `add`.
+            self._notify(self._unavailable_reason(data), "warning")
 
     def on_log_tree_action_requested(self, message: LogTree.ActionRequested) -> None:
-        """A marker on a row was clicked. The row says what it stands for."""
+        """A marker on a row was clicked. The row says what it stands for.
 
-        if message.node.data is not MERGED_VIEW:
-            return
-        if message.action == "open":
-            self.action_open_merged()
-        elif message.action == "save":
-            self.action_save_view()
-        elif message.action == "clear":
-            self.action_clear_merged()
+        Row type first, verb second: the marker is attached to a row, and the
+        namespaced verb then confirms it belongs there. Anything that does not
+        pair falls through and does nothing — the same contract `_on_click`
+        already states for a cell carrying no marker at all.
+        """
+
+        data = message.node.data
+        if data is MERGED_VIEW:
+            if message.action == ACTION_MERGED_OPEN:
+                self.action_open_merged()
+            elif message.action == ACTION_MERGED_SAVE:
+                self.action_save_view()
+            elif message.action == ACTION_MERGED_CLEAR:
+                self.action_clear_merged()
+        elif isinstance(data, SavedView):
+            if message.action == ACTION_VIEW_RENAME:
+                self._edit_view(data, "rename")
+            elif message.action == ACTION_VIEW_DELETE:
+                self._edit_view(data, "delete")
+        elif is_source_ref(data) and message.action == ACTION_STAR_REMOVE:
+            # Through the cursor, so the toggle acts on the row that was
+            # clicked rather than on whatever the tree last highlighted. The
+            # action is async, so it runs as a worker like the toolbar's does.
+            try:
+                tree = self.query_one("#source-tree", LogTree)
+            except NoMatches:  # pragma: no cover - the click came from it
+                return
+            tree.focus()
+            tree.move_cursor(message.node)
+            self.run_worker(self.action_toggle_star(), group="star", exit_on_error=False)
 
     def on_tree_node_highlighted(self, _event: Tree.NodeHighlighted[Path]) -> None:
         # The star target follows the cursor while the tree has focus, so the
