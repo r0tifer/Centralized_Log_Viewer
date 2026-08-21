@@ -321,3 +321,42 @@ def test_bindings_cut_from_the_footer_are_all_in_the_overlay() -> None:
                 assert format_key(key) in rendered
 
     asyncio.run(scenario())
+
+
+def test_a_binding_names_the_sub_keys_of_the_modal_it_opens() -> None:
+    """Deleting a saved view was reachable and undiscoverable.
+
+    `v` opens a modal where `r` renames and `d` deletes twice, and none of that
+    appeared anywhere the overlay or the README key table could show it — the
+    keys lived only in the modal's own hint line. Carried in the *description*
+    rather than as synthetic rows, so the overlay stays a pure function of
+    `BINDINGS` and the README table inherits the same words for free.
+    """
+
+    rows = {
+        key: description
+        for section in build_help_sections(LogViewerApp.BINDINGS)
+        for key, description in section.rows
+    }
+    assert "r renames" in rows["v"] and "d deletes" in rows["v"]
+    assert "a adds" in rows["W"] and "d deletes" in rows["W"]
+    # "then" is what scopes them to the modal. `d` is toggle_detail globally,
+    # and the overlay lists that row too.
+    assert "then" in rows["v"] and "then" in rows["W"]
+
+
+def test_every_description_fits_the_overlay_at_eighty_columns() -> None:
+    """A description that overruns its column is clipped, silently.
+
+    `#help-dialog` is 76 wide, `padding: 1 2` takes 4, `.help-key` is a fixed 12
+    and the scrollbar takes 2 — leaving 58 cells on a `.help-row` that is one
+    line tall. This was folklore until a description grew; now it fails the
+    build instead.
+    """
+
+    budget = 76 - 4 - 12 - 2
+    for binding in (
+        list(LogViewerApp.BINDINGS) + list(LogView.BINDINGS) + list(TimelineBar.BINDINGS)
+    ):
+        description = binding.description or binding.action
+        assert len(description) <= budget, f"{binding.key}: {description!r}"
