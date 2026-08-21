@@ -14,11 +14,13 @@ bug report from people who cannot read the source to work out what happened.
 Correctness and the contract come first; the door opens third; the seams that
 make the door worth walking through come after that.
 
-Seventeen phases is a lot. The alternative was to declare half of them out of
+Eighteen phases is a lot. The alternative was to declare half of them out of
 scope, which is what the first draft of this file did — and the objection to
 that draft was correct: a plugin system that cannot touch the query language,
 the watch rules, the clustering, the timeline or the screen is not an
-ecosystem, it is three hooks and a directory.
+ecosystem, it is three hooks and a directory. Seventeen of the eighteen are
+that argument; Phase 7b is the exception, and it is here because designing the
+`LogFormat` seam is what proved one particular format could not go through it.
 
 ## Status
 
@@ -34,7 +36,8 @@ ecosystem, it is three hooks and a directory.
 | 5 — Ordering, config, lifecycle | `priority`, `[plugin:<name>]`, `setup`/`teardown` | ⬜ Not started |
 | 6 — Performance guard | A slow plugin costs itself, not the pane | ⬜ Not started |
 | **Stage C — Core seams** | | |
-| 7 — Parsing | `LogFormat`, and a plugin that teaches CLV a format | ⬜ Not started |
+| 7a — Parsing | `LogFormat`, and a plugin that teaches CLV a format | ⬜ Not started |
+| 7b — logfmt | `key=value` parsing, built in because a plugin cannot | ⬜ Not started |
 | 8 — Query | `QueryOperator`, `ComputedField`, and the degradation rule | ⬜ Not started |
 | 9 — Watch | `WatchMatcher`, `WatchSink`, off the event loop | ⬜ Not started |
 | 10 — Clustering | `ClusterRule`, `ShapeContributor`, and the shape cache | ⬜ Not started |
@@ -59,11 +62,12 @@ viewer down.
 
 The bar is **a plugin extends a core feature on equal terms with a built-in**.
 Not "beside" it: a plugin-supplied log format must be searchable by field query,
-bucketed by the timeline and folded by the clusterer with no special-casing
-anywhere; a plugin-supplied query operator must work in a saved view and in a
-watch rule; a plugin-supplied command must appear in the help overlay next to
-`?`. Where a seam cannot offer equal terms, the phase says so in the same
-sentence it offers the seam.
+bucketed by the timeline, folded by the clusterer, and drawn as a structured row
+with its own source cell and chips, with no special-casing anywhere; a
+plugin-supplied query operator must work in a saved view and in a watch rule; a
+plugin-supplied command must appear in the help overlay next to `?`. Where a
+seam cannot offer equal terms, the phase says so in the same sentence it offers
+the seam.
 
 Three things follow that bound every phase below.
 
@@ -181,7 +185,7 @@ rather than one at a time.
 | `LogSourceProvider` | exists | Where lines come from | ✅ |
 | `FilterStage` | exists | Transform or drop an entry | ❌ per-entry |
 | `Exporter` | exists | Send the filtered set somewhere | ✅ |
-| `LogFormat` | 7 | Teach CLV to parse a line | ❌ per-line |
+| `LogFormat` | 7a | Teach CLV to parse a line | ❌ per-line |
 | `QueryOperator` | 8 | A new comparison token | ❌ per-entry |
 | `ComputedField` | 8 | A queryable field derived, not parsed | ❌ per-entry |
 | `WatchMatcher` | 9 | A rule kind beyond pattern | ❌ per-entry |
@@ -215,10 +219,15 @@ Phase 16's documentation pass is where it gets rewritten.
 
 **Ordering between the two files is mostly free.** Stage A here is strictly
 additive and can land during SSH_TODO's Phase 0–2 without interference. Two
-couplings, both one-directional:
+couplings, both one-directional, and one of them already discharged:
 
-- **Phase 7 should follow SSH_TODO Phase 1** if both are in flight: a format
-  plugin's `field_names` interacts with the `node` field that phase introduces.
+- **Phase 7a's coupling to SSH_TODO Phase 1 is spent.** That phase has landed
+  and `node` is already in `NORMALISED_FIELD_KEYS`
+  ([query.py:114-120](clv/services/query.py#L114-L120)), so a format's
+  `field_names` now meets it as an existing key rather than a moving one. Kept
+  rather than deleted because the constraint was real: a format declaring `node`
+  would have collided with the one key that means *where CLV read the line*
+  rather than what the line says about itself.
 - **Phase 12's drawer sections should follow SSH_TODO Phase 7**, which adds the
   host-management dialog and is the larger claim on the drawer's layout budget.
 
@@ -782,7 +791,7 @@ per-entry query path and the memoised shape path.
   drawer, re-enablable from Phase 4's control.
 - **Two budgets, not one.** A render-path budget for anything called per entry
   during filtering, and a **read-path budget** measured per line for
-  `LogFormat` and `ClusterRule` in Phase 7 and 10. The read path is where an
+  `LogFormat` and `ClusterRule` in Phase 7a and 10. The read path is where an
   expensive plugin does the most damage and where the operator has the least
   evidence that a plugin is responsible.
 - **The buffer ceiling is the stated risk.** `max_buffer_lines` is configurable
@@ -821,18 +830,35 @@ removing the double call and no regression with zero plugins. Suite green on
 
 # Stage C — Core seams
 
-Five phases, one per core feature a plugin could not previously reach. Each ends
+Five seams, one per core feature a plugin could not previously reach. Each ends
 with the same kind of gate: a plugin-supplied thing working through a core
 feature that knows nothing about plugins (Requirement 9).
 
-## Phase 7 — Parsing
+Six phases, though, and only five of them are seams. Designing the parsing seam
+is what found the format it cannot carry: logfmt needs a built-in matcher to
+stand down in its favour, and *"replacing a built-in format"* is refused to
+plugins in *Still deliberately out of scope*. Phase 7b is therefore core work
+with no plugin in it. Where a seam cannot offer equal terms the phase says so in
+the same sentence it offers the seam; here the phase after it does the work.
 
-`_parse_structured` ([parsing.py:545-630](clv/services/parsing.py#L545-L630))
+## Phase 7a — Parsing
+
+`_parse_structured` ([parsing.py:545-632](clv/services/parsing.py#L545-L632))
 dispatches through hardcoded formats on cheap first-character checks and falls
 through to `raw`. There is no registry and no hook, so "CLV does not know my
 format" has no plugin-shaped answer — and a `FilterStage` is not one: it can
 rewrite `fields` after the fact but cannot make a line parse, cannot claim a
 `format_name`, and cannot supply the timestamp the timeline buckets on.
+
+A `format_name` is four registrations, though, and only the first is in
+`parsing.py`: the dispatch that sets the name, `FORMAT_LABELS` and
+`NO_FIELD_REASONS` ([detail_pane.py:40-66](clv/widgets/detail_pane.py#L40-L66)),
+`FORMAT_PROFILES` ([columns.py:128](clv/widgets/columns.py#L128)) and
+`_JSON_CONSUMED` ([columns.py:179](clv/widgets/columns.py#L179)). The last two
+postdate this phase's first draft and are the ones that fail quietly: a format
+with no profile gets `DEFAULT_PROFILE`, which is a row with no source cell and
+no chips. No test imports any of the three tables, and there is no canonical
+list of format names to check them against.
 
 **Expected outcomes**
 
@@ -844,6 +870,16 @@ rewrite `fields` after the fact but cannot make a line parse, cannot claim a
       #: before a matching line has been seen.
       field_names: frozenset[str] = frozenset()
 
+      #: What an operator calls this format in the detail pane. Without
+      #: one the pane falls back to the bare `format_name` identifier.
+      label: str = ""
+
+      #: Which of `field_names` earns the source cell, a pinned chip or a
+      #: varying chip in a structured row. `FormatProfile()` is a legal
+      #: answer and means "message only" — but it has to be the author's
+      #: answer rather than a default they never saw.
+      columns: FormatProfile = FormatProfile()
+
       @abstractmethod
       def parse(self, line: str) -> Optional[LogEntry]: ...
   ```
@@ -851,45 +887,84 @@ rewrite `fields` after the fact but cannot make a line parse, cannot claim a
 - **Built-ins first, plugins second, `raw` last.** Two load-bearing reasons: a
   line that already parses costs a plugin nothing, and a third-party format
   cannot shadow syslog. A plugin wanting to *replace* a built-in is out of
-  scope and the documentation says so.
+  scope and the documentation says so — Phase 7b is what CLV does instead, on
+  its own account, when the format is worth the phase.
 - **Injection, not import.** `LogParser`
   ([parsing.py:699-741](clv/services/parsing.py#L699-L741)) gains a `formats=()`
   keyword, `Buffer` ([session.py:119](clv/services/session.py#L119)) passes what
   the session was given, and the app supplies the registry's formats.
   `parsing.py` keeps knowing nothing about plugins.
+- **A format declares its row, or it does not get one.** `FormatProfile`
+  ([columns.py:110-124](clv/widgets/columns.py#L110-L124)) is re-exported from
+  `clv.api` and gains one field, `consumed: frozenset[str] = frozenset()` — the
+  keys the format already spent on the time, level or message cell and must not
+  get back as chips. That set is `_JSON_CONSUMED` today, reached through
+  `if entry.format_name == "json"`
+  ([columns.py:381](clv/widgets/columns.py#L381)), and generalising it is not
+  tidying: a format whose keys are the writer's choice rather than a regex's
+  group names is exactly the case that needs it, and **every** plugin format is
+  one. The special case goes, `json`'s entry carries the set that used to be
+  hardcoded, and `_chips_for` reads it off the profile.
+- **Profiles are injected, like everything else.** `columns.py` does not import
+  `clv.plugins`; the app calls `columns.install_profiles(...)` once at startup
+  with the enabled formats' `columns` and `label`, and the two lookup sites
+  ([columns.py:603](clv/widgets/columns.py#L603),
+  [columns.py:647](clv/widgets/columns.py#L647)) resolve through it before
+  falling back to `FORMAT_PROFILES` and then `DEFAULT_PROFILE`. The same
+  asymmetry as Phase 8's `query.install_operators(...)`, for the same reason:
+  the renderer runs per row and cannot afford a registry walk.
 - **A format's entries are first-class.** This is Requirement 9 for this phase.
   An entry a plugin format produced must be searchable by field query — which
   means `field_names` feeds `NORMALISED_FIELD_KEYS`
-  ([query.py:99](clv/services/query.py#L99)) and `_known_fields`
-  ([app.py:2193](clv/app.py#L2193)) so completion offers the field before a
-  matching line is on screen — bucketed by the timeline, clustered by the repeat
-  folder, shown in the detail pane with its `format_name`, and exportable. None
-  of these need new code if the entry is well-formed, and the test is that none
-  of them need new code.
+  ([query.py:110-122](clv/services/query.py#L110-L122)) and `_known_fields`
+  ([app.py:3321-3328](clv/app.py#L3321-L3328)) so completion offers the field
+  before a matching line is on screen — bucketed by the timeline, clustered by
+  the repeat folder, shown in the detail pane, and exportable. Those five need
+  no new code if the entry is well-formed, and the test is that they need none.
+- **The structured row is the exception, and it is why the bullet above no
+  longer says "none of these".** `plan_columns` and `render_row` key off
+  `format_name` in tables `parsing.py` does not own, so an entry from a format
+  that declared no `label` and no `columns` renders without error and reads as a
+  downgrade: the right timestamp and level, the bare identifier where the format
+  name should be, no source cell, no chips. Equal terms there is a
+  *declaration*, not an inference — which is what the two new attributes buy,
+  and the reason they are not optional in the docs even though they are optional
+  in the type.
 - **Continuation still works.** A plugin format participates in carry-forward
   exactly as a built-in does: an unparsed line after a plugin-format line
   inherits its timestamp and level, and inherits no fields
   ([parsing.py:718-741](clv/services/parsing.py#L718-L741)).
 - **A format that raises is disabled**; a format returning a malformed
-  `LogEntry` — wrong types, `format_name` of `"raw"`, a non-string field value,
-  a non-`LogEntry` — is rejected with a message naming the rule it broke. The
-  read path cannot afford to trust this one: a stage that misbehaves costs a
-  render, a format that misbehaves corrupts the buffer.
+  `LogEntry` — wrong types, `format_name` of `"raw"`, a `format_name` already in
+  `FORMAT_NAMES`, a non-string field value, a non-`LogEntry` — is rejected with
+  a message naming the rule it broke. A `columns` naming a key outside
+  `field_names` is rejected the same way and at load, because a profile pointing
+  at a field the format never produces is a row that quietly loses its source
+  cell. The read path cannot afford to trust this one: a stage that misbehaves
+  costs a render, a format that misbehaves corrupts the buffer.
 - **A format is inside the read-path budget** from Phase 6, measured per line.
 - **A worked example ships**: `clv/plugins/formats/` as a live drop-in
   directory, with nginx `error_log` as the reference — genuinely common and
-  genuinely not covered by the five built-ins. It ships **disabled** and the
+  genuinely not covered by the built-ins. It ships **disabled** and the
   operator enables it like any other, so the drawer's count keeps meaning
   "plugins someone installed" ([TODO.md:243-246](TODO.md#L243-L246)).
 
 **Documentation changes.** `clv/plugins/AGENTS.md` gains a `LogFormat` section
 of equal weight to the others: the interface, the built-ins-first rule,
-`field_names` and why it exists, the `LogEntry` contract a format must honour,
-carry-forward, the per-line budget, and the note that `parse()` is the hottest
-third-party code in CLV. `README.md`'s multi-format bullet gains "and any format
-a plugin teaches it."
+`field_names`, `label` and `columns` and why each exists, the `LogEntry`
+contract a format must honour, carry-forward, the per-line budget, and the note
+that `parse()` is the hottest third-party code in CLV. `FORMAT_PROFILES`' own
+comment ([columns.py:126-127](clv/widgets/columns.py#L126-L127)) stops being a
+note about a dict and becomes the statement of the contract — what a format has
+to register, in which four places, and what `DEFAULT_PROFILE` means when it is
+reached by accident rather than on purpose. `parsing.py`'s module docstring
+gains `FORMAT_NAMES` beside its format/keys table
+([parsing.py:22-31](clv/services/parsing.py#L22-L31)) as the list all four are
+checked against. `README.md`'s multi-format bullet gains "and any format a
+plugin teaches it."
 
-**Testing** (new `tests/test_plugin_formats.py`, extend `tests/test_parsing.py`)
+**Testing** (new `tests/test_plugin_formats.py` and
+`tests/test_format_registration.py`)
 
 - A plugin format parses a line the built-ins return `raw` for; a line a
   built-in already handles is **never** offered to the plugin.
@@ -907,15 +982,188 @@ a plugin teaches it."
 - Ordering across several plugin formats follows Phase 5's `priority`.
 - The nginx reference against a captured fixture, in the manner of
   `tests/test_journald.py`.
+- **The completeness test, and it is about built-ins as much as plugins.**
+  `FORMAT_NAMES` in `parsing.py` becomes the canonical list and carries one
+  fixture line per name. For every name: a real line parses to it, it has a
+  `FORMAT_LABELS` entry, and if that line recovered any fields it has a
+  `FORMAT_PROFILES` entry too. In the other direction, no key of
+  `FORMAT_LABELS`, `NO_FIELD_REASONS` or `FORMAT_PROFILES` is missing from
+  `FORMAT_NAMES`. Adding a format to the parser and nowhere else has to fail the
+  suite, because today it fails nothing.
+- A plugin format that declares neither `label` nor `columns` still renders, so
+  the degradation is defined rather than accidental; one that declares both gets
+  a source cell and chips, asserted through `render_row` rather than by reading
+  the profile table back.
+- A `columns` naming a key outside `field_names` is rejected at load, and so is
+  a format claiming a `format_name` already in `FORMAT_NAMES`.
+- `consumed` off the profile reproduces `_JSON_CONSUMED` exactly: the journald
+  allowlist test ([test_log_columns.py:125](tests/test_log_columns.py#L125))
+  passes unmodified with the `format_name == "json"` branch deleted.
 - Zero format plugins: `LogParser` behaves byte-identically to today, asserted
   against the existing parsing suite unchanged.
 
 **Gate.** A plugin file in `~/.config/clv/plugins/` teaches CLV a format it did
-not know, and every core feature works on the result with no core change beyond
-this phase's. `tests/test_parsing.py` passes unmodified. Suite green on 3.11 and
-3.14.
+not know, every core feature works on the result with no core change beyond this
+phase's, and its rows carry a source cell and chips rather than
+`DEFAULT_PROFILE`. Adding a format to the parser and to nothing else now fails
+the suite — which is the first thing Phase 7b leans on. `tests/test_parsing.py`
+passes unmodified. Suite green on 3.11 and 3.14.
 
-**Commit.** `feat(plugins): a LogFormat seam and an nginx reference format`
+**Commit.** `feat(plugins): a LogFormat seam, column profiles and an nginx reference`
+
+---
+
+## Phase 7b — logfmt as a built-in
+
+`key=value key=value` is the densest format CLV cannot read, and it is what Go,
+Rust and most of the Prometheus-adjacent ecosystem write by default.
+`level=info msg="thing happened" dur=1.2ms` is `raw` today; so is
+`ts=2026-08-07T09:25:01Z level=error msg="boom" svc=api`; but
+`2026-08-07T09:25:01Z level=info msg="boom" svc=api` is **`iso`**, its whole
+logfmt remainder sitting in `message` with no fields and no level, because
+`_RE_ISO_PLAIN` ([parsing.py:449-452](clv/services/parsing.py#L449-L452)) got
+there first — all three verified against the live parser. Teaching a built-in
+branch to stand down is what a plugin is refused in *Still deliberately out of
+scope*, so logfmt is a phase rather than the reference plugin: Phase 7a's seam
+is sound; this is the one format it cannot carry.
+
+**Expected outcomes**
+
+- **A sixth built-in, `logfmt`, matched last.** After every anchored format has
+  declined — BSD syslog in particular — and before the fall-through to `raw`.
+  Ordering is the anti-false-positive mechanism, not a performance detail:
+  `key=value` is ordinary inside a syslog *message*. `Failed password for root
+  from 10.0.0.5 rhost=10.0.0.5 user=root` and `audit: type=1400
+  apparmor=DENIED pid=991` both parse as `syslog` today, verified, and this
+  phase's first requirement is that they still do.
+- **The guards are structural and deliberately hard to satisfy**, in the voice
+  of `payloads.py`'s detectors and for the reason `_csv` gives about commas in
+  prose:
+  * **The line opens with a pair** — `key=` at the start, a key being
+    `[A-Za-z_][A-Za-z0-9_.\-/]*`. Prose that mentions `rhost=` in the middle
+    never reaches the second guard.
+  * **Every token is a pair.** Pairs are consumed left to right; anything left
+    over that is not whitespace refuses the line, so `audit: type=1400 ...`
+    fails on its first token even with no syslog prefix in front of it.
+  * **Two pairs at least.** One `key=value` alone is a `.env` line, a
+    `.properties` entry or a shell assignment, and CLV opens *any readable text
+    file* ([README.md:39](README.md#L39)).
+  * **One anchor key** from `_JSON_TS_KEYS`, `_JSON_LEVEL_KEYS` or
+    `_JSON_MSG_KEYS` ([parsing.py:474-476](clv/services/parsing.py#L474-L476)).
+    A line with none of the three has nothing to put in the message cell, so
+    claiming it buys a structured row that says less than the raw one did. This
+    is the guard most likely to be revisited: `dur=1.2ms code=500 path=/x` is
+    real logfmt and is refused by it.
+- **Quoting and escaping, stated rather than inherited.** A value runs bare to
+  the next space or is double-quoted. Inside quotes `\"` and `\\` are honoured
+  and every other backslash stays literal, because `path="C:\Users\bob"` is the
+  common case and a deliberate `\n` is not. An unterminated quote refuses the
+  pair and therefore the line. `key=` with an empty value is **kept**, as
+  `_parse_json` keeps `{"err":""}` — a writer who typed `err=` said something,
+  and `_chips_for` already declines to draw an empty chip.
+- **Both ISO branches defer; nothing else does.** When `_RE_ISO_LEVEL` or
+  `_RE_ISO_PLAIN` matches, its `msg` remainder is offered to the collector under
+  the same guards, and on acceptance the entry is `logfmt` carrying that
+  branch's timestamp — and, from `iso-level`, the level it already recovered.
+  Syslog does **not** defer: a syslog line whose payload happens to be logfmt is
+  still a syslog line, and its `host`, `tag` and `pid` outrank the relabelling.
+- **`normalize_level()` on the parsed value, never `_scan_level`.**
+  `_RE_BARE_LEVEL` ([parsing.py:479](clv/services/parsing.py#L479)) is not
+  `re.IGNORECASE`, so the scanner reads `level=INFO` and misses `level=info` —
+  which is what the `iso` path does to these lines today. The branch resolves
+  the level from the value through `_JSON_LEVEL_KEYS` in order, as `_parse_json`
+  does, and the collector is `_flatten_json`'s shape
+  ([parsing.py:406-428](clv/services/parsing.py#L406-L428)) rather than
+  `_match_fields`' ([parsing.py:362-377](clv/services/parsing.py#L362-L377)),
+  which reads named regex groups against a fixed key list and has nothing to
+  offer a format whose keys are the writer's: build a dict, stop at
+  `_MAX_FIELDS = 64` in document order, freeze with `_freeze_fields`. Values are
+  strings and never coerced; a repeated key keeps the last, which is what
+  `json.loads` does with a repeated object key. **Every key is kept, including
+  the consumed ones** ([parsing.py:534-536](clv/services/parsing.py#L534-L536))
+  — `msg:` has to stay queryable on the line that carried it.
+- **Registered in all four places, or it is not done.** The dispatch sets the
+  name; `FORMAT_LABELS` gains `"logfmt": "logfmt (key=value)"`;
+  `FORMAT_PROFILES` gains an entry — `source_keys` of `("service", "logger",
+  "component", "app", "subsystem")`, `pid_key="pid"`, and a chip **allowlist,
+  never a sweep**, for the reason the `json` entry already argues
+  ([columns.py:150-156](clv/widgets/columns.py#L150-L156)) — whose `consumed` is
+  the set Phase 7a lifted off `_JSON_CONSUMED`, shared with `json` because
+  `msg=` and `"msg":` mean the same thing. `NO_FIELD_REASONS` needs no entry: a
+  line that cleared the guards carries two fields by construction.
+- **Logfmt lines stop being continuations, and that is the trade.**
+  `LogEntry.structured` is `format_name != "raw"`
+  ([parsing.py:237-239](clv/services/parsing.py#L237-L239)) and it gates
+  carry-forward in `parse_lines`
+  ([parsing.py:682](clv/services/parsing.py#L682)) and `LogParser.feed`
+  ([parsing.py:726](clv/services/parsing.py#L726)). In a mixed file a logfmt
+  line that today inherits the timestamp above it and renders dimmed becomes a
+  first-class row, with its own level and fields and — if it carries no `ts=` —
+  an **empty time cell where one used to appear**. Taken deliberately:
+  `parse_lines`' docstring already argues a continuation must not claim facts
+  its line never stated, and a line that said `level=error` stated plenty. It is
+  also why the anchor guard is not negotiable — a line claimed on `a=1 b=2`
+  alone would give up an inherited timestamp and return nothing for it.
+- **Field names behave exactly like JSON's, including where that stings.**
+  Logfmt keys are the writer's, so they do **not** join `NORMALISED_FIELD_KEYS`
+  ([query.py:110-122](clv/services/query.py#L110-L122)), which `README.md`
+  publishes as a fixed list. They reach completion through `collect_field_names`
+  ([query.py:198-209](clv/services/query.py#L198-L209)) the moment a line
+  carrying one is read — no change to `query.py` at all, which is the parity
+  claim rather than a convenience. `host=`, `status=`, `user=` and `size=` are
+  common logfmt keys that collide with normalised names, and the collision
+  resolves the way JSON's already does: the line's own value wins.
+
+**Documentation changes.** `parsing.py`'s module docstring gains a `logfmt` row
+in its format/keys table ([parsing.py:22-31](clv/services/parsing.py#L22-L31)) —
+*every `key=value` pair on the line* — and a paragraph on the guards and the ISO
+deferral, because *"why was my line not claimed"* is the question this format
+will generate and the answer has to be findable from the source. `README.md`'s
+multi-format bullet ([README.md:16-18](README.md#L16-L18)) names logfmt, and the
+field-vocabulary sentence becomes "every key a JSON or logfmt line carries". The
+new `FORMAT_PROFILES` entry carries its allowlist argument inline, as `json`'s
+does.
+
+**Testing** (new `tests/test_logfmt.py`, extend `tests/test_parsing.py`)
+
+- The detection table ([test_parsing.py:35-51](tests/test_parsing.py#L35-L51))
+  and the fields table
+  ([test_parsing.py:148-173](tests/test_parsing.py#L148-L173)) each gain all
+  three dialects: bare, `ts=`-first, and ISO-timestamp-first.
+- **The false-positive corpus is what `tests/test_logfmt.py` is for.** Both
+  syslog lines above still parse as `syslog` with `host`, `tag` and `pid`
+  intact; a one-pair line, a `KEY=value` `.env` line, a line with a trailing
+  bare word, an unterminated quote and a pair-free line all stay `raw`.
+- `level=info` and `level=INFO` both yield INFO — the test that fails the day
+  the branch reaches for `_scan_level`.
+- Quoting: spaces inside quotes survive, `\"` and `\\` unescape, a Windows path
+  keeps its backslashes, and `key=` yields an empty string that is kept.
+- Sixty-five pairs yield sixty-four fields, in document order.
+- **The four-table registration**, through Phase 7a's
+  `tests/test_format_registration.py` with no edit beyond one fixture line: this
+  phase is the first proof that the completeness test does its job.
+- A logfmt row renders with a source cell and chips and repeats neither `msg`,
+  `level` nor `ts` as a chip, with the journald allowlist test
+  ([test_log_columns.py:125](tests/test_log_columns.py#L125)) as the template;
+  the detail pane shows `logfmt (key=value)` and every pair, after the JSON
+  dotted-keys test ([test_detail_pane.py:299](tests/test_detail_pane.py#L299)).
+- `collect_field_names` reports a logfmt line's keys
+  ([test_field_query.py:257](tests/test_field_query.py#L257)); a colliding
+  `host=` keeps the line's value, mirroring
+  `test_a_json_key_colliding_with_a_normalised_name_keeps_the_json_value`
+  ([test_parsing.py:267](tests/test_parsing.py#L267)); and
+  `NORMALISED_FIELD_KEYS` is asserted unchanged.
+- **The carry-forward change is an assertion, not a discovery**: a logfmt line
+  after an ISO line is not a continuation, inherits no timestamp, and is counted
+  in `Timeline.undated` when it carries no `ts=`.
+
+**Gate.** A Go service's log reads as columns — time, level, source, message,
+chips — with no plugin installed and no setting touched; a syslog line
+mentioning `user=root` is still syslog; and every existing case in
+`tests/test_parsing.py` passes unchanged except the rows this phase added. Suite
+green on 3.11 and 3.14.
+
+**Commit.** `feat(parsing): logfmt as a sixth built-in format`
 
 ---
 
@@ -1695,7 +1943,7 @@ reason that survives the decision to include everything else.
 | **Widget injection into `compose()` and plugin CSS** | Requirement 11. Styling is CSS-only by doctrine and the breakpoint tests must stay unconditional on what is installed. Phase 12's vocabulary, drawer sections and modal screens cover the cases without handing out the layout. | A design for a plugin widget contract that survives the breakpoint rules — a real piece of design work, not a phase. |
 | **Isolating per-entry plugin kinds** | `FilterStage`, `LogFormat` and the rest are called per entry or per line. An IPC round trip there is not a slower version of the same program, it is a different one. Phase 13 refuses it out loud rather than shipping something unusable. | Nothing anticipated at CLV's scale. |
 | **`OR`, parentheses and precedence in the query grammar** | Still a stated non-goal, and Phase 0's reversal is written narrowly to keep it one. Operators and computed fields add vocabulary; they do not add structure. | A concrete case that implicit-AND genuinely cannot express — and it would be its own file. |
-| **Replacing a built-in format, operator or cluster rule** | Plugins extend; they do not override. A plugin that could shadow syslog parsing or redefine `:` would make every bug report unanswerable without knowing what was installed. | Nothing anticipated. |
+| **Replacing a built-in format, operator or cluster rule** | Plugins extend; they do not override. A plugin that could shadow syslog parsing or redefine `:` would make every bug report unanswerable without knowing what was installed. The escape hatch is CLV's to pull and not the author's: a format that needs a built-in branch to stand down in its favour gets absorbed as a built-in instead, which is what Phase 7b is and why logfmt is not the reference plugin. | Nothing anticipated. |
 | **Plugin-owned persisted session state** | `SessionState.PERSISTED_FIELDS` is closed on purpose — every field carries an argument about whether recording it leaks what someone was reading. A plugin's own file under its own directory has none of that ambiguity. | A case where a plugin's state genuinely belongs in CLV's session rather than beside it. |
 | **Hot reload** | A plugin swapped underneath a running viewer is a debugging surface nobody asked for. Enable and disable change what is *active*, which covers the real need. | Nothing anticipated. |
 | **Plugin-supplied CLI subcommands** | Requirement 13. An installed file must not change what a shell command does. | Nothing anticipated. |
@@ -1707,33 +1955,37 @@ reason that survives the decision to include everything else.
 | File | Phases | Change |
 | --- | --- | --- |
 | `clv/plugins/AGENTS.md` | 0–16 | Trust model, contract, and every seam |
-| `clv/plugins/__init__.py` | 1,3,5,6,7,13 | Loader, search roots, ordering, timing, registries, host |
+| `clv/plugins/__init__.py` | 1,3,5,6,7a,13 | Loader, search roots, ordering, timing, registries, host |
 | `clv/api.py` | 2, all seams | **New** — the published surface, extended per phase |
 | `clv/plugins/host.py` | 13 | **New** — the subprocess host and the wire protocol |
 | `clv/cli.py` | 14,15 | **New** — argv, `doctor`, `plugin` subcommands |
 | `clv/plugins/manifest.py` | 15 | **New** — manifest parsing, checksums, signatures |
 | `clv/services/config.py` | 3,5,6 | `plugins`, `[plugin:<name>]`, `plugin_time_budget_ms` |
-| `clv/services/parsing.py` | 7 | `LogParser(formats=...)`, injected dispatch |
+| `clv/services/parsing.py` | 7a,7b | `LogParser(formats=...)`, injected dispatch, `FORMAT_NAMES`, the logfmt matcher and the ISO deferral |
 | `clv/services/query.py` | 8 | Operator registry, computed fields, generated `_TERM_RE` |
 | `clv/services/filtering.py` | 8 | `FilterSpec.parse` routes through the operator registry |
 | `clv/services/watch.py` | 9 | `WatchRule.kind`, matcher dispatch, sink delivery |
 | `clv/services/clustering.py` | 10 | Plugin rules, shape contributors, cache generation |
 | `clv/services/timeline.py` | 11 | `Bucket.value`, annotations, foldable metrics |
-| `clv/services/session.py` | 7 | `Buffer` passes formats to its parser |
+| `clv/services/session.py` | 7a | `Buffer` passes formats to its parser |
 | `clv/storage.py` | 8 | `SavedView.requires` |
-| `clv/app.py` | 1,2,4,5,6,7,8,9,11,12,13 | Wiring, cache, dispatch, drawer, host lifecycle |
+| `clv/app.py` | 1,2,4,5,6,7a,8,9,11,12,13 | Wiring, cache, dispatch, drawer, host lifecycle |
 | `clv/widgets/advanced_drawer.py` | 4,12 | Plugin section; plugin-contributed sections |
+| `clv/widgets/columns.py` | 7a,7b | `FormatProfile.consumed`, `install_profiles`, the logfmt profile |
+| `clv/widgets/detail_pane.py` | 7a,7b | Plugin format labels; `FORMAT_LABELS` gains logfmt |
 | `clv/widgets/help_overlay.py` | 12 | Plugin command section |
 | `clv/widgets/timeline.py` | 11 | Annotation rendering and stepping |
 | `clv/__main__.py` | 13,14 | `freeze_support()`, argv entry |
-| `clv/plugins/formats/` | 7 | **New** — drop-in directory and the nginx reference |
+| `clv/plugins/formats/` | 7a | **New** — drop-in directory and the nginx reference |
 | `examples/plugins/` | 16 | **New** — one copyable example per interface |
 | `clv/plugins/README.md` | 16 | **New** — author-facing quick start. Covers the **shipped** sources too: journald, and the SSH transport `SSH_TODO.md` Phase 4 added (a backend rather than a provider — see `clv/plugins/AGENTS.md`, which holds that contract until this file exists). |
-| `settings.conf`, `README.md` | 3,5,6,8,9,10,11,12,14,15,16 | Keys, chapter, sweep |
+| `settings.conf`, `README.md` | 3,5,6,7b,8,9,10,11,12,14,15,16 | Keys, the format list, chapter, sweep |
 | `tests/test_api_surface.py` | 2 | **New** — the freeze |
 | `tests/test_plugin_drawer.py` | 4 | **New** |
 | `tests/test_plugin_perf.py` | 6 | **New** |
-| `tests/test_plugin_formats.py` | 7 | **New** |
+| `tests/test_plugin_formats.py` | 7a | **New** |
+| `tests/test_format_registration.py` | 7a | **New** — the four-table completeness test |
+| `tests/test_logfmt.py` | 7b | **New** — the three dialects, the guards, the false-positive corpus |
 | `tests/test_plugin_query.py` | 8 | **New** |
 | `tests/test_plugin_watch.py` | 9 | **New** |
 | `tests/test_plugin_clustering.py` | 10 | **New** |
