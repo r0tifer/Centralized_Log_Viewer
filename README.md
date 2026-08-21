@@ -84,7 +84,8 @@ desktop terminal and on a headless 80-column SSH session.
 - ⭐ **Starred logs.** Press `*` on any log to star it. Starred logs are
   repeated in a group at the top of the tree, so a favourite buried several
   folders deep is one keystroke away. Star exactly one and CLV opens it on
-  launch.
+  launch. A star whose log has since rotated away is still listed — dimmed,
+  and carrying the `✕` that removes it.
 - 💾 **Session state that persists.** Filters, toggles, drawer settings and
   stars come back on restart. The source you merely had open does not: without
   a star, CLV opens on its discovery summary, so every launch starts from a
@@ -292,6 +293,42 @@ One wrinkle worth knowing: while the cursor is in the query input, `?` types a
 literal question mark, because it is a valid regex character. Press `Esc` first
 if the input has focus. Tailing continues while the overlay is open.
 
+### Starred logs
+
+`*` stars the log under the tree cursor, or the one you are reading. Starred
+logs are repeated as a group at the top of the tree, so a favourite is one
+keystroke away however deep it sits:
+
+```
+⭐ Starred
+  ⭐ ✕ logs/auth.log
+  ⭐ ✕ logs/runtime_2026-08-04.log   ← dimmed: the last scan did not find it
+📂 /var/log
+   ⭐ auth.log                        the star replaces the file icon
+    📄 syslog
+```
+
+The verbs sit between the icon and the name rather than after it, so a long
+path can never push them off the panel; the icon keeps the left edge of the row
+inert, so a click aimed at selecting cannot land on a control.
+
+| On a `⭐` row | | Keyboard |
+| --- | --- | --- |
+| `✕` | Unstar this log | `*` |
+| the name | Open it | `Enter` |
+
+Star exactly one log and CLV opens it on launch. Star several and it does not:
+that is a set of favourites rather than an instruction about what to open, and
+the group is there to jump from.
+
+**A star outlives the log it points at.** When the last scan could not find the
+source, the row is dimmed rather than dropped, and selecting it says why —
+a rotated-away file, a journal source whose switch is off, a host that was
+unreachable. Those are different problems with different fixes, so they get
+different sentences. The star is kept because a rotated log comes back; it
+carries the same `✕` as any other row, so keeping one has never meant being
+stuck with it.
+
 ### Merging sources
 
 The name promises centralized logs, and until now it delivered centralized
@@ -300,7 +337,7 @@ it to the **merged set**; `u` opens the set as one timestamp-ordered stream:
 
 ```
 ⭐ Starred
-  ⭐ logs/auth.log            alpha.log   2026-08-11 10:00:00 INFO  request accepted
+  ⭐ ✕ logs/auth.log          alpha.log   2026-08-11 10:00:00 INFO  request accepted
 ⧉ Merged (2 sources)   ←     beta.log    2026-08-11 10:00:01 INFO  upstream connect
   ⧉ logs/alpha.log     click alpha.log   2026-08-11 10:00:02 ERROR upstream timeout
   ⧉ logs/beta.log      to open beta.log  2026-08-11 10:00:03 WARN  retrying
@@ -883,10 +920,30 @@ active; `v` opens the list of saved ones.
 V  →  name it "5xx on web01"      (query, severity, time window, search
                                    options, globs and the open log)
 v  →  Enter applies it            r renames · d deletes (twice) · Esc closes
+      or click  [Close] [Delete] [Apply]
 ```
 
 Saved views also appear as a group at the top of the source tree, above the
-starred logs, so applying one is a single click or a couple of arrow keys.
+starred logs, so applying one is a single click or a couple of arrow keys. Each
+row carries its own verbs, between the icon and the name so a long name cannot
+push them off the panel:
+
+```
+📑 Views
+  📑 ✎ ✕ 5xx on web01
+  📑 ✎ ✕ auth failures
+```
+
+| On a `📑` row | | Keyboard |
+| --- | --- | --- |
+| the name | Apply the view | `Enter` |
+| `✎` | Rename it | `v` then `r` |
+| `✕` | Delete it | `v` then `d`, twice |
+
+Both markers open the picker on that view rather than acting where they are.
+A merged set is a working set and its `✕` empties it on one click; a view is
+named work and CLV has no undo, so deleting one always asks — once, in the
+place that already knew how.
 
 Applying a view puts everything back at once — one repaint, not one per field —
 and reopens the log it was saved against. If that log has since gone, the
@@ -1008,8 +1065,8 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `n` / `N` | Next / previous match (or warning-and-worse, with no query) |
 | `g` | Go to a timestamp |
 | `m` / `M` | Mark the cursor line / jump to the next mark |
-| `v` / `V` | Open saved views / save the current filters as a view |
-| `W` | Manage watch rules (live highlights and alerts) |
+| `v` / `V` | Saved views (then `r` renames, `d` deletes) / save the current filters as a view |
+| `W` | Watch rules (then `a` adds, `d` deletes) |
 | `d` | Show / hide the event detail pane |
 | `b` | Show / hide the severity timeline (then `←` `→` `Enter` to filter to a bucket) |
 | `c` | Collapse / expand repeated lines (then `Enter` on a cluster row) |
