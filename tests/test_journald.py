@@ -1235,3 +1235,38 @@ def test_the_connection_double_matches_the_real_connection() -> None:
         assert isinstance(getattr(real, name, None), property) == isinstance(
             getattr(_Connection, name, None), property
         ), f"_Connection.{name} does not match SSHConnection.{name}"
+
+
+def test_a_starred_unit_opens_from_the_starred_group(tmp_path: Path) -> None:
+    """The starred group lists the bare ref, not the provider record.
+
+    Selection dispatched on the record, so this row matched nothing and did
+    nothing at all — a latent dead end that only surfaced once the group had a
+    reason to be clicked.
+    """
+
+    unit = JournalRef("", "unit", "sshd.service")
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            app._plugins = PluginRegistry(sources=[_Journal()])
+            app._source_manager = SourceManager([], [])
+            app._update_state(starred=(format_ref(unit),))
+            await app._rescan()
+            await pilot.pause()
+
+            tree = app.query_one("#source-tree", LogTree)
+            group = app._starred_group(tree)
+            assert group is not None
+            row = next(child for child in group.children if child.data == unit)
+            group.expand()
+            await pilot.pause()
+
+            tree.select_node(row)
+            await pilot.pause()
+            await pilot.pause()
+
+            assert app._selected_source == unit
+
+    asyncio.run(scenario())
