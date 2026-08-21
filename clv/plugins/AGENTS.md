@@ -114,7 +114,7 @@ Each plugin must define a class implementing one of the **Abstract Base Classes 
 Provides a new source of logs to tail or read.
 
 ```python
-from clv.plugins import LogSourceProvider
+from clv.api import LogSourceProvider
 
 class MySource(LogSourceProvider):
     name = "My Custom Source"
@@ -135,10 +135,13 @@ group in the source tree, and selecting one opens it like any other source.
 Return `ProviderSource(path, label)` records rather than bare identifiers when
 you have a better name than the identifier's last component.
 
-**A provider source is not a file, and CLV does not treat it as one.** Starring,
-include/exclude globs and rotated-set grouping all test for a real `Path` and
-skip yours. That is deliberate rather than an omission: a provider identifier
-persisted into `session.json` would be a path that does not exist.
+**A provider source is not a file, and CLV does not treat it as one.**
+Include/exclude globs describe a directory walk and rotated-set grouping is name
+arithmetic over files that rotate, so both refuse a provider identifier by name.
+Starring and merging used to be on that list and are not any more — see
+[Reversed](#reversed): a persisted *identifier* is not a persisted path, and a
+journal unit is exactly the source an operator wants starred and compared across
+a fleet.
 
 #### Tailing a live source
 
@@ -221,7 +224,7 @@ class TagUnknownHosts(FilterStage):
 
 ```python
 from dataclasses import replace
-from clv.plugins import FilterStage
+from clv.api import FilterStage
 
 class RedactFilter(FilterStage):
     name = "RedactSensitiveData"
@@ -259,10 +262,11 @@ stages and the user's filters, plus the `FilterContext`, and returns an
 
 - The sequence is the **whole filtered set**, not the `_show_lines` window the
   pane happens to be showing. Do not assume it is small.
-- There is no destination argument. An exporter picks its own path and reports it
-  back as `ExportResult.destination`; the dialog disables its path input for
-  plugin exporters and says so. Confine writes to somewhere the operator would
-  expect, and never to a temp or cache directory — log content is sensitive.
+- **By default there is no destination argument.** An exporter picks its own
+  path — or sends the entries somewhere that is not a path at all — and reports
+  what it did as `ExportResult.destination`; the dialog disables its path input
+  and says so. Confine writes to somewhere the operator would expect, and never
+  to a temp or cache directory — log content is sensitive.
 - Raising is survivable but visible: the exception is recorded in
   `PluginRegistry.errors`, surfaced as a notification and shown in the Advanced
   drawer. Returning `ExportResult(ok=False, detail=...)` is the way to report a
@@ -271,7 +275,7 @@ stages and the user's filters, plus the `FilterContext`, and returns an
 ```python
 import json
 from pathlib import Path
-from clv.plugins import Exporter, ExportResult
+from clv.api import Exporter, ExportResult
 
 class JsonExporter(Exporter):
     name = "JSON Exporter"
@@ -284,6 +288,36 @@ class JsonExporter(Exporter):
         )
         return ExportResult(ok=True, detail=f"{len(entries)} lines", destination=destination)
 ```
+
+#### Asking for the operator's destination
+
+An exporter that writes a **file** usually wants the path the operator just
+typed, and until API 1.0 it could not have one: every plugin choice was marked
+as supplying its own destination, so the dialog's path input was disabled and an
+exporter had to invent a location nobody had agreed to.
+
+Set `wants_path` and the input is enabled, the suggested filename takes your
+`suggested_extension`, the overwrite confirmation applies as it does to a
+built-in format, and the chosen path arrives as the keyword-only `destination`:
+
+```python
+class NdjsonExporter(Exporter):
+    name = "NDJSON"
+    wants_path = True
+    suggested_extension = "ndjson"
+
+    def export(self, entries, context, *, destination=None):
+        destination.write_text(
+            "\n".join(json.dumps({"raw": e.raw}) for e in entries),
+            encoding="utf-8",
+        )
+        return ExportResult(ok=True, detail=f"{len(entries)} lines", destination=destination)
+```
+
+`destination` is passed **only** when `wants_path` is set, so an exporter
+written as `export(self, entries, context)` against the original interface is
+called exactly as it always was. That is the compatibility rule for this
+attribute and it is pinned by a test.
 
 ---
 
@@ -377,12 +411,111 @@ choosing what to install.
 
 ---
 
+## API surface and stability
+
+**Import from `clv.api`.** It is the whole of what CLV publishes to plugins, and
+the only part of CLV covered by a stability promise.
+
+```python
+from clv.api import FilterStage, LogEntry, normalize_level
+```
+
+Everything there is a **re-export of the real object**, never a wrapper or a
+DTO. Your `apply` receives the same `LogEntry` CLV's own render path holds. That
+is a deliberate refusal: converting an entry per plugin per render is the one
+cost CLV cannot pay, and an author who had to convert would be writing against a
+lesser version of the core than the core writes against itself.
+
+### What is published
+
+| Group | Names |
+| --- | --- |
+| Version | `PLUGIN_API_VERSION` |
+| Interfaces | `Plugin`, `LogSourceProvider`, `FilterStage`, `Exporter` |
+| Handed to you | `LogEntry`, `FilterContext`, `FilterSpec`, `TimeWindow`, `ProviderSource`, `SourceRef` |
+| Handed back | `ExportResult` |
+| Severity | `normalize_level`, `level_rank`, `level_matches`, `highest_level`, `LEVEL_TRACE` … `LEVEL_CRITICAL`, `LEVEL_ORDER`, `SEVERITY_BUCKETS` |
+| Fields | `NORMALISED_FIELD_KEYS` |
+| Process boundary | `WIRE_VERSION`, `entry_to_wire`, `entry_from_wire` |
+
+The severity helpers are published because the alternative is every plugin
+reimplementing them, and reimplementing them badly: `WARNING`, `WARN` and
+syslog's numeric `4` are one severity, and a plugin that decides otherwise makes
+CLV disagree with itself about what the operator filtered for.
+`SEVERITY_BUCKETS` is a plain dict and is read-only **by convention** — mutating
+it changes what every severity filter in the process means.
+
+### Two versions, and they are not the same version
+
+`PLUGIN_API_VERSION` tracks the promise. `clv.__version__` tracks the
+application. They move independently, and **`requires_api` is the one to
+declare**:
+
+```python
+class Redact(FilterStage):
+    name = "redact-secrets"
+    requires_api = ">=1.0,<2.0"   # what you actually depend on
+    requires_clv = ">=2.0,<3.0"   # optional, and rarely what you mean
+```
+
+Both use the grammar in [The constraint grammar](#the-constraint-grammar) and
+both fail the same two ways: an unsatisfied constraint names your constraint and
+the running version, an unreadable one names the constraint and says it could
+not be read. Neither is ever a silent skip.
+
+Pinning `requires_clv` instead means re-releasing your plugin every time CLV
+ships a release that changed nothing you can see. The API is additive from 1.0:
+each new seam adds names and the version stays 1.0, which is what that
+separation is for.
+
+### The deprecation policy
+
+- A name published in `clv.api` is **removed only on an API major**.
+- A name deprecated in API *N* keeps working for the whole of *N* and emits a
+  `DeprecationWarning` naming what to use instead.
+- **Anything not in `clv.api` is internal and may move without notice** —
+  including `clv.services.parsing.LogEntry` under its own name, and including
+  every name `clv.plugins` exports beyond the interfaces re-exported here.
+  Importing from `clv.services.*` is a plugin taking a risk it has been warned
+  about; it is not forbidden, and it is not supported.
+
+`tests/test_api_surface.py` holds the published list and every published
+signature as literal data, so changing any of this means changing that file, in
+the diff, where a reviewer sees it.
+
+### The wire form
+
+`LogEntry.fields` is a `mappingproxy`, so `pickle.dumps` raises `TypeError` on
+*every* entry CLV produces — the shared empty mapping included. An entry
+therefore cannot cross a process boundary by the obvious route, and
+`entry_to_wire` / `entry_from_wire` are the route it does take:
+
+```python
+payload = entry_to_wire(entry)     # a plain dict, every value a JSON scalar
+same = entry_from_wire(payload)    # fields come back read-only
+```
+
+The payload carries `WIRE_VERSION` under `"v"`, and `entry_from_wire` refuses a
+version it does not know **before reading any other key** — a payload from a
+future CLV is rejected whole rather than half-decoded into an entry that looks
+plausible and is not.
+
+You will not need this in-process. It is published now, ahead of the isolation
+host that consumes it, so that the encoding is part of the frozen contract
+rather than an artefact of whichever phase first needed it.
+
+---
+
 ## Versioning & Compatibility
 
 - Follow **semantic versioning** for each plugin.
-- Set `requires_clv` on the plugin class to declare compatibility, e.g.
-  `requires_clv = ">=2.0,<3.0"`. Omitting it means "any version".
-- A plugin failing its constraint is skipped and reported in
+- Set `requires_api` on the plugin class to declare what you depend on, e.g.
+  `requires_api = ">=1.0,<2.0"`. This is the one to reach for; see
+  [Two versions, and they are not the same version](#two-versions-and-they-are-not-the-same-version).
+- Set `requires_clv` when you genuinely depend on the application rather than on
+  the API, e.g. `requires_clv = ">=2.0,<3.0"`. Omitting either means "any
+  version", and a plugin may declare both — each is checked on its own account.
+- A plugin failing either constraint is skipped and reported in
   `PluginRegistry.errors`, which the Advanced drawer surfaces.
 
 ### The constraint grammar
@@ -410,8 +543,9 @@ would make `requires_clv = ">=2.6"` unsatisfied on a running `2.7.0rc1` and
 silently disable every installed plugin on any release-candidate build.
 
 An **unparseable** constraint — `~~2.6`, `>=abc`, a bare `~=2` — is reported
-against your plugin by name. It is never a silent "unsatisfied": a typo and a
-genuine incompatibility must not look the same from the outside.
+against your plugin by name, as `bad requires_clv:` or `bad requires_api:`. It
+is never a silent "unsatisfied": a typo and a genuine incompatibility must not
+look the same from the outside.
 
 ## Failure Handling
 

@@ -5068,10 +5068,20 @@ class LogViewerApp(App[None]):
     def _exporter_choices(self) -> list[ExportChoice]:
         """Built-ins first, then whatever the plugin registry supplied.
 
-        Plugin exporters are marked ``needs_path=False``: ``Exporter.export``
-        receives the entries and a :class:`FilterContext` and nothing else, so
-        the destination is theirs to choose and the dialog's path input does not
-        apply to them.
+        A plugin exporter says for itself whether it wants a destination. The
+        default is still no: ``Exporter.export`` receives the entries and a
+        :class:`FilterContext`, chooses its own path and reports it back, and
+        the dialog's path input does not apply. An exporter that sets
+        ``wants_path`` gets the input enabled and the operator's choice passed
+        through — before that attribute existed, an exporter writing a file had
+        no way to honour the location the operator had just typed.
+
+        ``bool()`` and ``str()`` because both are third-party class attributes
+        and a plugin may well have written ``wants_path = "yes"``.
+
+        The index is a position in the **whole** ``exporters`` list, disabled
+        entries included: :meth:`_exporter_at` resolves ``plugin:<n>`` by
+        position, so skipping anything here would silently re-target an export.
         """
 
         choices = [
@@ -5080,7 +5090,10 @@ class LogViewerApp(App[None]):
         ]
         choices += [
             ExportChoice(
-                f"plugin:{index}", f"{_plugin_name(exporter)} (plugin)", needs_path=False
+                f"plugin:{index}",
+                f"{_plugin_name(exporter)} (plugin)",
+                extension=str(getattr(exporter, "suggested_extension", "") or ""),
+                needs_path=bool(getattr(exporter, "wants_path", False)),
             )
             for index, exporter in enumerate(self._plugins.exporters)
         ]
@@ -5180,8 +5193,19 @@ class LogViewerApp(App[None]):
             self._notify("That exporter is no longer available.", "error")
             return
         name = _plugin_name(exporter)
+        wants_path = bool(getattr(exporter, "wants_path", False))
+        if wants_path and request.path is None:  # pragma: no cover - defensive
+            # The dialog will not return a None path for a choice it built with
+            # needs_path=True, so this is a guard against the two falling out of
+            # step rather than a state an operator can reach.
+            self._notify(f"Exporter {name} needs a destination.", "error")
+            return
         try:
-            outcome = exporter.export(entries, self._plugin_context())
+            outcome = (
+                exporter.export(entries, self._plugin_context(), destination=request.path)
+                if wants_path
+                else exporter.export(entries, self._plugin_context())
+            )
         except Exception as exc:  # noqa: BLE001 - third-party code
             # Same contract as a FilterStage that raises: recorded, surfaced,
             # and survivable. An export must never take down the app.

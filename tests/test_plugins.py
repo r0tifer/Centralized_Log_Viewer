@@ -701,3 +701,240 @@ def test_an_entry_point_whose_register_raises_does_not_escape(monkeypatch) -> No
     registry = _load_entry_point(monkeypatch, module)
 
     assert any("register() failed" in error.message for error in registry.errors)
+
+
+# --- the published API contract ---------------------------------------------
+
+
+def test_requires_api_is_checked_and_accepted() -> None:
+    """The constraint the documentation tells authors to use, honoured."""
+
+    class Modern(FilterStage):
+        name = "modern"
+        requires_api = ">=1.0,<2.0"
+
+        def apply(self, entry, context):
+            return entry
+
+    registry = _registry(Modern())
+
+    assert [p.name for p in registry.filters] == ["modern"]
+    assert not registry.errors
+
+
+def test_an_unsatisfied_requires_api_names_both_versions() -> None:
+    """"Which API do you want, and which am I" — a report a stranger can act on."""
+
+    class FromTheFuture(FilterStage):
+        name = "future-api"
+        requires_api = ">=2.0"
+
+        def apply(self, entry, context):
+            return entry
+
+    registry = PluginRegistry()
+    registry.add(FromTheFuture(), origin="test", clv_version="2.1.0", api_version="1.0")
+
+    assert registry.total == 0
+    message = registry.errors[0].message
+    assert "requires plugin API >=2.0" in message
+    assert "running 1.0" in message
+
+
+def test_an_unreadable_requires_api_is_an_error_not_a_silent_false() -> None:
+    """Same rule as ``requires_clv``: a typo must not look like incompatibility."""
+
+    class Typo(FilterStage):
+        name = "api-typo"
+        requires_api = "~~1.0"
+
+        def apply(self, entry, context):
+            return entry
+
+    registry = _registry(Typo())
+
+    assert registry.total == 0
+    assert "bad requires_api" in registry.errors[0].message
+    assert "~~1.0" in registry.errors[0].message
+
+
+def test_both_constraints_are_checked_independently() -> None:
+    """A plugin may declare either or both, and each fails on its own account.
+
+    The pairing matters: `requires_clv` satisfied is not a reason to skip
+    `requires_api`, and a loop over the two that short-circuited on the first
+    pass would do exactly that.
+    """
+
+    class Both(FilterStage):
+        name = "both"
+        requires_clv = ">=2.0,<3.0"
+        requires_api = ">=9.0"
+
+        def apply(self, entry, context):
+            return entry
+
+    registry = PluginRegistry()
+    registry.add(Both(), origin="test", clv_version="2.1.0", api_version="1.0")
+
+    assert registry.total == 0
+    assert "requires plugin API" in registry.errors[0].message
+
+    class OtherWay(Both):
+        name = "other-way"
+        requires_clv = ">=9.0"
+        requires_api = ">=1.0"
+
+    registry = PluginRegistry()
+    registry.add(OtherWay(), origin="test", clv_version="2.1.0", api_version="1.0")
+
+    assert registry.total == 0
+    assert "requires CLV" in registry.errors[0].message
+
+
+def test_a_plugin_declaring_neither_constraint_still_loads() -> None:
+    """`requires_api` is optional, and adding it changed nothing for anyone."""
+
+    assert _registry(Redactor()).total == 1
+
+
+def test_an_exporter_written_before_wants_path_is_never_handed_a_destination() -> None:
+    """The compatibility claim, tested against code that would break if it were false.
+
+    ``Exporter`` is an ABC and does not check signatures, so an exporter written
+    against the original three-argument ``export`` subclasses cleanly. What
+    keeps it *working* is that ``wants_path`` defaults to False and the app
+    calls the two shapes differently — this asserts the old shape is still
+    called the old way, by using one that would raise ``TypeError`` otherwise.
+    """
+
+    class Legacy(Exporter):
+        name = "legacy"
+
+        def __init__(self) -> None:
+            self.seen = 0
+
+        def export(self, entries, context):  # no `destination`, deliberately
+            self.seen = len(entries)
+            return ExportResult(ok=True, detail="legacy")
+
+    legacy = Legacy()
+    registry = _registry(legacy)
+
+    assert registry.exporters == [legacy]
+    assert legacy.wants_path is False
+    assert legacy.suggested_extension == ""
+    assert legacy.export([], CONTEXT).ok
+
+
+def test_an_exporter_can_ask_for_the_operator_s_destination() -> None:
+    class Writer(Exporter):
+        name = "writer"
+        wants_path = True
+        suggested_extension = "ndjson"
+
+        def __init__(self) -> None:
+            self.destination = None
+
+        def export(self, entries, context, *, destination=None):
+            self.destination = destination
+            return ExportResult(ok=True, detail="written", destination=destination)
+
+    writer = Writer()
+    _registry(writer)
+
+    outcome = writer.export([], CONTEXT, destination=Path("/tmp/out.ndjson"))
+
+    assert writer.destination == Path("/tmp/out.ndjson")
+    assert outcome.destination == Path("/tmp/out.ndjson")
+
+
+def test_a_plugin_importing_only_clv_api_loads_and_runs_every_interface(drop_in) -> None:
+    """Phase 2's gate, as a test rather than as a paragraph.
+
+    The published API is only a promise if a plugin can be written against it
+    *alone*. This drops a module whose sole CLV import is ``clv.api`` into a
+    real plugin subpackage, loads it through the real loader, and then exercises
+    all three interfaces — including the two things the API added, a
+    ``requires_api`` constraint and an exporter that asks for a destination.
+
+    If ``clv.api`` ever stops re-exporting something an author needs, this fails
+    at import with a ``ImportError`` recorded against the module, which is
+    exactly how a stranger would experience the same gap.
+    """
+
+    module = drop_in(
+        "filters",
+        "tmp_api_only_plugin",
+        "from dataclasses import replace\n"
+        "\n"
+        "from clv.api import (\n"
+        "    Exporter,\n"
+        "    ExportResult,\n"
+        "    FilterStage,\n"
+        "    LEVEL_ERROR,\n"
+        "    LogSourceProvider,\n"
+        "    NORMALISED_FIELD_KEYS,\n"
+        "    ProviderSource,\n"
+        "    entry_from_wire,\n"
+        "    entry_to_wire,\n"
+        "    level_rank,\n"
+        "    normalize_level,\n"
+        ")\n"
+        "from pathlib import Path\n"
+        "\n"
+        "class ApiSource(LogSourceProvider):\n"
+        "    name = 'api-source'\n"
+        "    requires_api = '>=1.0,<2.0'\n"
+        "    def discover(self):\n"
+        "        return [ProviderSource(Path('/virtual/api.log'), 'API log')]\n"
+        "    def open(self, path):\n"
+        "        yield 'a line from the api-only provider'\n"
+        "\n"
+        "class ApiStage(FilterStage):\n"
+        "    name = 'api-stage'\n"
+        "    requires_api = '>=1.0,<2.0'\n"
+        "    def apply(self, entry, context):\n"
+        "        assert 'host' in NORMALISED_FIELD_KEYS\n"
+        "        if level_rank(normalize_level('err')) != level_rank(LEVEL_ERROR):\n"
+        "            return None\n"
+        "        return replace(entry, message=entry.message.upper())\n"
+        "\n"
+        "class ApiExporter(Exporter):\n"
+        "    name = 'api-exporter'\n"
+        "    requires_api = '>=1.0,<2.0'\n"
+        "    wants_path = True\n"
+        "    suggested_extension = 'ndjson'\n"
+        "    def export(self, entries, context, *, destination=None):\n"
+        "        # Round-tripping through the wire form is what a plugin does\n"
+        "        # when it hands entries to something outside this process.\n"
+        "        moved = [entry_from_wire(entry_to_wire(e)) for e in entries]\n"
+        "        return ExportResult(ok=True, detail=str(len(moved)), destination=destination)\n"
+        "\n"
+        "def register():\n"
+        "    return [ApiSource(), ApiStage(), ApiExporter()]\n",
+    )
+
+    registry = _local()
+
+    assert not [error for error in registry.errors if module in error.origin]
+    assert [p.name for p in registry.sources if p.name == "api-source"] == ["api-source"]
+    assert [p.name for p in registry.filters if p.name == "api-stage"] == ["api-stage"]
+    assert [p.name for p in registry.exporters if p.name == "api-exporter"] == [
+        "api-exporter"
+    ]
+
+    # The provider offers its source and opens it.
+    offered = [s for s in registry.discover_sources() if s.provider == "api-source"]
+    assert [s.label for s in offered] == ["API log"]
+    reader = registry.open_source(offered[0], max_lines=10)
+    assert reader.prime().lines == ["a line from the api-only provider"]
+
+    # The stage runs over real entries and the exporter takes a destination.
+    entries = parse_lines(["2026-08-21 09:25:01 ERROR boom"])
+    staged = registry.apply_filters(entries, CONTEXT)
+    assert [e.message for e in staged] == ["BOOM"]
+
+    exporter = next(p for p in registry.exporters if p.name == "api-exporter")
+    outcome = exporter.export(staged, CONTEXT, destination=Path("/tmp/api.ndjson"))
+    assert outcome.ok and outcome.detail == "1"

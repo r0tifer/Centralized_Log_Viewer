@@ -76,8 +76,8 @@ desktop terminal and on a headless 80-column SSH session.
   remote logs interleave in one pane, and `node:` says which machine each line
   came from.
 - 🧩 **Plugins.** `LogSourceProvider`, `FilterStage` and `Exporter` interfaces,
-  loaded from `clv/plugins/` or from installed packages via the `clv.plugins`
-  entry point group. A broken plugin is reported, never fatal. A plugin is
+  published as a versioned API in `clv.api` and loaded from `clv/plugins/` or
+  from installed packages via the `clv.plugins` entry point group. A broken plugin is reported, never fatal. A plugin is
   **trusted code** — it runs with your privileges, in CLV's process, and can
   read every log CLV can open; install one the way you would install any other
   program. `clv/plugins/AGENTS.md` has the trust model in full.
@@ -1182,11 +1182,11 @@ publish one from an installed package under the `clv.plugins` entry point group.
 
 ```python
 from dataclasses import replace
-from clv.plugins import FilterStage
+from clv.api import FilterStage
 
 class Redact(FilterStage):
     name = "redact-secrets"
-    requires_clv = ">=2.0,<3.0"     # optional
+    requires_api = ">=1.0,<2.0"     # optional
 
     def apply(self, entry, context):
         if "password" not in entry.raw:
@@ -1201,11 +1201,23 @@ Return `None` from `apply` to drop a line. A plugin that fails to import, fails
 its version check, or raises at runtime is disabled and reported in the
 Advanced drawer — it cannot take the app down.
 
+**Import from `clv.api`.** It publishes the interfaces, the `LogEntry` and
+filter types you are handed, the severity helpers and the field vocabulary — the
+same objects CLV uses itself, not copies — and it is the only part of CLV under
+a stability promise. It carries its own `PLUGIN_API_VERSION`, which is what
+`requires_api` constrains: pin that rather than CLV's release number and your
+plugin stops caring which CLV it is running on. Everything else, `clv.services.*`
+included, is internal and may move. The full contract, the deprecation policy
+and the published list are in
+[`clv/plugins/AGENTS.md`](clv/plugins/AGENTS.md).
+
 `Exporter` plugins are reachable from the UI: `Ctrl+E` lists them alongside the
-three built-in formats and hands the selected one the whole filtered set. An
-exporter chooses its own destination (`export` receives the entries and a
-`FilterContext`, not a path), and one that raises is reported and skipped like
-any other plugin failure.
+three built-in formats and hands the selected one the whole filtered set. By
+default an exporter chooses its own destination (`export` receives the entries
+and a `FilterContext`, not a path); one that sets `wants_path = True` gets the
+dialog's path input enabled and the operator's choice passed through as
+`destination`. An exporter that raises is reported and skipped like any other
+plugin failure.
 
 `LogSourceProvider` plugins are wired too: whatever `discover()` returns appears
 in a **Providers** group in the tree, and selecting one opens it like any other
@@ -1217,9 +1229,11 @@ and at shutdown. The shipped [`journald`](clv/plugins/sources/journald.py)
 provider is the worked example.
 
 Provider sources are **not** filesystem paths, and CLV does not pretend they
-are: starring, include/exclude globs and rotated-set grouping all test for a
-real `Path` and so skip them. That is deliberate — a provider identifier in
-your `session.json` would be a path that does not exist.
+are: include/exclude globs describe a directory walk and rotated-set grouping is
+name arithmetic over files that rotate, so both refuse a provider identifier by
+name. Starring and merging are a different question and do work — a persisted
+*identifier* is not a persisted path, and a journal unit is exactly the source
+worth starring and comparing across a fleet.
 
 ---
 
@@ -1228,6 +1242,6 @@ your `session.json` would be a path that does not exist.
 ```bash
 python -m pip install -e .
 python -m pip install pytest
-python -m pytest            # 791 tests
+python -m pytest            # 1625 passed, 1 skipped, 11 deselected
 python -m textual run clv/app.py --dev
 ```

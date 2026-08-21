@@ -29,7 +29,7 @@ that argument; Phase 7b is the exception, and it is here because designing the
 | **Stage A — Foundations** | | |
 | 0 — Doctrine | Withdraw the sandbox claim; reverse three stated non-goals | ✅ Done |
 | 1 — Loader correctness | The six defects, before anyone depends on them | ✅ Done |
-| 2 — The contract | `clv/api.py`, `PLUGIN_API_VERSION`, the entry wire form | ⬜ Not started |
+| 2 — The contract | `clv/api.py`, `PLUGIN_API_VERSION`, the entry wire form | ✅ Done |
 | **Stage B — Reach** | | |
 | 3 — Installation | `~/.config/clv/plugins/`, `CLV_PLUGIN_PATH`, the enable-list | ⬜ Not started |
 | 4 — Management UI | A plugin surface, not a status string | ⬜ Not started |
@@ -526,7 +526,51 @@ rewritten to import from `clv.api`.
 
 **Gate.** A plugin file whose only CLV import is `from clv.api import ...`
 loads and runs every interface. An entry survives a wire round trip unchanged
-for every format CLV parses. Suite green on 3.11 and 3.14.
+for every format CLV parses. Suite green on 3.11 and 3.14: 1625 passed on both.
+
+**As shipped.** Four decisions worth recording, none a change of scope.
+
+*`PLUGIN_API_VERSION` lives in `clv/plugins/__init__.py`, not in `clv/api.py`.*
+`api.py` imports the interfaces from `plugins`, so a constant defined in `api.py`
+and checked in `PluginRegistry.add` would be a cycle. The loader owns the check,
+so the loader owns the constant; `clv.api` re-exports it as the name authors
+see. `add()` takes it as a defaulted `api_version=` keyword — a parameter only so
+a test can pin it, and defaulted so every existing call site is untouched.
+
+*Both constraints are checked by one loop, and it does not short-circuit.*
+`requires_clv` satisfied is not a reason to skip `requires_api`; each fails on
+its own account with the same two shapes Phase 1 settled — `bad requires_api:`
+naming an unreadable constraint, and `requires plugin API X, running Y` for an
+unsatisfied one. Pinned by a test that runs it both ways round.
+
+*Three names beyond the list above are published.* `SourceRef`, because
+`ProviderSource.path` is one and `discover()` may return one, so every provider
+author needs the type; and the severity helpers `level_matches`,
+`highest_level`, `LEVEL_ORDER` and `SEVERITY_BUCKETS`, on the same argument that
+already published `normalize_level` and `level_rank` — the alternative is every
+plugin reimplementing the level vocabulary and making CLV disagree with itself
+about what an operator filtered for. Additive, so the API is still 1.0.
+
+*`==` cannot test the wire round trip on its own.* `LogEntry.fields` is
+`compare=False`, so `entry_from_wire(entry_to_wire(e)) == e` passes even when
+the fields are dropped entirely. Every round-trip assertion in
+`tests/test_api_surface.py` pairs it with an explicit `dict(...) == dict(...)`
+and a read-only check, and a decoded entry with no fields comes back on the
+*shared* empty mapping rather than a fresh one.
+
+**Also swept here.** [README.md](README.md)'s test count (791, five phases
+stale) and its copy of the provider-source claim that
+`tests/test_plugin_docs.py` already forbids in `clv/plugins/AGENTS.md` —
+"starring … tests for a real `Path`" stopped being true when `JournalRef` became
+a ref. `AGENTS.md` carried the same sentence under different wording and is
+corrected too.
+
+**A note for Phase 7a.** `tests/test_api_surface.py` asserts out of process that
+importing `clv.api` pulls in no Textual widget and no Rich renderable, so a
+plugin's own unit tests need no screen. Phase 7a plans to re-export
+`FormatProfile` from [columns.py](clv/widgets/columns.py), which imports both.
+That type has to move, or be mirrored, before it can join `clv.api` — the test
+is the constraint, and it is the right one.
 
 **Commit.** `feat(api): a published, versioned plugin API and an entry wire form`
 

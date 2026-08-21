@@ -48,7 +48,9 @@ nothing. It is excluded from equality and hashing because it is derived from
 leaving it out keeps :class:`LogEntry` hashable. One consequence worth knowing:
 ``copy.deepcopy`` (and therefore :func:`dataclasses.asdict`) cannot handle a
 ``mappingproxy``, so a consumer that needs a plain dict should call
-``dict(entry.fields)``.
+``dict(entry.fields)``. Neither can ``pickle``, on *every* entry rather than an
+unlucky few — which is why an entry that has to cross a process boundary goes
+through :func:`entry_to_wire` rather than through the obvious thing.
 """
 
 from __future__ import annotations
@@ -237,6 +239,86 @@ class LogEntry:
     def structured(self) -> bool:
         """True when a format matched this line outright."""
         return self.format_name != "raw"
+
+
+# --- the wire form ----------------------------------------------------------
+#
+# ``pickle`` cannot carry a ``LogEntry``. ``fields`` is a ``mappingproxy`` --
+# including the shared empty one, so this is every entry CLV produces rather
+# than an edge case -- and ``pickle.dumps`` raises ``TypeError: cannot pickle
+# 'mappingproxy' object`` on all of them. Anything that has to move an entry
+# across a process boundary therefore needs an explicit encoding, and inventing
+# one at the point of need would mean changing a type that had already been
+# published.
+#
+# So it is published now, and it is **JSON-safe by construction**: every value
+# below is a JSON scalar, which is what makes a pipe a legal transport without a
+# second encoding step layered on top. ``tests/test_api_surface.py`` pins that
+# with an actual ``json.dumps``, so it cannot quietly stop being true.
+
+#: Version of the dict :func:`entry_to_wire` produces. Bumped when the shape
+#: changes, never reused: :func:`entry_from_wire` refuses a payload it does not
+#: recognise rather than half-decoding one.
+WIRE_VERSION = 1
+
+
+def entry_to_wire(entry: LogEntry) -> dict[str, object]:
+    """Encode *entry* as a plain, JSON-safe dict.
+
+    The timestamp goes as an ISO-8601 string (naive or aware, microseconds
+    intact) and ``fields`` as an ordinary ``dict``, because the read-only
+    mapping is the whole reason this function exists.
+    """
+
+    return {
+        "v": WIRE_VERSION,
+        "raw": entry.raw,
+        "timestamp": None if entry.timestamp is None else entry.timestamp.isoformat(),
+        "level": entry.level,
+        "message": entry.message,
+        "format_name": entry.format_name,
+        "continuation": entry.continuation,
+        "fields": dict(entry.fields),
+    }
+
+
+def entry_from_wire(payload: Mapping[str, object]) -> LogEntry:
+    """Rebuild the entry :func:`entry_to_wire` encoded.
+
+    Raises:
+        ValueError: if the payload carries no version, or one this build does
+            not know. Checked first and on its own, so a payload from a future
+            CLV is refused whole rather than half-read into an entry that looks
+            plausible and is not.
+    """
+
+    version = payload.get("v")
+    if version != WIRE_VERSION:
+        raise ValueError(
+            f"unsupported wire version {version!r}, expected {WIRE_VERSION}"
+        )
+
+    stamp = payload.get("timestamp")
+    timestamp = None if stamp is None else datetime.fromisoformat(str(stamp))
+
+    raw_fields = payload.get("fields") or {}
+    # The shared mapping when there is nothing to carry, so a decoded entry
+    # costs what a parsed one costs -- most lines have no fields at all.
+    fields = (
+        _EMPTY_FIELDS
+        if not raw_fields
+        else MappingProxyType({str(k): str(v) for k, v in dict(raw_fields).items()})
+    )
+
+    return LogEntry(
+        raw=str(payload.get("raw", "")),
+        timestamp=timestamp,
+        level=None if payload.get("level") is None else str(payload["level"]),
+        message=str(payload.get("message", "")),
+        format_name=str(payload.get("format_name", "raw")),
+        continuation=bool(payload.get("continuation", False)),
+        fields=fields,
+    )
 
 
 # --- timestamp helpers ------------------------------------------------------

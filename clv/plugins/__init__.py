@@ -15,6 +15,13 @@ Loading is defensive on purpose. A plugin that raises on import, fails its
 version check, or does not implement an interface is recorded in
 :attr:`PluginRegistry.errors` and skipped — a broken third-party plugin must
 never stop CLV from starting.
+
+**Import from :mod:`clv.api`, not from here.** Everything a plugin needs is
+re-exported there — the same objects, not copies — under a written stability
+promise and its own :data:`PLUGIN_API_VERSION`. This module keeps exporting
+what it always has, so nothing existing breaks, but it is the loader's own
+namespace: it holds internals that will move, and only ``clv.api`` is covered
+by the deprecation policy in ``clv/plugins/AGENTS.md``.
 """
 
 from __future__ import annotations
@@ -35,6 +42,21 @@ from ..services.filtering import FilterSpec
 from ..services.parsing import LogEntry
 from ..services.refs import SourceRef
 
+#: The version of the published plugin API — the surface re-exported by
+#: :mod:`clv.api` — and **not** CLV's own version.
+#:
+#: The separation is the point. ``clv.__version__`` tracks the application and
+#: moves whenever anything ships; this moves only when a published name changes
+#: meaning, so a plugin declaring ``requires_api = ">=1.0,<2.0"`` stops caring
+#: what release it is running on. The API is additive from here: a seam phase
+#: adds names and this stays "1.0".
+#:
+#: Defined here rather than in :mod:`clv.api` because ``clv.api`` imports the
+#: interfaces from this module, so the constant has to sit on the far side of
+#: that edge for :meth:`PluginRegistry.add` to check against it without a cycle.
+#: ``clv.api`` re-exports it as the name authors actually see.
+PLUGIN_API_VERSION = "1.0"
+
 #: Entry point group installed packages use to advertise CLV plugins.
 ENTRY_POINT_GROUP = "clv.plugins"
 
@@ -54,6 +76,13 @@ class Plugin(ABC):
     #: Optional CLV version constraint, e.g. ``">=2.0,<3.0"``. When set and
     #: unsatisfied, the plugin is rejected with a recorded error.
     requires_clv: Optional[str] = None
+
+    #: Optional constraint on the *published API*, e.g. ``">=1.0,<2.0"``, in
+    #: the same grammar as :attr:`requires_clv`. This is the one to reach for:
+    #: what a plugin actually depends on is the shape of :mod:`clv.api`, and
+    #: pinning CLV's own version instead means re-releasing on every CLV
+    #: release that changed nothing a plugin can see.
+    requires_api: Optional[str] = None
 
     def describe(self) -> str:
         return self.name
@@ -172,11 +201,47 @@ class ExportResult:
 
 
 class Exporter(Plugin):
-    """Sends the currently visible entries somewhere."""
+    """Sends the currently visible entries somewhere.
+
+    **Two kinds, and the default is the self-routing one.** An exporter that
+    knows where its output goes — a syslog forwarder, an HTTP endpoint, a fixed
+    report path — implements ``export(entries, context)`` and reports what it
+    did as :class:`ExportResult`. Nothing about that changed.
+
+    An exporter that writes a *file* wants the destination the operator just
+    typed, and until now could not have it: the export dialog hardcoded every
+    plugin choice as supplying no path, disabled its path input, and said so.
+    Setting :attr:`wants_path` re-enables the input and hands the chosen path to
+    :meth:`export` as ``destination``.
+    """
+
+    #: Whether the export dialog should ask the operator for a destination and
+    #: pass it to :meth:`export`. False — the default, and what every exporter
+    #: written before this attribute existed gets — means the dialog's path
+    #: input stays disabled and ``destination`` is never passed, so an
+    #: ``export(self, entries, context)`` written against the original
+    #: interface keeps working untouched.
+    wants_path: bool = False
+
+    #: Suffix the dialog's suggested filename gets when :attr:`wants_path` is
+    #: set, without a leading dot (``"ndjson"``). Empty falls back to ``log``,
+    #: which is what the built-in formats do.
+    suggested_extension: str = ""
 
     @abstractmethod
-    def export(self, entries: Sequence[LogEntry], context: FilterContext) -> ExportResult:
-        """Write or transmit *entries*."""
+    def export(
+        self,
+        entries: Sequence[LogEntry],
+        context: FilterContext,
+        *,
+        destination: Optional[Path] = None,
+    ) -> ExportResult:
+        """Write or transmit *entries*.
+
+        *destination* is the path the operator chose, and is passed **only**
+        when the exporter set :attr:`wants_path`. Keyword-only so that adding it
+        could not change what an existing positional call means.
+        """
 
 
 # --- adapting the simple contract -------------------------------------------
@@ -654,8 +719,19 @@ class PluginRegistry:
 
     # --- loading -------------------------------------------------------------
 
-    def add(self, plugin: Any, *, origin: str, clv_version: str) -> bool:
-        """Classify and store *plugin*, recording why it was rejected if so."""
+    def add(
+        self,
+        plugin: Any,
+        *,
+        origin: str,
+        clv_version: str,
+        api_version: str = PLUGIN_API_VERSION,
+    ) -> bool:
+        """Classify and store *plugin*, recording why it was rejected if so.
+
+        *api_version* defaults to the running :data:`PLUGIN_API_VERSION` and is
+        a parameter only so a test can pin it; no loader passes it.
+        """
 
         if isinstance(plugin, type):
             try:
@@ -670,23 +746,33 @@ class PluginRegistry:
             )
             return False
 
-        requirement = getattr(plugin, "requires_clv", None)
-        try:
-            compatible = satisfies(clv_version, requirement)
-        except ValueError as exc:
-            # A constraint CLV cannot read is an error naming the constraint,
-            # never a silent False: a typo and a genuine incompatibility used to
-            # look identical from the outside, and both simply vanished.
-            self.errors.append(PluginError(origin, f"bad requires_clv: {exc}"))
-            return False
-        if not compatible:
-            self.errors.append(
-                PluginError(
-                    origin,
-                    f"requires CLV {requirement}, running {clv_version}",
+        # Both constraints, in the same grammar, with the same two failure
+        # shapes: an unreadable constraint is an error naming it, and an
+        # unsatisfied one names both versions. A plugin may declare either or
+        # both, and each is checked on its own account -- `requires_api` is the
+        # one the documentation tells authors to use.
+        for label, requirement, running in (
+            ("requires_clv", getattr(plugin, "requires_clv", None), clv_version),
+            ("requires_api", getattr(plugin, "requires_api", None), api_version),
+        ):
+            try:
+                compatible = satisfies(running, requirement)
+            except ValueError as exc:
+                # A constraint CLV cannot read is an error naming the
+                # constraint, never a silent False: a typo and a genuine
+                # incompatibility used to look identical from the outside, and
+                # both simply vanished.
+                self.errors.append(PluginError(origin, f"bad {label}: {exc}"))
+                return False
+            if not compatible:
+                subject = "CLV" if label == "requires_clv" else "plugin API"
+                self.errors.append(
+                    PluginError(
+                        origin,
+                        f"requires {subject} {requirement}, running {running}",
+                    )
                 )
-            )
-            return False
+                return False
 
         if isinstance(plugin, LogSourceProvider):
             self.sources.append(plugin)
@@ -1118,6 +1204,7 @@ def load_plugins(
 __all__ = [
     "ENTRY_POINT_GROUP",
     "MAX_PLUGIN_ERRORS",
+    "PLUGIN_API_VERSION",
     "Exporter",
     "ExportResult",
     "FilterContext",

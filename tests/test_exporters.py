@@ -612,3 +612,95 @@ def test_default_stem_is_unchanged_for_every_local_source() -> None:
         "web01-syslog+2-more-"
     )
     assert default_stem(None, now=moment) == "clv-export-20260811-142530"
+
+
+class _PathWanting(Exporter):
+    """An exporter that writes a file, and therefore wants the operator's path.
+
+    Before ``wants_path`` existed this could not be written: the dialog marked
+    every plugin choice as supplying no destination, disabled its path input,
+    and an exporter that wrote a file had to invent a location the operator had
+    no say in.
+    """
+
+    name = "path-wanting"
+    wants_path = True
+    suggested_extension = "ndjson"
+
+    def __init__(self) -> None:
+        self.destinations: list[Path | None] = []
+
+    def export(self, entries, context, *, destination=None) -> ExportResult:
+        self.destinations.append(destination)
+        if destination is not None:
+            destination.write_text(
+                "\n".join(entry.raw for entry in entries), encoding="utf-8"
+            )
+        return ExportResult(ok=True, detail=f"wrote {len(entries)}", destination=destination)
+
+
+def test_an_exporter_that_wants_a_path_gets_the_input_and_the_choice(tmp_path: Path) -> None:
+    """The dialog treats it exactly like a built-in format, and it never learned how.
+
+    ``ExportDialog`` was not changed for this. Whether a choice takes a path was
+    always a flag on the choice; the app had simply been hardcoding it to False
+    for every plugin.
+    """
+
+    async def scenario() -> None:
+        app, session, pilot, context = await _open(tmp_path, count=6)
+        try:
+            writer = _PathWanting()
+            app._plugins.exporters.append(writer)
+
+            dialog = await _open_dialog(app, pilot)
+            dialog.query_one("#export-format", OptionList).highlighted = 3
+            await pilot.pause()
+
+            path_input = dialog.query_one("#export-path", Input)
+            assert path_input.disabled is False
+            # The suggested extension reaches the suggested filename, which is
+            # the only reason an exporter declares one.
+            assert path_input.value.endswith(".ndjson")
+
+            destination = tmp_path / "chosen.ndjson"
+            path_input.value = str(destination)
+            await _confirm(pilot, dialog)
+
+            assert writer.destinations == [destination]
+            assert destination.exists()
+            assert "wrote 6" in session.messages()
+        finally:
+            await context.__aexit__(None, None, None)
+
+    asyncio.run(scenario())
+
+
+def test_a_self_routing_exporter_is_still_called_the_old_way(tmp_path: Path) -> None:
+    """The default path, asserted against an exporter that would break otherwise.
+
+    ``_Recorder.export`` takes no ``destination``. If the app ever started
+    passing one unconditionally this raises ``TypeError``, is caught as a plugin
+    failure, and the recorder never runs — so the assertion on ``calls`` is the
+    one carrying the compatibility promise.
+    """
+
+    async def scenario() -> None:
+        app, session, pilot, context = await _open(tmp_path, count=4)
+        try:
+            recorder = _Recorder()
+            app._plugins.exporters.append(recorder)
+
+            dialog = await _open_dialog(app, pilot)
+            dialog.query_one("#export-format", OptionList).highlighted = 3
+            await pilot.pause()
+            assert dialog.query_one("#export-path", Input).disabled is True
+
+            await _confirm(pilot, dialog)
+
+            assert recorder.calls == [4]
+            assert not app._plugins.errors
+        finally:
+            await context.__aexit__(None, None, None)
+
+    asyncio.run(scenario())
