@@ -635,6 +635,7 @@ _PERSISTED_NAMES = ("ORIGIN_FIELD",)
 #: several of these use it as well.
 _BOUNDARY_FUNCTIONS = {
     ("clv/app.py", "_starred_paths"): "parse_ref",
+    ("clv/app.py", "_starred_display_refs"): "parse_ref",
     ("clv/app.py", "_merged_paths"): "parse_ref",
     ("clv/app.py", "_merged_display_paths"): "parse_ref",
     ("clv/app.py", "_merged_name"): "parse_ref",
@@ -645,7 +646,6 @@ _BOUNDARY_FUNCTIONS = {
     ("clv/app.py", "_capture_view"): "format_ref",
     ("clv/app.py", "action_toggle_star"): "ref_key",
     ("clv/app.py", "action_toggle_merge"): "ref_key",
-    ("clv/app.py", "_sync_star_button"): "ref_key",
     ("clv/storage.py", "summary"): "parse_ref",
     ("clv/services/session.py", "tag_origins"): "format_ref",
     ("clv/services/session.py", "origin_of"): "parse_ref",
