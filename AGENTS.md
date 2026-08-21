@@ -474,6 +474,14 @@ installed" — the trade Item 12 asked for.
   session and settings files.
 - Layout regressions are caught by asserting widget `region` bounds at a given
   terminal size rather than by eyeballing screenshots.
+- A click target that a *long name* can push off the panel is not a control.
+  Assert that its `ACTION_META` cell is actually painted, at the **default**
+  `tree_width`, with a realistic name — a 120-column terminal and an eight-
+  character fixture will pass while the real thing is unreachable.
+- `Button` ignores a click while it is still showing its press animation
+  (`if not self.has_class("-active")`), so two `pilot.click`s in a row register
+  as one. Testing an arm-then-confirm button means waiting out
+  `active_effect_duration` between them.
 
 - **The default run never touches a network**, and the one suite that does is
   opt-in: `tests/containers/run.sh alpine` / `gnu`, which builds a throwaway
@@ -485,7 +493,7 @@ installed" — the trade Item 12 asked for.
   and `workspace` fixtures, and every assertion runs against another backend —
   which is how `RemoteBackend` is held to the same behaviour as `LocalBackend`.
 
-Run: `python -m pytest` (1532 passed, 1 skipped, 11 deselected) on **both** 3.11
+Run: `python -m pytest` (1557 passed, 1 skipped, 11 deselected) on **both** 3.11
 and 3.14 — the local default is 3.14 and a green suite there is not evidence
 that the supported floor still works.
 
