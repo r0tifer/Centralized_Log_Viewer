@@ -1201,7 +1201,10 @@ def test_the_row_offers_open_name_and_clear(tmp_path: Path) -> None:
             await app._rescan()
             await pilot.pause()
 
-            positions = {name: _find_action(app, name) for name in ("open", "save", "clear")}
+            positions = {
+                name: _find_action(app, name)
+                for name in ("merged-open", "merged-save", "merged-clear")
+            }
             # Three distinct cells on the same row.
             assert len({positions[name] for name in positions}) == 3
             assert len({y for _x, y in positions.values()}) == 1
@@ -1222,7 +1225,7 @@ def test_the_clear_marker_empties_the_set(tmp_path: Path) -> None:
             await app._rescan()
             await pilot.pause()
 
-            await _click_at(pilot, _find_action(app, "clear"))
+            await _click_at(pilot, _find_action(app, "merged-clear"))
 
             from clv.app import LogTree
 
@@ -1643,3 +1646,44 @@ def test_the_source_column_qualifies_both_when_names_and_machines_differ() -> No
         mixed[2]: "alpha.log",
     }
 
+
+def test_a_row_that_is_both_starred_and_merged_keeps_both_markers(tmp_path: Path) -> None:
+    """The trap: `_relabel_sources` rewrites labels as plain strings.
+
+    A starred row's label is rich text carrying the metadata behind its `✕`.
+    Rewriting one here would leave a control that renders and does nothing, and
+    it would not fail until the first `x` after a star — so the starred group is
+    rebuilt rather than patched, and this pins it.
+    """
+
+    alpha, _beta = _sources(tmp_path)
+
+    async def scenario() -> None:
+        from clv.app import ACTION_META, ACTION_STAR_REMOVE, ICON_MERGED, LogTree
+
+        app = LogViewerApp()
+        async with app.run_test(size=(150, 40)) as pilot:
+            app._source_manager = SourceManager([alpha.parent], [])
+            app._update_state(starred=(str(alpha.resolve()),))
+            await app._rescan()
+            await pilot.pause()
+
+            tree = app.query_one("#source-tree", LogTree)
+            group = app._starred_group(tree)
+            assert group is not None
+
+            app._highlight_source(alpha, select=False)
+            await pilot.pause()
+            app.action_toggle_merge()
+            await pilot.pause()
+
+            row = app._starred_group(tree).children[0]
+            assert row.label.plain.startswith(ICON_MERGED), "the merge indicator is missing"
+            metas = [
+                span.style.meta.get(ACTION_META)
+                for span in row.label.spans
+                if hasattr(span.style, "meta")
+            ]
+            assert ACTION_STAR_REMOVE in metas, "merging stripped the unstar control"
+
+    asyncio.run(scenario())
