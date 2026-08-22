@@ -66,6 +66,7 @@ from .services.config import (
     LogConfig,
     RemoteHost,
     get_config_file,
+    ensure_user_plugin_dir,
     default_config_text,
     host_options,
     load_config,
@@ -727,6 +728,10 @@ class LogViewerApp(App[None]):
         self._store = store or StateStore()
         self._config = config or load_config()
         self._settings_path = get_config_file() or user_config_path()
+        # Created beside settings.conf on first run, so the directory an
+        # operator is told to copy a plugin into actually exists -- and
+        # explains itself, via the README.txt this drops in it.
+        ensure_user_plugin_dir()
         self._persist_state = False
         self._is_shutting_down = False
 
@@ -896,7 +901,10 @@ class LogViewerApp(App[None]):
 
     async def on_mount(self) -> None:
         self.state = self._store.load()
-        self._plugins = load_plugins()
+        # The enable-list is passed *in*, not applied afterwards: it decides
+        # whether a user plugin is imported at all, and a consent check that
+        # ran after the import would be guarding nothing.
+        self._plugins = load_plugins(enabled=self._config.plugins)
         self._wire_remote_providers()
         self._apply_breakpoint(self.size.width)
         self._sources_panel_width = self.state.tree_width or self._config.tree_width
@@ -5733,6 +5741,13 @@ class LogViewerApp(App[None]):
             )
         else:
             parts.append("No plugins loaded")
+        # Installed but not named in `plugins`. Not an error -- it is the
+        # designed resting state of a user plugin -- so it is said here rather
+        # than in the log panel's amber problem channel. Phase 4 replaces this
+        # whole string with a row per plugin.
+        available = self._plugins.available()
+        if available:
+            parts.append(f"{len(available)} installed, not enabled")
         if self._plugins.errors:
             parts.append(f"{len(self._plugins.errors)} failed: " + "; ".join(
                 str(error) for error in self._plugins.errors[:3]

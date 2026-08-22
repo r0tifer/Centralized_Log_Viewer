@@ -31,7 +31,7 @@ that argument; Phase 7b is the exception, and it is here because designing the
 | 1 — Loader correctness | The six defects, before anyone depends on them | ✅ Done |
 | 2 — The contract | `clv/api.py`, `PLUGIN_API_VERSION`, the entry wire form | ✅ Done |
 | **Stage B — Reach** | | |
-| 3 — Installation | `~/.config/clv/plugins/`, `CLV_PLUGIN_PATH`, the enable-list | ⬜ Not started |
+| 3 — Installation | `~/.config/clv/plugins/`, `CLV_PLUGIN_PATH`, the enable-list | ✅ Done |
 | 4 — Management UI | A plugin surface, not a status string | ⬜ Not started |
 | 5 — Ordering, config, lifecycle | `priority`, `[plugin:<name>]`, `setup`/`teardown` | ⬜ Not started |
 | 6 — Performance guard | A slow plugin costs itself, not the pane | ⬜ Not started |
@@ -660,7 +660,84 @@ model in two sentences. The plugin bullet at
 **Gate.** On a machine with CLV installed from the tarball and no Python
 toolchain: copy a `.py` into `~/.config/clv/plugins/`, add one word to
 `settings.conf`, restart, and the plugin is in the drawer's count. Checked by
-hand on a real frozen build. Suite green on 3.11 and 3.14.
+hand on a real frozen build. Suite green on 3.11 and 3.14: 1660 passed on both.
+
+**Outstanding: the frozen build has not been checked by hand.** The gate above
+asks for a tarball install on a machine with no Python toolchain, and that has
+not been done — there is no build spec in the tree and no PyInstaller here, so
+the check belongs to whoever cuts the next artifact. What was done instead is a
+test pinning the property whose loss would cause it
+(`test_the_user_root_does_not_depend_on_where_the_package_lives`): the user root
+comes from `$XDG_CONFIG_HOME` and never from `__file__`, asserted with
+`sys._MEIPASS` set. That is a proxy for a frozen build and not a substitute for
+one — recorded here because `Path.is_dir()` silently removing the journal from
+the shipped binary is precisely the failure a source checkout cannot see.
+
+**As shipped.** Six decisions worth recording, none a change of scope.
+
+*User plugins are imported under a synthetic package, not off `sys.path`.* A
+module in `~/.config/clv/plugins/` is not reachable by dotted import, and the
+obvious fix — prepend the directory to `sys.path` — is the wrong one: a user
+file called `json.py` would then shadow the standard library for the whole
+process, and a plugin directory is exactly where an unremarkable name like that
+gets used. Instead a namespace package (`clv_user_plugins`) is installed in
+`sys.modules` with the search roots as its `__path__`. That is not a workaround
+but the cheaper design: a bare `foo.py` and a package directory `foo/` load
+through one code path, relative imports inside a package plugin work, every
+module gets a stable `__name__` for `_extract_plugins`' namespace scan to
+compare against, and the walk is the same shape `_load_local` already used — so
+the per-module body is now **shared** by both (`_load_module`) rather than
+copied.
+
+*Only an **enabled** user module may shadow a bundled one.* The search order in
+this file, read literally, says a user root wins over `clv/plugins/`. Taken at
+face value that means dropping a file called `journald.py` into the plugin
+directory takes the shipped journal provider out of service — an install-time
+side effect from a file the operator never named, which is the precise thing
+Requirement 2 exists to prevent. An unlisted module is never imported and
+therefore claims nothing. Deliberately overriding a bundled plugin is still
+possible, still first-name-wins, and still reported; it now requires the same
+act of consent as running any other user plugin. Pinned by a test in both
+directions.
+
+*Two bundled subpackages may still share a module basename.* `sources/x.py` and
+`filters/x.py` have always been two different modules. The shadow rule consults
+a map of names claimed by *user* roots and never writes bundled names into it,
+so nothing about the bundled walk changed. Pinned, because the general version
+of the rule would have quietly broken it.
+
+*A malformed enable-list entry is dropped on its own account.* This file said
+the value "degrades to empty and is reported", which read strictly means one
+stray character voids the whole list. `parse_log_dirs` is the house pattern for
+a validated list key and it drops the entry it cannot read and keeps the rest;
+`plugins` follows it. Voiding the list would silently disable a working set of
+plugins while the file the operator is staring at looks correct — the failure
+they are least equipped to diagnose. "Degrades to empty" now applies only to a
+value that cannot be read at all. An underscore-prefixed name gets its own
+message rather than the generic one, because it *is* a legal module name and
+the generic message would be false.
+
+*Discovered-but-not-enabled is registry state, not an error.* `PluginErrors` has
+no severity, and [app.py:3589](clv/app.py#L3589) prints every entry into the log
+panel in amber as a *problem*. A plugin waiting to be named is not a problem —
+it is the designed resting state of an installed plugin — so it became a
+`DiscoveredPlugin` list on the registry, surfaced by `available()` and by one
+extra clause in the drawer's status string. Phase 4 replaces that whole string
+and inherits the state rather than inventing it.
+
+*Names are matched case-insensitively, and `config_version` moved to 2.* A
+settings file is operator prose; `Redact` where the file is `redact.py` is a
+typo class, not an intent. And the template's option set changed, which is the
+stated rule for bumping `CURRENT_CONFIG_VERSION` — so existing operators get the
+upgrade notice, and `clv --upgrade-config` merges the new `plugins` block into
+their file instead of leaving them a key with no prose.
+
+**Also swept here.** `plugin_search_roots()` de-duplicates by resolved path, so
+naming the user directory in `CLV_PLUGIN_PATH` does not make every plugin in it
+report itself as shadowing itself. `tests/test_plugins.py` gained an autouse
+fixture dropping the synthetic package from `sys.modules` between tests: without
+it a plugin loaded from one test's temp directory was handed to the next test
+that asked for the same name.
 
 **Commit.** `feat(plugins): user plugin directory and the enable-list`
 

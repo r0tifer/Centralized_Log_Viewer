@@ -30,8 +30,10 @@ import collections.abc
 import importlib
 import importlib.metadata
 import inspect
+import os
 import pkgutil
 import re
+import sys
 import types
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -62,6 +64,33 @@ ENTRY_POINT_GROUP = "clv.plugins"
 
 #: Subdirectories of clv/plugins scanned for drop-in modules.
 _LOCAL_SUBPACKAGES = ("sources", "filters", "exporters")
+
+#: Extra plugin directories, ``os.pathsep``-separated, searched *before* the
+#: user plugin directory.
+#:
+#: A development and test mechanism, not a way to install a plugin: it is how
+#: this package's own tests get a plugin root without writing into the source
+#: tree, and how an author runs a plugin they are editing in place. The
+#: enable-list applies to it exactly as it does to the user directory.
+PLUGIN_PATH_ENV = "CLV_PLUGIN_PATH"
+
+#: The package name user plugins are imported *under*.
+#:
+#: A module in ``~/.config/clv/plugins/`` is not reachable by dotted import,
+#: and putting the directory on ``sys.path`` is not the answer: a user file
+#: called ``json.py`` would then shadow the standard library for the whole
+#: process. Instead a synthetic namespace package is installed in
+#: ``sys.modules`` whose ``__path__`` is the search roots, and user plugins are
+#: imported as its submodules.
+#:
+#: That buys four things at once, each of which would otherwise be bespoke
+#: code here: a bare ``foo.py`` and a package directory ``foo/`` load through
+#: one code path; relative imports inside a package plugin work; every module
+#: gets a stable ``__name__`` for :func:`_extract_plugins` to compare against
+#: in its namespace scan; and the whole walk is the same shape
+#: :func:`_load_local` already uses, so the per-module body is shared rather
+#: than copied.
+USER_PLUGIN_PACKAGE = "clv_user_plugins"
 
 
 # --- interfaces -------------------------------------------------------------
@@ -653,6 +682,32 @@ class PluginErrors(Sequence[PluginError]):
         return f"PluginErrors({self._errors!r}, dropped={self._dropped})"
 
 
+@dataclass(frozen=True, slots=True)
+class DiscoveredPlugin:
+    """A plugin CLV found in a user root, whether or not it was loaded.
+
+    New state, and deliberately not a :class:`PluginError`. Being installed but
+    not enabled is the *designed* resting state of a user plugin -- it is what
+    "installing a plugin is not consent to run it" looks like from the
+    registry's side -- and ``app.py`` prints every error into the log panel in
+    amber as a problem. A plugin waiting to be named is not a problem.
+
+    A shadowed entry keeps :attr:`shadowed_by` so the report can say which
+    origin won the name rather than only that something did.
+    """
+
+    #: The module name as found on disk, without ``.py``.
+    name: str
+    #: The search root it was found in.
+    root: Path
+    #: Whether it was named in the enable-list and therefore imported.
+    enabled: bool
+    #: A directory with an ``__init__.py`` rather than a single file.
+    is_package: bool = False
+    #: The origin that claimed this name first, if this one lost it.
+    shadowed_by: Optional[str] = None
+
+
 @dataclass
 class PluginRegistry:
     """Everything successfully loaded, plus everything that failed to load."""
@@ -661,6 +716,10 @@ class PluginRegistry:
     filters: list[FilterStage] = field(default_factory=list)
     exporters: list[Exporter] = field(default_factory=list)
     errors: PluginErrors = field(default_factory=PluginErrors)
+    #: Every plugin found in a user root, loaded or not, in search order.
+    #: Empty on a build with no user plugin directory, which is the common case
+    #: and stays free: nothing is imported to fill this in.
+    discovered: list[DiscoveredPlugin] = field(default_factory=list)
     #: Which provider offered which source, filled by `discover_sources`. Keyed
     #: on **(provider name, path)**, because a source identifier means nothing
     #: without the provider that coined it: keyed on the path alone, the second
@@ -678,6 +737,21 @@ class PluginRegistry:
     @property
     def total(self) -> int:
         return len(self.sources) + len(self.filters) + len(self.exporters)
+
+    def available(self) -> list[DiscoveredPlugin]:
+        """Plugins installed in a user root but not enabled.
+
+        What an operator who copied a file in and has not yet named it in
+        ``settings.conf`` needs to be told. A shadowed plugin is not here: it
+        was not merely left unenabled, it lost its name to something else and
+        is reported on its own account.
+        """
+
+        return [
+            entry
+            for entry in self.discovered
+            if not entry.enabled and entry.shadowed_by is None
+        ]
 
     # --- taking a plugin out of service -------------------------------------
 
@@ -1055,7 +1129,205 @@ def _extract_plugins(module: Any) -> tuple[list[Any], Optional[str]]:
     return [], "defines no plugin — add register() or __all__"
 
 
-def _load_local(registry: PluginRegistry, clv_version: str) -> None:
+def _load_module(
+    registry: PluginRegistry,
+    module_name: str,
+    *,
+    origin: str,
+    clv_version: str,
+) -> None:
+    """Import one module and file whatever it exports into *registry*.
+
+    Shared by the bundled walk and the user-root walk. The two differ in where
+    they find a name and in whether they are allowed to import it at all; once
+    a name has been cleared for import the handling is identical, and it should
+    stay identical -- a plugin must not be diagnosed differently for having been
+    installed in a different directory.
+    """
+
+    try:
+        module = importlib.import_module(module_name)
+    except Exception as exc:  # noqa: BLE001 - third-party code
+        registry.errors.append(PluginError(origin, f"import failed: {exc}"))
+        return
+    try:
+        candidates, diagnosis = _extract_plugins(module)
+    except Exception as exc:  # noqa: BLE001 - third-party code
+        registry.errors.append(PluginError(origin, f"register() failed: {exc}"))
+        return
+    if diagnosis:
+        registry.errors.append(PluginError(origin, diagnosis))
+    for candidate in candidates:
+        registry.add(candidate, origin=origin, clv_version=clv_version)
+
+
+def plugin_search_roots() -> list[Path]:
+    """The user plugin roots, in search order, first-wins.
+
+    ``CLV_PLUGIN_PATH`` first, then ``~/.config/clv/plugins/``. The env var is
+    ahead so an author can run a plugin they are editing without moving it, and
+    so the tests get a root without writing into the source tree.
+
+    De-duplicated by resolved path with order preserved: naming the user
+    directory in ``CLV_PLUGIN_PATH`` should not make every plugin in it report
+    itself as shadowing itself.
+    """
+
+    roots: list[Path] = []
+    raw = os.environ.get(PLUGIN_PATH_ENV, "")
+    roots.extend(
+        Path(piece).expanduser()
+        for piece in raw.split(os.pathsep)
+        if piece.strip()
+    )
+    # Local import for the same reason `load_plugins` imports `clv.__version__`
+    # locally: `clv.api` re-exports this module, and the loader has no business
+    # dragging the settings parser into a plugin author's unit tests.
+    from ..services.config import user_plugin_dir
+
+    try:
+        roots.append(user_plugin_dir())
+    except Exception:  # noqa: BLE001 - a $HOME-less environment is not fatal
+        pass
+
+    ordered: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        try:
+            key = str(root.resolve())
+        except OSError:  # pragma: no cover - unresolvable path
+            key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(root)
+    return ordered
+
+
+def _install_user_package(roots: Sequence[Path]) -> None:
+    """Put the synthetic user-plugin package into ``sys.modules``.
+
+    Rebuilt on every load rather than cached, because the roots can differ
+    between one call and the next -- which in practice means between one test
+    and the next.
+    """
+
+    package = types.ModuleType(USER_PLUGIN_PACKAGE)
+    package.__path__ = [str(root) for root in roots]  # type: ignore[attr-defined]
+    package.__doc__ = "Synthetic package: CLV user plugins, imported by path."
+    sys.modules[USER_PLUGIN_PACKAGE] = package
+
+
+def _load_user_roots(
+    registry: PluginRegistry,
+    clv_version: str,
+    roots: Sequence[Path],
+    enabled: Sequence[str],
+    claimed: dict[str, str],
+) -> None:
+    """Walk the user roots, importing only what the enable-list names.
+
+    The order of the two checks in the loop is the phase's whole point:
+    ``pkgutil.iter_modules`` yields a name **without importing it**, and
+    ``importlib`` is reached only for a name the operator wrote in
+    ``settings.conf``. An unlisted module is recorded and left alone, so
+    dropping a file into the plugin directory cannot execute anything.
+    """
+
+    # Each root paired with what is in it, resolved before anything is
+    # installed: on the overwhelmingly common machine with no user plugins at
+    # all there is nothing to search, and nothing should be put into
+    # `sys.modules` on its behalf.
+    listings: list[tuple[Path, list]] = []
+    for root in roots:
+        try:
+            if not root.is_dir():
+                continue
+            listings.append((root, list(pkgutil.iter_modules([str(root)]))))
+        except OSError:
+            # An unreadable root is a non-event, not a failure. The operator
+            # who chmod'd their own plugin directory does not need CLV to stop.
+            continue
+
+    wanted = set(enabled)
+    found: set[str] = set()
+
+    # Not an early return even when there is nothing to search: a plugin named
+    # in settings.conf that is nowhere on disk still has to be reported, and
+    # "the directory does not exist" is the most likely reason for it.
+    if listings:
+        _install_user_package([root for root, _ in listings])
+
+    for root, entries in listings:
+        for info in entries:
+            if info.name.startswith("_"):
+                continue
+            key = info.name.casefold()
+            found.add(key)
+            origin = f"{root / info.name}"
+
+            if key in claimed:
+                registry.discovered.append(
+                    DiscoveredPlugin(
+                        name=info.name,
+                        root=root,
+                        enabled=False,
+                        is_package=info.ispkg,
+                        shadowed_by=claimed[key],
+                    )
+                )
+                registry.errors.append(
+                    PluginError(origin, f"shadowed by {claimed[key]}, which was found first")
+                )
+                continue
+
+            if key not in wanted:
+                registry.discovered.append(
+                    DiscoveredPlugin(
+                        name=info.name,
+                        root=root,
+                        enabled=False,
+                        is_package=info.ispkg,
+                    )
+                )
+                continue
+
+            claimed[key] = origin
+            registry.discovered.append(
+                DiscoveredPlugin(
+                    name=info.name,
+                    root=root,
+                    enabled=True,
+                    is_package=info.ispkg,
+                )
+            )
+            _load_module(
+                registry,
+                f"{USER_PLUGIN_PACKAGE}.{info.name}",
+                origin=origin,
+                clv_version=clv_version,
+            )
+
+    # A typo in settings.conf says so. Naming a plugin that is not there used
+    # to be indistinguishable from naming nothing at all.
+    where = ", ".join(str(root) for root in roots)
+    for name in enabled:
+        if name not in found:
+            registry.errors.append(
+                PluginError(
+                    "plugins",
+                    f"{name!r} is named in settings.conf but was not found"
+                    + (f" in {where}" if where else " -- no plugin directory exists"),
+                )
+            )
+
+
+def _load_local(
+    registry: PluginRegistry,
+    clv_version: str,
+    claimed: Optional[dict[str, str]] = None,
+    claimed_by_user: Optional[dict[str, str]] = None,
+) -> None:
     """Import drop-in modules under clv/plugins/ (flat and in subpackages).
 
     Where each subpackage *lives* is asked of the import system rather than of
@@ -1066,6 +1338,9 @@ def _load_local(registry: PluginRegistry, clv_version: str) -> None:
     journal: not packaging, not the opt-in, just a filesystem check standing in
     for a question only the loader can answer.
     """
+
+    claimed = {} if claimed is None else claimed
+    claimed_by_user = {} if claimed_by_user is None else claimed_by_user
 
     package_dir = Path(__file__).resolve().parent
     search: list[tuple[str, str]] = [(str(package_dir), __name__)]
@@ -1087,20 +1362,24 @@ def _load_local(registry: PluginRegistry, clv_version: str) -> None:
             if info.name.startswith("_") or info.name in _LOCAL_SUBPACKAGES:
                 continue
             module_name = f"{package_name}.{info.name}"
-            try:
-                module = importlib.import_module(module_name)
-            except Exception as exc:  # noqa: BLE001 - third-party code
-                registry.errors.append(PluginError(module_name, f"import failed: {exc}"))
+            key = info.name.casefold()
+            # Only a *user* root can shadow a bundled drop-in, and only one the
+            # operator enabled -- an unlisted file is never imported, so it
+            # cannot displace anything. Two bundled subpackages sharing a
+            # basename are untouched by this: `claimed_by_user` holds user
+            # names only, and nothing here writes into it.
+            if key in claimed_by_user:
+                registry.errors.append(
+                    PluginError(
+                        module_name,
+                        f"shadowed by {claimed_by_user[key]}, which was found first",
+                    )
+                )
                 continue
-            try:
-                candidates, diagnosis = _extract_plugins(module)
-            except Exception as exc:  # noqa: BLE001 - third-party code
-                registry.errors.append(PluginError(module_name, f"register() failed: {exc}"))
-                continue
-            if diagnosis:
-                registry.errors.append(PluginError(module_name, diagnosis))
-            for candidate in candidates:
-                registry.add(candidate, origin=module_name, clv_version=clv_version)
+            claimed.setdefault(key, module_name)
+            _load_module(
+                registry, module_name, origin=module_name, clv_version=clv_version
+            )
 
 
 def _entry_point_candidates(loaded: Any) -> tuple[list[Any], Optional[str]]:
@@ -1148,8 +1427,19 @@ def _entry_point_candidates(loaded: Any) -> tuple[list[Any], Optional[str]]:
     return [loaded], None
 
 
-def _load_entry_points(registry: PluginRegistry, clv_version: str) -> None:
-    """Load plugins advertised by installed distributions."""
+def _load_entry_points(
+    registry: PluginRegistry,
+    clv_version: str,
+    claimed: Optional[dict[str, str]] = None,
+) -> None:
+    """Load plugins advertised by installed distributions.
+
+    Last in the search order, so an entry point whose name a user root or a
+    bundled drop-in already took loses it -- and is told so, rather than being
+    resolved by whichever happened to run first.
+    """
+
+    claimed = {} if claimed is None else claimed
 
     try:
         entry_points = importlib.metadata.entry_points()
@@ -1160,6 +1450,13 @@ def _load_entry_points(registry: PluginRegistry, clv_version: str) -> None:
 
     for entry_point in selected:
         origin = f"{ENTRY_POINT_GROUP}:{entry_point.name}"
+        key = entry_point.name.casefold()
+        if key in claimed:
+            registry.errors.append(
+                PluginError(origin, f"shadowed by {claimed[key]}, which was found first")
+            )
+            continue
+        claimed.setdefault(key, origin)
         try:
             loaded = entry_point.load()
         except Exception as exc:  # noqa: BLE001 - third-party code
@@ -1184,8 +1481,24 @@ def load_plugins(
     clv_version: Optional[str] = None,
     include_local: bool = True,
     include_entry_points: bool = True,
+    include_user: bool = True,
+    roots: Optional[Sequence[Path]] = None,
+    enabled: Iterable[str] = (),
 ) -> PluginRegistry:
     """Discover and load all available plugins.
+
+    Search order, first name wins, and a loser is **reported** rather than
+    silently dropped: ``CLV_PLUGIN_PATH``, then ``~/.config/clv/plugins/``,
+    then the bundled ``clv/plugins/`` drop-ins, then ``clv.plugins`` entry
+    points.
+
+    *enabled* names the user-root modules the operator consented to run. It has
+    to be passed in rather than applied afterwards, because it decides whether
+    a module is **imported at all** -- filtering an already-loaded registry
+    would be a consent check that runs after the code it was guarding.
+
+    Bundled drop-ins ignore *enabled* entirely. They shipped with CLV, and the
+    operator's trust in them is the trust they placed in CLV.
 
     Never raises: any failure is captured in :attr:`PluginRegistry.errors`.
     """
@@ -1194,10 +1507,27 @@ def load_plugins(
         from .. import __version__ as clv_version  # local import avoids a cycle
 
     registry = PluginRegistry()
+    #: Names taken by an enabled *user* module. Only these may displace a
+    #: bundled drop-in; two bundled subpackages sharing a basename are two
+    #: different modules, as they have always been.
+    claimed_by_user: dict[str, str] = {}
+    #: The above plus bundled module names -- what an entry point competes with.
+    claimed: dict[str, str] = {}
+
+    if include_user:
+        search_roots = list(roots) if roots is not None else plugin_search_roots()
+        _load_user_roots(
+            registry,
+            clv_version,
+            search_roots,
+            [name.casefold() for name in enabled],
+            claimed,
+        )
+        claimed_by_user.update(claimed)
     if include_local:
-        _load_local(registry, clv_version)
+        _load_local(registry, clv_version, claimed, claimed_by_user)
     if include_entry_points:
-        _load_entry_points(registry, clv_version)
+        _load_entry_points(registry, clv_version, claimed)
     return registry
 
 
@@ -1205,6 +1535,9 @@ __all__ = [
     "ENTRY_POINT_GROUP",
     "MAX_PLUGIN_ERRORS",
     "PLUGIN_API_VERSION",
+    "PLUGIN_PATH_ENV",
+    "USER_PLUGIN_PACKAGE",
+    "DiscoveredPlugin",
     "Exporter",
     "ExportResult",
     "FilterContext",
@@ -1217,5 +1550,6 @@ __all__ = [
     "PluginErrors",
     "PluginRegistry",
     "load_plugins",
+    "plugin_search_roots",
     "satisfies",
 ]

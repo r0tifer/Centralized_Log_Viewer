@@ -733,3 +733,48 @@ def test_an_alias_already_configured_is_not_offered_again(tmp_path: Path) -> Non
             assert notes and "already configured" in notes[0][1]
 
     asyncio.run(scenario())
+
+
+# --- installed but not enabled ----------------------------------------------
+
+
+def test_the_drawer_says_how_many_plugins_are_installed_but_not_enabled() -> None:
+    """The hint an operator gets between copying a file in and naming it.
+
+    Not an error, so it does not go to the log panel's amber problem channel —
+    a plugin waiting to be enabled is the designed resting state, not a fault.
+    Phase 4 replaces this whole string with a row per plugin.
+    """
+
+    from clv.plugins import DiscoveredPlugin
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(120, 30)) as pilot:
+            app._plugins.discovered.append(
+                DiscoveredPlugin(
+                    name="redact_secrets", root=Path("/home/x"), enabled=False
+                )
+            )
+            app._refresh_plugin_status()
+            await pilot.pause()
+
+            text = str(app.advanced_drawer.query_one("#plugin-status").content)
+            assert "1 installed, not enabled" in text
+
+    _run(scenario)
+
+
+def test_the_drawer_says_nothing_extra_when_every_plugin_is_enabled() -> None:
+    """Requirement 10: nothing installed means nothing new on screen."""
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(120, 30)) as pilot:
+            app._refresh_plugin_status()
+            await pilot.pause()
+
+            text = str(app.advanced_drawer.query_one("#plugin-status").content)
+            assert "not enabled" not in text
+
+    _run(scenario)

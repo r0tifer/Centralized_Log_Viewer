@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib
+import os
 import sys
+import time
 import types
 from dataclasses import replace
 from pathlib import Path
@@ -11,6 +13,9 @@ import pytest
 
 from clv.plugins import (
     MAX_PLUGIN_ERRORS,
+    PLUGIN_PATH_ENV,
+    USER_PLUGIN_PACKAGE,
+    DiscoveredPlugin,
     Exporter,
     ExportResult,
     FilterContext,
@@ -21,6 +26,7 @@ from clv.plugins import (
     PluginRegistry,
     ProviderSource,
     load_plugins,
+    plugin_search_roots,
     satisfies,
 )
 from clv.services.filtering import FilterSpec
@@ -938,3 +944,461 @@ def test_a_plugin_importing_only_clv_api_loads_and_runs_every_interface(drop_in)
     exporter = next(p for p in registry.exporters if p.name == "api-exporter")
     outcome = exporter.export(staged, CONTEXT, destination=Path("/tmp/api.ndjson"))
     assert outcome.ok and outcome.detail == "1"
+
+
+# --- the user plugin directory ----------------------------------------------
+#
+# Phase 3. A plugin an operator installed lives outside the package, is found
+# without being imported, and runs only once they have named it. The tests
+# below are ordered the way the rule is: what loads, then what must *not*.
+
+
+@pytest.fixture(autouse=True)
+def _forget_user_plugins():
+    """Drop the synthetic user package between tests.
+
+    ``load_plugins`` installs it in ``sys.modules`` whenever it has roots to
+    search, so without this a test that loaded a plugin from a temp directory
+    would leave the package — and everything imported under it — for the next
+    test that asked for the same name.
+    """
+
+    yield
+    for name in [
+        n
+        for n in sys.modules
+        if n == USER_PLUGIN_PACKAGE or n.startswith(f"{USER_PLUGIN_PACKAGE}.")
+    ]:
+        del sys.modules[name]
+
+
+@pytest.fixture
+def user_root(tmp_path, monkeypatch):
+    """Plugin roots on ``CLV_PLUGIN_PATH`` — which is what that variable is for.
+
+    Simpler than ``drop_in``'s ``__path__`` surgery, and deliberately so: this
+    is the documented development mechanism, so the tests and a plugin author
+    reach the loader by the same door. ``conftest.py`` already points
+    ``XDG_CONFIG_HOME`` at a temp tree, so the real user plugin directory is
+    isolated for free and stays empty.
+
+    ``sys.modules`` is cleaned up for the same reason ``drop_in`` cleans it: the
+    synthetic user package and everything imported under it would otherwise be
+    handed to the next test that imports the same name.
+    """
+
+    known = set(sys.modules)
+    roots: list[Path] = []
+
+    def make(name: str = "root") -> Path:
+        root = tmp_path / name
+        root.mkdir(parents=True, exist_ok=True)
+        roots.append(root)
+        monkeypatch.setenv(PLUGIN_PATH_ENV, os.pathsep.join(str(r) for r in roots))
+        importlib.invalidate_caches()
+        return root
+
+    yield make
+
+    for name in [n for n in sys.modules if n not in known]:
+        del sys.modules[name]
+
+
+#: A filter stage whose name says which file it came from, so a shadowing test
+#: can tell the winner from the loser rather than merely counting.
+_STAGE = """\
+from clv.api import FilterStage
+
+class Stage(FilterStage):
+    name = "{name}"
+
+    def apply(self, entry, context):
+        return entry
+"""
+
+
+def _plugin(root: Path, module: str, name: str | None = None) -> Path:
+    path = root / f"{module}.py"
+    path.write_text(_STAGE.format(name=name or module), encoding="utf-8")
+    return path
+
+
+def _user(**kwargs) -> PluginRegistry:
+    """Load from user roots only, so a real bundled plugin cannot blur a result."""
+
+    return load_plugins(
+        clv_version="2.1.0", include_local=False, include_entry_points=False, **kwargs
+    )
+
+
+def test_a_named_module_in_a_user_root_loads(user_root) -> None:
+    root = user_root()
+    _plugin(root, "redact_secrets")
+
+    registry = _user(enabled=["redact_secrets"])
+
+    assert [stage.name for stage in registry.filters] == ["redact_secrets"]
+    assert not registry.errors
+
+
+def test_an_unnamed_module_is_listed_but_not_loaded(user_root) -> None:
+    root = user_root()
+    _plugin(root, "redact_secrets")
+
+    registry = _user(enabled=[])
+
+    assert registry.total == 0
+    assert [entry.name for entry in registry.available()] == ["redact_secrets"]
+    # Being installed and not enabled is the designed resting state, not a
+    # problem, so it must not reach the channel the log panel paints amber.
+    assert not registry.errors
+
+
+def test_an_unnamed_module_is_never_imported(user_root) -> None:
+    """Requirement 2's teeth, and the one assertion here that cannot be softened.
+
+    Deliberately not an assertion about the registry: a module could be
+    imported for its side effects and then have its plugins discarded, and
+    every registry-level assertion in this file would still pass while the
+    operator's machine had run a stranger's code. The only proof is that the
+    code did not run, so the module writes a file and the test is that the file
+    is not there.
+    """
+
+    root = user_root()
+    sentinel = root / "SENTINEL"
+    (root / "loud.py").write_text(
+        f"from pathlib import Path\n"
+        f"Path({str(sentinel)!r}).write_text('imported')\n" + _STAGE.format(name="loud"),
+        encoding="utf-8",
+    )
+
+    registry = _user(enabled=[])
+
+    assert not sentinel.exists(), "an unlisted plugin executed code"
+    assert registry.total == 0
+
+    # And the same module, named, does run — otherwise the assertion above
+    # would pass just as well against a loader that had stopped working.
+    registry = _user(enabled=["loud"])
+    assert sentinel.exists()
+    assert [stage.name for stage in registry.filters] == ["loud"]
+
+
+def test_a_package_directory_loads_like_a_single_file(user_root) -> None:
+    """Including a relative import, which is why the synthetic package exists."""
+
+    root = user_root()
+    package = root / "nginx_format"
+    package.mkdir()
+    (package / "patterns.py").write_text("LABEL = 'nginx'\n", encoding="utf-8")
+    (package / "__init__.py").write_text(
+        "from . import patterns\n" + _STAGE.format(name="{name}").format(name="nginx"),
+        encoding="utf-8",
+    )
+    # The sibling module is reachable, which a bare sys.path insertion or a
+    # hand-rolled spec loader would not give for free.
+    (package / "__init__.py").write_text(
+        "from . import patterns\n"
+        "from clv.api import FilterStage\n"
+        "\n"
+        "class Stage(FilterStage):\n"
+        "    name = patterns.LABEL\n"
+        "\n"
+        "    def apply(self, entry, context):\n"
+        "        return entry\n",
+        encoding="utf-8",
+    )
+
+    registry = _user(enabled=["nginx_format"])
+
+    assert [stage.name for stage in registry.filters] == ["nginx"]
+    assert [entry.is_package for entry in registry.discovered] == [True]
+
+
+def test_the_enable_list_is_matched_without_regard_to_case(user_root) -> None:
+    root = user_root()
+    _plugin(root, "redact_secrets")
+
+    registry = _user(enabled=["Redact_Secrets"])
+
+    assert [stage.name for stage in registry.filters] == ["redact_secrets"]
+
+
+def test_a_module_whose_name_starts_with_underscore_is_skipped(user_root) -> None:
+    root = user_root()
+    _plugin(root, "_private")
+
+    registry = _user(enabled=["_private"])
+
+    assert registry.total == 0
+    assert registry.discovered == []
+    # It is not "installed but not enabled" either — CLV never considered it.
+    assert "not found" in registry.errors[0].message
+
+
+def test_the_earlier_root_wins_and_the_shadow_is_reported(user_root) -> None:
+    first, second = user_root("first"), user_root("second")
+    _plugin(first, "dup", name="from-first")
+    _plugin(second, "dup", name="from-second")
+
+    registry = _user(enabled=["dup"])
+
+    assert [stage.name for stage in registry.filters] == ["from-first"]
+    assert len(registry.errors) == 1
+    assert "shadowed by" in registry.errors[0].message
+    assert str(first) in registry.errors[0].message
+    shadowed = [e for e in registry.discovered if e.shadowed_by]
+    assert [entry.root for entry in shadowed] == [second]
+
+
+def test_an_enabled_user_module_shadows_a_bundled_one(user_root, drop_in) -> None:
+    """Replacing a shipped plugin is possible, and it is reported when it happens."""
+
+    drop_in("filters", "shadowme", _STAGE.format(name="bundled"))
+    root = user_root()
+    _plugin(root, "shadowme", name="from-the-user")
+
+    registry = load_plugins(
+        clv_version="2.1.0", include_entry_points=False, enabled=["shadowme"]
+    )
+
+    names = [stage.name for stage in registry.filters]
+    assert "from-the-user" in names
+    assert "bundled" not in names
+    assert any(
+        "shadowed by" in error.message and "shadowme" in error.origin
+        for error in registry.errors
+    )
+
+
+def test_an_unlisted_user_module_shadows_nothing(user_root, drop_in) -> None:
+    """The guard that keeps a dropped file from changing CLV without being named.
+
+    Without it, copying a file called `journald.py` into the plugin directory
+    would take the shipped journal provider out of service — an install-time
+    side effect from a file the operator never enabled, which is precisely what
+    the enable-list exists to prevent.
+    """
+
+    drop_in("filters", "shadowme", _STAGE.format(name="bundled"))
+    root = user_root()
+    _plugin(root, "shadowme", name="from-the-user")
+
+    registry = load_plugins(clv_version="2.1.0", include_entry_points=False, enabled=[])
+
+    names = [stage.name for stage in registry.filters]
+    assert "bundled" in names
+    assert "from-the-user" not in names
+    assert not [e for e in registry.errors if "shadowed" in e.message]
+
+
+def test_two_bundled_subpackages_may_share_a_module_name(drop_in) -> None:
+    """Unchanged behaviour, pinned because the shadow rule could have broken it.
+
+    `sources/x.py` and `filters/x.py` are two different modules and always have
+    been. Only a *user* root may claim a name away from a bundled drop-in.
+    """
+
+    drop_in("filters", "samename", _STAGE.format(name="the-filter"))
+    drop_in(
+        "exporters",
+        "samename",
+        "from clv.api import Exporter, ExportResult\n"
+        "\n"
+        "class E(Exporter):\n"
+        "    name = 'the-exporter'\n"
+        "\n"
+        "    def export(self, entries, context, *, destination=None):\n"
+        "        return ExportResult(ok=True, detail='')\n",
+    )
+
+    registry = load_plugins(clv_version="2.1.0", include_entry_points=False)
+
+    assert "the-filter" in [stage.name for stage in registry.filters]
+    assert "the-exporter" in [exp.name for exp in registry.exporters]
+    assert not [e for e in registry.errors if "shadowed" in e.message]
+
+
+def test_a_named_but_absent_plugin_is_reported_by_name(user_root) -> None:
+    root = user_root()
+    _plugin(root, "present")
+
+    registry = _user(enabled=["present", "typo_here"])
+
+    assert [stage.name for stage in registry.filters] == ["present"]
+    assert len(registry.errors) == 1
+    assert "typo_here" in registry.errors[0].message
+    assert str(root) in registry.errors[0].message
+
+
+def test_a_missing_or_empty_root_is_a_silent_non_event(tmp_path, monkeypatch) -> None:
+    absent = tmp_path / "not-there"
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setenv(PLUGIN_PATH_ENV, os.pathsep.join([str(absent), str(empty)]))
+
+    registry = _user(enabled=[])
+
+    assert registry.total == 0
+    assert registry.discovered == []
+    assert not registry.errors
+
+
+def test_an_unreadable_root_is_reported_or_ignored_never_raised(
+    tmp_path, monkeypatch
+) -> None:
+    """An operator who chmod'd their own plugin directory does not need a crash."""
+
+    root = tmp_path / "locked"
+    root.mkdir()
+    _plugin(root, "hidden")
+    root.chmod(0o000)
+    monkeypatch.setenv(PLUGIN_PATH_ENV, str(root))
+    try:
+        # Running as root, mode 000 stops nothing, and the assertion below would
+        # be about the container rather than about the loader.
+        if os.access(root, os.R_OK):
+            pytest.skip("this user can read a mode-000 directory")
+        registry = _user(enabled=["hidden"])
+    finally:
+        root.chmod(0o755)
+
+    # Either silently skipped or reported; raising is what must not happen.
+    assert registry.total == 0
+
+
+def test_no_roots_at_all_stays_silent(monkeypatch) -> None:
+    """Requirement 10: a build with no user plugins costs nothing and says nothing."""
+
+    monkeypatch.delenv(PLUGIN_PATH_ENV, raising=False)
+
+    registry = _user(roots=[], enabled=[])
+
+    assert registry.total == 0
+    assert registry.discovered == []
+    assert not registry.errors
+    # Nothing was imported, so no synthetic package was installed.
+    assert USER_PLUGIN_PACKAGE not in sys.modules
+
+
+def test_a_named_plugin_with_no_plugin_directory_still_says_so() -> None:
+    """The silence guard: no directory is the likeliest reason a name is absent.
+
+    Worth its own test because the natural implementation returns early when
+    there is nothing to search, which would swallow exactly the report the
+    operator in this situation needs.
+    """
+
+    registry = _user(roots=[], enabled=["redact_secrets"])
+
+    assert len(registry.errors) == 1
+    assert "redact_secrets" in registry.errors[0].message
+    assert "no plugin directory" in registry.errors[0].message
+
+
+def test_clv_plugin_path_is_searched_before_the_user_directory(
+    tmp_path, monkeypatch
+) -> None:
+    from clv.services.config import user_plugin_dir
+
+    override = tmp_path / "dev"
+    override.mkdir()
+    monkeypatch.setenv(PLUGIN_PATH_ENV, str(override))
+
+    roots = plugin_search_roots()
+
+    assert roots[0] == override
+    assert roots[-1] == user_plugin_dir()
+
+
+def test_the_search_roots_are_de_duplicated(tmp_path, monkeypatch) -> None:
+    """Naming the user directory in CLV_PLUGIN_PATH must not make it shadow itself."""
+
+    from clv.services.config import user_plugin_dir
+
+    monkeypatch.setenv(PLUGIN_PATH_ENV, str(user_plugin_dir()))
+
+    assert plugin_search_roots().count(user_plugin_dir()) == 1
+
+
+def test_the_user_root_does_not_depend_on_where_the_package_lives(
+    tmp_path, monkeypatch
+) -> None:
+    """A frozen build is an equal citizen, and this is the reason it can be.
+
+    The bundled walk asks the *import system* where `clv/plugins/sources/`
+    lives, because under PyInstaller it is inside an archive and not a
+    directory at all — the lesson recorded on `_load_local`. The user root is
+    the opposite case and must not inherit that problem: it is derived from
+    `$XDG_CONFIG_HOME`, never from `__file__`, so it is a real writable
+    directory in every build.
+
+    Simulating `sys._MEIPASS` is a proxy for a real frozen build, not a
+    substitute for one. It is here because the property it pins — that nothing
+    about finding a user plugin is a function of where the package was
+    unpacked — is the one that would silently make the binary user's install
+    path vanish, exactly as `Path.is_dir()` once silently removed the journal.
+    """
+
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path / "bundle"), raising=False)
+    root = tmp_path / "userplugins"
+    root.mkdir()
+    _plugin(root, "frozen_ok")
+    monkeypatch.setenv(PLUGIN_PATH_ENV, str(root))
+
+    registry = _user(enabled=["frozen_ok"])
+
+    assert [stage.name for stage in registry.filters] == ["frozen_ok"]
+    assert not registry.errors
+
+
+def test_discovering_many_unlisted_files_costs_nothing_measurable(
+    tmp_path, monkeypatch
+) -> None:
+    """A directory of files nobody enabled must not become a startup cost.
+
+    A deliberately loose ceiling, in the shape `tests/test_clustering.py` uses:
+    the point is to catch an order-of-magnitude regression — an implementation
+    that imports first and filters afterwards — not to measure this machine. A
+    tight budget on a shared CI box is a flaky test, and a flaky test gets
+    deleted. The measured number goes in the commit message.
+    """
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    crowded = tmp_path / "crowded"
+    crowded.mkdir()
+    for index in range(200):
+        _plugin(crowded, f"plugin_{index}")
+
+    monkeypatch.setenv(PLUGIN_PATH_ENV, str(empty))
+    start = time.perf_counter()
+    _user(enabled=[])
+    baseline = time.perf_counter() - start
+
+    monkeypatch.setenv(PLUGIN_PATH_ENV, str(crowded))
+    start = time.perf_counter()
+    registry = _user(enabled=[])
+    crowded_cost = time.perf_counter() - start
+
+    assert len(registry.available()) == 200
+    assert registry.total == 0, "not one of them was imported"
+    assert crowded_cost < 0.5, (
+        f"200 unlisted files took {crowded_cost:.3f}s against {baseline:.3f}s empty"
+    )
+
+
+def test_the_registry_reports_where_each_plugin_was_found(user_root) -> None:
+    root = user_root()
+    _plugin(root, "enabled_one")
+    _plugin(root, "disabled_one")
+
+    registry = _user(enabled=["enabled_one"])
+
+    found = {entry.name: entry for entry in registry.discovered}
+    assert found["enabled_one"] == DiscoveredPlugin(
+        name="enabled_one", root=root, enabled=True, is_package=False
+    )
+    assert found["disabled_one"].enabled is False
+    assert all(entry.root == root for entry in registry.discovered)

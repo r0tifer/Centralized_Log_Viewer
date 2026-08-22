@@ -24,11 +24,13 @@ from clv.services.config import (
     RemoteHost,
     bundled_config_path,
     config_version_of,
+    ensure_user_plugin_dir,
     ensure_user_settings_file,
     host_options,
     load_config,
     parse_log_dirs,
     user_config_path,
+    user_plugin_dir,
     validate_host_name,
     validate_identity_file,
     validate_port,
@@ -938,6 +940,7 @@ def test_the_shipped_file_parses_into_the_documented_defaults(monkeypatch) -> No
     assert config.cluster_lookback == 200
     assert config.enable_journald is False
     assert config.enable_ssh is False
+    assert config.plugins == ()
 
 
 def test_the_shipped_file_names_no_hosts_and_reports_nothing(monkeypatch) -> None:
@@ -1026,3 +1029,105 @@ def test_the_second_commented_host_example_still_parses(tmp_path, monkeypatch) -
     assert config.hosts[0].name == "db02"
     assert config.hosts[0].host == "10.0.0.12"
     assert config.hosts[0].log_dirs == ("/var/log/postgresql",)
+
+
+# --- the plugin enable-list -------------------------------------------------
+
+
+def test_plugins_is_empty_by_default(tmp_path) -> None:
+    config = load_config(_write(tmp_path / "settings.conf", "[log_viewer]\n"))
+
+    assert config.plugins == ()
+    assert config.issues == ()
+
+
+def test_plugins_tolerates_the_shapes_an_operator_writes(tmp_path) -> None:
+    """Whitespace, a trailing comma, a duplicate and the wrong case."""
+
+    body = "[log_viewer]\nplugins =  redact_secrets , Nginx_Format,, redact_secrets,\n"
+
+    config = load_config(_write(tmp_path / "settings.conf", body))
+
+    assert config.plugins == ("redact_secrets", "nginx_format")
+    assert config.issues == ()
+
+
+def test_an_unusable_plugin_name_is_dropped_and_the_rest_still_load(tmp_path) -> None:
+    """Per-entry, like `log_dirs` — one stray character must not void the list.
+
+    Voiding it would silently disable a working set of plugins, which is the
+    failure an operator is least able to diagnose: nothing loads, and the file
+    they are reading looks right.
+    """
+
+    body = "[log_viewer]\nplugins = good_one, my-plugin, foo.bar, other_one\n"
+
+    config = load_config(_write(tmp_path / "settings.conf", body))
+
+    assert config.plugins == ("good_one", "other_one")
+    assert [issue.origin for issue in config.issues] == ["plugins", "plugins"]
+    assert "'my-plugin'" in str(config.issues[0])
+    assert "'foo.bar'" in str(config.issues[1])
+
+
+def test_an_underscored_plugin_name_says_why_it_cannot_work(tmp_path) -> None:
+    """It parses as a module name, so the generic message would be wrong."""
+
+    body = "[log_viewer]\nplugins = _private\n"
+
+    config = load_config(_write(tmp_path / "settings.conf", body))
+
+    assert config.plugins == ()
+    assert "underscore" in config.issues[0].message
+
+
+def test_an_empty_plugins_value_reports_nothing(tmp_path) -> None:
+    config = load_config(_write(tmp_path / "settings.conf", "[log_viewer]\nplugins =\n"))
+
+    assert config.plugins == ()
+    assert config.issues == ()
+
+
+# --- the user plugin directory ----------------------------------------------
+
+
+def test_the_plugin_directory_sits_beside_the_settings_file() -> None:
+    """One place, already in the operator's muscle memory."""
+
+    assert user_plugin_dir().parent == user_config_path().parent
+
+
+def test_the_plugin_directory_is_created_with_a_readme() -> None:
+    created = ensure_user_plugin_dir()
+
+    assert created == user_plugin_dir()
+    assert created.is_dir()
+    readme = created / "README.txt"
+    assert readme.exists()
+    # The two things an empty folder cannot say for itself.
+    text = readme.read_text(encoding="utf-8")
+    assert "plugins" in text and "settings.conf" in text
+    assert "trusted code" in text
+
+
+def test_creating_the_plugin_directory_is_idempotent() -> None:
+    ensure_user_plugin_dir()
+    readme = user_plugin_dir() / "README.txt"
+    readme.write_text("edited by the operator", encoding="utf-8")
+
+    ensure_user_plugin_dir()
+
+    assert readme.read_text(encoding="utf-8") == "edited by the operator", (
+        "an operator's own note in their own directory was overwritten"
+    )
+
+
+def test_an_unwritable_home_is_not_a_startup_failure(monkeypatch, tmp_path) -> None:
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(locked))
+    try:
+        assert ensure_user_plugin_dir() is None
+    finally:
+        locked.chmod(0o700)

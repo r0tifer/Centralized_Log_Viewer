@@ -76,8 +76,11 @@ desktop terminal and on a headless 80-column SSH session.
   remote logs interleave in one pane, and `node:` says which machine each line
   came from.
 - 🧩 **Plugins.** `LogSourceProvider`, `FilterStage` and `Exporter` interfaces,
-  published as a versioned API in `clv.api` and loaded from `clv/plugins/` or
-  from installed packages via the `clv.plugins` entry point group. A broken plugin is reported, never fatal. A plugin is
+  published as a versioned API in `clv.api`. Install one by copying a file into
+  `~/.config/clv/plugins/` — no root, no Python toolchain, and it survives a
+  package upgrade. A file there is listed but **not run** until you name it in
+  the `plugins` setting, so installing a plugin and running one stay two
+  separate decisions. A broken plugin is reported, never fatal. A plugin is
   **trusted code** — it runs with your privileges, in CLV's process, and can
   read every log CLV can open; install one the way you would install any other
   program. `clv/plugins/AGENTS.md` has the trust model in full.
@@ -177,6 +180,7 @@ use.
 | `watch_bell` | Ring the terminal bell when a watch rule notifies. | `false` |
 | `cluster_lookback` | How far back, in entries, `c` may reach to fold a repeated line into a cluster. A bound, not a taste: it keeps one cluster from spanning a session. | `200` |
 | `enable_journald` | Offer the systemd journal as a source. Off by default: reading it runs `journalctl`, and CLV spawns no subprocess unasked. The drawer's switch writes this line for you. | `false` |
+| `plugins` | Plugins to load from `~/.config/clv/plugins/`, comma separated, named without the `.py`. A file in that directory is listed but **not imported** until it is named here — installing a plugin and running one are two decisions. Plugins bundled with CLV are not listed here. | *(empty)* |
 | `enable_ssh` | Read log folders on machines named in `[ssh:<name>]` sections. Off by default, and for a stronger version of the same reason: a remote source spawns a *network* subprocess. With it false nothing connects, however many hosts are configured. | `false` |
 
 Invalid values fall back to safe defaults; the app never fails to start because
@@ -1175,10 +1179,55 @@ user-adjustable tree width. Responsive behavior comes from breakpoint classes
 
 ---
 
+## Installing a plugin
+
+Copy the file in, name it, restart:
+
+```bash
+mkdir -p ~/.config/clv/plugins
+cp redact_secrets.py ~/.config/clv/plugins/
+```
+
+Then in `~/.config/clv/settings.conf`, under `[log_viewer]`:
+
+```ini
+plugins = redact_secrets
+```
+
+Names are the file name without the `.py`, comma separated, matched without
+regard to case. A directory `redact_secrets/` containing an `__init__.py` works
+the same way. No root, no Python toolchain, and nothing that a package upgrade
+overwrites — this works identically on a `.deb`/`.rpm`/tarball install and on a
+source checkout. CLV creates the directory on first run and leaves a
+`README.txt` in it saying the same thing.
+
+**Copying the file in does not run it.** CLV lists what it finds in that
+directory and does not import it until the name appears in `plugins`. The
+Advanced drawer says how many are installed but not enabled; a name you list
+that isn't there is reported by name, so a typo says so rather than doing
+nothing.
+
+**A plugin is trusted code.** It is Python imported into CLV's own process: it
+runs with your privileges and can read every file you can, including every log
+CLV has open. The interfaces bound what CLV *asks* of a plugin, not what a
+plugin *can do*, and CLV does not sandbox one — install one the way you would
+install any other program. The trust model and a checklist for reviewing
+someone else's plugin are in
+[`clv/plugins/AGENTS.md`](clv/plugins/AGENTS.md).
+
+For development, `CLV_PLUGIN_PATH` names extra directories (`:`-separated)
+searched ahead of the user directory, so a plugin can be run from where it is
+being edited. It is a development mechanism, not an install path, and the
+`plugins` enable-list still applies.
+
+---
+
 ## Writing a plugin
 
-Drop a module into `clv/plugins/filters/` (or `sources/` / `exporters/`), or
-publish one from an installed package under the `clv.plugins` entry point group.
+Drop a module into `~/.config/clv/plugins/` and name it in `plugins` (above),
+or — for a plugin shipped as part of CLV itself — into `clv/plugins/filters/`
+(or `sources/` / `exporters/`), or publish one from an installed package under
+the `clv.plugins` entry point group.
 
 ```python
 from dataclasses import replace
@@ -1242,6 +1291,6 @@ worth starring and comparing across a fleet.
 ```bash
 python -m pip install -e .
 python -m pip install pytest
-python -m pytest            # 1625 passed, 1 skipped, 11 deselected
+python -m pytest            # 1660 passed, 1 skipped, 11 deselected
 python -m textual run clv/app.py --dev
 ```

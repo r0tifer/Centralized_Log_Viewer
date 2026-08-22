@@ -45,7 +45,7 @@ CONFIG_VERSION_OPTION = "config_version"
 #: template's option set changes. Deliberately not ``__version__``: most
 #: releases do not touch the settings schema, and stamping the app version
 #: would re-migrate every operator's file for nothing.
-CURRENT_CONFIG_VERSION = 1
+CURRENT_CONFIG_VERSION = 2
 
 #: One remote host per section: ``[ssh:web01]``. The suffix is the host's name
 #: within CLV — what the tree shows, what ``node:`` matches, and the fallback
@@ -161,6 +161,18 @@ cluster_lookback = 200
 # without being asked. The Advanced drawer's "Journal (systemd)" switch turns
 # this on and writes it back here.
 enable_journald = false
+
+# Plugins to load from ~/.config/clv/plugins/, comma separated, named without
+# the .py. Empty by default. A file placed in that directory is listed but not
+# run until it is named here, so installing a plugin and running one are two
+# separate decisions.
+#
+# A plugin is trusted code: it runs in CLV's process with your privileges and
+# can read every log CLV can open. CLV does not sandbox one.
+#
+# Plugins that shipped with CLV are not listed here - they load on their own,
+# because trusting them is the trust you already placed in CLV.
+plugins =
 
 # Read log folders on other machines over SSH. Off by default, and for a
 # stronger version of the reason above: a remote source spawns ssh, and a
@@ -348,6 +360,21 @@ class LogConfig:
     #: than lowering it. With this false nothing connects and nothing spawns,
     #: however many hosts are configured.
     enable_ssh: bool = False
+    #: Which plugins in the *user* plugin directory the operator has enabled,
+    #: casefolded and de-duplicated, in file order.
+    #:
+    #: A file in `~/.config/clv/plugins/` is discovered and listed but never
+    #: imported until its name appears here. That is the whole of the rule that
+    #: installing a plugin is not consent to run it: an unnamed module does not
+    #: execute, so dropping a file into the directory cannot run anything.
+    #:
+    #: A list rather than a boolean on purpose. "Enable everything in this
+    #: directory" is exactly the behaviour that makes a dropped file dangerous.
+    #:
+    #: Bundled drop-ins under `clv/plugins/` are not governed by this: they
+    #: shipped with CLV, and the operator's trust in them is the trust they
+    #: already placed in CLV.
+    plugins: tuple[str, ...] = ()
     #: Every `[ssh:<name>]` section that parsed, in file order.
     #:
     #: Populated regardless of :attr:`enable_ssh`. Parsing is inert, and a
@@ -377,6 +404,19 @@ def get_xdg_config_home() -> Path:
 
 def user_config_path() -> Path:
     return get_xdg_config_home() / "clv" / "settings.conf"
+
+
+def user_plugin_dir() -> Path:
+    """Where an operator installs a plugin: beside ``settings.conf``.
+
+    One place, already in their muscle memory, and writable without root on
+    every build — which the bundled ``clv/plugins/`` is not. On a `.deb` or
+    tarball install that directory is inside a root-owned tree a package
+    upgrade overwrites, so for the operator CLV is actually distributed to it
+    is not an install path at all.
+    """
+
+    return get_xdg_config_home() / "clv" / "plugins"
 
 
 def bundled_config_path() -> Path:
@@ -525,6 +565,75 @@ def ensure_user_settings_file() -> Optional[Path]:
         return template if template.exists() else None
 
 
+#: Dropped into ``~/.config/clv/plugins/`` the first time CLV runs, so the
+#: directory explains itself to an operator who found it before they found the
+#: documentation.
+#:
+#: It says the two things that are not guessable from an empty folder: that a
+#: file here does nothing until it is named in ``settings.conf``, and that
+#: naming it is an act of trust, because a plugin is ordinary Python running at
+#: CLV's privilege rather than something CLV can contain.
+PLUGIN_DIR_README = """\
+CLV plugins
+===========
+
+Put a plugin here: either a single `my_plugin.py`, or a directory
+`my_plugin/` containing an `__init__.py`.
+
+A file in this directory is NOT run just because it is here. CLV lists it,
+and nothing more, until you name it in the `plugins` line of
+
+    settings.conf
+
+under [log_viewer]:
+
+    plugins = my_plugin, another_plugin
+
+Names are the file (or directory) name without the `.py`, separated by
+commas, and matched without regard to case.
+
+A plugin is trusted code
+------------------------
+
+A plugin is Python that CLV imports into its own process. It runs with your
+privileges and can read every file you can read, including every log CLV has
+open. The plugin interfaces bound what CLV *asks* of a plugin; they do not
+bound what a plugin *can do*, and CLV does not sandbox one.
+
+Install a plugin the way you would install any other program: from someone
+you have reason to trust, after reading it if you can. The trust model, and
+what to look at when reviewing a third-party plugin, are written out in
+CLV's `clv/plugins/AGENTS.md`.
+"""
+
+
+def ensure_user_plugin_dir() -> Optional[Path]:
+    """Create the user plugin directory and its README, returning the path.
+
+    Separate from :func:`ensure_user_settings_file` rather than folded into it,
+    which would have been the shorter edit and the wrong one: that function
+    returns early when ``settings.conf`` already exists, so every installation
+    that predates this directory would never get it.
+
+    Never raises. A read-only or unwritable ``$HOME`` means no user plugins,
+    which is a valid state and not worth a startup failure.
+    """
+
+    target = user_plugin_dir()
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+
+    readme = target / "README.txt"
+    if not readme.exists():
+        try:
+            readme.write_text(PLUGIN_DIR_README, encoding="utf-8")
+        except OSError:
+            pass
+    return target
+
+
 def _names_sources(path: Path) -> bool:
     try:
         return _text_names_sources(path.read_text(encoding="utf-8"))
@@ -626,6 +735,55 @@ def _split_list(raw: str) -> list[str]:
         for text in (piece.strip().strip('"').strip("'") for piece in raw.split(","))
         if text
     ]
+
+
+def _read_plugin_list(section, issues: list[ConfigIssue]) -> tuple[str, ...]:
+    """Parse the ``plugins`` enable-list, reporting each name it cannot use.
+
+    Per-entry rather than all-or-nothing: this follows :func:`parse_log_dirs`,
+    which drops and reports the one entry it cannot read and keeps the rest.
+    Voiding the whole list on a single stray character would silently disable a
+    working set of plugins, which is the failure an operator is least equipped
+    to diagnose from the outside.
+
+    Matching is case-insensitive. A settings file is operator prose, and
+    ``Redact`` where the file on disk is ``redact.py`` is a typo class rather
+    than an intent -- so the name is casefolded here and compared casefolded by
+    the loader.
+    """
+
+    raw = section.get("plugins", fallback=None)
+    if raw is None:
+        return ()
+
+    names: list[str] = []
+    for text in _split_list(raw):
+        # A plugin name is a module name, so it is exactly what Python will
+        # accept as one. Rejecting `my-plugin`, `foo.bar` and `../evil` here
+        # means the loader never builds an import path out of operator text.
+        if not text.isidentifier():
+            issues.append(
+                ConfigIssue(
+                    "plugins",
+                    f"{text!r} is not a usable plugin name: name the file "
+                    "without its .py, using letters, digits and underscores",
+                )
+            )
+            continue
+        if text.startswith("_"):
+            issues.append(
+                ConfigIssue(
+                    "plugins",
+                    f"{text!r} is not loadable: CLV skips modules whose name "
+                    "starts with an underscore",
+                )
+            )
+            continue
+        names.append(text.casefold())
+
+    # Order-preserving de-duplication, as `persist_log_sources` does for the
+    # source list: naming a plugin twice is a harmless mistake, not an issue.
+    return tuple(dict.fromkeys(names))
 
 
 #: What to tell an operator whose ``log_dirs`` entry read as an identifier:
@@ -1078,6 +1236,7 @@ def load_config(path: Optional[Path] = None) -> LogConfig:
         cluster_lookback=_read_int(section, "cluster_lookback"),
         watch_bell=_read_bool(section, "watch_bell", False),
         enable_journald=_read_bool(section, "enable_journald", False),
+        plugins=_read_plugin_list(section, issues),
         enable_ssh=_read_bool(section, "enable_ssh", False),
         hosts=_parse_hosts(parser, issues),
         issues=tuple(issues),

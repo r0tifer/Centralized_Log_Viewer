@@ -87,10 +87,32 @@ evidence of care. It is not evidence of safety.
 
 Each plugin is a Python module or package located in one of the following:
 
-1. Local development folder: `clv/plugins/`
-2. Installed entry point: via Python package (declared in `pyproject.toml`)
+1. **The user plugin directory**, `~/.config/clv/plugins/` — where a plugin
+   somebody else wrote gets installed. Either `my_plugin.py` or a directory
+   `my_plugin/` with an `__init__.py`; both load the same way.
+2. **`CLV_PLUGIN_PATH`** — extra directories, `os.pathsep`-separated, searched
+   ahead of the user directory. A development and test mechanism.
+3. **Bundled drop-ins**, `clv/plugins/` and its `sources/`, `filters/` and
+   `exporters/` subpackages — for a plugin shipped as part of CLV.
+4. **Installed entry point** — a Python package advertising the `clv.plugins`
+   entry point group in its `pyproject.toml`.
 
 ### Example Structure
+
+A plugin an operator installed:
+
+```
+~/.config/clv/
+  settings.conf         # plugins = redact_filter, nginx_format
+  plugins/
+    README.txt          # written by CLV on first run
+    redact_filter.py
+    nginx_format/
+      __init__.py
+      patterns.py
+```
+
+One shipped with CLV:
 
 ```
 clv/
@@ -323,13 +345,64 @@ attribute and it is pinned by a test.
 
 ## Plugin Discovery
 
-The app dynamically discovers plugins using:
+Four stages, searched in this order. **The first to claim a name wins, and the
+loser is reported** — never silently dropped, because two plugins quietly
+resolving by load order is the defect this ordering exists to prevent.
 
-1. **Local scan** — modules directly under `clv/plugins/` and in the
-   `sources/`, `filters/` and `exporters/` subpackages. Modules whose name
-   starts with `_` are skipped.
-2. **Entry points** — installed distributions advertising the `clv.plugins`
+1. **`CLV_PLUGIN_PATH`** — extra roots, `os.pathsep`-separated. For development
+   and for CLV's own tests: it is how a plugin runs from where it is being
+   edited, and how the test suite gets a plugin root without writing into the
+   source tree. Not documented to users as a way to install anything.
+2. **The user plugin directory**, `~/.config/clv/plugins/`. Created beside
+   `settings.conf` on first run, with a `README.txt` in it. **Governed by the
+   enable-list** (below).
+3. **Bundled drop-ins** — modules directly under `clv/plugins/` and in the
+   `sources/`, `filters/` and `exporters/` subpackages.
+4. **Entry points** — installed distributions advertising the `clv.plugins`
    entry point group.
+
+Modules whose name starts with `_` are skipped at every stage.
+
+### The enable-list
+
+**A file in the user plugin directory is not run because it is there.** CLV
+records its name and does nothing else — it is not imported — until the name
+appears in `settings.conf`:
+
+```ini
+[log_viewer]
+plugins = redact_secrets, nginx_format
+```
+
+Installing a plugin and running a plugin are deliberately two decisions. A
+directory that runs whatever is dropped into it is a directory that anything
+able to write to `$HOME` can run code from, and "enable everything here" is
+exactly the behaviour that would make it one.
+
+Names are the module name without `.py`, comma separated, and are matched
+**case-insensitively**: a settings file is operator prose, and `Redact` where
+the file is `redact.py` is a typo class rather than an intent. Whitespace,
+trailing commas and duplicates are tolerated. A name that could not be a module
+name — `my-plugin`, `foo.bar` — is dropped and reported on its own, and the
+rest of the list still loads. A name that is listed but not present in any root
+is reported by name, so a typo says so rather than doing nothing.
+
+**Bundled drop-ins ignore the enable-list.** They shipped with CLV, and the
+operator's trust in them is the trust they already placed in CLV. The journald
+provider's `enable_journald` opt-in is a separate and unrelated thing: it gates
+what `discover()` offers, not whether the module loads.
+
+### Shadowing
+
+A user plugin may take a name a bundled drop-in uses, which is how a plugin
+*replaces* a shipped one — but **only if it is enabled**. An unlisted file
+shadows nothing, because it is never imported and so cannot displace anything;
+this is what stops a dropped file from changing CLV's behaviour without being
+named. The shadowed plugin is reported with the origin that won.
+
+Two bundled subpackages may share a module basename, exactly as they always
+could: `sources/x.py` and `filters/x.py` are two different modules and neither
+shadows the other.
 
 ### How a module says what it exports
 
