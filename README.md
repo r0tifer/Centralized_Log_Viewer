@@ -1083,6 +1083,7 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `y` | Copy the selected line, or the visible lines, to the clipboard (OSC 52) |
 | `Ctrl+L` | Copy mode (hides all chrome) |
 | `R` | Add, edit, test and remove remote hosts (SSH); also reachable from `a` |
+| `P` | Manage plugins (then `space` toggles, `r` re-enables) |
 | `Ctrl+S` | Save added sources to `settings.conf` |
 | `Ctrl+R` | Reload configuration and rescan |
 | `q` | Quit |
@@ -1207,6 +1208,37 @@ Advanced drawer says how many are installed but not enabled; a name you list
 that isn't there is reported by name, so a typo says so rather than doing
 nothing.
 
+### Managing what is installed
+
+`P` — or the **Plugins** button in the Advanced drawer (`f`) — opens a list of
+everything CLV found, one row per plugin, with its name, the interfaces it
+supplies, where it came from, and one of five states:
+
+| State | What it means |
+| --- | --- |
+| `loaded` | Running. |
+| `not enabled` | Installed and waiting to be named in `plugins`, or switched off. |
+| `failed` | It raised, or CLV could not read it. The row shows the message. |
+| `incompatible` | It asked for a CLV or plugin API this build is not. Both versions are named. |
+| `isolated` | Reserved; nothing produces it yet. |
+
+**Space** enables or disables the highlighted row, and **r** puts back a plugin
+a failure took out of service. Nothing is written until the dialog is closed, so
+`Esc` genuinely cancels.
+
+Two consequences the dialog states as you toggle, because they are not
+symmetrical:
+
+- Enabling a plugin CLV has not already imported **needs a restart**. Plugins
+  are imported once at startup and there is no hot reload; the name is written
+  to `settings.conf` immediately, and it loads next launch.
+- Disabling a plugin **CLV shipped** lasts for the session only. The `plugins`
+  key governs your own plugin directory, so a bundled plugin has no name in it
+  to remove, and it comes back on restart.
+
+Plugin failures are summarised in one line in the log panel rather than listed
+there — the detail, in full, is in this dialog.
+
 **A plugin is trusted code.** It is Python imported into CLV's own process: it
 runs with your privileges and can read every file you can, including every log
 CLV has open. The interfaces bound what CLV *asks* of a plugin, not what a
@@ -1291,6 +1323,6 @@ worth starring and comparing across a fleet.
 ```bash
 python -m pip install -e .
 python -m pip install pytest
-python -m pytest            # 1660 passed, 1 skipped, 11 deselected
+python -m pytest            # 1767 passed, 1 skipped, 11 deselected
 python -m textual run clv/app.py --dev
 ```
