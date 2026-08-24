@@ -45,7 +45,15 @@ def test_sections_follow_the_declared_category_order() -> None:
     assert titles[0] == "Help"
     assert titles == sorted(
         titles,
-        key=["Help", "Search", "Navigation", "View", "Sources", "Session"].index,
+        key=[
+            "Help",
+            "Search",
+            "Navigation",
+            "View",
+            "Sources",
+            "Plugins",
+            "Session",
+        ].index,
     )
     assert "Navigation" in titles
 
@@ -340,9 +348,10 @@ def test_a_binding_names_the_sub_keys_of_the_modal_it_opens() -> None:
     }
     assert "r renames" in rows["v"] and "d deletes" in rows["v"]
     assert "a adds" in rows["W"] and "d deletes" in rows["W"]
+    assert "space toggles" in rows["P"] and "r re-enables" in rows["P"]
     # "then" is what scopes them to the modal. `d` is toggle_detail globally,
     # and the overlay lists that row too.
-    assert "then" in rows["v"] and "then" in rows["W"]
+    assert "then" in rows["v"] and "then" in rows["W"] and "then" in rows["P"]
 
 
 def test_every_description_fits_the_overlay_at_eighty_columns() -> None:
