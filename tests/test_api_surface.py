@@ -65,6 +65,9 @@ EXPECTED_API = frozenset(
         "LEVEL_CRITICAL",
         "LEVEL_ORDER",
         "SEVERITY_BUCKETS",
+        # reading a plugin's own settings
+        "setting_bool",
+        "setting_list",
         # the field vocabulary
         "NORMALISED_FIELD_KEYS",
         # crossing a process boundary
@@ -80,6 +83,9 @@ EXPECTED_API = frozenset(
 #: by keyword, so renaming that parameter is a break even if the shape holds.
 EXPECTED_SIGNATURES: dict[str, str] = {
     "Plugin.describe": "(self) -> 'str'",
+    "Plugin.configure": "(self, settings: 'Mapping[str, str]') -> 'None'",
+    "Plugin.setup": "(self) -> 'None'",
+    "Plugin.teardown": "(self) -> 'None'",
     "LogSourceProvider.discover": "(self) -> 'Iterable[Path | ProviderSource]'",
     "LogSourceProvider.open": "(self, path: 'Path') -> 'Iterator[str]'",
     "LogSourceProvider.open_reader": (
@@ -99,6 +105,11 @@ EXPECTED_SIGNATURES: dict[str, str] = {
     "highest_level": "(levels: 'Iterable[Optional[str]]') -> 'Optional[str]'",
     "entry_to_wire": "(entry: 'LogEntry') -> 'dict[str, object]'",
     "entry_from_wire": "(payload: 'Mapping[str, object]') -> 'LogEntry'",
+    "setting_bool": (
+        "(settings: 'Mapping[str, str]', key: 'str', default: 'bool' = False) "
+        "-> 'bool'"
+    ),
+    "setting_list": "(settings: 'Mapping[str, str]', key: 'str') -> 'list[str]'",
 }
 
 #: Attributes every plugin class carries, with their defaults. These are the
@@ -108,6 +119,7 @@ EXPECTED_PLUGIN_DEFAULTS: dict[str, object] = {
     "name": "unnamed plugin",
     "requires_clv": None,
     "requires_api": None,
+    "priority": 100,
 }
 
 
