@@ -392,6 +392,147 @@ operator's trust in them is the trust they already placed in CLV. The journald
 provider's `enable_journald` opt-in is a separate and unrelated thing: it gates
 what `discover()` offers, not whether the module loads.
 
+### Per-plugin configuration
+
+A plugin that needs settings of its own gets a section named after it, and the
+name is the same one the enable-list uses:
+
+```ini
+[log_viewer]
+plugins = redact_secrets
+
+[plugin:redact_secrets]
+patterns = password, api_key, token
+replacement = ******
+```
+
+CLV parses the section and hands it over; it never interprets it. What a key
+means is the plugin's business, and a validator in `config.py` would be CLV
+guessing at a schema it does not own.
+
+The section reaches the plugin through the optional `configure()` hook:
+
+```python
+from clv.api import FilterStage, setting_list
+
+class Redact(FilterStage):
+    name = "redact-secrets"
+
+    def configure(self, settings):
+        self._settings = settings
+
+    @property
+    def patterns(self):
+        return setting_list(self._settings, "patterns")
+```
+
+Four things about `settings` are worth knowing before writing against it.
+
+**It is a read-only view of a mapping CLV owns, not a copy.** When CLV re-reads
+the settings file — the operator pressed `Ctrl+R`, or flipped a switch in the
+Advanced drawer — the values behind the view change and the plugin sees the new
+ones without being called again. So keep the mapping and read through it, as
+above, rather than copying values out in `configure()`. That is what lets the
+journal provider honour the drawer's switch without a restart.
+
+**It is empty when the operator wrote no section**, which is the common case.
+An empty mapping is not an error and must not be treated as one; every key a
+plugin reads needs a default.
+
+**The values are the raw strings `configparser` read.** Use `setting_bool` and
+`setting_list` from `clv.api` rather than writing the coercions again — CLV and
+a plugin disagreeing about whether `yes` is true is a bug an operator has no
+way to see. Both are total: an unreadable value is the default, never a raise.
+
+**A section that configures nothing is reported.** A `[plugin:x]` for a plugin
+that is installed but not enabled says so; one for a name that is nowhere says
+that instead. The two need different answers, so they get different messages.
+
+Section names are validated exactly as enable-list names are — a name that
+could not be a module name is dropped and reported, and the sections around it
+still load. `[plugin:]` with no name, and a duplicated section, are each
+reported and skipped.
+
+**One legacy key, folded in rather than renamed.** `enable_journald` lives in
+`[log_viewer]`, is in every operator's settings file, and is what the Advanced
+drawer's switch writes. It is read into `[plugin:journald]` as `enabled`, so
+the journal provider reads one place while nobody's settings file changes. A
+section that sets `enabled` itself wins.
+
+### Lifecycle
+
+Three optional hooks, all defaulting to doing nothing, so a plugin that
+implements none of them behaves exactly as it did before they existed.
+
+| Hook | When | Guarantee |
+|------|------|-----------|
+| `configure(settings)` | Once, straight after instantiation | Before `setup()`, and before anything asks the plugin for anything |
+| `setup()` | Once, after every plugin has loaded and been configured | Before first use |
+| `teardown()` | Once, at shutdown | After CLV has closed its readers, before the session is persisted |
+
+`teardown()` runs after the readers so a plugin cannot resurrect a source on
+its way out, and before the session is persisted so a plugin that fails on exit
+still leaves the operator's session intact.
+
+**Failure in any of the three disables the plugin for the session** and records
+the reason once — the same mechanism a raising `apply()` has used since the
+loader was made correct, not a second one with its own semantics. A plugin that
+fails `configure()` is never `setup()`; one that fails `setup()` is never
+`teardown()`, because calling `teardown()` on a half-built object is how a
+shutdown path acquires bugs of its own.
+
+**An exception in `teardown()` is contained. A hang is not.** CLV records the
+exception and carries on, but a `teardown()` that blocks forever blocks exit,
+and nothing here stops it. Bounding plugin *time* rather than plugin
+*exceptions* is a separate piece of work (`PLUGIN_TODO.md` Phase 6); until it
+lands, a plugin author is being trusted not to block on the way out, and that
+is a convention rather than a protection like every other one on this page.
+
+**`setup()` and `teardown()` are session lifecycle, not the enable switch.**
+Turning a plugin off in the `P` dialog and back on does not re-run `setup()`.
+
+**Plugin state is the plugin's own problem.** CLV's session file has a closed
+set of fields, and it is closed deliberately: every field in it carries an
+argument about whether recording it leaks what somebody was reading. A plugin
+that needs to remember something across runs writes its own file under its own
+directory and owns the same question about its contents.
+
+### Managing what is installed
+
+`P` in the viewer — or the **Plugins** button in the Advanced drawer — lists
+every plugin CLV found, one row per **installable unit**: the module, not the
+plugin object inside it, because that is what an operator installs, names and
+deletes. A module exporting three stages is one row saying `filter`.
+
+Five states:
+
+| State | Meaning |
+| --- | --- |
+| `loaded` | Imported and in service. |
+| `not enabled` | Present, and not named in `plugins` — or switched off from the dialog. Not a fault, and not reported as one. |
+| `failed` | It raised at import or at runtime, or CLV could not read it. The row carries the recorded message in full. |
+| `incompatible` | An unsatisfied `requires_clv` or `requires_api`. The row names the constraint *and* the running version. |
+| `isolated` | Reserved for the isolation host. Nothing produces it yet. |
+
+Two asymmetries the dialog states as it is used, because neither is guessable:
+
+- **Enabling something CLV has not imported needs a restart.** Loading is
+  import-time and single-shot; there is no hot reload. The name is written to
+  `settings.conf` at once and the plugin loads next launch.
+- **Disabling a bundled plugin lasts for the session.** The enable-list governs
+  the user directory only, so a bundled drop-in has no name in it to remove. It
+  returns on restart. A *user* plugin's disable is written to `settings.conf`
+  and also takes effect immediately.
+
+A plugin a fault took out of service can be put back with `r`. Doing so
+discards the recorded failure as well as clearing the disable — left on the
+record, it would keep the row reading `failed`, and the next genuine failure
+would collapse into it as a repeat of something already dealt with rather than
+be reported as news.
+
+Nothing is written until the dialog closes, so `Esc` cancels for real and one
+confirm is one write to a file full of the operator's comments.
+
 ### Shadowing
 
 A user plugin may take a name a bundled drop-in uses, which is how a plugin
@@ -453,6 +594,34 @@ a message about interfaces.
 
 ---
 
+## Ordering
+
+Every plugin carries a `priority`, and every ordered registry CLV keeps runs in
+ascending order of it:
+
+```python
+class Redact(FilterStage):
+    name = "redact-secrets"
+    priority = 50          # sees the line before anything has rewritten it
+```
+
+The default is **100**, with room deliberately left on both sides. A stage that
+must see a line before anything has touched it — an audit trail, a metric
+counter — takes a low number; one that must see the final text takes a high one.
+
+**Ties are broken by name**, casefolded. That matters more than it looks: before
+it, two stages that both took the default composed in whatever order
+`pkgutil.iter_modules` happened to list them, so the same two plugins could
+redact-then-rewrite on one machine and rewrite-then-redact on another. Name
+order is not meaningful, but it is *predictable*, which is what an author needs
+to design around.
+
+The order is settled once, when plugins are loaded, and does not change for the
+session. Enabling or disabling a plugin from the `P` dialog changes whether it
+runs, never where.
+
+---
+
 ## Conventions for plugin authors
 
 These are **conventions, not protections**. Each says who is trusting whom, and
@@ -462,9 +631,11 @@ A reviewer enforces these by reading the code; the operator enforces them by
 choosing what to install.
 
 - **Never perform a network call or spawn a subprocess without user consent.**
-  *Not enforced.* The shipped `journald` provider is the pattern to copy: a
-  `settings.conf` opt-in, read fresh on every `discover()`, offering nothing at
-  all until it is true.
+  *Not enforced.* The shipped `journald` provider is the pattern to copy, and it
+  is now copyable: an `enabled` key in its own `[plugin:journald]` section,
+  taken through `configure()`, read fresh on every `discover()`, offering
+  nothing at all until it is true. No import of CLV's settings parser is
+  involved, which is what makes it a pattern rather than a privilege.
 - **Confine file reads and writes to configured directories.** *Not enforced.*
   A plugin runs with the operator's full filesystem access; see
   [Trust model](#trust-model).
@@ -636,8 +807,20 @@ plugin that raised on one entry will raise on the next.
 
 `PluginRegistry.errors` deduplicates identical `(origin, message)` pairs into a
 single entry with a count, and caps the number of distinct problems it stores,
-reporting how many it dropped. A broken plugin can no longer bury the discovery
-summary in the log panel.
+reporting how many it dropped. Each entry also carries a `category` — `load`,
+`incompatible`, `shadowed`, `missing` or `runtime` — so "this plugin is broken"
+and "this plugin wants a CLV you are not running" can be told apart without
+reading the message, which is what lets the management UI name a state.
+
+The log panel reports plugin problems as **one line** pointing at `P`, not one
+line per problem: deduplication capped the repeats, but four distinct faults
+still buried the discovery summary the operator opened CLV to read, and none of
+those lines had room to say what to do about any of them.
+
+**Turning a plugin off is not a failure.** `PluginRegistry.disable()` takes
+`record=False` for an operator's own decision, so `errors` stays what it is —
+the amber channel for things that went wrong — and a plugin doing exactly as it
+was told never appears in it.
 
 ---
 
