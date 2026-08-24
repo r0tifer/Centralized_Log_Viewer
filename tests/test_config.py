@@ -29,6 +29,7 @@ from clv.services.config import (
     host_options,
     load_config,
     parse_log_dirs,
+    plugin_settings_for,
     user_config_path,
     user_plugin_dir,
     validate_host_name,
@@ -1131,3 +1132,143 @@ def test_an_unwritable_home_is_not_a_startup_failure(monkeypatch, tmp_path) -> N
         assert ensure_user_plugin_dir() is None
     finally:
         locked.chmod(0o700)
+
+
+# --- [plugin:<name>] sections -----------------------------------------------
+#
+# `config.py` parses these and never interprets them. What a key means is the
+# plugin's business, so the only things asserted here are that a well-formed
+# section arrives intact and that a malformed one costs itself and nothing else.
+
+
+def test_a_plugin_section_is_parsed_verbatim(tmp_path) -> None:
+    config = load_config(
+        _write(
+            tmp_path / "settings.conf",
+            "[log_viewer]\nlog_dirs = /var/log\n\n"
+            "[plugin:redact_secrets]\npatterns = password, api_key\n"
+            "replacement = ******\n",
+        )
+    )
+
+    assert config.plugin_settings == {
+        "redact_secrets": {
+            "patterns": "password, api_key",
+            "replacement": "******",
+        }
+    }
+    assert config.issues == ()
+
+
+def test_plugin_sections_are_matched_case_insensitively(tmp_path) -> None:
+    """A settings file is operator prose, exactly as the enable-list argues."""
+
+    config = load_config(
+        _write(
+            tmp_path / "settings.conf",
+            "[log_viewer]\nlog_dirs = /var/log\n\n[plugin:Redact]\na = 1\n",
+        )
+    )
+
+    assert set(config.plugin_settings) == {"redact"}
+
+
+def test_no_plugin_section_is_an_empty_mapping_not_an_issue(tmp_path) -> None:
+    config = load_config(
+        _write(tmp_path / "settings.conf", "[log_viewer]\nlog_dirs = /var/log\n")
+    )
+
+    assert config.plugin_settings == {}
+    assert config.issues == ()
+
+
+def test_a_malformed_plugin_section_costs_only_itself(tmp_path) -> None:
+    """The rule `config.py` follows everywhere: skip it, say so, keep going.
+
+    Voiding the neighbouring section would silently stop a working plugin from
+    being configured while the file the operator is staring at looks correct.
+    """
+
+    config = load_config(
+        _write(
+            tmp_path / "settings.conf",
+            "[log_viewer]\nlog_dirs = /var/log\n\n"
+            "[plugin:]\na = 1\n\n"
+            "[plugin:my-plugin]\na = 1\n\n"
+            "[plugin:_hidden]\na = 1\n\n"
+            "[plugin:good]\na = 1\n",
+        )
+    )
+
+    assert set(config.plugin_settings) == {"good"}
+    origins = [issue.origin for issue in config.issues]
+    assert origins == ["[plugin:]", "[plugin:my-plugin]", "[plugin:_hidden]"]
+    assert "has no plugin name" in config.issues[0].message
+
+
+def test_a_duplicated_plugin_section_is_reported_and_skipped(tmp_path) -> None:
+    config = load_config(
+        _write(
+            tmp_path / "settings.conf",
+            "[log_viewer]\nlog_dirs = /var/log\n\n"
+            "[plugin:twice]\na = first\n\n"
+            "[plugin:Twice]\na = second\n",
+        )
+    )
+
+    assert config.plugin_settings == {"twice": {"a": "first"}}
+    assert "already configured" in config.issues[-1].message
+
+
+def test_a_bad_plugin_section_is_never_a_startup_failure(tmp_path) -> None:
+    config = load_config(
+        _write(
+            tmp_path / "settings.conf",
+            "[log_viewer]\nlog_dirs = /var/log\n\n[plugin:my-plugin]\na = 1\n",
+        )
+    )
+
+    assert config.log_dirs == [Path("/var/log")]
+
+
+# --- the legacy alias -------------------------------------------------------
+
+
+def test_enable_journald_is_read_into_the_journald_section() -> None:
+    """The key stays where every operator's file and the drawer already put it.
+
+    Renaming it would buy tidiness at the cost of a config migration and a
+    drawer change. Folding it in costs one table entry and changes nobody's
+    settings file.
+    """
+
+    on = plugin_settings_for(LogConfig(enable_journald=True))
+    off = plugin_settings_for(LogConfig(enable_journald=False))
+
+    assert on["journald"]["enabled"] == "true"
+    assert off["journald"]["enabled"] == "false"
+
+
+def test_an_explicit_section_wins_over_the_legacy_alias() -> None:
+    settings = plugin_settings_for(
+        LogConfig(
+            enable_journald=False,
+            plugin_settings={"journald": {"enabled": "true"}},
+        )
+    )
+
+    assert settings["journald"]["enabled"] == "true"
+
+
+def test_plugin_settings_for_hands_out_copies() -> None:
+    """The registry owns its dicts for the session and mutates them in place."""
+
+    config = LogConfig(plugin_settings={"x": {"a": "1"}})
+    settings = plugin_settings_for(config)
+    settings["x"]["a"] = "changed"
+
+    assert config.plugin_settings["x"]["a"] == "1"
+
+
+def test_the_shipped_template_documents_a_plugin_section() -> None:
+    assert "[plugin:" in DEFAULT_SETTINGS_TEMPLATE
