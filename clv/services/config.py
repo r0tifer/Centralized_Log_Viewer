@@ -28,7 +28,7 @@ import shutil
 import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Iterable, Literal, Optional
+from typing import Iterable, Literal, Mapping, Optional
 
 from .discovery import DEFAULT_EXCLUDE_GLOBS, DEFAULT_MAX_FILES, DiscoverySettings
 from .refs import SourceRef, format_ref, normalize_ref, scheme_of
@@ -51,6 +51,31 @@ CURRENT_CONFIG_VERSION = 2
 #: within CLV — what the tree shows, what ``node:`` matches, and the fallback
 #: for ``host`` when the operator does not give one.
 SSH_SECTION_PREFIX = "ssh:"
+
+#: One plugin's own settings per section: ``[plugin:redact_secrets]``. The
+#: suffix is the module name -- the same word the operator writes in the
+#: ``plugins`` enable-list, so there is one name for a plugin and not two.
+#:
+#: CLV parses these and never interprets them. What a key means is the plugin's
+#: business; what ``config.py`` guarantees is that the section is well-formed,
+#: that a malformed one costs only itself, and that the plugin is handed the
+#: values rather than left to import the settings parser.
+PLUGIN_SECTION_PREFIX = "plugin:"
+
+#: Keys that predate ``[plugin:<name>]`` and still live in ``[log_viewer]``,
+#: read into the section they would live in today.
+#:
+#: ``enable_journald`` is the whole list, and moving it was declined rather than
+#: overlooked: it is in every operator's settings file, it is what the Advanced
+#: drawer's switch writes, and it is documented in the README. Renaming it would
+#: buy tidiness at the cost of a config migration and a drawer change, and the
+#: point of the exercise is that the *plugin* stops importing the settings
+#: parser -- which this achieves without touching a single operator's file.
+#:
+#: A section that sets the key itself wins. The alias only fills a gap.
+_LEGACY_PLUGIN_KEYS: dict[str, dict[str, str]] = {
+    "journald": {"enabled": "enable_journald"},
+}
 
 #: The port range a TCP port can actually occupy. Out of it is a typo, and a
 #: typo is reported rather than clamped: clamping 70000 to 65535 would connect
@@ -204,6 +229,19 @@ enable_ssh = false
 # max_files = 2000
 # correct_clock_skew = false
 # enabled = true
+
+# One section per plugin that has settings of its own. The name after "plugin:"
+# is the plugin's file name without the .py - the same word you write in the
+# plugins line above, so a plugin has one name and not two.
+#
+# CLV parses these sections and never interprets them: what a key means is the
+# plugin's business, and its own documentation is what says which keys it reads.
+# A section for a plugin that is not installed, or not enabled, is reported in
+# the plugin dialog (P) rather than ignored.
+#
+# [plugin:redact_secrets]
+# patterns = password, api_key, token
+# replacement = ******
 """
 
 
@@ -375,6 +413,20 @@ class LogConfig:
     #: shipped with CLV, and the operator's trust in them is the trust they
     #: already placed in CLV.
     plugins: tuple[str, ...] = ()
+    #: Every `[plugin:<name>]` section that parsed, keyed on the casefolded
+    #: plugin name, values exactly as `configparser` read them.
+    #:
+    #: Populated regardless of whether the plugin is enabled or even present,
+    #: for the same reason `hosts` is populated regardless of `enable_ssh`:
+    #: parsing is inert, and a mistake in a section should be reported the
+    #: launch it is *made*. Who is missing is the loader's question, not this
+    #: one's -- `plugins.load_plugins` reports a section that configures nothing,
+    #: because only it knows what loaded.
+    #:
+    #: The values are raw strings. `config.py` does not interpret a plugin's
+    #: keys and must not start: what `patterns` means is the plugin's business,
+    #: and a validator here would be CLV guessing at a schema it does not own.
+    plugin_settings: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
     #: Every `[ssh:<name>]` section that parsed, in file order.
     #:
     #: Populated regardless of :attr:`enable_ssh`. Parsing is inert, and a
@@ -1129,6 +1181,85 @@ def _parse_host(
     )
 
 
+def _parse_plugin_sections(
+    parser, issues: list[ConfigIssue]
+) -> dict[str, dict[str, str]]:
+    """Read every ``[plugin:<name>]`` section, skipping the ones it cannot use.
+
+    Modelled on :func:`_parse_hosts`, and for the same reason: a malformed
+    section costs itself and nothing else. A settings file is the operator's,
+    and one bad header must not be able to void the plugin next to it -- still
+    less to stop CLV starting.
+
+    The two name checks are ``_read_plugin_list``'s, deliberately. A name that
+    the enable-list would refuse is a name the loader will never import, so a
+    section for it can only ever configure nothing; catching it here means the
+    operator is told once, in terms that match what they wrote.
+    """
+
+    found: dict[str, dict[str, str]] = {}
+    for raw_section in parser.sections():
+        if not raw_section.startswith(PLUGIN_SECTION_PREFIX):
+            continue
+        origin = f"[{raw_section}]"
+        name = raw_section[len(PLUGIN_SECTION_PREFIX) :].strip()
+        if not name:
+            issues.append(
+                ConfigIssue(origin, "has no plugin name; use [plugin:<name>].")
+            )
+            continue
+        if not name.isidentifier() or name.startswith("_"):
+            issues.append(
+                ConfigIssue(
+                    origin,
+                    f"{name!r} is not a usable plugin name: name the plugin as "
+                    "its file is named, without the .py",
+                )
+            )
+            continue
+        key = name.casefold()
+        if key in found:
+            issues.append(
+                ConfigIssue(origin, f"{name!r} is already configured; skipped.")
+            )
+            continue
+        try:
+            found[key] = dict(parser[raw_section])
+        except Exception as exc:  # pragma: no cover - defensive
+            issues.append(ConfigIssue(origin, f"could not be read: {exc}"))
+    return found
+
+
+def plugin_settings_for(config: "LogConfig") -> dict[str, dict[str, str]]:
+    """The settings each plugin should be handed, legacy keys folded in.
+
+    Takes the whole :class:`LogConfig` rather than the parser, and that is what
+    makes the aliasing correct rather than merely convenient: ``app.py`` turns
+    the journal on with ``replace(self._config, enable_journald=True)`` and
+    never re-reads the file, so an alias resolved at parse time would hand the
+    plugin the value from disk while the drawer showed the operator the value in
+    memory. Resolved from the config object, both agree by construction.
+
+    Copies, so mutating the result cannot reach into ``LogConfig``. The registry
+    then owns these dicts for the session and mutates them in place -- see
+    :meth:`~clv.plugins.PluginRegistry.refresh_settings`.
+    """
+
+    settings = {
+        name: dict(values) for name, values in config.plugin_settings.items()
+    }
+    for name, aliases in _LEGACY_PLUGIN_KEYS.items():
+        section = settings.setdefault(name, {})
+        for key, option in aliases.items():
+            if key in section:
+                continue
+            value = getattr(config, option, None)
+            if value is None:
+                continue
+            section[key] = str(value).lower() if isinstance(value, bool) else str(value)
+    return settings
+
+
 def _parse_hosts(parser, issues: list[ConfigIssue]) -> tuple[RemoteHost, ...]:
     hosts: list[RemoteHost] = []
     claimed: set[str] = set()
@@ -1237,6 +1368,7 @@ def load_config(path: Optional[Path] = None) -> LogConfig:
         watch_bell=_read_bool(section, "watch_bell", False),
         enable_journald=_read_bool(section, "enable_journald", False),
         plugins=_read_plugin_list(section, issues),
+        plugin_settings=_parse_plugin_sections(parser, issues),
         enable_ssh=_read_bool(section, "enable_ssh", False),
         hosts=_parse_hosts(parser, issues),
         issues=tuple(issues),
