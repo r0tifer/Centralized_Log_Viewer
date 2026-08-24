@@ -32,8 +32,8 @@ that argument; Phase 7b is the exception, and it is here because designing the
 | 2 — The contract | `clv/api.py`, `PLUGIN_API_VERSION`, the entry wire form | ✅ Done |
 | **Stage B — Reach** | | |
 | 3 — Installation | `~/.config/clv/plugins/`, `CLV_PLUGIN_PATH`, the enable-list | ✅ Done |
-| 4 — Management UI | A plugin surface, not a status string | ⬜ Not started |
-| 5 — Ordering, config, lifecycle | `priority`, `[plugin:<name>]`, `setup`/`teardown` | ⬜ Not started |
+| 4 — Management UI | A plugin surface, not a status string | ✅ Done |
+| 5 — Ordering, config, lifecycle | `priority`, `[plugin:<name>]`, `setup`/`teardown` | ✅ Done |
 | 6 — Performance guard | A slow plugin costs itself, not the pane | ⬜ Not started |
 | **Stage C — Core seams** | | |
 | 7a — Parsing | `LogFormat`, and a plugin that teaches CLV a format | ⬜ Not started |
@@ -801,7 +801,62 @@ The help overlay gains a line only if a binding is added.
 
 **Gate.** With four plugins installed — one working, one disabled, one raising
 on import, one requiring a future CLV — the drawer tells an operator which is
-which and what to do about each, at 80 columns. Suite green on 3.11 and 3.14.
+which and what to do about each, at 80 columns. Checked by hand against a real
+`CLV_PLUGIN_PATH` root, which also produced a fifth row this phase did not
+plan for: a name in `settings.conf` matching nothing on disk. Suite green on
+3.11 and 3.14: 1690 passed on both.
+
+**As shipped.** Five decisions worth recording, one of them a departure from the
+text above.
+
+*The rows are in a modal, not in the drawer.* This phase asked for "a plugin
+section in the Advanced drawer", and that section cannot exist. The drawer is
+capped at `max-height: 16` and
+[clv/widgets/AGENTS.md](clv/widgets/AGENTS.md) records the consequence in the
+imperative: a new **row** pushes what follows below the fold, where it lays out
+and paints nothing — join an existing row, or use `#drawer-actions`, which is
+horizontal and costs no rows. One row per installed plugin is precisely the
+shape that box has no room for, and four installed plugins is four rows before
+any of them has said anything. The SSH fleet hit the same wall and settled it
+the same way ([SSH_TODO.md](SSH_TODO.md) Phase 7): a summary line in the drawer,
+the detail in a modal. Plugins follow the precedent rather than inventing a
+second answer — a `Plugins` button beside `Rescan sources`, and `P`.
+
+*The row is the origin, not the plugin object.* The enable-list names modules
+and one module may export three stages, so a row is the thing an operator
+installs, names and deletes. Kinds aggregate over the plugins the module
+supplied, which is what makes "a row lists kinds rather than one kind" true
+rather than decorative.
+
+*`add()` now files a plugin under every interface it implements.* It used
+`if/elif/else`, so a plugin that was both a provider and a stage was stored as a
+provider alone and its `apply()` was never called — a plugin silently doing half
+of what it declares, with no diagnosis anywhere, because from the outside it had
+loaded. A row cannot honestly list two kinds while that is true. Strictly a
+fix, and `sources`, `filters` and `exporters` stay append-only-at-load so the
+positional `plugin:<index>` export key is untouched.
+
+*Disabling a bundled plugin lasts for the session.* The enable-list governs the
+user directory only, so a shipped drop-in has no name in it to remove. The
+alternative — a `disabled_plugins` key — was declined: it adds config surface
+Phase 3 deliberately did not create, and gives a plugin's fate two places to be
+decided. The dialog says which kind of disable it is offering, beside the
+control, before it is pressed.
+
+*`DiscoveredPlugin.enabled` is kept in step with the file.* Found in review, not
+in the plan: a plugin that raises on *import* has no live object to mark
+disabled, so switching it off removed the name from `settings.conf` and the row
+sprang straight back to `enabled` on the next redraw. `_adopt_enable_list`
+re-reads the decision onto the discovered entries after every write. Pinned by a
+test, because it is invisible in every other state.
+
+**Also swept here.** A disabled exporter is no longer offered by `Ctrl+E`.
+[app.py](clv/app.py)'s `_exporter_choices` kept disabled entries so that
+`plugin:<n>` stayed positional — but the index rides *in the key*, so omitting
+one renumbers nothing, and without this the disable control never reached the
+one kind an operator is most likely to aim it at. `_exporter_at` re-checks too:
+a request can outlive the list it was built from, because `P` is reachable while
+the export dialog is open.
 
 **Commit.** `feat(drawer): manage plugins instead of describing them`
 
@@ -876,8 +931,83 @@ plugin's own problem and why. `settings.conf` and the template gain a commented
   `tests/test_journald.py` unchanged.
 
 **Gate.** Two ordering-sensitive stages compose predictably; a configured plugin
-reads its own settings without importing anything from `clv.services`. Suite
-green on 3.11 and 3.14.
+reads its own settings without importing anything from `clv.services`. Checked
+by hand against a real `CLV_PLUGIN_PATH` root with two stages that fight over
+the same text: at `priority = 50` the redactor sees `password` and replaces it;
+at `950` the shouter has already uppercased the line and the redactor's pattern
+no longer matches. The composition flips, deterministically, and nothing else
+moves. Suite green on 3.11 and 3.14: 1767 passed on both.
+
+**As shipped.** Five decisions worth recording, one of them a bug this phase
+found rather than a choice it made.
+
+*`configure()` hands over a live mapping, not a snapshot.* The phase asked for
+"a read-only mapping" and for journald to keep "re-reading its opt-in on every
+`discover()`", and a frozen mapping cannot do both. What is handed over is a
+`MappingProxyType` over a dict the registry owns: CLV mutates the dict in place
+when it re-reads the settings file, and every view already handed out sees the
+new values. So a plugin keeps its mapping and reads through it, `configure()`
+stays a one-shot that nobody has to make idempotent, and the drawer's switch
+still takes effect without a restart. `LogEntry.fields` is the same mechanism,
+which is why `refresh_settings` clears and repopulates rather than replacing:
+replacing a dict strands every view onto it.
+
+*`enable_journald` stayed in `[log_viewer]`, aliased into `[plugin:journald]`.*
+Moving it was the tidier end state and was declined. It is in every operator's
+settings file, it is what the Advanced drawer writes, and it is in the README —
+so renaming it buys tidiness at the cost of a config migration and a drawer
+change. `config._LEGACY_PLUGIN_KEYS` is one entry, and it makes the provider's
+`configure()` exactly what a third party would write, which is the whole of what
+the phase wanted proved. A section that sets `enabled` itself still wins.
+
+*The module-level `journald.enabled()` survives, and is not a second mechanism.*
+It is what the drawer's `_sync_journald_status` calls and what a directly
+constructed provider falls back to — which is every test in
+`tests/test_journald.py`, unchanged, as the phase required. What changed is
+which of the two is the *plugin's* route to its own settings: it is
+`configure()`, and `test_a_configured_provider_never_reads_the_settings_file`
+pins that by making `load_config` raise.
+
+*`setup()` runs from the app, not from the loader.* "Before first use" has no
+single meaning here, and putting it inside `load_plugins()` would make a
+function that half this suite and every plugin author's unit tests call start
+acquiring resources on their behalf. `PluginRegistry.start()` is called from
+`on_mount` after the remote wiring, so a provider's `setup()` sees a fully
+assembled plugin rather than one still waiting for its resolver. `shutdown()` is
+the mirror, from `on_unmount`, between the readers closing and the session being
+saved — pinned as an exact three-element sequence rather than a pair of
+inequalities, because "after the readers" and "before the save" are two claims
+and a test that checked one would pass while the other rotted.
+
+*A hanging `teardown()` still hangs exit, and the docs say so.* Exceptions are
+contained; time is not. Bounding plugin *time* is Phase 6, and building a second
+time-bounding mechanism here is exactly what having a Phase 6 is meant to
+prevent. `clv/plugins/AGENTS.md` states the limit in the same paragraph that
+offers the hook, per Requirement 3 — which applies to CLV's own documentation
+about itself, not only to the isolation chapter.
+
+**Also swept here.** `clv --upgrade-config` deleted `[plugin:<name>]` sections.
+`config_upgrade._merge` copied `[log_viewer]` options and `[ssh:<name>]` sections
+and dropped everything else, so the first upgrade after this phase shipped would
+have silently removed an operator's plugin configuration — silently, because
+nothing else in the file changes and the plugin simply starts running on its
+defaults. The section loop is now driven by a prefix table rather than by `ssh:`
+alone, and the rule it encodes is the general one: a section this module does not
+understand is *copied*, not judged unused. `UpgradeResult` gained `plugins`
+alongside `hosts` and `describe()` names them. Found in planning, so the
+regression test fails against the previous code rather than merely passing
+against the new.
+
+*`setting_bool` and `setting_list` joined `clv.api`.* Beyond the phase text, on
+the argument that already published `normalize_level`: `configure()` hands over
+the raw strings `configparser` read, and without these every plugin writes
+`value.lower() == "true"` and CLV ends up disagreeing with the operator's own
+file about what `yes` means. Additive, so the API is still 1.0.
+
+*`_set_enable_ssh` needed no refresh call.* It persists and then delegates to
+`action_reload_sources`, which re-reads the config and refreshes there. Noted
+because the plan listed it as a third call site and it would have been a second
+refresh of the same values.
 
 **Commit.** `feat(plugins): stage ordering, per-plugin config and lifecycle`
 
