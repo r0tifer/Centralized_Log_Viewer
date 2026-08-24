@@ -27,6 +27,7 @@ by the deprecation policy in ``clv/plugins/AGENTS.md``.
 from __future__ import annotations
 
 import collections.abc
+import configparser
 import importlib
 import importlib.metadata
 import inspect
@@ -38,7 +39,7 @@ import types
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Optional, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
 
 from ..services.filtering import FilterSpec
 from ..services.parsing import LogEntry
@@ -113,8 +114,65 @@ class Plugin(ABC):
     #: release that changed nothing a plugin can see.
     requires_api: Optional[str] = None
 
+    #: Where this plugin sits in every ordered registry CLV keeps. Lower runs
+    #: first; ties are broken by name, so the order is a function of what is
+    #: installed rather than of what the filesystem happened to list first.
+    #:
+    #: 100 leaves room on both sides deliberately. A stage that must see a line
+    #: before anything has touched it -- an audit log, a metric counter -- takes
+    #: a low number; one that must see the final text takes a high one. Two
+    #: plugins that do not care both take the default and compose by name, which
+    #: is at least a rule their authors can predict.
+    priority: int = 100
+
     def describe(self) -> str:
         return self.name
+
+    # --- lifecycle ----------------------------------------------------------
+    #
+    # All three are optional and all three default to doing nothing, so a plugin
+    # that implements none of them behaves exactly as it did before they
+    # existed. Each is guarded exactly as `apply` is: raising disables the
+    # plugin for the session and records the reason once.
+
+    def configure(self, settings: Mapping[str, str]) -> None:
+        """Receive this plugin's ``[plugin:<name>]`` section, if it has one.
+
+        Called once, after instantiation and before :meth:`setup`. *settings* is
+        a **read-only view of a mapping CLV owns**, not a copy: when CLV re-reads
+        the settings file, the values behind it change and this plugin sees the
+        new ones without being called again. Keep the mapping rather than
+        copying out of it if freshness matters -- that is what lets the journal
+        provider honour the Advanced drawer's switch without a restart.
+
+        Empty when the operator wrote no section, which is the common case and
+        must not be treated as an error.
+
+        Values are the raw strings ``configparser`` read. Use
+        :func:`setting_bool` and :func:`setting_list` rather than reimplementing
+        them: CLV and a plugin disagreeing about whether ``yes`` is true is a
+        bug an operator has no way to see.
+        """
+
+    def setup(self) -> None:
+        """Acquire whatever this plugin needs, once, before it is first used.
+
+        Called after every plugin has been loaded and configured. Anything
+        opened here should be released in :meth:`teardown`.
+
+        Not called again when an operator re-enables a plugin from the ``P``
+        dialog: this is session lifecycle, not the enable switch.
+        """
+
+    def teardown(self) -> None:
+        """Release what :meth:`setup` acquired. Called once, at shutdown.
+
+        Runs after CLV has closed its readers and before the session is
+        persisted, so a plugin cannot resurrect a source on its way out.
+
+        An exception here is recorded and ignored. A *hang* is not bounded --
+        see ``clv/plugins/AGENTS.md``.
+        """
 
 
 @dataclass(frozen=True, slots=True)
@@ -582,6 +640,16 @@ def satisfies(version: str, constraint: Optional[str]) -> bool:
 MAX_PLUGIN_ERRORS = 50
 
 
+#: What kind of problem a :class:`PluginError` records. A string rather than an
+#: enum, to match ``ConfigIssue.severity`` next door and to stay printable.
+#:
+#: The distinction is not cosmetic: "this plugin is broken" and "this plugin
+#: wants a CLV you are not running" call for different actions from the
+#: operator, and the management UI must not have to *parse the message* to tell
+#: them apart. ``"load"`` is the unremarkable case and stays the default.
+ERROR_CATEGORIES = ("load", "incompatible", "shadowed", "missing", "runtime")
+
+
 @dataclass
 class PluginError:
     origin: str
@@ -590,6 +658,11 @@ class PluginError:
     #: :meth:`PluginErrors.append`; a plugin that fails per render used to
     #: append a fresh identical error every pass.
     count: int = 1
+    #: One of :data:`ERROR_CATEGORIES`. Deliberately **not** part of the
+    #: identity used to collapse repeats: the same origin reporting the same
+    #: message is the same problem however it is classified, and a category
+    #: that split the dedup key would let one fault grow two entries.
+    category: str = "load"
 
     def __str__(self) -> str:  # pragma: no cover - trivial
         repeats = f" (×{self.count})" if self.count > 1 else ""
@@ -653,6 +726,31 @@ class PluginErrors(Sequence[PluginError]):
             return ""
         return f"and {self._dropped} more"
 
+    def discard(self, origin: str, *, category: Optional[str] = None) -> int:
+        """Forget everything recorded against *origin*. Returns how many went.
+
+        The counterpart to :meth:`PluginRegistry.enable`. A plugin taken out of
+        service by a fault keeps the fault on the record, which is right up
+        until the operator puts it back — after that the entry describes a state
+        that no longer holds, and, worse, it is still in :attr:`_index`, so the
+        *next* genuine failure would collapse into it and be reported as a
+        repeat of something already dealt with rather than as news.
+
+        *category* narrows it, so re-enabling clears the runtime fault without
+        also erasing the load-time diagnosis that is still true.
+        """
+
+        doomed = [
+            error
+            for error in self._errors
+            if error.origin == origin
+            and (category is None or error.category == category)
+        ]
+        for error in doomed:
+            self._errors.remove(error)
+            self._index.pop((error.origin, error.message), None)
+        return len(doomed)
+
     def clear(self) -> None:
         self._errors.clear()
         self._index.clear()
@@ -708,6 +806,124 @@ class DiscoveredPlugin:
     shadowed_by: Optional[str] = None
 
 
+#: The reason recorded when an operator turns a plugin off from the management
+#: UI, as opposed to a fault taking it out of service. Compared against rather
+#: than merely displayed: a fault always leaves a :class:`PluginError` behind
+#: and an operator's decision never does, so this is what tells
+#: :meth:`PluginRegistry.status` whether a disabled plugin is *broken* or simply
+#: *switched off* — two rows that must not read the same.
+OPERATOR_DISABLE_REASON = "turned off by the operator"
+
+#: Every state a plugin can be in, as the management UI names them.
+#:
+#: ``"isolated"`` is here and is never produced. Phase 13 of ``PLUGIN_TODO.md``
+#: fills it in; naming it now is what stops the row layout being redesigned then.
+PLUGIN_STATES = ("loaded", "not enabled", "failed", "incompatible", "isolated")
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedPlugin:
+    """A live plugin, and the module it came out of.
+
+    :meth:`PluginRegistry.add` files plugins into :attr:`~PluginRegistry.sources`,
+    :attr:`~PluginRegistry.filters` and :attr:`~PluginRegistry.exporters` by
+    kind, and nothing there records *where each one came from*. Enable and
+    disable need that: the enable-list names a module, one module may export
+    several plugins, and turning it off has to reach all of them.
+    """
+
+    #: Excluded from equality: a plugin is third-party code and may define
+    #: ``__eq__`` however it likes, which is not something a registry record
+    #: should inherit.
+    plugin: Any = field(compare=False)
+    #: The plugin's own name, as :func:`_plugin_name` reads it.
+    name: str
+    #: The origin string its loader used — a path, a dotted module, or
+    #: ``clv.plugins:<entry point>``.
+    origin: str
+    #: Which interfaces it was filed under, in :data:`_KINDS` order.
+    kinds: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PluginStatus:
+    """One row of the management UI: an installable unit and how it is doing.
+
+    The unit is the **origin**, not the plugin object, because that is what an
+    operator installs, names in ``settings.conf`` and deletes. One module
+    exporting three stages is one row that says ``filter``, not three rows.
+
+    Built by :meth:`PluginRegistry.status` and handed to the dialog, which flips
+    :attr:`enabled` and :attr:`reinstate` on a copy and hands the set back. The
+    dialog decides nothing: the app diffs the two and does the work.
+    """
+
+    #: What the operator would write in ``settings.conf`` — the module name for
+    #: a user plugin, the last dotted segment for a bundled one.
+    name: str
+    #: The full origin, shown as the row's detail line.
+    origin: str
+    #: ``"user"``, ``"bundled"`` or ``"entry point"``. Decides whether turning
+    #: this row off is written to ``settings.conf`` or lasts for the session.
+    source: str
+    #: The interfaces this origin supplies, aggregated over its plugins.
+    kinds: tuple[str, ...] = ()
+    #: One of :data:`PLUGIN_STATES`.
+    state: str = "loaded"
+    #: The recorded message, the unsatisfied constraint, or what shadowed it —
+    #: in full, because being truncated into a shared line is the problem this
+    #: whole surface exists to fix.
+    detail: str = ""
+    #: The category of the error driving :attr:`state`, so the dialog knows
+    #: whether Re-enable applies without reading :attr:`detail`.
+    category: str = ""
+    #: Working copy. True when this plugin should be running.
+    enabled: bool = True
+    #: Working copy. Set when the operator asks for a fault-disabled plugin to
+    #: be put back into service.
+    reinstate: bool = False
+
+
+#: Interface name to the registry list it is filed in, in the order a row lists
+#: them. One definition, so ``add`` and ``status`` cannot disagree about what
+#: kinds exist.
+_KINDS: tuple[tuple[str, type], ...] = (
+    ("source", LogSourceProvider),
+    ("filter", FilterStage),
+    ("exporter", Exporter),
+)
+
+
+def _origin_source(origin: str) -> str:
+    """Which of the three search roots *origin* came from.
+
+    Read off the string rather than recorded at load time, because ``add()``
+    takes an origin and nothing else — and every loader already spells its
+    origins distinctly: ``clv.plugins:<name>`` with a colon for an entry point,
+    ``clv.plugins.<name>`` with a dot for a bundled drop-in, and a filesystem
+    path for anything in a user root.
+    """
+
+    if origin == ENTRY_POINT_GROUP or origin.startswith(f"{ENTRY_POINT_GROUP}:"):
+        return "entry point"
+    if origin.startswith(f"{ENTRY_POINT_GROUP}."):
+        return "bundled"
+    return "user"
+
+
+def _origin_label(origin: str, source: str) -> str:
+    """The short name for *origin* — what an operator would type or look for."""
+
+    if source == "entry point":
+        _, _, name = origin.partition(":")
+        return name or origin
+    if source == "bundled":
+        return origin.rpartition(".")[2] or origin
+    # A path, or the bare name of a plugin that settings.conf asked for and that
+    # was never found on disk.
+    return Path(origin).name if os.sep in origin or "/" in origin else origin
+
+
 @dataclass
 class PluginRegistry:
     """Everything successfully loaded, plus everything that failed to load."""
@@ -720,6 +936,11 @@ class PluginRegistry:
     #: Empty on a build with no user plugin directory, which is the common case
     #: and stays free: nothing is imported to fill this in.
     discovered: list[DiscoveredPlugin] = field(default_factory=list)
+    #: Every plugin that loaded, paired with the module it came from, in load
+    #: order. The three lists above are keyed by *kind* and a plugin appears in
+    #: as many of them as it implements; this is the one place a live plugin can
+    #: be traced back to the thing an operator installed.
+    loaded: list[LoadedPlugin] = field(default_factory=list)
     #: Which provider offered which source, filled by `discover_sources`. Keyed
     #: on **(provider name, path)**, because a source identifier means nothing
     #: without the provider that coined it: keyed on the path alone, the second
@@ -733,10 +954,142 @@ class PluginRegistry:
     #: ``__hash__``; the registry's own lists hold every plugin alive for the
     #: session, so an id cannot be recycled underneath this map.
     _disabled: dict[int, str] = field(default_factory=dict, repr=False)
+    #: Each plugin's ``[plugin:<name>]`` section, keyed on the casefolded name
+    #: the operator writes in ``settings.conf``.
+    #:
+    #: These dicts are **handed out as read-only views and then mutated in
+    #: place**, which is the whole mechanism: a plugin keeps the view it was
+    #: given at ``configure()`` time, CLV updates the dict behind it whenever it
+    #: re-reads the settings file, and the plugin sees the new value without a
+    #: second hook and without reading a file itself. Replacing a dict here
+    #: instead of clearing it would strand every view already handed out.
+    _settings: dict[str, dict[str, str]] = field(default_factory=dict, repr=False)
+    #: Section names claimed by a plugin that actually loaded. What is left in
+    #: :attr:`_settings` after a load is a section configuring nothing, which is
+    #: reported -- an operator who tuned a plugin that is not running should be
+    #: told, not left wondering why the setting does nothing.
+    _configured: set[str] = field(default_factory=set, repr=False)
+    #: Whether :meth:`start` has run. ``setup()`` is once per session.
+    _started: bool = field(default=False, repr=False)
+    #: Whether :meth:`shutdown` has run. ``teardown()`` is once per session, and
+    #: ``on_unmount`` is not guaranteed to fire exactly once.
+    _stopped: bool = field(default=False, repr=False)
 
     @property
     def total(self) -> int:
         return len(self.sources) + len(self.filters) + len(self.exporters)
+
+    # --- ordering ------------------------------------------------------------
+
+    def order(self) -> None:
+        """Sort every ordered registry by :func:`plugin_sort_key`.
+
+        Called once, at the end of :func:`load_plugins`, and deliberately **not**
+        from :meth:`add`. Two reasons, and the second is the load-bearing one:
+        a caller that adds a plugin after load reads it back as ``filters[-1]``
+        and sorting under it would be a surprise; and ``app.py`` builds the
+        export dialog's choices as ``plugin:<index>`` over
+        :attr:`exporters`, so the order these lists are in has to be settled
+        before anything can address them positionally. Sorting once, before any
+        dialog exists, is what keeps that safe.
+        """
+
+        self.sources.sort(key=plugin_sort_key)
+        self.filters.sort(key=plugin_sort_key)
+        self.exporters.sort(key=plugin_sort_key)
+
+    # --- configuration -------------------------------------------------------
+
+    def settings_for(self, name: str) -> Mapping[str, str]:
+        """The read-only view of *name*'s section, created if it is new.
+
+        Always a view onto a dict this registry owns, even when the operator
+        wrote no section: a plugin handed an empty mapping at load time and a
+        section added by a later ``refresh_settings`` should see it appear,
+        rather than holding a view onto something that got replaced.
+        """
+
+        return types.MappingProxyType(self._settings.setdefault(name.casefold(), {}))
+
+    def refresh_settings(self, settings: Mapping[str, Mapping[str, str]]) -> None:
+        """Adopt a freshly parsed set of ``[plugin:<name>]`` sections.
+
+        In place, per section, so every view already handed to a plugin stays
+        live. A section the new mapping does not carry is emptied rather than
+        forgotten -- an operator who deleted a section means the plugin should
+        fall back to its defaults, and a view onto a stale dict would go on
+        reporting the deleted values forever.
+        """
+
+        for name, values in settings.items():
+            current = self._settings.setdefault(name.casefold(), {})
+            current.clear()
+            current.update(values)
+        for name, current in self._settings.items():
+            if name not in settings:
+                current.clear()
+
+    # --- lifecycle -----------------------------------------------------------
+
+    def _run_hook(self, plugin: Any, hook: str, *args: Any) -> bool:
+        """Call one optional hook, guarded exactly as ``apply`` is.
+
+        Returns whether it succeeded. A raise disables the plugin for the
+        session through :meth:`disable`, which records the reason once however
+        many times it is reached -- the same mechanism a raising filter stage
+        has used since Phase 1, rather than a second one with its own semantics.
+        """
+
+        method = getattr(plugin, hook, None)
+        if method is None:
+            return True
+        try:
+            method(*args)
+        except Exception as exc:  # noqa: BLE001 - third-party code
+            self.disable(
+                plugin, f"{hook}() raised: {exc}", origin=_plugin_name(plugin)
+            )
+            return False
+        return True
+
+    def start(self) -> None:
+        """Run ``setup()`` on every plugin still in service. Once per session.
+
+        Called by the app after loading and after any post-load wiring, not by
+        the loader: :func:`load_plugins` is imported by plugin authors' own unit
+        tests and by half this project's suite, and it should not start
+        acquiring resources on their behalf.
+        """
+
+        if self._started:
+            return
+        self._started = True
+        for record in self.loaded:
+            if self.is_disabled(record.plugin):
+                continue
+            self._run_hook(record.plugin, "setup")
+
+    def shutdown(self) -> None:
+        """Run ``teardown()`` on every plugin that was set up. Once per session.
+
+        A plugin disabled by a failed ``configure()`` or ``setup()`` is skipped:
+        it never acquired anything, and calling ``teardown()`` on a half-built
+        object is how a shutdown path acquires its own bugs.
+
+        An exception is recorded and shutdown continues. A plugin that *hangs*
+        here still hangs exit -- bounding that needs the time budget, and
+        building a second one here is what ``PLUGIN_TODO.md`` Phase 6 exists to
+        prevent. Said out loud in ``clv/plugins/AGENTS.md`` rather than left for
+        an operator to discover.
+        """
+
+        if self._stopped:
+            return
+        self._stopped = True
+        for record in self.loaded:
+            if self.is_disabled(record.plugin):
+                continue
+            self._run_hook(record.plugin, "teardown")
 
     def available(self) -> list[DiscoveredPlugin]:
         """Plugins installed in a user root but not enabled.
@@ -753,9 +1106,154 @@ class PluginRegistry:
             if not entry.enabled and entry.shadowed_by is None
         ]
 
+    def status(self) -> list[PluginStatus]:
+        """One row per installable unit: what it is, and how it is doing.
+
+        The whole of what the management UI knows, built here rather than in
+        ``app.py`` so it can be asserted without a screen. It merges the three
+        things the loader records separately and that an operator experiences as
+        one fact -- :attr:`loaded`, :attr:`discovered` and :attr:`errors` -- and
+        it is keyed on origin, because the origin is the file somebody copied in.
+
+        Empty for a registry that loaded nothing and found nothing, which is
+        Requirement 10: a build with no plugins has nothing to say.
+        """
+
+        by_origin: dict[str, list[LoadedPlugin]] = {}
+        for record in self.loaded:
+            by_origin.setdefault(record.origin, []).append(record)
+
+        # Indexed twice on purpose. A load-time error is recorded against the
+        # origin, but a *runtime* one is recorded against the plugin's own name
+        # -- `disable()` and `app.py` both name the plugin, which is the right
+        # thing for the message and the wrong key for this join.
+        errors_by_origin: dict[str, list[PluginError]] = {}
+        for error in self.errors:
+            errors_by_origin.setdefault(error.origin, []).append(error)
+        origins_by_name: dict[str, str] = {}
+        for record in self.loaded:
+            origins_by_name.setdefault(record.name, record.origin)
+
+        claimed_errors: set[int] = set()
+
+        def errors_for(origin: str, names: Sequence[str]) -> list[PluginError]:
+            found = list(errors_by_origin.get(origin, ()))
+            for name in names:
+                if origins_by_name.get(name) != origin:
+                    continue
+                found.extend(
+                    error
+                    for error in errors_by_origin.get(name, ())
+                    if error not in found
+                )
+            claimed_errors.update(id(error) for error in found)
+            return found
+
+        rows: list[PluginStatus] = []
+        seen: set[str] = set()
+
+        def build(origin: str, discovered: Optional[DiscoveredPlugin]) -> None:
+            if origin in seen:
+                return
+            seen.add(origin)
+            records = by_origin.get(origin, [])
+            source = _origin_source(origin)
+            kinds = tuple(
+                label
+                for label, _ in _KINDS
+                if any(label in record.kinds for record in records)
+            )
+            errors = errors_for(origin, [record.name for record in records])
+            categories = {error.category for error in errors}
+            detail = "; ".join(
+                error.message + (f" (x{error.count})" if error.count > 1 else "")
+                for error in errors
+            )
+            operator_off = bool(records) and all(
+                self.disabled_reason(record.plugin) == OPERATOR_DISABLE_REASON
+                for record in records
+            )
+            faulted = [
+                reason
+                for reason in (
+                    self.disabled_reason(record.plugin) for record in records
+                )
+                if reason is not None and reason != OPERATOR_DISABLE_REASON
+            ]
+
+            if "incompatible" in categories:
+                state, category = "incompatible", "incompatible"
+            elif categories - {"shadowed"}:
+                state = "failed"
+                category = next(
+                    error.category for error in errors if error.category != "shadowed"
+                )
+            elif categories:
+                # Shadowed, and nothing else. Losing a name to something found
+                # first is not a fault -- the plugin is intact and the operator
+                # has a choice to make about which one they meant.
+                state, category = "not enabled", "shadowed"
+            elif faulted:
+                state, category, detail = "failed", "runtime", faulted[0]
+            elif operator_off:
+                state, category = "not enabled", ""
+                detail = (
+                    "off for this session"
+                    if source != "user"
+                    else "off"
+                )
+            elif discovered is not None and not discovered.enabled:
+                state, category = "not enabled", ""
+            else:
+                state, category = "loaded", ""
+
+            named = True if discovered is None else discovered.enabled
+            rows.append(
+                PluginStatus(
+                    name=(
+                        discovered.name
+                        if discovered is not None
+                        else _origin_label(origin, source)
+                    ),
+                    origin=origin,
+                    source=source,
+                    kinds=kinds,
+                    state=state,
+                    detail=detail,
+                    category=category,
+                    enabled=named and not operator_off,
+                )
+            )
+
+        # User roots first, and from `discovered` rather than from `loaded`:
+        # a plugin sitting there unimported has no live object to be found by.
+        for entry in self.discovered:
+            build(str(entry.root / entry.name), entry)
+        for origin in by_origin:
+            build(origin, None)
+        # Whatever is left is something that never produced a plugin at all --
+        # an import that raised, a version constraint that refused, a name in
+        # settings.conf matching nothing on disk. Those are the rows an operator
+        # most needs, so they are the ones that must not be dropped for having
+        # no object behind them.
+        for error in self.errors:
+            if id(error) not in claimed_errors:
+                build(error.origin, None)
+
+        group = {"user": 0, "bundled": 1, "entry point": 2}
+        rows.sort(key=lambda row: (group[row.source], row.name.casefold()))
+        return rows
+
     # --- taking a plugin out of service -------------------------------------
 
-    def disable(self, plugin: Any, reason: str, *, origin: Optional[str] = None) -> None:
+    def disable(
+        self,
+        plugin: Any,
+        reason: str,
+        *,
+        origin: Optional[str] = None,
+        record: bool = True,
+    ) -> None:
         """Take *plugin* out of service for the rest of the session.
 
         Idempotent: the second and later calls record nothing, which is the
@@ -772,13 +1270,23 @@ class PluginRegistry:
         :attr:`exporters`. Those lists are addressed positionally elsewhere
         (``app.py`` builds export choices keyed ``plugin:<index>``), so removal
         would silently re-target an in-flight export. Disabling is a marking.
+
+        *record* is False when the operator switched the plugin off themselves.
+        :attr:`errors` is the amber problem channel, and a plugin doing exactly
+        what it was told is not a problem — the same distinction Phase 3 drew
+        for a plugin that is installed and waiting to be named.
         """
 
         key = id(plugin)
         if key in self._disabled:
             return
         self._disabled[key] = reason
-        self.errors.append(PluginError(origin or _plugin_name(plugin), reason))
+        if record:
+            self.errors.append(
+                PluginError(
+                    origin or _plugin_name(plugin), reason, category="runtime"
+                )
+            )
 
     def enable(self, plugin: Any) -> bool:
         """Put a disabled plugin back into service. True if it was disabled."""
@@ -844,17 +1352,49 @@ class PluginRegistry:
                     PluginError(
                         origin,
                         f"requires {subject} {requirement}, running {running}",
+                        category="incompatible",
                     )
                 )
                 return False
 
-        if isinstance(plugin, LogSourceProvider):
-            self.sources.append(plugin)
-        elif isinstance(plugin, FilterStage):
-            self.filters.append(plugin)
-        else:
-            self.exporters.append(plugin)
+        # Every interface it implements, not the first one that matched. The
+        # previous `if/elif/else` filed a plugin that was both a provider and a
+        # stage as a provider alone, and its `apply()` was never called -- a
+        # plugin silently doing half of what it says it does, with no diagnosis
+        # anywhere, because from the outside it *had* loaded.
+        kinds: list[str] = []
+        for label, interface in _KINDS:
+            if isinstance(plugin, interface):
+                kinds.append(label)
+                self._list_for(label).append(plugin)
+        self.loaded.append(
+            LoadedPlugin(
+                plugin=plugin,
+                name=_plugin_name(plugin),
+                origin=origin,
+                kinds=tuple(kinds),
+            )
+        )
+        # Configured *after* filing, because a hook that raises is disabled
+        # through `disable()`, and `disable()` marks a plugin the registry is
+        # already holding. A plugin that fails here stays in the lists and stays
+        # skipped by every use site, exactly as a raising filter stage does.
+        #
+        # Keyed on the origin's short name -- `_origin_label` yields `journald`
+        # for `clv.plugins.sources.journald` and `redact_secrets` for a user
+        # path -- so the word in `[plugin:<name>]` is the same word the operator
+        # already wrote in `plugins =`.
+        section = _origin_label(origin, _origin_source(origin))
+        self._configured.add(section.casefold())
+        self._run_hook(plugin, "configure", self.settings_for(section))
         return True
+
+    def _list_for(self, kind: str) -> list[Any]:
+        return {
+            "source": self.sources,
+            "filter": self.filters,
+            "exporter": self.exporters,
+        }[kind]
 
     def discover_sources(self) -> list[ProviderSource]:
         """Ask every provider what it offers, skipping the ones that raise.
@@ -1069,6 +1609,73 @@ def _plugin_name(plugin: Any) -> str:
     return name or type(plugin).__name__
 
 
+def plugin_sort_key(plugin: Any) -> tuple[int, str]:
+    """The order every ordered plugin registry runs in. Ascending.
+
+    **One rule, defined once.** Filter stages are the only ordered registry
+    today; ``PLUGIN_TODO.md`` adds five more -- formats, query operators, cluster
+    rules, watch matchers, sinks -- and each of them calls this rather than
+    restating it, so two plugins cannot be ordered one way in one registry and
+    the other way in another.
+
+    ``priority`` first, then the plugin's own name casefolded. The tie-break is
+    what makes the order a function of *what is installed* rather than of what
+    ``pkgutil.iter_modules`` happened to list first: two stages that both take
+    the default compose the same way on every machine, which is at least a rule
+    their authors can predict and design around.
+
+    :func:`_plugin_name` never raises and never returns empty, which is what
+    makes this safe to call on third-party code. A ``priority`` that is not an
+    int is read as the default rather than raising mid-sort -- a plugin with a
+    typo in one attribute should be mis-ordered, not fatal.
+    """
+
+    priority = getattr(plugin, "priority", 100)
+    if not isinstance(priority, int) or isinstance(priority, bool):
+        priority = 100
+    return (priority, _plugin_name(plugin).casefold())
+
+
+#: What ``configparser`` accepts for a boolean, so a plugin and CLV cannot
+#: disagree about whether ``yes`` is true. Taken from the class rather than
+#: retyped, because retyping it is exactly the divergence this exists to stop.
+_BOOLEAN_STATES = configparser.ConfigParser.BOOLEAN_STATES
+
+
+def setting_bool(
+    settings: Mapping[str, str], key: str, default: bool = False
+) -> bool:
+    """Read *key* from a plugin's settings as a boolean.
+
+    Published for the same reason :func:`~clv.services.parsing.normalize_level`
+    is: the alternative is every plugin writing ``value.lower() == "true"`` and
+    CLV disagreeing with the operator's file about what ``yes``, ``on`` and
+    ``1`` mean. An unreadable value is *default*, not an error -- a plugin's
+    settings are operator prose and a typo should not take the plugin out of
+    service.
+    """
+
+    raw = settings.get(key)
+    if raw is None:
+        return default
+    return _BOOLEAN_STATES.get(str(raw).strip().casefold(), default)
+
+
+def setting_list(settings: Mapping[str, str], key: str) -> list[str]:
+    """Read *key* from a plugin's settings as a comma-separated list.
+
+    The same shape ``log_dirs`` uses, quotes stripped and empties dropped, so a
+    plugin's list and CLV's own parse identically. Absent or empty is ``[]``.
+    """
+
+    raw = settings.get(key)
+    if raw is None:
+        return []
+    from ..services.config import _split_list
+
+    return _split_list(str(raw))
+
+
 def _as_list(produced: Any) -> list[Any]:
     """Normalise whatever ``register()`` handed back into a list."""
 
@@ -1277,7 +1884,11 @@ def _load_user_roots(
                     )
                 )
                 registry.errors.append(
-                    PluginError(origin, f"shadowed by {claimed[key]}, which was found first")
+                    PluginError(
+                        origin,
+                        f"shadowed by {claimed[key]}, which was found first",
+                        category="shadowed",
+                    )
                 )
                 continue
 
@@ -1313,11 +1924,16 @@ def _load_user_roots(
     where = ", ".join(str(root) for root in roots)
     for name in enabled:
         if name not in found:
+            # Reported against the *name*, not against a generic "plugins"
+            # origin: this is a row in the management UI as much as it is a line
+            # in the log panel, and a row has to be able to say which plugin it
+            # is about.
             registry.errors.append(
                 PluginError(
-                    "plugins",
-                    f"{name!r} is named in settings.conf but was not found"
+                    name,
+                    "named in settings.conf but was not found"
                     + (f" in {where}" if where else " -- no plugin directory exists"),
+                    category="missing",
                 )
             )
 
@@ -1373,6 +1989,7 @@ def _load_local(
                     PluginError(
                         module_name,
                         f"shadowed by {claimed_by_user[key]}, which was found first",
+                        category="shadowed",
                     )
                 )
                 continue
@@ -1453,7 +2070,11 @@ def _load_entry_points(
         key = entry_point.name.casefold()
         if key in claimed:
             registry.errors.append(
-                PluginError(origin, f"shadowed by {claimed[key]}, which was found first")
+                PluginError(
+                    origin,
+                    f"shadowed by {claimed[key]}, which was found first",
+                    category="shadowed",
+                )
             )
             continue
         claimed.setdefault(key, origin)
@@ -1484,6 +2105,7 @@ def load_plugins(
     include_user: bool = True,
     roots: Optional[Sequence[Path]] = None,
     enabled: Iterable[str] = (),
+    settings: Optional[Mapping[str, Mapping[str, str]]] = None,
 ) -> PluginRegistry:
     """Discover and load all available plugins.
 
@@ -1500,6 +2122,11 @@ def load_plugins(
     Bundled drop-ins ignore *enabled* entirely. They shipped with CLV, and the
     operator's trust in them is the trust they placed in CLV.
 
+    *settings* is the parsed ``[plugin:<name>]`` sections. Seeded **before**
+    anything is imported, so a plugin is configured on the same pass it is
+    constructed rather than being handed its settings some time after it has
+    started deciding things without them.
+
     Never raises: any failure is captured in :attr:`PluginRegistry.errors`.
     """
 
@@ -1507,6 +2134,8 @@ def load_plugins(
         from .. import __version__ as clv_version  # local import avoids a cycle
 
     registry = PluginRegistry()
+    if settings:
+        registry.refresh_settings(settings)
     #: Names taken by an enabled *user* module. Only these may displace a
     #: bundled drop-in; two bundled subpackages sharing a basename are two
     #: different modules, as they have always been.
@@ -1528,14 +2157,52 @@ def load_plugins(
         _load_local(registry, clv_version, claimed, claimed_by_user)
     if include_entry_points:
         _load_entry_points(registry, clv_version, claimed)
+
+    _report_unclaimed_settings(registry)
+    # Last, so it sorts everything every loader contributed. See
+    # `PluginRegistry.order` for why this is not done incrementally in `add`.
+    registry.order()
     return registry
+
+
+def _report_unclaimed_settings(registry: PluginRegistry) -> None:
+    """Name every ``[plugin:<name>]`` section that configures nothing.
+
+    Two messages rather than one, because they have two different answers. A
+    section for a plugin sitting in the plugin directory unnamed means "you
+    tuned it but never turned it on"; a section for a name that is nowhere means
+    "this is a typo, or the plugin is gone". Telling an operator the first when
+    the second is true sends them looking in the wrong file.
+
+    Reported against ``plugin:<name>`` -- the section header they would search
+    for -- and categorised ``missing``, matching how a name in the enable-list
+    that resolves to nothing is already reported.
+    """
+
+    discovered = {entry.name.casefold() for entry in registry.discovered}
+    for name in registry._settings:
+        if name in registry._configured or not registry._settings[name]:
+            continue
+        registry.errors.append(
+            PluginError(
+                f"plugin:{name}",
+                "configured in settings.conf but not enabled; add it to the "
+                "plugins list to run it"
+                if name in discovered
+                else "configured in settings.conf but no such plugin is loaded",
+                category="missing",
+            )
+        )
 
 
 __all__ = [
     "ENTRY_POINT_GROUP",
+    "ERROR_CATEGORIES",
     "MAX_PLUGIN_ERRORS",
+    "OPERATOR_DISABLE_REASON",
     "PLUGIN_API_VERSION",
     "PLUGIN_PATH_ENV",
+    "PLUGIN_STATES",
     "USER_PLUGIN_PACKAGE",
     "DiscoveredPlugin",
     "Exporter",
@@ -1543,13 +2210,18 @@ __all__ = [
     "FilterContext",
     "FilterStage",
     "IteratorReader",
+    "LoadedPlugin",
     "LogSourceProvider",
     "ProviderSource",
     "Plugin",
     "PluginError",
     "PluginErrors",
     "PluginRegistry",
+    "PluginStatus",
     "load_plugins",
     "plugin_search_roots",
+    "plugin_sort_key",
     "satisfies",
+    "setting_bool",
+    "setting_list",
 ]
