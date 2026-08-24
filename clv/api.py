@@ -59,6 +59,8 @@ from .plugins import (
     LogSourceProvider,
     Plugin,
     ProviderSource,
+    setting_bool,
+    setting_list,
 )
 from .services.filtering import FilterSpec, TimeWindow
 from .services.parsing import (
@@ -123,6 +125,14 @@ __all__ = [
     # Read-only by convention rather than by type: it is a plain dict and
     # mutating it would change what every severity filter in the process means.
     "SEVERITY_BUCKETS",
+    # --- reading a plugin's own settings -------------------------------------
+    # `configure()` hands over the raw strings configparser read, and the two
+    # coercions every plugin then needs are published for the same reason
+    # `normalize_level` is: the alternative is each plugin writing
+    # `value.lower() == "true"` and CLV disagreeing with the operator's own file
+    # about what `yes`, `on` and `1` mean.
+    "setting_bool",
+    "setting_list",
     # --- the field vocabulary -----------------------------------------------
     # The keys the parser normalises across formats, recognised as field terms
     # even before a line carrying one has been read.
