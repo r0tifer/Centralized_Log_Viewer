@@ -493,7 +493,7 @@ installed" — the trade Item 12 asked for.
   and `workspace` fixtures, and every assertion runs against another backend —
   which is how `RemoteBackend` is held to the same behaviour as `LocalBackend`.
 
-Run: `python -m pytest` (1660 passed, 1 skipped, 11 deselected) on **both** 3.11
+Run: `python -m pytest` (1767 passed, 1 skipped, 11 deselected) on **both** 3.11
 and 3.14 — the local default is 3.14 and a green suite there is not evidence
 that the supported floor still works.
 
