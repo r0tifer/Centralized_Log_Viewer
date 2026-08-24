@@ -39,10 +39,12 @@ from textual.widgets import Button, Footer, Input, Label, Static, Switch, Tree
 from textual.widgets._tree import TreeNode
 
 from .plugins import (
+    OPERATOR_DISABLE_REASON,
     Exporter,
     FilterContext,
     PluginError,
     PluginRegistry,
+    PluginStatus,
     ProviderSource,
     load_plugins,
 )
@@ -70,6 +72,7 @@ from .services.config import (
     default_config_text,
     host_options,
     load_config,
+    plugin_settings_for,
     undocumented_settings,
     user_config_path,
 )
@@ -158,6 +161,7 @@ from .widgets.filter_chip import FilterChip, FilterChips
 from .widgets.goto_dialog import GotoDialog
 from .widgets.help_overlay import HelpOverlay, HelpSection
 from .widgets.log_view import LogView
+from .widgets.plugins_dialog import PluginsDialog
 from .widgets.query_bar import QueryBar
 from .widgets.remote_hosts_dialog import (
     EDITABLE_KEYS,
@@ -355,6 +359,7 @@ HELP_CATEGORY_ORDER: tuple[str, ...] = (
     "Navigation",
     "View",
     "Sources",
+    "Plugins",
     "Session",
     "Other",
 )
@@ -420,6 +425,11 @@ BINDING_CATEGORIES: dict[str, str] = {
     "merge_across_hosts": "Sources",
     "reload_sources": "Sources",
     "remote_hosts": "Sources",
+    # Its own section rather than folded into View or Sources. A plugin is not
+    # a view of the logs and not a place they come from -- it is a third party's
+    # code running inside CLV, which is a category an operator reasons about
+    # separately. Stage C of `PLUGIN_TODO.md` adds rows here.
+    "manage_plugins": "Plugins",
     "save_session": "Session",
     "quit_app": "Session",
 }
@@ -717,6 +727,14 @@ class LogViewerApp(App[None]):
         Binding("y", "copy_view", "Copy to clipboard", show=False),
         Binding("ctrl+s", "save_session", "Save sources", show=True),
         Binding("R", "remote_hosts", "Remote hosts", show=False),
+        # Hidden, like every binding added after the footer filled up at 80
+        # columns. `f` also reaches it, through the drawer's Plugins button.
+        Binding(
+            "P",
+            "manage_plugins",
+            "Manage plugins (then space toggles, r re-enables)",
+            show=False,
+        ),
         Binding("ctrl+r", "reload_sources", "Reload", show=True),
         Binding("q", "quit_app", "Quit", show=True),
     ]
@@ -904,8 +922,17 @@ class LogViewerApp(App[None]):
         # The enable-list is passed *in*, not applied afterwards: it decides
         # whether a user plugin is imported at all, and a consent check that
         # ran after the import would be guarding nothing.
-        self._plugins = load_plugins(enabled=self._config.plugins)
+        # `settings` is seeded the same way and for the same reason: a plugin is
+        # configured on the pass that constructs it, not some time after it has
+        # started deciding things without its settings.
+        self._plugins = load_plugins(
+            enabled=self._config.plugins,
+            settings=plugin_settings_for(self._config),
+        )
         self._wire_remote_providers()
+        # After the wiring, so a provider's `setup()` sees a fully assembled
+        # plugin rather than one still waiting for its resolver.
+        self._plugins.start()
         self._apply_breakpoint(self.size.width)
         self._sources_panel_width = self.state.tree_width or self._config.tree_width
         self._apply_panel_width()
@@ -3593,19 +3620,22 @@ class LogViewerApp(App[None]):
             )
         self._show_upgrade_notice()
         if self._plugins.errors:
+            # One line, not one per error. Deduplicating and capping the
+            # collection stopped a single raising stage producing two hundred
+            # identical lines, but four broken plugins still buried the
+            # discovery summary the operator opened CLV to read — and none of
+            # those lines had room to say what to do about it. `P` does.
+            total = sum(error.count for error in self._plugins.errors)
+            note = self._plugins.errors.overflow_note
             self.log_panel.write(Text(""))
-            for error in self._plugins.errors:
-                self.log_panel.write(Text(f"Plugin problem — {error}", style="#facc15"))
-            # The collection deduplicates and caps itself, so this can no longer
-            # bury the discovery summary the operator opened CLV to read — but
-            # it must still say what it is not showing.
-            if self._plugins.errors.overflow_note:
-                self.log_panel.write(
-                    Text(
-                        f"Plugin problems — {self._plugins.errors.overflow_note}",
-                        style="#facc15",
-                    )
+            self.log_panel.write(
+                Text(
+                    f"Plugin problems — {total}"
+                    + (f", {note}" if note else "")
+                    + " (press P for details)",
+                    style="#facc15",
                 )
+            )
         # Same channel and the same colour as a plugin problem, because it is
         # the same kind of fact: something the operator wrote that CLV could not
         # honour. A host section skipped in silence is a machine that vanishes
@@ -4009,6 +4039,144 @@ class LogViewerApp(App[None]):
         self.run_worker(
             self._prompt_remote_hosts(), group="dialogs", exit_on_error=False
         )
+
+    def action_manage_plugins(self) -> None:
+        """See what is installed, and enable, disable or re-enable one."""
+
+        if not self._plugins.status():
+            # Requirement 10, at the keyboard as well as in the drawer: with
+            # nothing installed there is nothing to manage, and an empty modal
+            # is a worse answer than a sentence.
+            self._notify("No plugins installed.")
+            return
+        self.run_worker(
+            self._prompt_plugins(), group="dialogs", exit_on_error=False
+        )
+
+    async def _prompt_plugins(self) -> None:
+        before = tuple(self._plugins.status())
+        after = await self.push_screen(
+            PluginsDialog(before), wait_for_dismiss=True
+        )
+        if after is None:  # nothing changed, or Escape
+            return
+        self._apply_plugin_decisions(before, after)
+
+    def _apply_plugin_decisions(
+        self,
+        before: Sequence[PluginStatus],
+        after: Sequence[PluginStatus],
+    ) -> None:
+        """Carry out what the dialog was told, in one pass and one write.
+
+        The dialog decides nothing and writes nothing -- it hands back a working
+        copy. Everything that costs something happens here: one rewrite of the
+        enable-list however many rows the operator toggled, session disables for
+        what is already loaded, and a rescan only if a *source* changed hands.
+        """
+
+        saved = {row.origin: row for row in before}
+        changed = [row for row in after if saved.get(row.origin) != row]
+        if not changed:
+            return
+
+        # One write for the whole dialog. The target is an INI full of the
+        # operator's comments and the fewer times it is rewritten the fewer
+        # chances there are to lose one -- the same reason RemoteHostsDialog
+        # hands back its whole list rather than reporting each edit.
+        listed = [row.name for row in after if row.source == "user" and row.enabled]
+        if listed != [row.name for row in before if row.source == "user" and row.enabled]:
+            try:
+                persist_setting(self._settings_path, "plugins", ", ".join(listed))
+            except OSError as exc:
+                # The journald switch's behaviour: say so, change nothing, and
+                # let the next render redraw the rows from the registry -- which
+                # is untouched, so they revert.
+                self._notify(f"Could not save the plugin list: {exc}", "error")
+                self._refresh_plugin_status()
+                return
+            self._config = replace(self._config, plugins=tuple(listed))
+            self._adopt_enable_list(listed)
+
+        restarts: list[str] = []
+        touches_sources = False
+
+        for row in changed:
+            was = saved.get(row.origin)
+            records = [
+                record
+                for record in self._plugins.loaded
+                if record.origin == row.origin
+            ]
+            touches_sources = touches_sources or "source" in row.kinds
+
+            if row.reinstate:
+                for record in records:
+                    self._plugins.enable(record.plugin)
+                # The fault goes with the decision to forgive it. Left on the
+                # record it would keep the row reading `failed` after the plugin
+                # was put back -- and, worse, the *next* genuine failure would
+                # collapse into the stale entry as a repeat rather than be
+                # reported as news.
+                self._plugins.errors.discard(row.origin, category="runtime")
+                for record in records:
+                    self._plugins.errors.discard(record.name, category="runtime")
+                continue
+
+            if was is not None and row.enabled == was.enabled:
+                continue
+
+            if row.enabled:
+                for record in records:
+                    self._plugins.enable(record.plugin)
+                if not records:
+                    # Loading is import-time and single-shot (`PLUGIN_TODO.md`,
+                    # "Loading model"), so naming a plugin CLV has never
+                    # imported cannot take effect now. Saying so is the whole
+                    # difference between a control that works and one that looks
+                    # broken.
+                    restarts.append(row.name)
+            else:
+                for record in records:
+                    self._plugins.disable(
+                        record.plugin, OPERATOR_DISABLE_REASON, record=False
+                    )
+
+        if restarts:
+            self._notify(
+                f"Enabled {', '.join(restarts)} in {self._settings_path} — "
+                "restart CLV to load it."
+                if len(restarts) == 1
+                else f"Enabled {', '.join(restarts)} in {self._settings_path} — "
+                "restart CLV to load them."
+            )
+        self._refresh_plugin_status()
+        if touches_sources:
+            self.run_worker(self._rescan(), group="discovery", exit_on_error=False)
+        else:
+            self._render_log()
+
+    def _adopt_enable_list(self, listed: Sequence[str]) -> None:
+        """Bring `discovered` into line with what `settings.conf` now says.
+
+        `DiscoveredPlugin.enabled` records whether the operator had named a
+        plugin *at load time*, and every row's "should this be running" answer
+        rests on it. Left stale it is wrong in the one case with no live plugin
+        to correct it: switch off something that failed to import, and there is
+        no object to mark disabled, so the row goes straight back to reading
+        enabled while the name it needs has already gone from the file.
+        """
+
+        wanted = {name.casefold() for name in listed}
+        self._plugins.discovered[:] = [
+            replace(entry, enabled=entry.name.casefold() in wanted)
+            # A shadowed entry lost its name to something found first and was
+            # never a candidate for the enable-list; naming it does not change
+            # that, and marking it enabled here would say it did.
+            if entry.shadowed_by is None
+            else entry
+            for entry in self._plugins.discovered
+        ]
 
     def _host_statuses(self) -> dict[str, str]:
         """What is already known about each host, without asking any of them.
@@ -4936,6 +5104,10 @@ class LogViewerApp(App[None]):
 
         self._stop_tail()
         self._config = load_config()
+        # Every plugin holds a live view of its own section, so re-reading the
+        # file is all it takes for one to see an edited setting -- no restart,
+        # and no plugin reaching for the settings parser itself.
+        self._plugins.refresh_settings(plugin_settings_for(self._config))
         self._settings_path = get_config_file() or user_config_path()
         refreshed = self._reconcile_backends()
         # The cap can have changed under us, so the session adopts the new one
@@ -5089,7 +5261,12 @@ class LogViewerApp(App[None]):
 
         The index is a position in the **whole** ``exporters`` list, disabled
         entries included: :meth:`_exporter_at` resolves ``plugin:<n>`` by
-        position, so skipping anything here would silently re-target an export.
+        position, so *renumbering* here would silently re-target an export.
+        Omitting a disabled one does not renumber anything — the index it would
+        have had rides in the key of every choice around it — so a plugin the
+        operator switched off, or one a fault took out, is not offered. Without
+        that, the disable control never reaches the one kind an operator is most
+        likely to aim it at.
         """
 
         choices = [
@@ -5104,6 +5281,7 @@ class LogViewerApp(App[None]):
                 needs_path=bool(getattr(exporter, "wants_path", False)),
             )
             for index, exporter in enumerate(self._plugins.exporters)
+            if not self._plugins.is_disabled(exporter)
         ]
         return choices
 
@@ -5236,7 +5414,13 @@ class LogViewerApp(App[None]):
         except (IndexError, ValueError):
             return None
         exporters = self._plugins.exporters
-        return exporters[index] if 0 <= index < len(exporters) else None
+        if not 0 <= index < len(exporters):
+            return None
+        exporter = exporters[index]
+        # Checked again here rather than trusted from the dialog: a request can
+        # outlive the list it was built from — the operator can disable an
+        # exporter from `P` while the export dialog is open.
+        return None if self._plugins.is_disabled(exporter) else exporter
 
     async def _prompt_custom_range(self) -> None:
         dialog = CustomTimeRangeDialog(
@@ -5403,6 +5587,11 @@ class LogViewerApp(App[None]):
             self._prompt_ssh_config_import(), group="dialogs", exit_on_error=False
         )
 
+    def on_advanced_filters_drawer_manage_plugins_requested(
+        self, _message: AdvancedFiltersDrawer.ManagePluginsRequested
+    ) -> None:
+        self.action_manage_plugins()
+
     def on_input_changed(self, event: Input.Changed) -> None:  # type: ignore[override]
         if event.input.id != "query-input":
             return
@@ -5520,6 +5709,11 @@ class LogViewerApp(App[None]):
             return
 
         self._config = replace(self._config, enable_journald=value)
+        # `enable_journald` is aliased into `[plugin:journald]`, so the plugin
+        # reads the switch through its own settings. Refreshing here is what
+        # makes "the plugin re-reads on every scan" true now that it reads a
+        # mapping rather than the file.
+        self._plugins.refresh_settings(plugin_settings_for(self._config))
         self._notify(
             f"systemd journal enabled — written to {self._settings_path}."
             if value
@@ -5732,27 +5926,31 @@ class LogViewerApp(App[None]):
         self._render_log()
 
     def _refresh_plugin_status(self) -> None:
-        parts = []
-        if self._plugins.total:
-            parts.append(
-                f"{len(self._plugins.sources)} source, "
-                f"{len(self._plugins.filters)} filter, "
-                f"{len(self._plugins.exporters)} exporter plugin(s) loaded"
-            )
+        """One line and a way in — no longer the whole plugin surface.
+
+        This string used to carry the counts, the installed-not-enabled hint and
+        the first three errors concatenated with semicolons, which is how a
+        plugin failure reached an operator: truncated, in a line that also had
+        to say how many exporters loaded. The rows are in `PluginsDialog` now,
+        and what is left here is a summary and the button that opens it.
+        """
+
+        rows = self._plugins.status()
+        if not rows:
+            # Requirement 10: nothing installed renders nothing new.
+            self.advanced_drawer.set_plugin_status("", installed=False)
         else:
-            parts.append("No plugins loaded")
-        # Installed but not named in `plugins`. Not an error -- it is the
-        # designed resting state of a user plugin -- so it is said here rather
-        # than in the log panel's amber problem channel. Phase 4 replaces this
-        # whole string with a row per plugin.
-        available = self._plugins.available()
-        if available:
-            parts.append(f"{len(available)} installed, not enabled")
-        if self._plugins.errors:
-            parts.append(f"{len(self._plugins.errors)} failed: " + "; ".join(
-                str(error) for error in self._plugins.errors[:3]
-            ))
-        self.advanced_drawer.set_plugin_status(" · ".join(parts))
+            counted: dict[str, int] = {}
+            for row in rows:
+                counted[row.state] = counted.get(row.state, 0) + 1
+            # Fixed order, so the line does not reshuffle as states change --
+            # and problems last, where the eye stops.
+            summary = ", ".join(
+                f"{counted[state]} {state}"
+                for state in ("loaded", "not enabled", "incompatible", "failed")
+                if counted.get(state)
+            )
+            self.advanced_drawer.set_plugin_status(f"Plugins: {summary}  (P)")
         # Read-only, so an operator can see what Ctrl+E offers without opening
         # the dialog.
         self.advanced_drawer.set_export_status(
@@ -5775,6 +5973,10 @@ class LogViewerApp(App[None]):
         closer = getattr(self._backends, "close", None)
         if closer is not None:
             closer()
+        # After the readers, so a plugin cannot resurrect a source on its way
+        # out; before the save, so a teardown that raises still leaves the
+        # session persisted.
+        self._plugins.shutdown()
         if self._persist_state:
             # Persist as-is: the selected source is deliberately kept so the
             # next launch reopens it.
