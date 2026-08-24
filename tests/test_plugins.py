@@ -13,6 +13,7 @@ import pytest
 
 from clv.plugins import (
     MAX_PLUGIN_ERRORS,
+    OPERATOR_DISABLE_REASON,
     PLUGIN_PATH_ENV,
     USER_PLUGIN_PACKAGE,
     DiscoveredPlugin,
@@ -1228,8 +1229,12 @@ def test_a_named_but_absent_plugin_is_reported_by_name(user_root) -> None:
 
     assert [stage.name for stage in registry.filters] == ["present"]
     assert len(registry.errors) == 1
-    assert "typo_here" in registry.errors[0].message
+    # Reported *as* the name rather than merely mentioning it: the management
+    # UI builds a row from the origin, and a row has to know which plugin it is.
+    assert registry.errors[0].origin == "typo_here"
+    assert registry.errors[0].category == "missing"
     assert str(root) in registry.errors[0].message
+    assert "typo_here" in str(registry.errors[0])
 
 
 def test_a_missing_or_empty_root_is_a_silent_non_event(tmp_path, monkeypatch) -> None:
@@ -1293,7 +1298,7 @@ def test_a_named_plugin_with_no_plugin_directory_still_says_so() -> None:
     registry = _user(roots=[], enabled=["redact_secrets"])
 
     assert len(registry.errors) == 1
-    assert "redact_secrets" in registry.errors[0].message
+    assert registry.errors[0].origin == "redact_secrets"
     assert "no plugin directory" in registry.errors[0].message
 
 
@@ -1402,3 +1407,646 @@ def test_the_registry_reports_where_each_plugin_was_found(user_root) -> None:
     )
     assert found["disabled_one"].enabled is False
     assert all(entry.root == root for entry in registry.discovered)
+
+
+# --- the state the management UI is built from -------------------------------
+
+
+class DualPurpose(LogSourceProvider, FilterStage):
+    """Both a provider and a stage, which used to be one of them silently.
+
+    ``add()`` filed with ``if/elif/else``, so this landed in ``sources`` alone
+    and ``apply()`` was never called — a plugin doing half of what it declares,
+    with no diagnosis anywhere, because from the outside it *had* loaded.
+    """
+
+    name = "dual"
+
+    def discover(self):
+        return [Path("/virtual/dual.log")]
+
+    def open(self, path):
+        yield "dual line"
+
+    def apply(self, entry, context):
+        return replace(entry, raw=f"[dual] {entry.raw}")
+
+
+def test_a_plugin_is_filed_under_every_interface_it_implements() -> None:
+    registry = _registry(DualPurpose())
+
+    assert [p.name for p in registry.sources] == ["dual"]
+    assert [p.name for p in registry.filters] == ["dual"]
+    assert registry.loaded[0].kinds == ("source", "filter")
+
+
+def test_both_halves_of_a_two_interface_plugin_actually_run() -> None:
+    """The registration fix is behaviour, not a label on a row."""
+
+    registry = _registry(DualPurpose())
+    entries = parse_lines(["2026-08-07 09:25:01 - INFO - hello"])
+
+    assert registry.apply_filters(entries, CONTEXT)[0].raw.startswith("[dual] ")
+    assert [str(source.path) for source in registry.discover_sources()] == [
+        "/virtual/dual.log"
+    ]
+
+
+def test_a_loaded_plugin_remembers_where_it_came_from() -> None:
+    registry = PluginRegistry()
+    registry.add(Redactor(), origin="clv.plugins.filters.redact", clv_version="2.1.0")
+
+    assert registry.loaded[0].origin == "clv.plugins.filters.redact"
+    assert registry.loaded[0].name == "redactor"
+
+
+def test_an_operator_disable_is_not_recorded_as_a_problem() -> None:
+    """`errors` is the amber channel; a plugin doing as it was told is not one."""
+
+    registry = _registry(Redactor())
+    stage = registry.filters[0]
+
+    registry.disable(stage, OPERATOR_DISABLE_REASON, record=False)
+
+    assert registry.is_disabled(stage)
+    assert registry.errors == []
+    assert registry.status()[0].state == "not enabled"
+
+
+def test_discarding_lets_the_next_failure_count_from_one() -> None:
+    """Why re-enabling has to forget, and not merely stop reporting.
+
+    `PluginErrors` collapses a repeat into the entry it already holds. Left in
+    place, the fault that disabled a plugin would swallow the *next* genuine
+    failure as a repeat of something already dealt with.
+    """
+
+    errors = PluginErrors()
+    errors.append(PluginError("noisy", "raised: boom", category="runtime"))
+    errors.append(PluginError("noisy", "raised: boom", category="runtime"))
+    assert errors[0].count == 2
+
+    assert errors.discard("noisy", category="runtime") == 1
+    assert errors == []
+
+    errors.append(PluginError("noisy", "raised: boom", category="runtime"))
+    assert errors[0].count == 1
+
+
+def test_discarding_by_category_leaves_the_load_time_diagnosis_alone() -> None:
+    errors = PluginErrors()
+    errors.append(PluginError("noisy", "import failed: no", category="load"))
+    errors.append(PluginError("noisy", "raised: boom", category="runtime"))
+
+    errors.discard("noisy", category="runtime")
+
+    assert [error.message for error in errors] == ["import failed: no"]
+
+
+def test_status_is_empty_when_nothing_is_installed() -> None:
+    """Requirement 10: a build with no plugins has nothing to say."""
+
+    assert PluginRegistry().status() == []
+
+
+def test_status_tells_the_five_conditions_apart(user_root) -> None:
+    """The row an operator reads, for each way a plugin can be.
+
+    One registry with all of it at once, because the point of the merge is that
+    `loaded`, `discovered` and `errors` are three collections describing one
+    fact and the UI must not have to join them itself.
+    """
+
+    root = user_root()
+    _plugin(root, "works")
+    _plugin(root, "waiting")
+    (root / "broken.py").write_text("raise RuntimeError('nope')\n", encoding="utf-8")
+    (root / "future.py").write_text(
+        "from clv.api import FilterStage\n"
+        "class F(FilterStage):\n"
+        "    name = 'future'\n"
+        "    requires_clv = '>=99.0'\n"
+        "    def apply(self, entry, context):\n"
+        "        return entry\n",
+        encoding="utf-8",
+    )
+
+    registry = _user(enabled=["works", "broken", "future"])
+    rows = {row.name: row for row in registry.status()}
+
+    assert rows["works"].state == "loaded"
+    assert rows["works"].kinds == ("filter",)
+    assert rows["waiting"].state == "not enabled"
+    assert rows["broken"].state == "failed"
+    assert "nope" in rows["broken"].detail
+    assert rows["future"].state == "incompatible"
+    # Both versions named, which is what makes the row actionable.
+    assert ">=99.0" in rows["future"].detail and "2.1.0" in rows["future"].detail
+    assert {row.source for row in registry.status()} == {"user"}
+
+
+def test_status_reports_a_name_that_matches_nothing_on_disk(user_root) -> None:
+    user_root()
+
+    rows = _user(enabled=["typo_here"]).status()
+
+    assert [row.name for row in rows] == ["typo_here"]
+    assert rows[0].state == "failed"
+    assert "settings.conf" in rows[0].detail
+
+
+def test_a_runtime_failure_reaches_the_row_through_the_plugins_own_name() -> None:
+    """The join that is easy to get wrong.
+
+    A load-time error is recorded against the origin; `disable()` records
+    against the plugin's own name, which is right for the message and is not the
+    key the row is built on.
+    """
+
+    registry = PluginRegistry()
+    registry.add(Exploding(), origin="/plugins/exploding", clv_version="2.1.0")
+    entries = parse_lines(["2026-08-07 09:25:01 - INFO - x"])
+    registry.apply_filters(entries, CONTEXT)
+
+    row = registry.status()[0]
+    assert row.name == "exploding"
+    assert row.state == "failed"
+    assert row.category == "runtime"
+    assert "boom" in row.detail
+
+
+def test_status_orders_user_plugins_ahead_of_bundled_and_entry_points() -> None:
+    registry = PluginRegistry()
+    registry.add(Redactor(), origin="clv.plugins.filters.zzz", clv_version="2.1.0")
+    registry.add(DropDebug(), origin="clv.plugins:aaa", clv_version="2.1.0")
+    registry.add(DemoExporter(), origin="/home/x/.config/clv/plugins/mmm", clv_version="2.1.0")
+
+    rows = registry.status()
+
+    assert [row.source for row in rows] == ["user", "bundled", "entry point"]
+    assert [row.name for row in rows] == ["mmm", "zzz", "aaa"]
+
+
+def test_a_shadowed_plugin_is_explained_rather_than_called_broken(user_root) -> None:
+    first = user_root("first")
+    second = user_root("second")
+    _plugin(first, "same", name="winner")
+    _plugin(second, "same", name="loser")
+
+    rows = [row for row in _user(enabled=["same"]).status() if row.name == "same"]
+
+    assert len(rows) == 2
+    states = {row.state for row in rows}
+    assert states == {"loaded", "not enabled"}
+    shadowed = next(row for row in rows if row.state == "not enabled")
+    assert "shadowed by" in shadowed.detail
+
+
+# --- ordering ---------------------------------------------------------------
+#
+# Before `priority`, two stages that both took the default composed in whatever
+# order `pkgutil.iter_modules` listed them — so the same two plugins could
+# redact-then-rewrite on one machine and rewrite-then-redact on another, with
+# nothing in either file to say which. These pin the replacement rule: ascending
+# priority, ties by name, settled once at load.
+
+
+class _Ordered(FilterStage):
+    """A stage that appends its own name, so composition is readable."""
+
+    def __init__(self, name: str, priority: int = 100) -> None:
+        self.name = name
+        self.priority = priority
+
+    def apply(self, entry, context):
+        return replace(entry, raw=f"{entry.raw}{self.name}")
+
+
+def _composed(registry: PluginRegistry) -> str:
+    entry = parse_lines(["seed"])[0]
+    return registry.apply_filters([entry], CONTEXT)[0].raw
+
+
+def test_stages_run_in_ascending_priority() -> None:
+    registry = _registry(
+        _Ordered("c", priority=300), _Ordered("a", priority=100), _Ordered("b", 200)
+    )
+    registry.order()
+
+    assert _composed(registry) == "seedabc"
+
+
+def test_equal_priorities_are_name_ordered_whatever_the_load_order() -> None:
+    """The tie-break, asserted against a shuffled load order.
+
+    Name order is not meaningful; it is *predictable*, which is the whole
+    property an author needs to design around.
+    """
+
+    import random
+
+    for seed in range(8):
+        names = ["delta", "alpha", "charlie", "bravo"]
+        random.Random(seed).shuffle(names)
+        registry = _registry(*(_Ordered(name) for name in names))
+        registry.order()
+
+        assert _composed(registry) == "seedalphabravocharliedelta"
+
+
+def test_priority_beats_name() -> None:
+    registry = _registry(_Ordered("aaa", priority=500), _Ordered("zzz", priority=1))
+    registry.order()
+
+    assert _composed(registry) == "seedzzzaaa"
+
+
+def test_a_plugin_that_declares_no_priority_lands_on_the_default() -> None:
+    from clv.plugins import plugin_sort_key
+
+    assert Redactor.priority == 100
+    assert plugin_sort_key(Redactor()) == (100, "redactor")
+
+
+def test_a_nonsense_priority_is_read_as_the_default_rather_than_raising() -> None:
+    """A typo in one attribute should mis-order a plugin, not kill the sort."""
+
+    from clv.plugins import plugin_sort_key
+
+    broken = _Ordered("broken")
+    broken.priority = "soon"  # type: ignore[assignment]
+
+    assert plugin_sort_key(broken) == (100, "broken")
+
+    registry = _registry(broken, _Ordered("aaa"))
+    registry.order()
+    assert _composed(registry) == "seedaaabroken"
+
+
+def test_every_ordered_registry_is_sorted_not_only_the_filters() -> None:
+    class _Source(LogSourceProvider):
+        def __init__(self, name, priority):
+            self.name, self.priority = name, priority
+
+        def discover(self):
+            return []
+
+        def open(self, path):
+            return iter(())
+
+    class _Exporter(Exporter):
+        def __init__(self, name, priority):
+            self.name, self.priority = name, priority
+
+        def export(self, entries, context, *, destination=None):
+            return ExportResult(ok=True)
+
+    registry = _registry(
+        _Source("late-source", 900),
+        _Exporter("late-exporter", 900),
+        _Source("early-source", 1),
+        _Exporter("early-exporter", 1),
+    )
+    registry.order()
+
+    assert [p.name for p in registry.sources] == ["early-source", "late-source"]
+    assert [p.name for p in registry.exporters] == ["early-exporter", "late-exporter"]
+
+
+def test_load_plugins_orders_what_it_loaded(user_root) -> None:
+    root = user_root()
+    (root / "zzz_first.py").write_text(
+        _STAGE.format(name="zzz_first").replace(
+            'name = "zzz_first"', 'name = "zzz_first"\n    priority = 10'
+        ),
+        encoding="utf-8",
+    )
+    _plugin(root, "aaa_second")
+
+    registry = _user(enabled=["zzz_first", "aaa_second"])
+
+    assert [stage.name for stage in registry.filters] == ["zzz_first", "aaa_second"]
+
+
+def test_ordering_does_not_happen_inside_add() -> None:
+    """A plugin added after load stays where it was put.
+
+    ``app.py`` reads back the stage it just registered as ``filters[-1]``, and
+    the export dialog addresses ``exporters`` positionally as ``plugin:<index>``.
+    Both rest on the lists being append-only once loading is over.
+    """
+
+    registry = _registry(_Ordered("zzz", priority=1))
+    registry.add(_Ordered("aaa", priority=999), origin="test", clv_version="2.1.0")
+
+    assert [stage.name for stage in registry.filters] == ["zzz", "aaa"]
+
+
+# --- per-plugin configuration -----------------------------------------------
+
+
+class _Configurable(FilterStage):
+    name = "configurable"
+
+    def __init__(self) -> None:
+        self.settings = None
+        self.calls = 0
+
+    def configure(self, settings):
+        self.settings = settings
+        self.calls += 1
+
+    def apply(self, entry, context):
+        return entry
+
+
+def test_a_section_reaches_its_own_plugin_and_nothing_elses() -> None:
+    mine, theirs = _Configurable(), _Configurable()
+    registry = PluginRegistry()
+    registry.refresh_settings({"mine": {"colour": "green"}})
+    registry.add(mine, origin="/plugins/mine", clv_version="2.1.0")
+    registry.add(theirs, origin="/plugins/theirs", clv_version="2.1.0")
+
+    assert dict(mine.settings) == {"colour": "green"}
+    assert dict(theirs.settings) == {}
+
+
+def test_a_plugin_with_no_section_is_configured_with_an_empty_mapping() -> None:
+    """Empty is the common case and must never read as an error."""
+
+    plugin = _Configurable()
+    _registry(plugin)
+
+    assert plugin.calls == 1
+    assert dict(plugin.settings) == {}
+
+
+def test_the_settings_mapping_is_read_only() -> None:
+    plugin = _Configurable()
+    _registry(plugin)
+
+    with pytest.raises(TypeError):
+        plugin.settings["nope"] = "1"  # type: ignore[index]
+
+
+def test_the_settings_mapping_is_live_rather_than_a_snapshot() -> None:
+    """The mechanism the journal switch rests on.
+
+    A plugin keeps the view it was handed; CLV updates the dict behind it. If
+    ``refresh_settings`` replaced the dict instead of clearing it, every view
+    already handed out would be stranded on the old values — and the plugin
+    would go on reporting them forever, with nothing to say it had.
+    """
+
+    plugin = _Configurable()
+    registry = PluginRegistry()
+    registry.refresh_settings({"mine": {"colour": "green"}})
+    registry.add(plugin, origin="/plugins/mine", clv_version="2.1.0")
+    handed_out = plugin.settings
+
+    registry.refresh_settings({"mine": {"colour": "red"}})
+
+    assert plugin.settings is handed_out
+    assert dict(handed_out) == {"colour": "red"}
+    assert plugin.calls == 1, "the plugin is not reconfigured; the values move"
+
+
+def test_a_deleted_section_empties_rather_than_stranding_the_view() -> None:
+    plugin = _Configurable()
+    registry = PluginRegistry()
+    registry.refresh_settings({"mine": {"colour": "green"}})
+    registry.add(plugin, origin="/plugins/mine", clv_version="2.1.0")
+
+    registry.refresh_settings({})
+
+    assert dict(plugin.settings) == {}
+
+
+def test_a_bundled_plugin_is_configured_under_its_module_name() -> None:
+    """`[plugin:journald]`, not `[plugin:systemd journal]`.
+
+    The section name is the word the operator already writes in the enable-list,
+    so a plugin has one name and not two.
+    """
+
+    plugin = _Configurable()
+    registry = PluginRegistry()
+    registry.refresh_settings({"journald": {"enabled": "true"}})
+    registry.add(
+        plugin, origin="clv.plugins.sources.journald", clv_version="2.1.0"
+    )
+
+    assert dict(plugin.settings) == {"enabled": "true"}
+
+
+def test_a_section_for_an_absent_plugin_is_reported_as_such(user_root) -> None:
+    user_root()
+
+    registry = _user(settings={"ghost": {"a": "1"}})
+
+    assert [error.origin for error in registry.errors] == ["plugin:ghost"]
+    assert "no such plugin is loaded" in registry.errors[0].message
+
+
+def test_a_section_for_an_installed_but_unenabled_plugin_says_so(user_root) -> None:
+    """A different problem, so a different sentence.
+
+    "You tuned it but never turned it on" sends the operator to the enable-list;
+    "no such plugin" sends them to look for a missing file. Telling them the
+    wrong one costs them the search.
+    """
+
+    root = user_root()
+    _plugin(root, "redact_secrets")
+
+    registry = _user(settings={"redact_secrets": {"replacement": "***"}})
+
+    assert [error.origin for error in registry.errors] == ["plugin:redact_secrets"]
+    assert "not enabled" in registry.errors[0].message
+
+
+def test_a_section_for_a_plugin_that_loaded_is_not_reported(user_root) -> None:
+    root = user_root()
+    _plugin(root, "redact_secrets")
+
+    registry = _user(
+        enabled=["redact_secrets"], settings={"redact_secrets": {"a": "1"}}
+    )
+
+    assert registry.errors == []
+
+
+def test_an_empty_section_configures_nothing_and_is_not_reported(user_root) -> None:
+    """A bare ``[plugin:x]`` header sets nothing, so there is nothing to warn about."""
+
+    user_root()
+
+    assert _user(settings={"ghost": {}}).errors == []
+
+
+# --- the coercion helpers ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("true", True), ("True", True), ("TRUE", True), (" yes ", True),
+        ("on", True), ("1", True),
+        ("false", False), ("no", False), ("off", False), ("0", False),
+        ("", False), ("nonsense", False),
+    ],
+)
+def test_setting_bool_agrees_with_configparser(raw, expected) -> None:
+    from clv.api import setting_bool
+
+    assert setting_bool({"k": raw}, "k") is expected
+
+
+def test_setting_bool_falls_back_to_the_default() -> None:
+    """Absent *and* unreadable are the default. A typo must not disable a plugin."""
+
+    from clv.api import setting_bool
+
+    assert setting_bool({}, "k", True) is True
+    assert setting_bool({"k": "maybe"}, "k", True) is True
+    assert setting_bool({}, "k") is False
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("a, b, c", ["a", "b", "c"]),
+        (" a ,, b ", ["a", "b"]),
+        ('"a", \'b\'', ["a", "b"]),
+        ("", []),
+        ("solo", ["solo"]),
+    ],
+)
+def test_setting_list_parses_as_log_dirs_does(raw, expected) -> None:
+    from clv.api import setting_list
+
+    assert setting_list({"k": raw}, "k") == expected
+
+
+def test_setting_list_of_an_absent_key_is_empty() -> None:
+    from clv.api import setting_list
+
+    assert setting_list({}, "k") == []
+
+
+# --- lifecycle --------------------------------------------------------------
+
+
+class _Lifecycle(FilterStage):
+    """Records what it was asked to do, and can be told to fail one hook."""
+
+    def __init__(self, name: str = "lifecycle", fail: str = "") -> None:
+        self.name = name
+        self._fail = fail
+        self.events: list[str] = []
+
+    def _note(self, hook: str) -> None:
+        self.events.append(hook)
+        if self._fail == hook:
+            raise RuntimeError(f"{hook} exploded")
+
+    def configure(self, settings):
+        self._note("configure")
+
+    def setup(self):
+        self._note("setup")
+
+    def teardown(self):
+        self._note("teardown")
+
+    def apply(self, entry, context):
+        return entry
+
+
+def test_the_hooks_run_in_order_once_each() -> None:
+    plugin = _Lifecycle()
+    registry = _registry(plugin)
+    registry.start()
+    registry.shutdown()
+
+    assert plugin.events == ["configure", "setup", "teardown"]
+
+
+def test_start_and_shutdown_are_idempotent() -> None:
+    """``on_unmount`` is not guaranteed to fire exactly once."""
+
+    plugin = _Lifecycle()
+    registry = _registry(plugin)
+    registry.start()
+    registry.start()
+    registry.shutdown()
+    registry.shutdown()
+
+    assert plugin.events == ["configure", "setup", "teardown"]
+
+
+def test_a_plugin_with_none_of_the_hooks_behaves_exactly_as_before() -> None:
+    registry = _registry(Redactor())
+    registry.start()
+    entries = parse_lines(["a password here"])
+    assert registry.apply_filters(entries, CONTEXT)[0].raw == "a ****** here"
+    registry.shutdown()
+
+    assert registry.errors == []
+    assert not registry.is_disabled(registry.filters[0])
+
+
+@pytest.mark.parametrize("hook", ["configure", "setup", "teardown"])
+def test_a_raising_hook_disables_the_plugin_and_records_once(hook) -> None:
+    plugin = _Lifecycle(fail=hook)
+    registry = _registry(plugin)
+    registry.start()
+    registry.shutdown()
+
+    assert registry.is_disabled(plugin)
+    assert len(registry.errors) == 1
+    assert f"{hook}() raised" in registry.errors[0].message
+    assert registry.errors[0].origin == "lifecycle"
+
+
+def test_a_failed_configure_means_setup_is_never_called() -> None:
+    """Half-built is not a state a later hook should have to survive."""
+
+    plugin = _Lifecycle(fail="configure")
+    registry = _registry(plugin)
+    registry.start()
+    registry.shutdown()
+
+    assert plugin.events == ["configure"]
+
+
+def test_a_failed_setup_means_teardown_is_never_called() -> None:
+    plugin = _Lifecycle(fail="setup")
+    registry = _registry(plugin)
+    registry.start()
+    registry.shutdown()
+
+    assert plugin.events == ["configure", "setup"]
+
+
+def test_a_raising_teardown_does_not_stop_the_others() -> None:
+    first = _Lifecycle("first", fail="teardown")
+    second = _Lifecycle("second")
+    registry = _registry(first, second)
+    registry.start()
+    registry.shutdown()
+
+    assert second.events == ["configure", "setup", "teardown"]
+    assert len(registry.errors) == 1
+
+
+def test_a_broken_stage_is_not_torn_down() -> None:
+    """It never acquired anything; ``apply`` took it out of service first."""
+
+    plugin = _Lifecycle("boom")
+    registry = _registry(plugin)
+    registry.start()
+    registry.disable(plugin, "taken out by something else")
+    registry.shutdown()
+
+    assert plugin.events == ["configure", "setup"]
