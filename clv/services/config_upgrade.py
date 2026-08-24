@@ -20,9 +20,12 @@ What survives a merge, and what does not:
 
 * every value ``[log_viewer]`` set, written into the new template *in the new
   template's position*, keeping the new prose;
-* every ``[ssh:<name>]`` section, copied byte-identical -- including one the
-  parser rejects. A host with a bad port never reaches ``LogConfig.hosts``, so
-  code that regenerated sections from parsed state would silently delete it;
+* every ``[ssh:<name>]`` and ``[plugin:<name>]`` section, copied
+  byte-identical -- including one the parser rejects. A host with a bad port
+  never reaches ``LogConfig.hosts``, so code that regenerated sections from
+  parsed state would silently delete it, and the same argument covers a plugin
+  section whose keys this version of CLV knows nothing about: what a key means
+  is the plugin's business, so the merge may not decide it is unused;
 * options this version no longer documents, kept under a banner rather than
   dropped, which is also what preserves a refused ``password =`` so it keeps
   producing its warning;
@@ -44,6 +47,7 @@ from typing import Optional
 from .config import (
     CONFIG_SECTION,
     CONFIG_VERSION_OPTION,
+    PLUGIN_SECTION_PREFIX,
     SSH_SECTION_PREFIX,
     _text_names_sources,
     config_version_of,
@@ -90,6 +94,7 @@ class UpgradeResult:
     backup_path: Optional[Path] = None
     carried: tuple[str, ...] = ()
     hosts: tuple[str, ...] = ()
+    plugins: tuple[str, ...] = ()
     error: str = ""
 
     @property
@@ -156,7 +161,7 @@ def upgrade_user_settings(
             ),
         )
 
-    merged, carried, hosts = _merge(existing, latest)
+    merged, carried, hosts, plugins = _merge(existing, latest)
 
     # The same guard ``ensure_user_settings_file`` applies to the template: a
     # settings file with no log_dirs is a viewer with nothing in it, and that is
@@ -200,13 +205,14 @@ def upgrade_user_settings(
         backup_path=backup_path,
         carried=carried,
         hosts=hosts,
+        plugins=plugins,
     )
 
 
 def _merge(
     existing: SettingsDocument, latest: int
-) -> tuple[SettingsDocument, tuple[str, ...], tuple[str, ...]]:
-    """The shipped template, wearing the operator's values and hosts."""
+) -> tuple[SettingsDocument, tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """The shipped template, wearing the operator's values, hosts and plugins."""
 
     merged = SettingsDocument(default_config_text().splitlines())
     documented = set(merged.options(CONFIG_SECTION))
@@ -231,16 +237,31 @@ def _merge(
             ],
         )
 
-    hosts: list[str] = []
+    # Every prefixed section is copied out, in file order, whatever the prefix.
+    # Driven by the prefix table rather than by `ssh:` alone because the loop
+    # that only knew about hosts *deleted* a `[plugin:<name>]` section on every
+    # upgrade -- silently, since nothing else in the file changed and the
+    # operator's plugin simply started running on its defaults. The rule is that
+    # a section this module does not understand is copied, not that there are
+    # two kinds of section it happens to know.
+    kept: dict[str, list[str]] = {SSH_SECTION_PREFIX: [], PLUGIN_SECTION_PREFIX: []}
     spans = spans_of(existing.lines)
     for position, span in enumerate(spans):
-        if not span.name.startswith(SSH_SECTION_PREFIX):
+        prefix = next(
+            (name for name in kept if span.name.startswith(name)), None
+        )
+        if prefix is None:
             continue
-        hosts.append(span.name[len(SSH_SECTION_PREFIX) :])
+        kept[prefix].append(span.name[len(prefix) :])
         merged.append_lines(_block(existing.lines, spans, position))
 
     merged.set(CONFIG_SECTION, CONFIG_VERSION_OPTION, str(latest))
-    return merged, tuple(carried), tuple(hosts)
+    return (
+        merged,
+        tuple(carried),
+        tuple(kept[SSH_SECTION_PREFIX]),
+        tuple(kept[PLUGIN_SECTION_PREFIX]),
+    )
 
 
 def _block(
@@ -312,6 +333,11 @@ def describe(result: UpgradeResult) -> str:
         lines.append(f"  Previous file saved as {result.backup_path}")
     if result.hosts:
         lines.append(f"  Kept {len(result.hosts)} host(s): {', '.join(result.hosts)}")
+    if result.plugins:
+        lines.append(
+            f"  Kept settings for {len(result.plugins)} plugin(s): "
+            f"{', '.join(result.plugins)}"
+        )
     if result.carried:
         lines.append(
             f"  Carried over {len(result.carried)} option(s) this version does not "
