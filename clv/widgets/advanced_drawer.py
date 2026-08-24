@@ -170,6 +170,13 @@ class AdvancedFiltersDrawer(Static):
         padding: 0 1;
     }
 
+    /* Requirement 10: a build with no plugins renders nothing new. The button
+       goes rather than being disabled — a control that cannot do anything is
+       still a question the operator has to answer. Class, not `.styles.*`:
+       styling is CSS-only by doctrine, and `-merged` and `-compact` above are
+       the pattern. */
+    AdvancedFiltersDrawer.-no-plugins #manage-plugins { display: none; }
+
     AdvancedFiltersDrawer #view-toggles {
         height: auto;
         width: 1fr;
@@ -363,6 +370,14 @@ class AdvancedFiltersDrawer(Static):
         # file, not a setting that stays on.
         with Container(id="drawer-actions"):
             yield Button("Scan SSH config", id="scan-ssh-config")
+            # A fourth button for the fifth time, and for the reason recorded
+            # above it four times already: `#drawer-actions` is
+            # `layout: horizontal`, so this costs *zero* rows against
+            # `max-height: 16`, while the plugin *section* the phase originally
+            # asked for is one row per installed plugin — which is what pushes
+            # everything below it off the fold. The rows live in `PluginsDialog`,
+            # which `P` also opens.
+            yield Button("Plugins", id="manage-plugins")
             yield Button("Rescan sources", id="rescan-sources", variant="primary")
             yield Button("Close", id="close-advanced")
 
@@ -372,7 +387,20 @@ class AdvancedFiltersDrawer(Static):
     def settings(self) -> AdvancedSettings:
         return self._settings
 
-    def set_plugin_status(self, text: str) -> None:
+    def set_plugin_status(self, text: str, *, installed: bool = True) -> None:
+        """Summarise the plugins in one line, and offer the way in.
+
+        A summary rather than the surface it used to be: this line once carried
+        the counts, the not-yet-enabled hint *and* the first three errors
+        concatenated with semicolons, which is how a plugin failure reached an
+        operator. The rows moved to `PluginsDialog`; what is left here is the
+        count and a button.
+
+        *installed* False hides the button and empties the line — nothing
+        installed, nothing new on screen.
+        """
+
+        self.set_class(not installed, "-no-plugins")
         try:
             self.query_one("#plugin-status", Static).update(text)
         except NoMatches:
@@ -583,6 +611,9 @@ class AdvancedFiltersDrawer(Static):
         if event.button.id == "scan-ssh-config":
             event.stop()
             self.post_message(self.ScanSSHConfigRequested())
+        elif event.button.id == "manage-plugins":
+            event.stop()
+            self.post_message(self.ManagePluginsRequested())
         elif event.button.id == "rescan-sources":
             event.stop()
             self.post_message(self.RescanRequested())
@@ -646,6 +677,14 @@ class AdvancedFiltersDrawer(Static):
         read that file, does not know what a host is, and does not write
         ``settings.conf``. The app owns the scan, the picker and the write —
         which is the same division the SSH switch above already follows.
+        """
+
+    class ManagePluginsRequested(Message):
+        """The operator asked to see what is installed and act on it.
+
+        Carries nothing, for the reason `ScanSSHConfigRequested` carries
+        nothing: this drawer does not know what a plugin is, does not hold the
+        registry, and does not write `settings.conf`. The app owns all three.
         """
 
     class Closed(Message):
