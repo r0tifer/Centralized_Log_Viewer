@@ -417,13 +417,19 @@ shared globals or reaching into another widget's tree.
 
 ## Plugins
 
-Three interfaces in `clv/plugins/__init__.py`:
+Six interfaces in `clv/plugins/__init__.py`:
 
 | Interface | Method | Purpose |
 | --- | --- | --- |
 | `LogSourceProvider` | `discover()`, `open(path)`, optional `open_reader(path)` | New ingestion backends |
+| `LogFormat` | `parse(line) -> LogEntry \| None` | Teach CLV a line shape no built-in matcher recognises |
+| `QueryOperator` | `test(stored, value) -> bool` | A comparison token the query grammar does not have |
+| `ComputedField` | `value(entry) -> str \| None` | A queryable field derived rather than parsed |
 | `FilterStage` | `apply(entry, context) -> LogEntry \| None` | Transform or drop entries |
 | `Exporter` | `export(entries, context) -> ExportResult` | Send the current view somewhere |
+
+Published as a versioned surface in `clv/api.py` — that, not this module, is
+what a plugin imports. See `clv/plugins/AGENTS.md`.
 
 Loaded from `clv/plugins/{sources,filters,exporters}/` drop-ins (via a
 `register()` function or `__all__`) and from the `clv.plugins` entry point
@@ -493,7 +499,7 @@ installed" — the trade Item 12 asked for.
   and `workspace` fixtures, and every assertion runs against another backend —
   which is how `RemoteBackend` is held to the same behaviour as `LocalBackend`.
 
-Run: `python -m pytest` (1557 passed, 1 skipped, 11 deselected) on **both** 3.11
+Run: `python -m pytest` (2042 passed, 1 skipped, 11 deselected) on **both** 3.11
 and 3.14 — the local default is 3.14 and a green suite there is not evidence
 that the supported floor still works.
 

@@ -46,8 +46,10 @@ Judge it the same way: by who wrote it and whether you read it.
 ### What isolation does and does not do
 
 **Today there is none.** Every plugin runs in CLV's process. A plugin that
-hangs, leaks memory or spins the CPU cannot be stopped — CLV can catch an
-exception, and that is the whole of the containment that exists.
+hangs or leaks memory cannot be stopped. CLV can catch an exception, and it can
+disable a stage that is repeatedly *slow* on the render path (see
+[Performance](#performance)) — but a budget only works on code that returns, and
+neither of those is isolation.
 
 When isolation arrives it will be **failure containment, not safety**: a
 subprocess host can be killed on crash, hang or timeout, which is the first
@@ -87,10 +89,32 @@ evidence of care. It is not evidence of safety.
 
 Each plugin is a Python module or package located in one of the following:
 
-1. Local development folder: `clv/plugins/`
-2. Installed entry point: via Python package (declared in `pyproject.toml`)
+1. **The user plugin directory**, `~/.config/clv/plugins/` — where a plugin
+   somebody else wrote gets installed. Either `my_plugin.py` or a directory
+   `my_plugin/` with an `__init__.py`; both load the same way.
+2. **`CLV_PLUGIN_PATH`** — extra directories, `os.pathsep`-separated, searched
+   ahead of the user directory. A development and test mechanism.
+3. **Bundled drop-ins**, `clv/plugins/` and its `sources/`, `filters/` and
+   `exporters/` subpackages — for a plugin shipped as part of CLV.
+4. **Installed entry point** — a Python package advertising the `clv.plugins`
+   entry point group in its `pyproject.toml`.
 
 ### Example Structure
+
+A plugin an operator installed:
+
+```
+~/.config/clv/
+  settings.conf         # plugins = redact_filter, nginx_format
+  plugins/
+    README.txt          # written by CLV on first run
+    redact_filter.py
+    nginx_format/
+      __init__.py
+      patterns.py
+```
+
+One shipped with CLV:
 
 ```
 clv/
@@ -114,7 +138,7 @@ Each plugin must define a class implementing one of the **Abstract Base Classes 
 Provides a new source of logs to tail or read.
 
 ```python
-from clv.plugins import LogSourceProvider
+from clv.api import LogSourceProvider
 
 class MySource(LogSourceProvider):
     name = "My Custom Source"
@@ -135,10 +159,13 @@ group in the source tree, and selecting one opens it like any other source.
 Return `ProviderSource(path, label)` records rather than bare identifiers when
 you have a better name than the identifier's last component.
 
-**A provider source is not a file, and CLV does not treat it as one.** Starring,
-include/exclude globs and rotated-set grouping all test for a real `Path` and
-skip yours. That is deliberate rather than an omission: a provider identifier
-persisted into `session.json` would be a path that does not exist.
+**A provider source is not a file, and CLV does not treat it as one.**
+Include/exclude globs describe a directory walk and rotated-set grouping is name
+arithmetic over files that rotate, so both refuse a provider identifier by name.
+Starring and merging used to be on that list and are not any more — see
+[Reversed](#reversed): a persisted *identifier* is not a persisted path, and a
+journal unit is exactly the source an operator wants starred and compared across
+a fleet.
 
 #### Tailing a live source
 
@@ -221,7 +248,7 @@ class TagUnknownHosts(FilterStage):
 
 ```python
 from dataclasses import replace
-from clv.plugins import FilterStage
+from clv.api import FilterStage
 
 class RedactFilter(FilterStage):
     name = "RedactSensitiveData"
@@ -244,7 +271,190 @@ class DropDebug(FilterStage):
 
 Stages run *before* the user's query, severity and time filters.
 
-### 3. Exporter
+### 3. LogFormat
+
+Teaches CLV to parse a line no built-in matcher recognises.
+
+**Built-ins first, plugins second, `raw` last.** `parse()` is offered only the
+lines every built-in already declined, so a syslog file costs an installed
+format nothing and a plugin cannot take over a name CLV already answers to.
+*Replacing* a built-in is out of scope and always will be: when a format is
+worth CLV's own attention it goes into `clv.services.parsing` on CLV's account.
+
+**A `format_name` is four registrations, and only one of them is parsing.** The
+others are a label, a column profile and — where a format recovers nothing — a
+sentence saying why. Miss them and nothing raises: the entry renders with the
+right timestamp and level, the bare identifier where the format name should be,
+no source cell and no chips. That is a worse row than a built-in gets for the
+same line, with no diagnosis anywhere. So a format *declares* them:
+
+```python
+from clv.api import FormatProfile, LogEntry, LogFormat, normalize_level
+
+class NginxError(LogFormat):
+    name = "nginx-error"
+    requires_api = ">=1.0,<2.0"
+
+    #: What every entry this format returns must carry. Not a display name.
+    format_name = "nginx-error"
+    #: What an operator calls it in the detail pane.
+    label = "nginx error log"
+    #: What it can produce, so a field query and the query box's completions
+    #: know the word before a matching line has been read.
+    field_names = frozenset({"pid", "host", "server", "request", "upstream"})
+    #: Which of those earn the source cell and the chips.
+    columns = FormatProfile(
+        source_keys=("server", "host"), pid_key="pid", chips=("host", "upstream")
+    )
+
+    def parse(self, line):
+        if len(line) < 20 or line[4] != "/":   # the cheap rejection, first
+            return None
+        match = _LINE.match(line)
+        if match is None:
+            return None
+        return LogEntry(
+            raw=line,
+            timestamp=...,
+            level=normalize_level(match.group("level")),
+            message=match.group("msg"),
+            format_name=self.format_name,
+            fields={"host": match.group("client")},
+        )
+```
+
+`clv/examples/nginx_error.py` is that plugin in full, commented; CLV writes a
+copy into `~/.config/clv/plugins/examples/` on first run.
+
+**Normalise onto CLV's vocabulary.** `NORMALISED_FIELD_KEYS` names the keys the
+parser already uses across formats — `host`, `tag`, `pid`, `request`, `status`
+and the rest. File your equivalent under the existing key rather than inventing
+a synonym: `host:10.0.0.5` should answer for your format the way it answers for
+syslog and for an access log. A genuinely new concept gets a key of its own.
+
+**What `parse()` must return.** An entry whose `format_name` is the one the class
+declared, and whose `fields` map strings to strings — values are compared as the
+parser stored them and nothing downstream coerces, so an HTTP status is `"500"`
+and not `500`. A plain `dict` is a fine `fields`; CLV treats it as read-only and
+never writes to it, and omitting it entirely gets the shared empty mapping that
+costs nothing. Return `None` to pass the line to the next format.
+
+**Anything else takes the format out of service**, named by the rule it broke —
+not a `LogEntry`, a `format_name` other than the declared one, a non-string
+field value. The read path is stricter than the render path on purpose: a stage
+that misbehaves costs a render, and a format that misbehaves writes a wrong
+entry into the buffer that every query, bucket and cluster downstream then
+believes.
+
+**Refused at load**, before a line is read, because each of these is silent at
+runtime: no `format_name`; a `format_name` that is a built-in's, including
+`raw`; one another loaded format already claimed; `field_names` that is not a
+set of non-empty strings; a `columns` naming a key outside `field_names`.
+
+**Continuation needs no cooperation.** An entry whose `format_name` is not
+`"raw"` is structured, so the unparsed line after it inherits its timestamp and
+level exactly as it would after a built-in's — and inherits no fields, because a
+stack trace frame has no host or PID of its own to report.
+
+**What you get for free, and it is the point of the seam.** An entry a plugin
+format produced is searchable by field query, bucketed by the timeline, folded
+by the repeat clusterer, shown in the detail pane, markable, watchable and
+exportable. None of that needed a line of code: it follows from the entry being
+well-formed, and `tests/test_plugin_formats.py` has one test per feature to keep
+it that way.
+
+**A format disabled mid-session does not re-parse what is already in the
+buffer.** Lines keep the `format_name` they were read with; re-opening the
+source is what re-reads them. New lines stop being offered to it immediately.
+
+### 4. QueryOperator
+
+Adds a comparison token to the query grammar.
+
+```python
+import re
+from clv.api import QueryOperator
+
+class RegexMatch(QueryOperator):
+    name = "field-regex"
+    token = "~"
+
+    def test(self, stored, value):
+        return re.search(value, stored) is not None
+```
+
+`host~^web[0-9]+` then works in the query box, in a saved view and in a watch
+rule, because all three route through `parse_query` and none of them knows a
+plugin exists.
+
+**Vocabulary, not structure.** This adds a word; it does not add a sentence
+shape. There is still no `OR`, no parentheses and no precedence — terms stay
+implicit-AND and flat. `clv/services/query.py`'s module docstring records how
+narrow that reversal is and why it stops where it does.
+
+**`test` receives two strings and returns a bool.** `stored` is the field value
+exactly as the parser stored it, `value` is what the operator typed. Nothing
+downstream coerces either, which is why `>=` has to decide numeric versus
+lexicographic per comparison rather than per field — your operator makes the
+same decision for itself.
+
+#### Which tokens are legal
+
+Checked at load, so a bad token is a message in the `P` dialog rather than a
+mystery at the first term:
+
+| Rule | Why |
+| --- | --- |
+| Not one of `>=` `<=` `!=` `>` `<` `=` `:` | Redefining `:` would change what every saved query already means. The list is published as `clv.api.BUILTIN_OPERATORS` so you can check rather than discover it from a load error. |
+| No character a *key* may contain — letters, digits, `_`, `.`, `-` | `key~avalue` could not be told from a key called `key~avalue`. The tokeniser has no way to prefer one reading, so the ambiguity is refused instead of resolved by accident. |
+| No whitespace, no `"` or `'` | A space ends a token and a quote groups a value. |
+| Not already claimed by another loaded plugin | Reported once, naming both. |
+
+**Longest token wins.** The alternation is rebuilt from the installed set,
+sorted longest first, so registering `~` cannot break `>=` and registering `~=`
+cannot break `~`. `!~` is found before a bare `~` for the same reason.
+
+### 5. ComputedField
+
+Adds a queryable field that is *derived* rather than parsed.
+
+```python
+from datetime import datetime, timezone
+from clv.api import ComputedField
+
+class EntryAge(ComputedField):
+    name = "entry-age"
+    field_name = "age"
+
+    def value(self, entry):
+        if entry.timestamp is None:
+            return None
+        now = datetime.now(timezone.utc) if entry.timestamp.tzinfo else datetime.now()
+        return str(int((now - entry.timestamp).total_seconds()))
+```
+
+`age<60 level:error` is then "what has gone wrong in the last minute", without
+touching the time window. The name joins the query vocabulary and the
+completion list immediately, before any line has been read — the same promise
+the parser's normalised keys make.
+
+**Parsed fields resolve first, per entry.** `match_terms` asks the entry's own
+`fields` first and only calls a plugin when the entry has no field of that name.
+So a computed `field_name` may collide with a parsed key and is *not* rejected
+for it: on a line that carries the key, the line wins. A plugin can add to what
+CLV can be asked; it can never change what a line said.
+
+**Return a string, or `None`.** `None` means "this entry has no such field",
+which is a different outcome from "did not match": the entry is hidden and
+counted into `hidden_missing_field`, and the UI explains it by name. Returning
+anything that is not a string takes the plugin out of service with a message
+saying so — a number compared against a string would quietly never match.
+
+`field_name` must be a legal query key: it starts with a letter or underscore
+and uses only letters, digits, `_`, `.` and `-`. Anything else could never be
+typed as a term.
+
+### 6. Exporter
 
 Saves or transmits the entries the filters kept.
 
@@ -259,10 +469,11 @@ stages and the user's filters, plus the `FilterContext`, and returns an
 
 - The sequence is the **whole filtered set**, not the `_show_lines` window the
   pane happens to be showing. Do not assume it is small.
-- There is no destination argument. An exporter picks its own path and reports it
-  back as `ExportResult.destination`; the dialog disables its path input for
-  plugin exporters and says so. Confine writes to somewhere the operator would
-  expect, and never to a temp or cache directory — log content is sensitive.
+- **By default there is no destination argument.** An exporter picks its own
+  path — or sends the entries somewhere that is not a path at all — and reports
+  what it did as `ExportResult.destination`; the dialog disables its path input
+  and says so. Confine writes to somewhere the operator would expect, and never
+  to a temp or cache directory — log content is sensitive.
 - Raising is survivable but visible: the exception is recorded in
   `PluginRegistry.errors`, surfaced as a notification and shown in the Advanced
   drawer. Returning `ExportResult(ok=False, detail=...)` is the way to report a
@@ -271,7 +482,7 @@ stages and the user's filters, plus the `FilterContext`, and returns an
 ```python
 import json
 from pathlib import Path
-from clv.plugins import Exporter, ExportResult
+from clv.api import Exporter, ExportResult
 
 class JsonExporter(Exporter):
     name = "JSON Exporter"
@@ -285,17 +496,241 @@ class JsonExporter(Exporter):
         return ExportResult(ok=True, detail=f"{len(entries)} lines", destination=destination)
 ```
 
+#### Asking for the operator's destination
+
+An exporter that writes a **file** usually wants the path the operator just
+typed, and until API 1.0 it could not have one: every plugin choice was marked
+as supplying its own destination, so the dialog's path input was disabled and an
+exporter had to invent a location nobody had agreed to.
+
+Set `wants_path` and the input is enabled, the suggested filename takes your
+`suggested_extension`, the overwrite confirmation applies as it does to a
+built-in format, and the chosen path arrives as the keyword-only `destination`:
+
+```python
+class NdjsonExporter(Exporter):
+    name = "NDJSON"
+    wants_path = True
+    suggested_extension = "ndjson"
+
+    def export(self, entries, context, *, destination=None):
+        destination.write_text(
+            "\n".join(json.dumps({"raw": e.raw}) for e in entries),
+            encoding="utf-8",
+        )
+        return ExportResult(ok=True, detail=f"{len(entries)} lines", destination=destination)
+```
+
+`destination` is passed **only** when `wants_path` is set, so an exporter
+written as `export(self, entries, context)` against the original interface is
+called exactly as it always was. That is the compatibility rule for this
+attribute and it is pinned by a test.
+
 ---
 
 ## Plugin Discovery
 
-The app dynamically discovers plugins using:
+Four stages, searched in this order. **The first to claim a name wins, and the
+loser is reported** — never silently dropped, because two plugins quietly
+resolving by load order is the defect this ordering exists to prevent.
 
-1. **Local scan** — modules directly under `clv/plugins/` and in the
-   `sources/`, `filters/` and `exporters/` subpackages. Modules whose name
-   starts with `_` are skipped.
-2. **Entry points** — installed distributions advertising the `clv.plugins`
+1. **`CLV_PLUGIN_PATH`** — extra roots, `os.pathsep`-separated. For development
+   and for CLV's own tests: it is how a plugin runs from where it is being
+   edited, and how the test suite gets a plugin root without writing into the
+   source tree. Not documented to users as a way to install anything.
+2. **The user plugin directory**, `~/.config/clv/plugins/`. Created beside
+   `settings.conf` on first run, with a `README.txt` in it. **Governed by the
+   enable-list** (below).
+3. **Bundled drop-ins** — modules directly under `clv/plugins/` and in the
+   `sources/`, `filters/` and `exporters/` subpackages.
+4. **Entry points** — installed distributions advertising the `clv.plugins`
    entry point group.
+
+Modules whose name starts with `_` are skipped at every stage.
+
+### The enable-list
+
+**A file in the user plugin directory is not run because it is there.** CLV
+records its name and does nothing else — it is not imported — until the name
+appears in `settings.conf`:
+
+```ini
+[log_viewer]
+plugins = redact_secrets, nginx_format
+```
+
+Installing a plugin and running a plugin are deliberately two decisions. A
+directory that runs whatever is dropped into it is a directory that anything
+able to write to `$HOME` can run code from, and "enable everything here" is
+exactly the behaviour that would make it one.
+
+Names are the module name without `.py`, comma separated, and are matched
+**case-insensitively**: a settings file is operator prose, and `Redact` where
+the file is `redact.py` is a typo class rather than an intent. Whitespace,
+trailing commas and duplicates are tolerated. A name that could not be a module
+name — `my-plugin`, `foo.bar` — is dropped and reported on its own, and the
+rest of the list still loads. A name that is listed but not present in any root
+is reported by name, so a typo says so rather than doing nothing.
+
+**Bundled drop-ins ignore the enable-list.** They shipped with CLV, and the
+operator's trust in them is the trust they already placed in CLV. The journald
+provider's `enable_journald` opt-in is a separate and unrelated thing: it gates
+what `discover()` offers, not whether the module loads.
+
+### Per-plugin configuration
+
+A plugin that needs settings of its own gets a section named after it, and the
+name is the same one the enable-list uses:
+
+```ini
+[log_viewer]
+plugins = redact_secrets
+
+[plugin:redact_secrets]
+patterns = password, api_key, token
+replacement = ******
+```
+
+CLV parses the section and hands it over; it never interprets it. What a key
+means is the plugin's business, and a validator in `config.py` would be CLV
+guessing at a schema it does not own.
+
+The section reaches the plugin through the optional `configure()` hook:
+
+```python
+from clv.api import FilterStage, setting_list
+
+class Redact(FilterStage):
+    name = "redact-secrets"
+
+    def configure(self, settings):
+        self._settings = settings
+
+    @property
+    def patterns(self):
+        return setting_list(self._settings, "patterns")
+```
+
+Four things about `settings` are worth knowing before writing against it.
+
+**It is a read-only view of a mapping CLV owns, not a copy.** When CLV re-reads
+the settings file — the operator pressed `Ctrl+R`, or flipped a switch in the
+Advanced drawer — the values behind the view change and the plugin sees the new
+ones without being called again. So keep the mapping and read through it, as
+above, rather than copying values out in `configure()`. That is what lets the
+journal provider honour the drawer's switch without a restart.
+
+**It is empty when the operator wrote no section**, which is the common case.
+An empty mapping is not an error and must not be treated as one; every key a
+plugin reads needs a default.
+
+**The values are the raw strings `configparser` read.** Use `setting_bool` and
+`setting_list` from `clv.api` rather than writing the coercions again — CLV and
+a plugin disagreeing about whether `yes` is true is a bug an operator has no
+way to see. Both are total: an unreadable value is the default, never a raise.
+
+**A section that configures nothing is reported.** A `[plugin:x]` for a plugin
+that is installed but not enabled says so; one for a name that is nowhere says
+that instead. The two need different answers, so they get different messages.
+
+Section names are validated exactly as enable-list names are — a name that
+could not be a module name is dropped and reported, and the sections around it
+still load. `[plugin:]` with no name, and a duplicated section, are each
+reported and skipped.
+
+**One legacy key, folded in rather than renamed.** `enable_journald` lives in
+`[log_viewer]`, is in every operator's settings file, and is what the Advanced
+drawer's switch writes. It is read into `[plugin:journald]` as `enabled`, so
+the journal provider reads one place while nobody's settings file changes. A
+section that sets `enabled` itself wins.
+
+### Lifecycle
+
+Three optional hooks, all defaulting to doing nothing, so a plugin that
+implements none of them behaves exactly as it did before they existed.
+
+| Hook | When | Guarantee |
+|------|------|-----------|
+| `configure(settings)` | Once, straight after instantiation | Before `setup()`, and before anything asks the plugin for anything |
+| `setup()` | Once, after every plugin has loaded and been configured | Before first use |
+| `teardown()` | Once, at shutdown | After CLV has closed its readers, before the session is persisted |
+
+`teardown()` runs after the readers so a plugin cannot resurrect a source on
+its way out, and before the session is persisted so a plugin that fails on exit
+still leaves the operator's session intact.
+
+**Failure in any of the three disables the plugin for the session** and records
+the reason once — the same mechanism a raising `apply()` has used since the
+loader was made correct, not a second one with its own semantics. A plugin that
+fails `configure()` is never `setup()`; one that fails `setup()` is never
+`teardown()`, because calling `teardown()` on a half-built object is how a
+shutdown path acquires bugs of its own.
+
+**An exception in `teardown()` is contained. A hang is not.** CLV records the
+exception and carries on, but a `teardown()` that blocks forever blocks exit,
+and nothing here stops it. The [budget](#the-budget) bounds a stage's time on
+the render path and deliberately does not reach the lifecycle hooks: a hook that
+never returns cannot be timed out from inside the process it is hanging, which
+needs a process CLV can kill (`PLUGIN_TODO.md` Phase 13). Until that lands a
+plugin author is being trusted not to block on the way out, and that is a
+convention rather than a protection, like every other one on this page.
+
+**`setup()` and `teardown()` are session lifecycle, not the enable switch.**
+Turning a plugin off in the `P` dialog and back on does not re-run `setup()`.
+
+**Plugin state is the plugin's own problem.** CLV's session file has a closed
+set of fields, and it is closed deliberately: every field in it carries an
+argument about whether recording it leaks what somebody was reading. A plugin
+that needs to remember something across runs writes its own file under its own
+directory and owns the same question about its contents.
+
+### Managing what is installed
+
+`P` in the viewer — or the **Plugins** button in the Advanced drawer — lists
+every plugin CLV found, one row per **installable unit**: the module, not the
+plugin object inside it, because that is what an operator installs, names and
+deletes. A module exporting three stages is one row saying `filter`.
+
+Five states:
+
+| State | Meaning |
+| --- | --- |
+| `loaded` | Imported and in service. |
+| `not enabled` | Present, and not named in `plugins` — or switched off from the dialog. Not a fault, and not reported as one. |
+| `failed` | It raised at import or at runtime, or CLV could not read it. The row carries the recorded message in full. |
+| `incompatible` | An unsatisfied `requires_clv` or `requires_api`. The row names the constraint *and* the running version. |
+| `isolated` | Reserved for the isolation host. Nothing produces it yet. |
+
+Two asymmetries the dialog states as it is used, because neither is guessable:
+
+- **Enabling something CLV has not imported needs a restart.** Loading is
+  import-time and single-shot; there is no hot reload. The name is written to
+  `settings.conf` at once and the plugin loads next launch.
+- **Disabling a bundled plugin lasts for the session.** The enable-list governs
+  the user directory only, so a bundled drop-in has no name in it to remove. It
+  returns on restart. A *user* plugin's disable is written to `settings.conf`
+  and also takes effect immediately.
+
+A plugin a fault took out of service can be put back with `r`. Doing so
+discards the recorded failure as well as clearing the disable — left on the
+record, it would keep the row reading `failed`, and the next genuine failure
+would collapse into it as a repeat of something already dealt with rather than
+be reported as news.
+
+Nothing is written until the dialog closes, so `Esc` cancels for real and one
+confirm is one write to a file full of the operator's comments.
+
+### Shadowing
+
+A user plugin may take a name a bundled drop-in uses, which is how a plugin
+*replaces* a shipped one — but **only if it is enabled**. An unlisted file
+shadows nothing, because it is never imported and so cannot displace anything;
+this is what stops a dropped file from changing CLV's behaviour without being
+named. The shadowed plugin is reported with the origin that won.
+
+Two bundled subpackages may share a module basename, exactly as they always
+could: `sources/x.py` and `filters/x.py` are two different modules and neither
+shadows the other.
 
 ### How a module says what it exports
 
@@ -346,6 +781,187 @@ a message about interfaces.
 
 ---
 
+## Ordering
+
+Every plugin carries a `priority`, and every ordered registry CLV keeps runs in
+ascending order of it:
+
+```python
+class Redact(FilterStage):
+    name = "redact-secrets"
+    priority = 50          # sees the line before anything has rewritten it
+```
+
+The default is **100**, with room deliberately left on both sides. A stage that
+must see a line before anything has touched it — an audit trail, a metric
+counter — takes a low number; one that must see the final text takes a high one.
+
+**Ties are broken by name**, casefolded. That matters more than it looks: before
+it, two stages that both took the default composed in whatever order
+`pkgutil.iter_modules` happened to list them, so the same two plugins could
+redact-then-rewrite on one machine and rewrite-then-redact on another. Name
+order is not meaningful, but it is *predictable*, which is what an author needs
+to design around.
+
+The order is settled once, when plugins are loaded, and does not change for the
+session. Enabling or disabling a plugin from the `P` dialog changes whether it
+runs, never where.
+
+---
+
+## Saved views, watch rules and a missing plugin
+
+A `QueryOperator` or `ComputedField` is the first kind of plugin whose absence
+can change what a **saved** thing *means*, and that is a different problem from
+a plugin that is merely not there.
+
+`host~^web` without the operator is not a syntax error. The token is unknown, so
+nothing in the string is recognised as a term, the whole query falls through to
+the regex half, and it matches lines containing the literal text `host~^web` —
+a different query that happens to parse. A saved view that quietly did that
+would be worse than one that refused.
+
+So a `SavedView` and a `WatchRule` each carry `requires`: the plugins their
+query depends on, recorded **when the view or rule is saved** and never
+recomputed afterwards. Recomputing while a plugin was missing would erase the
+record that marks it unusable, which is why only the record an operator just
+typed is ever stamped.
+
+**There are two absences and they are reported differently.**
+
+| State | What happens | Where the operator sees it |
+| --- | --- | --- |
+| The plugin is **not installed** | The view or rule is kept byte-intact, marked unusable, and named with the plugin it needs. A view refuses to apply; a rule never matches. | `⚠ needs the 'x' plugin, which is not installed` — on the tree row, in the view picker, in the rules dialog |
+| The plugin is installed but **switched off** (a fault, the time budget, or the `P` dialog) | Its token stays reserved and the query reports it. The saved record is untouched and still applicable the moment the plugin is back. | The query bar's validation line: `~ needs the 'x' plugin, which is not in service` |
+
+Collapsing the two would mean an operator who switched a plugin off for a minute
+found their saved views marked broken; keeping the token reserved in the second
+case is what stops the query silently becoming a regex in the meantime.
+
+**Nothing is ever rewritten.** A state file written before `requires` existed
+loads with an empty one; a file written after it stays readable on a build
+without the plugin. A view or rule is preserved, disabled and explained — in
+that order, and never reinterpreted into meaning something else.
+
+---
+
+## Performance
+
+CLV contains a plugin's *exceptions*. Until now it did nothing about a plugin's
+*time*, and the two failures look completely different from the operator's
+chair: a stage that raises is named in the `P` dialog with its traceback, while
+a stage that is merely slow makes CLV look broken and says nothing at all.
+
+### How often each kind is called
+
+| Kind | Called | Per what |
+| --- | --- | --- |
+| `LogSourceProvider.discover` | on startup and on rescan | once |
+| `LogSourceProvider.open` | when a source is opened | once |
+| `LogFormat.parse` | **every read** | **once per unrecognised line** |
+| `QueryOperator.test` | **every render** | **once per buffered entry, per term** |
+| `ComputedField.value` | **every render** | **once per buffered entry whose own fields lack the key** |
+| `FilterStage.apply` | **every render** | **once per buffered entry** |
+| `Exporter.export` | on `Ctrl+E` | once |
+
+The bold rows are the ones to design against, and they are bold for
+different reasons. `apply` is called *often*: a render happens on every keystroke
+in the query box. `parse` is called once per line, but on a source nothing
+recognises that is every line of the file, arriving in one batch while the
+operator waits for the pane to appear — and it runs before anything is on screen
+to show for it. A render happens on every keystroke
+in the query box, and `max_buffer_lines` is configurable up to **500 000** — so
+a stage doing one regex match per entry at that ceiling is running half a
+million regexes between one character and the next. Make the cheap rejection
+first:
+
+```python
+def apply(self, entry, context):
+    if "password" not in entry.raw:      # a substring scan, not a regex
+        return entry
+    return replace(entry, raw=_SECRET.sub("******", entry.raw))
+```
+
+The same rule in a `LogFormat`, where the rejection is the common case rather
+than the exception — and compile the pattern once at class level, never inside
+`parse`:
+
+```python
+def parse(self, line):
+    if len(line) < 20 or line[4] != "/":   # two character tests
+        return None
+    ...
+```
+
+A `QueryOperator` is the one where the cheap work is usually a *cache*: the
+query box re-filters the whole buffer on every keystroke, so compiling the same
+pattern per entry means compiling it once per line per keypress. Cache on the
+value the operator typed, and cache the failure too — a half-finished `svc~(`
+should not re-raise and re-catch half a million times:
+
+```python
+@lru_cache(maxsize=256)
+def _compiled(pattern):
+    try:
+        return re.compile(pattern)
+    except re.error:
+        return None            # matches nothing; never raises at the operator
+```
+
+### The budget
+
+Every stage is charged the wall time of its own calls, accumulated per render
+pass. A pass over `plugin_time_budget_ms` is a strike; a pass under it clears
+the count. **Three strikes in a row and the plugin is disabled** for the
+session, through the same `disable()` a raising stage goes through — so it turns
+up in the `P` dialog as `failed`, with the elapsed number and the ceiling in the
+message, and **Re-enable** puts it back with a clean count.
+
+Three consecutive passes rather than one, because the first render after a
+source opens pays every cold cost a plugin has, and a large paste or a loaded
+machine can put a healthy stage over the line for a pass or two. A plugin that
+is genuinely slow still strikes out within about a second and a half of typing.
+
+**Three budgets, one policy.** `LogFormat.parse` is charged against a separate
+ceiling, because it is measured against a different thing: a pass on the read
+path is one batch of lines from a reader's `prime` or `poll`, not one render.
+The query plugins get a third instance, sharing the render path's ceiling
+because they are the same kind of work on the same trigger — but settling
+separately, so a slow `FilterStage` and a slow `QueryOperator` do not have their
+strikes interleaved by whichever happened to be measured first. Everything else
+is identical in all three: three consecutive passes over the line, disabled,
+named in `P`, and reachable by **Re-enable**.
+
+```ini
+[log_viewer]
+plugin_time_budget_ms = 250     # FilterStage.apply, and the query plugins
+plugin_read_budget_ms = 50      # the read path: LogFormat.parse
+```
+
+Setting either to `0` turns that guard off entirely, for an operator who would rather
+have a slow plugin than a disabled one. There is no per-plugin override: a
+budget a plugin could raise for itself is not a budget.
+
+**Being disabled by the budget is the intended outcome, not a bug to work
+around.** If your stage cannot do its work per entry at the operator's buffer
+size, the fix is a cheaper stage — not a larger ceiling.
+
+### What is not bounded
+
+Time inside `apply()` is measured; nothing else is. In particular:
+
+- **`setup()`, `configure()` and `teardown()` are outside every budget.** A
+  plugin that *hangs* in one of them hangs CLV, and on `teardown()` that means
+  hanging exit. Exceptions there are contained; time is not. Bounding it needs a
+  process CLV can kill, which is `PLUGIN_TODO.md` Phase 13 and not a timer.
+- **Memory is not bounded at all.** A plugin that accumulates every entry it
+  sees will exhaust the process, and nothing here will notice.
+
+Both are consequences of a plugin running in CLV's own process — see
+[Trust model](#trust-model).
+
+---
+
 ## Conventions for plugin authors
 
 These are **conventions, not protections**. Each says who is trusting whom, and
@@ -355,9 +971,11 @@ A reviewer enforces these by reading the code; the operator enforces them by
 choosing what to install.
 
 - **Never perform a network call or spawn a subprocess without user consent.**
-  *Not enforced.* The shipped `journald` provider is the pattern to copy: a
-  `settings.conf` opt-in, read fresh on every `discover()`, offering nothing at
-  all until it is true.
+  *Not enforced.* The shipped `journald` provider is the pattern to copy, and it
+  is now copyable: an `enabled` key in its own `[plugin:journald]` section,
+  taken through `configure()`, read fresh on every `discover()`, offering
+  nothing at all until it is true. No import of CLV's settings parser is
+  involved, which is what makes it a pattern rather than a privilege.
 - **Confine file reads and writes to configured directories.** *Not enforced.*
   A plugin runs with the operator's full filesystem access; see
   [Trust model](#trust-model).
@@ -377,12 +995,119 @@ choosing what to install.
 
 ---
 
+## API surface and stability
+
+**Import from `clv.api`.** It is the whole of what CLV publishes to plugins, and
+the only part of CLV covered by a stability promise.
+
+```python
+from clv.api import FilterStage, LogEntry, normalize_level
+```
+
+Everything there is a **re-export of the real object**, never a wrapper or a
+DTO. Your `apply` receives the same `LogEntry` CLV's own render path holds. That
+is a deliberate refusal: converting an entry per plugin per render is the one
+cost CLV cannot pay, and an author who had to convert would be writing against a
+lesser version of the core than the core writes against itself.
+
+### What is published
+
+| Group | Names |
+| --- | --- |
+| Version | `PLUGIN_API_VERSION` |
+| Interfaces | `Plugin`, `LogSourceProvider`, `LogFormat`, `QueryOperator`, `ComputedField`, `FilterStage`, `Exporter` |
+| Handed to you | `LogEntry`, `FilterContext`, `FilterSpec`, `TimeWindow`, `ProviderSource`, `SourceRef` |
+| Declaring a format | `FormatProfile`, `DEFAULT_PROFILE`, `FORMAT_NAMES` |
+| Handed back | `ExportResult` |
+| Severity | `normalize_level`, `level_rank`, `level_matches`, `highest_level`, `LEVEL_TRACE` … `LEVEL_CRITICAL`, `LEVEL_ORDER`, `SEVERITY_BUCKETS` |
+| Fields | `NORMALISED_FIELD_KEYS` |
+| Extending the query | `BUILTIN_OPERATORS` |
+| Settings | `setting_bool`, `setting_list` |
+| Process boundary | `WIRE_VERSION`, `entry_to_wire`, `entry_from_wire` |
+
+The severity helpers are published because the alternative is every plugin
+reimplementing them, and reimplementing them badly: `WARNING`, `WARN` and
+syslog's numeric `4` are one severity, and a plugin that decides otherwise makes
+CLV disagree with itself about what the operator filtered for.
+`SEVERITY_BUCKETS` is a plain dict and is read-only **by convention** — mutating
+it changes what every severity filter in the process means.
+
+`FORMAT_NAMES` is published for the same kind of reason: it is the set of names
+a `LogFormat` may *not* claim, and an author should be able to check that rather
+than discover it from a load error. `BUILTIN_OPERATORS` is the same idea one
+seam along: the comparison tokens a `QueryOperator` may not claim.
+
+### Two versions, and they are not the same version
+
+`PLUGIN_API_VERSION` tracks the promise. `clv.__version__` tracks the
+application. They move independently, and **`requires_api` is the one to
+declare**:
+
+```python
+class Redact(FilterStage):
+    name = "redact-secrets"
+    requires_api = ">=1.0,<2.0"   # what you actually depend on
+    requires_clv = ">=2.0,<3.0"   # optional, and rarely what you mean
+```
+
+Both use the grammar in [The constraint grammar](#the-constraint-grammar) and
+both fail the same two ways: an unsatisfied constraint names your constraint and
+the running version, an unreadable one names the constraint and says it could
+not be read. Neither is ever a silent skip.
+
+Pinning `requires_clv` instead means re-releasing your plugin every time CLV
+ships a release that changed nothing you can see. The API is additive from 1.0:
+each new seam adds names and the version stays 1.0, which is what that
+separation is for.
+
+### The deprecation policy
+
+- A name published in `clv.api` is **removed only on an API major**.
+- A name deprecated in API *N* keeps working for the whole of *N* and emits a
+  `DeprecationWarning` naming what to use instead.
+- **Anything not in `clv.api` is internal and may move without notice** —
+  including `clv.services.parsing.LogEntry` under its own name, and including
+  every name `clv.plugins` exports beyond the interfaces re-exported here.
+  Importing from `clv.services.*` is a plugin taking a risk it has been warned
+  about; it is not forbidden, and it is not supported.
+
+`tests/test_api_surface.py` holds the published list and every published
+signature as literal data, so changing any of this means changing that file, in
+the diff, where a reviewer sees it.
+
+### The wire form
+
+`LogEntry.fields` is a `mappingproxy`, so `pickle.dumps` raises `TypeError` on
+*every* entry CLV produces — the shared empty mapping included. An entry
+therefore cannot cross a process boundary by the obvious route, and
+`entry_to_wire` / `entry_from_wire` are the route it does take:
+
+```python
+payload = entry_to_wire(entry)     # a plain dict, every value a JSON scalar
+same = entry_from_wire(payload)    # fields come back read-only
+```
+
+The payload carries `WIRE_VERSION` under `"v"`, and `entry_from_wire` refuses a
+version it does not know **before reading any other key** — a payload from a
+future CLV is rejected whole rather than half-decoded into an entry that looks
+plausible and is not.
+
+You will not need this in-process. It is published now, ahead of the isolation
+host that consumes it, so that the encoding is part of the frozen contract
+rather than an artefact of whichever phase first needed it.
+
+---
+
 ## Versioning & Compatibility
 
 - Follow **semantic versioning** for each plugin.
-- Set `requires_clv` on the plugin class to declare compatibility, e.g.
-  `requires_clv = ">=2.0,<3.0"`. Omitting it means "any version".
-- A plugin failing its constraint is skipped and reported in
+- Set `requires_api` on the plugin class to declare what you depend on, e.g.
+  `requires_api = ">=1.0,<2.0"`. This is the one to reach for; see
+  [Two versions, and they are not the same version](#two-versions-and-they-are-not-the-same-version).
+- Set `requires_clv` when you genuinely depend on the application rather than on
+  the API, e.g. `requires_clv = ">=2.0,<3.0"`. Omitting either means "any
+  version", and a plugin may declare both — each is checked on its own account.
+- A plugin failing either constraint is skipped and reported in
   `PluginRegistry.errors`, which the Advanced drawer surfaces.
 
 ### The constraint grammar
@@ -410,8 +1135,9 @@ would make `requires_clv = ">=2.6"` unsatisfied on a running `2.7.0rc1` and
 silently disable every installed plugin on any release-candidate build.
 
 An **unparseable** constraint — `~~2.6`, `>=abc`, a bare `~=2` — is reported
-against your plugin by name. It is never a silent "unsatisfied": a typo and a
-genuine incompatibility must not look the same from the outside.
+against your plugin by name, as `bad requires_clv:` or `bad requires_api:`. It
+is never a silent "unsatisfied": a typo and a genuine incompatibility must not
+look the same from the outside.
 
 ## Failure Handling
 
@@ -429,8 +1155,20 @@ plugin that raised on one entry will raise on the next.
 
 `PluginRegistry.errors` deduplicates identical `(origin, message)` pairs into a
 single entry with a count, and caps the number of distinct problems it stores,
-reporting how many it dropped. A broken plugin can no longer bury the discovery
-summary in the log panel.
+reporting how many it dropped. Each entry also carries a `category` — `load`,
+`incompatible`, `shadowed`, `missing` or `runtime` — so "this plugin is broken"
+and "this plugin wants a CLV you are not running" can be told apart without
+reading the message, which is what lets the management UI name a state.
+
+The log panel reports plugin problems as **one line** pointing at `P`, not one
+line per problem: deduplication capped the repeats, but four distinct faults
+still buried the discovery summary the operator opened CLV to read, and none of
+those lines had room to say what to do about any of them.
+
+**Turning a plugin off is not a failure.** `PluginRegistry.disable()` takes
+`record=False` for an operator's own decision, so `errors` stays what it is —
+the amber channel for things that went wrong — and a plugin doing exactly as it
+was told never appears in it.
 
 ---
 
@@ -492,6 +1230,17 @@ the rule stated at the head of [TODO.md](../../TODO.md).
   stands and **no index is planned**. What is planned is a user plugin
   directory, an explicit enable-list, and manifests a `clv plugin install` can
   verify from a path, a tarball or a URL that anyone may host.
+- **"No query DSL."** *Reversed 2026-08-14* by
+  [PLUGIN_TODO.md](../../PLUGIN_TODO.md) Phase 8, and the reversal is narrow
+  enough to state exactly. The objection was to a query *language* — `OR`,
+  parentheses, precedence — and it stands: none of the three exists, and all
+  three remain out of scope in [TODO.md](../../TODO.md). What a plugin may now
+  add is a `QueryOperator` (a comparison token) and a `ComputedField` (a
+  queryable field derived rather than parsed). Both add vocabulary; neither adds
+  structure. The grammar is still implicit-AND and still flat — a plugin can
+  teach it a new word, not a new sentence shape. CLV's own tokens stay reserved,
+  and a computed field resolves *after* the parsed ones, so neither can change
+  what an existing query means.
 - **"A provider source cannot be starred or merged."** *Reversed 2026-08-19* by
   [SSH_TODO.md](../../SSH_TODO.md) Phase 9. The objection was that a provider
   source is not a file — nothing on disk answers to `journal:unit/sshd.service`

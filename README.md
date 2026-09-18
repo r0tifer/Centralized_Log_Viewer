@@ -14,8 +14,9 @@ desktop terminal and on a headless 80-column SSH session.
   parse are still searchable rather than silently dropped. Smart case: a
   lowercase query is case-insensitive, an uppercase character opts back in.
 - 🧬 **Multi-format parsing.** syslog (RFC 3164 and 5424), ISO-8601/bracketed
-  levels, Python `logging`, JSON lines, and Common Log Format access logs.
-  Anything else is kept as a raw line with its text intact.
+  levels, Python `logging`, JSON lines, logfmt (`level=info msg="..."`, what Go
+  and Rust services write), Common Log Format access logs — and any format a
+  plugin teaches it. Anything else is kept as a raw line with its text intact.
 - 🧵 **Stack traces stay attached.** A line no format recognises inherits the
   timestamp and severity of the entry above it, so a traceback survives a
   "show me only errors" filter along with the ERROR that produced it.
@@ -75,9 +76,13 @@ desktop terminal and on a headless 80-column SSH session.
   do on a single file. A set may span machines: with SSH configured, local and
   remote logs interleave in one pane, and `node:` says which machine each line
   came from.
-- 🧩 **Plugins.** `LogSourceProvider`, `FilterStage` and `Exporter` interfaces,
-  loaded from `clv/plugins/` or from installed packages via the `clv.plugins`
-  entry point group. A broken plugin is reported, never fatal. A plugin is
+- 🧩 **Plugins.** Seven interfaces — sources, log formats, query operators,
+  computed fields, filter stages and exporters — published as a versioned API
+  in `clv.api`. Install one by copying a file into
+  `~/.config/clv/plugins/` — no root, no Python toolchain, and it survives a
+  package upgrade. A file there is listed but **not run** until you name it in
+  the `plugins` setting, so installing a plugin and running one stay two
+  separate decisions. A broken plugin is reported, never fatal. A plugin is
   **trusted code** — it runs with your privileges, in CLV's process, and can
   read every log CLV can open; install one the way you would install any other
   program. `clv/plugins/AGENTS.md` has the trust model in full.
@@ -177,6 +182,9 @@ use.
 | `watch_bell` | Ring the terminal bell when a watch rule notifies. | `false` |
 | `cluster_lookback` | How far back, in entries, `c` may reach to fold a repeated line into a cluster. A bound, not a taste: it keeps one cluster from spanning a session. | `200` |
 | `enable_journald` | Offer the systemd journal as a source. Off by default: reading it runs `journalctl`, and CLV spawns no subprocess unasked. The drawer's switch writes this line for you. | `false` |
+| `plugins` | Plugins to load from `~/.config/clv/plugins/`, comma separated, named without the `.py`. A file in that directory is listed but **not imported** until it is named here — installing a plugin and running one are two decisions. Plugins bundled with CLV are not listed here. | *(empty)* |
+| `plugin_time_budget_ms` | Wall time one plugin may spend on a single pass of the render path. A plugin over it on three consecutive passes is disabled and named in the `P` dialog. `0` turns the guard off. | `250` |
+| `plugin_read_budget_ms` | The same, for a plugin-supplied log format, measured over one batch of lines read from a file rather than over a render. `0` turns the guard off. | `50` |
 | `enable_ssh` | Read log folders on machines named in `[ssh:<name>]` sections. Off by default, and for a stronger version of the same reason: a remote source spawns a *network* subprocess. With it false nothing connects, however many hosts are configured. | `false` |
 
 Invalid values fall back to safe defaults; the app never fails to start because
@@ -1079,6 +1087,7 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `y` | Copy the selected line, or the visible lines, to the clipboard (OSC 52) |
 | `Ctrl+L` | Copy mode (hides all chrome) |
 | `R` | Add, edit, test and remove remote hosts (SSH); also reachable from `a` |
+| `P` | Manage plugins (then `space` toggles, `r` re-enables) |
 | `Ctrl+S` | Save added sources to `settings.conf` |
 | `Ctrl+R` | Reload configuration and rescan |
 | `q` | Quit |
@@ -1121,12 +1130,29 @@ always been, matched against the whole raw line.
 
 Quote a value to keep spaces or colons inside it: `msg:"disk full"`.
 
+**The operator set is extensible, and so is the list of names.** A plugin can
+add a comparison token of its own and a field that is *derived* rather than
+parsed — the shipped `examples/field_regex.py` adds `~` for "this field matches
+this regex" and `age` for seconds since the line was written, so `host~^web[0-9]+`
+and `age<60 level:error` become things you can type. They work everywhere a
+built-in term does, including in a saved view and in a watch rule. CLV's own
+seven tokens are reserved and a computed field never overrides what a line
+actually said, so nothing you already search for changes. See
+`clv/plugins/AGENTS.md` for the interfaces.
+
+**A saved view or watch rule records which plugins its query needs.** If one is
+not installed the record is kept exactly as you wrote it, marked `⚠` with the
+plugin named, and refused rather than applied — because `host~^web` without its
+operator is not a narrower search, it is a regex that happens to parse. Install
+the plugin again and it works again; nothing was rewritten in the meantime.
+
 Which names work depends on the source. The parser's own vocabulary — `host`,
 `tag`, `pid`, `msgid`, `ident`, `user`, `request`, `status`, `size` — is always
-available, and every key a JSON line carries is added as soon as one is read.
-Start typing a name and the field list drops down under the input: `Tab` takes
-the first suggestion, `↓` steps into the list, `Esc` dismisses it. The Advanced
-drawer keeps a one-line reminder of the syntax under Search options.
+available, and every key a JSON or logfmt line carries is added as soon as one
+is read. Start typing a name and the field list drops down under the input:
+`Tab` takes the first suggestion, `↓` steps into the list, `Esc` dismisses it.
+The Advanced drawer keeps a one-line reminder of the syntax under Search
+options.
 
 **Nothing you already search for changes.** A word that is not a known field
 name is text, so `sshd:` and `kernel: oom-killer` search for exactly what they
@@ -1175,18 +1201,132 @@ user-adjustable tree width. Responsive behavior comes from breakpoint classes
 
 ---
 
+## Installing a plugin
+
+Copy the file in, name it, restart:
+
+```bash
+mkdir -p ~/.config/clv/plugins
+cp redact_secrets.py ~/.config/clv/plugins/
+```
+
+Then in `~/.config/clv/settings.conf`, under `[log_viewer]`:
+
+```ini
+plugins = redact_secrets
+```
+
+Names are the file name without the `.py`, comma separated, matched without
+regard to case. A directory `redact_secrets/` containing an `__init__.py` works
+the same way. No root, no Python toolchain, and nothing that a package upgrade
+overwrites — this works identically on a `.deb`/`.rpm`/tarball install and on a
+source checkout. CLV creates the directory on first run and leaves a
+`README.txt` in it saying the same thing.
+
+**Copying the file in does not run it.** CLV lists what it finds in that
+directory and does not import it until the name appears in `plugins`. The
+Advanced drawer says how many are installed but not enabled; a name you list
+that isn't there is reported by name, so a typo says so rather than doing
+nothing.
+
+### A worked example, already on your machine
+
+`~/.config/clv/plugins/examples/nginx_error.py` is a complete, commented plugin
+that teaches CLV to read nginx's error log — a format the built-in matchers do
+not recognise, so every line of one is a raw line today. Copy it up a level to
+use it, or as the starting point for your own:
+
+```bash
+cd ~/.config/clv/plugins && cp examples/nginx_error.py .
+```
+
+then add `nginx_error` to `plugins`. Nothing in `examples/` is listed or run:
+it is one directory down and CLV only looks in the directory itself, so the
+plugin count keeps meaning *plugins you installed*.
+
+**Teaching CLV a format is a plugin's job like any other.** A `LogFormat` gets
+offered every line the built-ins declined; what it returns is an entry on equal
+terms with a built-in's — searchable by field query, bucketed by the timeline,
+folded by `c`, shown in the detail pane and exportable, with its own source cell
+and chips in the structured view. `clv/plugins/AGENTS.md` has the interface.
+
+**So is teaching the query box a new word.** A `QueryOperator` adds a comparison
+token and a `ComputedField` adds a queryable field derived rather than parsed —
+see [Field queries](#field-queries). Both add vocabulary and neither adds
+grammar: there is still no `OR`, no parentheses and no precedence.
+
+### Managing what is installed
+
+`P` — or the **Plugins** button in the Advanced drawer (`f`) — opens a list of
+everything CLV found, one row per plugin, with its name, the interfaces it
+supplies, where it came from, and one of five states:
+
+| State | What it means |
+| --- | --- |
+| `loaded` | Running. |
+| `not enabled` | Installed and waiting to be named in `plugins`, or switched off. |
+| `failed` | It raised, or CLV could not read it. The row shows the message. |
+| `incompatible` | It asked for a CLV or plugin API this build is not. Both versions are named. |
+| `isolated` | Reserved; nothing produces it yet. |
+
+**Space** enables or disables the highlighted row, and **r** puts back a plugin
+a failure took out of service. Nothing is written until the dialog is closed, so
+`Esc` genuinely cancels.
+
+Two consequences the dialog states as you toggle, because they are not
+symmetrical:
+
+- Enabling a plugin CLV has not already imported **needs a restart**. Plugins
+  are imported once at startup and there is no hot reload; the name is written
+  to `settings.conf` immediately, and it loads next launch.
+- Disabling a plugin **CLV shipped** lasts for the session only. The `plugins`
+  key governs your own plugin directory, so a bundled plugin has no name in it
+  to remove, and it comes back on restart.
+
+Plugin failures are summarised in one line in the log panel rather than listed
+there — the detail, in full, is in this dialog.
+
+**A plugin that is merely slow is disabled too.** A filter stage runs over every
+buffered line on every render, and a render happens on every keystroke in the
+query box — so one that is slow is indistinguishable from CLV being broken, and
+it used to say nothing at all. Each stage is now timed; one that goes over
+`plugin_time_budget_ms` (250 ms by default) on three consecutive passes turns up
+here as `failed`, with how long it took and what the ceiling was, and **r** puts
+it back. Set the key to `0` if you would rather have the slow plugin. A plugin
+that teaches CLV a *format* is timed the same way against
+`plugin_read_budget_ms`, measured over one batch of lines read rather than over
+a render — its `parse` runs once per line as the file is read, not once per
+keystroke.
+
+**A plugin is trusted code.** It is Python imported into CLV's own process: it
+runs with your privileges and can read every file you can, including every log
+CLV has open. The interfaces bound what CLV *asks* of a plugin, not what a
+plugin *can do*, and CLV does not sandbox one — install one the way you would
+install any other program. The trust model and a checklist for reviewing
+someone else's plugin are in
+[`clv/plugins/AGENTS.md`](clv/plugins/AGENTS.md).
+
+For development, `CLV_PLUGIN_PATH` names extra directories (`:`-separated)
+searched ahead of the user directory, so a plugin can be run from where it is
+being edited. It is a development mechanism, not an install path, and the
+`plugins` enable-list still applies.
+
+---
+
 ## Writing a plugin
 
-Drop a module into `clv/plugins/filters/` (or `sources/` / `exporters/`), or
-publish one from an installed package under the `clv.plugins` entry point group.
+Drop a module into `~/.config/clv/plugins/` and name it in `plugins` (above),
+or — for a plugin shipped as part of CLV itself — into `clv/plugins/filters/`
+(or `sources/` / `exporters/`), or publish one from an installed package under
+the `clv.plugins` entry point group.
 
 ```python
 from dataclasses import replace
-from clv.plugins import FilterStage
+from clv.api import FilterStage
 
 class Redact(FilterStage):
     name = "redact-secrets"
-    requires_clv = ">=2.0,<3.0"     # optional
+    requires_api = ">=1.0,<2.0"     # optional
 
     def apply(self, entry, context):
         if "password" not in entry.raw:
@@ -1201,11 +1341,23 @@ Return `None` from `apply` to drop a line. A plugin that fails to import, fails
 its version check, or raises at runtime is disabled and reported in the
 Advanced drawer — it cannot take the app down.
 
+**Import from `clv.api`.** It publishes the interfaces, the `LogEntry` and
+filter types you are handed, the severity helpers and the field vocabulary — the
+same objects CLV uses itself, not copies — and it is the only part of CLV under
+a stability promise. It carries its own `PLUGIN_API_VERSION`, which is what
+`requires_api` constrains: pin that rather than CLV's release number and your
+plugin stops caring which CLV it is running on. Everything else, `clv.services.*`
+included, is internal and may move. The full contract, the deprecation policy
+and the published list are in
+[`clv/plugins/AGENTS.md`](clv/plugins/AGENTS.md).
+
 `Exporter` plugins are reachable from the UI: `Ctrl+E` lists them alongside the
-three built-in formats and hands the selected one the whole filtered set. An
-exporter chooses its own destination (`export` receives the entries and a
-`FilterContext`, not a path), and one that raises is reported and skipped like
-any other plugin failure.
+three built-in formats and hands the selected one the whole filtered set. By
+default an exporter chooses its own destination (`export` receives the entries
+and a `FilterContext`, not a path); one that sets `wants_path = True` gets the
+dialog's path input enabled and the operator's choice passed through as
+`destination`. An exporter that raises is reported and skipped like any other
+plugin failure.
 
 `LogSourceProvider` plugins are wired too: whatever `discover()` returns appears
 in a **Providers** group in the tree, and selecting one opens it like any other
@@ -1217,9 +1369,11 @@ and at shutdown. The shipped [`journald`](clv/plugins/sources/journald.py)
 provider is the worked example.
 
 Provider sources are **not** filesystem paths, and CLV does not pretend they
-are: starring, include/exclude globs and rotated-set grouping all test for a
-real `Path` and so skip them. That is deliberate — a provider identifier in
-your `session.json` would be a path that does not exist.
+are: include/exclude globs describe a directory walk and rotated-set grouping is
+name arithmetic over files that rotate, so both refuse a provider identifier by
+name. Starring and merging are a different question and do work — a persisted
+*identifier* is not a persisted path, and a journal unit is exactly the source
+worth starring and comparing across a fleet.
 
 ---
 
@@ -1228,6 +1382,6 @@ your `session.json` would be a path that does not exist.
 ```bash
 python -m pip install -e .
 python -m pip install pytest
-python -m pytest            # 791 tests
+python -m pytest            # 2042 passed, 1 skipped, 11 deselected
 python -m textual run clv/app.py --dev
 ```

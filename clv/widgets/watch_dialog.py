@@ -28,7 +28,15 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, OptionList, Static
 from textual.widgets.option_list import Option
 
-from ..services.watch import ACTION_BOTH, ACTIONS, WatchRule, validate_pattern
+from ..services.watch import (
+    ACTION_BOTH,
+    ACTIONS,
+    UNUSABLE_MARK,
+    WatchRule,
+    describe_missing,
+    rule_requirements,
+    validate_pattern,
+)
 
 #: Cycled through by the editor's Action button, in this order.
 ACTION_LABELS = {
@@ -36,6 +44,22 @@ ACTION_LABELS = {
     "notify": "Notify only",
     "both": "Highlight + notify",
 }
+
+
+def _rule_line(rule: WatchRule) -> str:
+    """One list row: state, name, pattern, action, and whether it can run."""
+
+    line = (
+        f"{'[on] ' if rule.enabled else '[off]'} {rule.name} — "
+        f"{rule.pattern}  ({ACTION_LABELS[rule.action]})"
+    )
+    absent = rule.missing_plugins
+    if absent:
+        # An unusable rule keeps its `[on]`: it *is* enabled, and showing it as
+        # off would tell the operator to flip a switch that would change
+        # nothing. What is wrong with it is named instead.
+        return f"{line}  {UNUSABLE_MARK} {describe_missing(absent)}"
+    return line
 
 
 class WatchRulesDialog(ModalScreen[tuple[WatchRule, ...] | None]):
@@ -201,13 +225,7 @@ class WatchRulesDialog(ModalScreen[tuple[WatchRule, ...] | None]):
         # a "[" in a regex is not ours to interpret.
         option_list.add_options(
             [
-                Option(
-                    Text(
-                        f"{'[on] ' if rule.enabled else '[off]'} {rule.name} — "
-                        f"{rule.pattern}  ({ACTION_LABELS[rule.action]})"
-                    ),
-                    id=rule.name,
-                )
+                Option(Text(_rule_line(rule)), id=rule.name)
                 for rule in self._rules
             ]
         )
@@ -272,6 +290,10 @@ class WatchRulesDialog(ModalScreen[tuple[WatchRule, ...] | None]):
             # is indistinguishable from one that is simply not firing yet.
             self._hint(problem, warning=True)
             return
+        # Recorded on the rule the operator just typed, and only on that one.
+        # Re-stamping the whole list would recompute a rule's requirements while
+        # its plugin was missing and erase the record that marks it unusable.
+        requires = rule_requirements(pattern, self._known_fields)
 
         enabled = True
         replacing = self._editing
@@ -279,7 +301,13 @@ class WatchRulesDialog(ModalScreen[tuple[WatchRule, ...] | None]):
             existing = next((r for r in self._rules if r.name == replacing), None)
             if existing is not None:
                 enabled = existing.enabled
-        rule = WatchRule(name=name, pattern=pattern, action=self._action, enabled=enabled)
+        rule = WatchRule(
+            name=name,
+            pattern=pattern,
+            action=self._action,
+            enabled=enabled,
+            requires=requires,
+        )
         self._rules = [
             other for other in self._rules if other.name not in {replacing, name}
         ] + [rule]

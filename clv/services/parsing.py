@@ -27,14 +27,56 @@ Format           Keys
 ``access-log``   ``host``, ``ident``, ``user``, ``request``, ``status``,
                  ``size``
 ``json``         every key of the object, flattened to dotted paths
+``logfmt``       every ``key=value`` pair on the line
 others           none
 ===============  ==========================================================
+
+:data:`FORMAT_NAMES` is the canonical list of the names in that first column,
+and it is load-bearing rather than documentary. A ``format_name`` is four
+registrations — the dispatch here, a label, a no-field reason where one is
+needed, and a column profile — and only the first is in this module. The other
+three fail *quietly*: a format with no profile renders with no source cell and
+no chips. ``tests/test_format_registration.py`` checks all four against this
+list in both directions, so adding a format to the parser and nowhere else
+fails the suite.
 
 RFC 5424's APP-NAME is deliberately filed under ``tag``, the same key BSD
 syslog uses for the program name, so ``tag:sshd`` answers the question against
 either dialect. A source that reports a genuinely different concept — systemd's
 ``_SYSTEMD_UNIT``, say — should use its own key rather than overloading this
 one.
+
+logfmt
+------
+
+``level=info msg="thing happened" dur=1.2ms`` is what Go, Rust and most of the
+Prometheus-adjacent ecosystem write, and it is the one format here that is not
+*anchored*: there is no timestamp shape, no bracket and no leading character to
+dispatch on, only a token that also occurs in ordinary prose. So it is matched
+**last** — after every anchored format has declined, BSD syslog in particular
+— and it is claimed only by a line that clears four structural guards:
+
+1. the line **opens with a pair**, so prose mentioning ``rhost=`` mid-line is
+   never considered;
+2. **every token is a pair** — anything left over that is not whitespace
+   refuses the line, which is what stops ``audit: type=1400 apparmor=DENIED``;
+3. there are **at least two pairs**, because one is a ``.env`` line, a
+   ``.properties`` entry or a shell assignment, and CLV opens any readable text
+   file; and
+4. **one key is an anchor** — a timestamp, level or message key from the same
+   three tuples :func:`_parse_json` resolves against. A line with none of them
+   has nothing to put in the message cell, so claiming it would buy a
+   structured row that says less than the raw one did. ``dur=1.2ms code=500
+   path=/x`` is real logfmt and is refused by this guard.
+
+Both ISO branches **defer** to it: their message remainder is offered to the
+collector under the same guards, and on acceptance the line is ``logfmt``
+carrying the timestamp — and, from ``iso-level``, the level — the branch had
+already recovered. Without that, ``2026-08-07T09:25:01Z level=error msg="boom"``
+would be an ``iso`` line with its whole payload sitting unparsed in ``message``.
+Syslog does **not** defer: a syslog line whose payload happens to be logfmt is
+still a syslog line, and its ``host``, ``tag`` and ``pid`` outrank the
+relabelling.
 
 Values are stored as **strings and never coerced**: an HTTP status is
 ``"500"``, not ``500``. Comparison semantics belong to whatever runs the query,
@@ -48,7 +90,9 @@ nothing. It is excluded from equality and hashing because it is derived from
 leaving it out keeps :class:`LogEntry` hashable. One consequence worth knowing:
 ``copy.deepcopy`` (and therefore :func:`dataclasses.asdict`) cannot handle a
 ``mappingproxy``, so a consumer that needs a plain dict should call
-``dict(entry.fields)``.
+``dict(entry.fields)``. Neither can ``pickle``, on *every* entry rather than an
+unlucky few — which is why an entry that has to cross a process boundary goes
+through :func:`entry_to_wire` rather than through the obvious thing.
 """
 
 from __future__ import annotations
@@ -58,10 +102,32 @@ import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from types import MappingProxyType
-from typing import Iterable, Mapping, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 #: How far past "now" an inferred syslog year may land before we roll it back.
 _FUTURE_TOLERANCE = timedelta(days=1)
+
+
+#: Every ``format_name`` this module can produce, ``raw`` included.
+#:
+#: The canonical list the three registration tables outside this module are
+#: checked against, and the set a plugin-supplied ``LogFormat`` may not claim a
+#: name from: a third-party format that could call itself ``syslog`` would take
+#: over the row shape, the label and the field vocabulary of a built-in, which
+#: is *replacing* a built-in rather than adding one and is refused at load.
+FORMAT_NAMES: frozenset[str] = frozenset(
+    {
+        "syslog",
+        "syslog-5424",
+        "access-log",
+        "json",
+        "logfmt",
+        "python-logging",
+        "iso-level",
+        "iso",
+        "raw",
+    }
+)
 
 
 # --- canonical severity vocabulary -----------------------------------------
@@ -237,6 +303,86 @@ class LogEntry:
     def structured(self) -> bool:
         """True when a format matched this line outright."""
         return self.format_name != "raw"
+
+
+# --- the wire form ----------------------------------------------------------
+#
+# ``pickle`` cannot carry a ``LogEntry``. ``fields`` is a ``mappingproxy`` --
+# including the shared empty one, so this is every entry CLV produces rather
+# than an edge case -- and ``pickle.dumps`` raises ``TypeError: cannot pickle
+# 'mappingproxy' object`` on all of them. Anything that has to move an entry
+# across a process boundary therefore needs an explicit encoding, and inventing
+# one at the point of need would mean changing a type that had already been
+# published.
+#
+# So it is published now, and it is **JSON-safe by construction**: every value
+# below is a JSON scalar, which is what makes a pipe a legal transport without a
+# second encoding step layered on top. ``tests/test_api_surface.py`` pins that
+# with an actual ``json.dumps``, so it cannot quietly stop being true.
+
+#: Version of the dict :func:`entry_to_wire` produces. Bumped when the shape
+#: changes, never reused: :func:`entry_from_wire` refuses a payload it does not
+#: recognise rather than half-decoding one.
+WIRE_VERSION = 1
+
+
+def entry_to_wire(entry: LogEntry) -> dict[str, object]:
+    """Encode *entry* as a plain, JSON-safe dict.
+
+    The timestamp goes as an ISO-8601 string (naive or aware, microseconds
+    intact) and ``fields`` as an ordinary ``dict``, because the read-only
+    mapping is the whole reason this function exists.
+    """
+
+    return {
+        "v": WIRE_VERSION,
+        "raw": entry.raw,
+        "timestamp": None if entry.timestamp is None else entry.timestamp.isoformat(),
+        "level": entry.level,
+        "message": entry.message,
+        "format_name": entry.format_name,
+        "continuation": entry.continuation,
+        "fields": dict(entry.fields),
+    }
+
+
+def entry_from_wire(payload: Mapping[str, object]) -> LogEntry:
+    """Rebuild the entry :func:`entry_to_wire` encoded.
+
+    Raises:
+        ValueError: if the payload carries no version, or one this build does
+            not know. Checked first and on its own, so a payload from a future
+            CLV is refused whole rather than half-read into an entry that looks
+            plausible and is not.
+    """
+
+    version = payload.get("v")
+    if version != WIRE_VERSION:
+        raise ValueError(
+            f"unsupported wire version {version!r}, expected {WIRE_VERSION}"
+        )
+
+    stamp = payload.get("timestamp")
+    timestamp = None if stamp is None else datetime.fromisoformat(str(stamp))
+
+    raw_fields = payload.get("fields") or {}
+    # The shared mapping when there is nothing to carry, so a decoded entry
+    # costs what a parsed one costs -- most lines have no fields at all.
+    fields = (
+        _EMPTY_FIELDS
+        if not raw_fields
+        else MappingProxyType({str(k): str(v) for k, v in dict(raw_fields).items()})
+    )
+
+    return LogEntry(
+        raw=str(payload.get("raw", "")),
+        timestamp=timestamp,
+        level=None if payload.get("level") is None else str(payload["level"]),
+        message=str(payload.get("message", "")),
+        format_name=str(payload.get("format_name", "raw")),
+        continuation=bool(payload.get("continuation", False)),
+        fields=fields,
+    )
 
 
 # --- timestamp helpers ------------------------------------------------------
@@ -542,8 +688,153 @@ def _parse_json(line: str) -> Optional[LogEntry]:
     )
 
 
+# --- logfmt -----------------------------------------------------------------
+#
+# Kept together and placed after `_parse_json` because it resolves its
+# timestamp, level and message through that format's three key tuples: `msg=`
+# and `"msg":` mean the same thing, and a writer who spells it one way on one
+# line and the other way on the next should not have to learn two vocabularies.
+
+#: A logfmt key. Deliberately wider than the query grammar's key
+#: (`query._TERM_RE` has no `/`): a key this pattern refused would refuse the
+#: whole *line*, which is a worse answer than a field that is shown but not
+#: filterable.
+_LOGFMT_KEY = r"[A-Za-z_][A-Za-z0-9_.\-/]*"
+
+#: Guard 1, and the only one that runs on every unclaimed line. An anchored
+#: match on a character class, which is the order of cost `_parse_structured`
+#: already pays for its first-character checks.
+_RE_LOGFMT_OPENS = re.compile(rf"^{_LOGFMT_KEY}=")
+
+#: One pair. The value is double-quoted or runs bare to the next space, and the
+#: two get **separate groups** rather than one alternation: a bare token can
+#: also start with a quote -- that is precisely what an unterminated one looks
+#: like -- so "was this properly closed" has to be something the pattern
+#: reports rather than something the caller infers from a leading character.
+_RE_LOGFMT_PAIR = re.compile(
+    rf"(?P<k>{_LOGFMT_KEY})=(?:\"(?P<quoted>(?:\\.|[^\"\\])*)\"|(?P<bare>\S*))"
+)
+
+#: Inside quotes only `\"` and `\\` are escapes. Every other backslash stays
+#: literal, because `path="C:\Users\bob"` is the common case and a deliberate
+#: `\n` is not.
+_RE_LOGFMT_UNESCAPE = re.compile(r'\\(["\\])')
+
+#: Guard 4. A line carrying none of these has nothing to put in the message
+#: cell, so claiming it buys a structured row that says less than the raw one.
+_LOGFMT_ANCHORS: frozenset[str] = frozenset(
+    _JSON_TS_KEYS + _JSON_LEVEL_KEYS + _JSON_MSG_KEYS
+)
+
+
+def _collect_logfmt(text: str) -> Optional[Mapping[str, str]]:
+    """Read *text* as a whole line of ``key=value`` pairs, or refuse it.
+
+    Refusing is the common answer and the important one: `key=value` is
+    ordinary inside a syslog *message*, and this runs on lines no anchored
+    format claimed. The four guards are described in the module docstring; all
+    four must pass, and the second is why the scan continues past
+    :data:`_MAX_FIELDS` even though storage does not.
+    """
+
+    stripped = text.strip()
+    if not _RE_LOGFMT_OPENS.match(stripped):
+        return None
+
+    values: dict[str, str] = {}
+    position = 0
+    limit = len(stripped)
+    while position < limit:
+        match = _RE_LOGFMT_PAIR.match(stripped, position)
+        if match is None:  # a leftover token that is not a pair
+            return None
+        quoted = match.group("quoted")
+        if quoted is not None:
+            value = _RE_LOGFMT_UNESCAPE.sub(r"\1", quoted)
+        else:
+            value = match.group("bare")
+            if '"' in value:  # an opening quote the pattern could not close
+                return None
+        key = match.group("k")
+        # A repeated key keeps the last, which is what `json.loads` does with a
+        # repeated object key -- and keeps its original position, so `fields`
+        # stays in document order.
+        if key in values or len(values) < _MAX_FIELDS:
+            values[key] = value
+        position = match.end()
+        while position < limit and stripped[position].isspace():
+            position += 1
+
+    if len(values) < 2 or values.keys().isdisjoint(_LOGFMT_ANCHORS):
+        return None
+    return _freeze_fields(values)
+
+
+def _logfmt_entry(
+    line: str,
+    text: str,
+    fields: Mapping[str, str],
+    *,
+    timestamp: Optional[datetime] = None,
+    level: Optional[str] = None,
+) -> LogEntry:
+    """Build the entry for pairs :func:`_collect_logfmt` accepted.
+
+    *line* is the whole physical line and becomes ``raw``. *text* is what the
+    pairs were collected from -- the same thing, except where an ISO branch
+    deferred its message remainder -- and is the message fallback, as the whole
+    line is :func:`_parse_json`'s. *timestamp* and *level* are what that branch
+    already recovered; the line's own pairs win wherever it states them.
+
+    The level comes from the parsed *value* and never from :func:`_scan_level`:
+    `_RE_BARE_LEVEL` is not ``re.IGNORECASE``, so the scanner reads
+    ``level=INFO`` and misses ``level=info``.
+    """
+
+    if timestamp is None:
+        for key in _JSON_TS_KEYS:
+            value = fields.get(key)
+            if value:
+                timestamp = _parse_iso_timestamp(value)
+                if timestamp is not None:
+                    break
+
+    for key in _JSON_LEVEL_KEYS:
+        value = fields.get(key)
+        if value:
+            parsed = normalize_level(value)
+            if parsed is not None:
+                level = parsed
+                break
+
+    message = ""
+    for key in _JSON_MSG_KEYS:
+        value = fields.get(key)
+        if value:
+            message = value
+            break
+
+    return LogEntry(
+        raw=line,
+        timestamp=timestamp,
+        level=level,
+        message=message or text,
+        format_name="logfmt",
+        # Every key is kept, including the ones consumed above: `msg:` has to
+        # stay queryable on the line that carried it.
+        fields=fields,
+    )
+
+
 def _parse_structured(line: str, *, now: Optional[datetime] = None) -> Optional[LogEntry]:
-    """Try each known format, dispatching on cheap prefix checks first."""
+    """Try each known format, dispatching on cheap prefix checks first.
+
+    ``logfmt`` is the exception and comes last, because it has no prefix to
+    check: it is claimed on structure alone, by a line that clears the four
+    guards in :func:`_collect_logfmt`. The two ISO branches offer it their
+    message remainder before returning; syslog does not. See the module
+    docstring for why the asymmetry is deliberate.
+    """
 
     stripped = line.lstrip()
     if not stripped:
@@ -585,11 +876,23 @@ def _parse_structured(line: str, *, now: Optional[datetime] = None) -> Optional[
     if first == "[" or (first.isdigit() and stripped[4:5] == "-"):
         match = _RE_ISO_LEVEL.match(stripped)
         if match:
+            message = match.group("msg")
+            timestamp = _parse_iso_timestamp(match.group("ts"))
+            level = normalize_level(match.group("level"))
+            # The remainder may itself be logfmt, in which case the line states
+            # far more than an `iso-level` row can show: this branch would put
+            # the whole payload in `message` with no fields at all. Deferring
+            # costs one guard check on a line that has already matched.
+            fields = _collect_logfmt(message)
+            if fields is not None:
+                return _logfmt_entry(
+                    line, message, fields, timestamp=timestamp, level=level
+                )
             return LogEntry(
                 raw=line,
-                timestamp=_parse_iso_timestamp(match.group("ts")),
-                level=normalize_level(match.group("level")),
-                message=match.group("msg"),
+                timestamp=timestamp,
+                level=level,
+                message=message,
                 format_name="iso-level",
             )
         match = _RE_ISO_PLAIN.match(stripped)
@@ -597,6 +900,12 @@ def _parse_structured(line: str, *, now: Optional[datetime] = None) -> Optional[
             timestamp = _parse_iso_timestamp(match.group("ts"))
             if timestamp is not None:
                 message = match.group("msg")
+                # The same deferral, and the branch that made it necessary:
+                # `2026-08-07T09:25:01Z level=error msg="boom"` matched here,
+                # which is how a logfmt line ended up as `iso` with no level.
+                fields = _collect_logfmt(message)
+                if fields is not None:
+                    return _logfmt_entry(line, message, fields, timestamp=timestamp)
                 return LogEntry(
                     raw=line,
                     timestamp=timestamp,
@@ -629,6 +938,13 @@ def _parse_structured(line: str, *, now: Optional[datetime] = None) -> Optional[
             fields=_match_fields(match, _CLF_FIELDS),
         )
 
+    # Last, and the ordering is the anti-false-positive mechanism rather than a
+    # performance detail: logfmt is the one format here with nothing to anchor
+    # on, and `key=value` is ordinary inside a syslog message.
+    fields = _collect_logfmt(stripped)
+    if fields is not None:
+        return _logfmt_entry(line, stripped, fields)
+
     return None
 
 
@@ -645,12 +961,31 @@ def _scan_level(text: str, *, window: int = 80) -> Optional[str]:
     return normalize_level(match.group(1))
 
 
-def parse_line(line: str, *, now: Optional[datetime] = None) -> LogEntry:
-    """Parse one line, always returning an entry (``raw`` format on no match)."""
+def parse_line(
+    line: str, *, now: Optional[datetime] = None, formats: Any = ()
+) -> LogEntry:
+    """Parse one line, always returning an entry (``raw`` format on no match).
+
+    **Built-ins first, plugins second, ``raw`` last**, and the order carries two
+    arguments rather than one. A line a built-in already handles costs a plugin
+    nothing, however many formats are installed; and a third-party format cannot
+    shadow syslog, which is what makes "a plugin extends parsing" different from
+    "a plugin replaces parsing".
+
+    *formats* is the enabled ``LogFormat`` plugins, already guarded — a
+    ``clv.plugins.FormatStack``, or ``()`` when there are none, which is the
+    common case and is falsy so nothing below it is entered. It is passed in and
+    never imported: this module does not know that ``clv.plugins`` exists, and
+    the dependency runs the other way round on purpose.
+    """
 
     entry = _parse_structured(line, now=now)
     if entry is not None:
         return entry
+    if formats:
+        entry = formats.parse(line)
+        if entry is not None:
+            return entry
     return LogEntry(raw=line, message=line, format_name="raw", level=_scan_level(line))
 
 
@@ -659,6 +994,7 @@ def parse_lines(
     *,
     now: Optional[datetime] = None,
     carry_forward: bool = True,
+    formats: Any = (),
 ) -> list[LogEntry]:
     """Parse a block of lines, letting continuations inherit their parent entry.
 
@@ -677,8 +1013,10 @@ def parse_lines(
     last_timestamp: Optional[datetime] = None
     last_level: Optional[str] = None
 
+    if formats:
+        formats.start()
     for line in lines:
-        entry = parse_line(line, now=now)
+        entry = parse_line(line, now=now, formats=formats)
         if entry.structured:
             if entry.timestamp is not None:
                 last_timestamp = entry.timestamp
@@ -693,6 +1031,8 @@ def parse_lines(
             )
         entries.append(entry)
 
+    if formats:
+        formats.settle()
     return entries
 
 
@@ -704,10 +1044,15 @@ class LogParser:
     across two polls still inherits correctly.
     """
 
-    def __init__(self, *, carry_forward: bool = True) -> None:
+    def __init__(self, *, carry_forward: bool = True, formats: Any = ()) -> None:
         self._carry_forward = carry_forward
         self._last_timestamp: Optional[datetime] = None
         self._last_level: Optional[str] = None
+        #: The enabled ``LogFormat`` plugins, guarded and budgeted by whoever
+        #: built them. ``()`` on a build with no format plugins, which is falsy
+        #: — so :meth:`feed` runs exactly the loop it ran before this parameter
+        #: existed and enters no measurement path at all.
+        self._formats = formats
 
     def reset(self) -> None:
         """Forget the trailing entry; call when switching source or reloading."""
@@ -719,10 +1064,19 @@ class LogParser:
 
         Carry-forward covers timestamp and level only; see :func:`parse_lines`
         for why a continuation does not inherit ``fields``.
+
+        **The call is the read-path budget's pass.** A batch is one reader's
+        ``prime`` or ``poll``, which is the only boundary this path has: there
+        is no render to close, and charging a plugin per line would mean a
+        verdict on a sample of one. So the stack's pass opens here and settles
+        here, and a format's time is judged over everything one read gave it.
         """
+        formats = self._formats
+        if formats:
+            formats.start()
         entries: list[LogEntry] = []
         for line in lines:
-            entry = parse_line(line, now=now)
+            entry = parse_line(line, now=now, formats=formats)
             if entry.structured:
                 if entry.timestamp is not None:
                     self._last_timestamp = entry.timestamp
@@ -738,4 +1092,6 @@ class LogParser:
                     continuation=True,
                 )
             entries.append(entry)
+        if formats:
+            formats.settle()
         return entries

@@ -33,7 +33,14 @@ from typing import Any, Dict, Iterable, Optional, Sequence
 from .filtering import compile_query
 from .marks import mark_key
 from .parsing import LogEntry
-from .query import MATCH_HIT, QueryError, match_terms, parse_query
+from .query import (
+    MATCH_HIT,
+    QueryError,
+    match_terms,
+    parse_query,
+    requirements,
+    unsatisfied,
+)
 from .refs import SourceRef
 
 #: What a rule does when it matches.
@@ -55,6 +62,13 @@ class WatchRule:
     pattern: str = ""
     action: str = ACTION_BOTH
     enabled: bool = True
+    #: Query plugins :attr:`pattern` depends on. Same contract as
+    #: :attr:`~clv.storage.SavedView.requires`: a rule naming a plugin that is
+    #: not installed is kept byte-intact, never matches, and is listed with the
+    #: plugin it needs. Without this the rule would fall through to
+    #: ``compile_query`` and start matching as a regex — quietly highlighting
+    #: the wrong lines, which is worse than highlighting none.
+    requires: tuple[str, ...] = ()
 
     @property
     def highlights(self) -> bool:
@@ -85,21 +99,49 @@ class WatchRule:
             return None
         action = raw.get("action")
         enabled = raw.get("enabled")
+        # Hand-written rather than annotation-driven like `SavedView`'s, so the
+        # house rule has to be restated: one bad element must not cost the list.
+        stored = raw.get("requires")
+        requires = (
+            tuple(item for item in stored if isinstance(item, str))
+            if isinstance(stored, (list, tuple))
+            else ()
+        )
         return cls(
             name=name.strip(),
             pattern=pattern,
             action=action if action in ACTIONS else ACTION_BOTH,
             enabled=enabled if isinstance(enabled, bool) else True,
+            requires=requires,
         )
 
+    @property
+    def missing_plugins(self) -> tuple[str, ...]:
+        """Plugins this rule needs that are not installed. Empty when usable."""
 
-def validate_pattern(pattern: str, known_fields: Iterable[str] = ()) -> Optional[str]:
+        return unsatisfied(self.requires)
+
+
+def validate_pattern(
+    pattern: str,
+    known_fields: Iterable[str] = (),
+    requires: Iterable[str] = (),
+) -> Optional[str]:
     """Why *pattern* is unusable, or ``None`` when it is fine.
 
     Used by the rules dialog so a bad pattern is reported where it was typed
     rather than swallowed at match time.
+
+    *requires* is a stored rule's recorded plugin dependencies, checked first:
+    an uninstalled plugin leaves nothing in the grammar to complain about, so
+    the pattern would otherwise validate cleanly and then mean something else.
+    A plugin that is merely *switched off* needs no special case — its token
+    stays reserved and ``parse_query`` raises below, naming it.
     """
 
+    absent = unsatisfied(requires)
+    if absent:
+        return "Rule " + describe_missing(absent) + "."
     if not pattern.strip():
         return "Enter a pattern."
     try:
@@ -108,6 +150,38 @@ def validate_pattern(pattern: str, known_fields: Iterable[str] = ()) -> Optional
     except QueryError as exc:
         return str(exc)
     return None
+
+
+def _name_list(names: Sequence[str]) -> str:
+    """``'a'``, ``'a' and 'b'``, ``'a', 'b' and 'c'`` — for a message."""
+
+    quoted = [f"'{name}'" for name in names]
+    if len(quoted) == 1:
+        return quoted[0]
+    return ", ".join(quoted[:-1]) + f" and {quoted[-1]}"
+
+
+#: Marks a saved view or watch rule whose query needs a plugin that is not
+#: installed. Here rather than in any one widget because three surfaces show it
+#: — the source tree, the view picker and the rules dialog — and a record that
+#: is unusable in three places must not be unusable in three different glyphs.
+#: It sits beside :func:`describe_missing` because the mark and the words it
+#: introduces are one message split across however much width there is.
+UNUSABLE_MARK = "⚠"
+
+
+def describe_missing(names: Sequence[str]) -> str:
+    """One clause naming the plugins a saved thing needs and does not have.
+
+    Shared by the watch dialog, the view picker and the app's own notification
+    so an operator meets the same sentence wherever they run into it — a saved
+    thing that is unusable in three places should not be unusable in three
+    different wordings.
+    """
+
+    if len(names) == 1:
+        return f"needs the '{names[0]}' plugin, which is not installed"
+    return f"needs the {_name_list(names)} plugins, which are not installed"
 
 
 class _CompiledRule:
@@ -120,6 +194,13 @@ class _CompiledRule:
         self.terms: tuple = ()
         self.pattern: Optional[re.Pattern[str]] = None
         self.broken = False
+        if rule.missing_plugins:
+            # **Before** the parse, not after it. An uninstalled operator is not
+            # a syntax error: the token is simply unknown, so the whole pattern
+            # falls through to `compile_query` and starts matching as a regex.
+            # That is the one outcome Requirement 12 forbids, and it is silent.
+            self.broken = True
+            return
         try:
             parsed = parse_query(rule.pattern, known_fields)
             self.terms = parsed.terms
@@ -310,6 +391,16 @@ def notifying(names: Sequence[str], rules: Sequence[WatchRule]) -> tuple[str, ..
     return tuple(name for name in names if name in wanted)
 
 
+def rule_requirements(pattern: str, known_fields: Iterable[str] = ()) -> tuple[str, ...]:
+    """The query plugins *pattern* depends on, for a rule about to be saved.
+
+    A thin pass-through to :func:`clv.services.query.requirements`, re-exported
+    here so the rules dialog does not have to reach past ``watch`` for it.
+    """
+
+    return requirements(pattern, known_fields)
+
+
 def describe_rules(rules: Sequence[WatchRule]) -> str:
     """Status line for the Advanced drawer."""
 
@@ -329,6 +420,9 @@ def toggled(rules: Sequence[WatchRule], name: str, enabled: bool) -> tuple[Watch
 
 __all__ = [
     "ACTIONS",
+    "UNUSABLE_MARK",
+    "describe_missing",
+    "rule_requirements",
     "ACTION_BOTH",
     "ACTION_HIGHLIGHT",
     "ACTION_NOTIFY",

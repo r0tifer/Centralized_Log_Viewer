@@ -37,7 +37,19 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, OptionList, Static
 from textual.widgets.option_list import Option
 
+from ..services.query import unsatisfied
+from ..services.watch import UNUSABLE_MARK, describe_missing
 from ..storage import SavedView
+
+
+def _view_line(view: SavedView) -> str:
+    """One picker row: the name, what it filters to, and whether it can run."""
+
+    line = f"{view.name} — {view.summary()}"
+    absent = unsatisfied(view.requires)
+    if absent:
+        return f"{line}  {UNUSABLE_MARK} {describe_missing(absent)}"
+    return line
 
 
 @dataclass(frozen=True)
@@ -249,7 +261,7 @@ class ViewPickerDialog(ModalScreen[ViewRequest | None]):
             # "[" in that name is not ours to interpret.
             yield OptionList(
                 *(
-                    Option(Text(f"{view.name} — {view.summary()}"), id=view.name)
+                    Option(Text(_view_line(view)), id=view.name)
                     for view in self._views
                 ),
                 id="view-list",
@@ -327,7 +339,25 @@ class ViewPickerDialog(ModalScreen[ViewRequest | None]):
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         event.stop()
         if 0 <= event.option_index < len(self._views):
-            self.dismiss(ViewRequest("apply", self._views[event.option_index].name))
+            self._apply(self._views[event.option_index])
+
+    def _apply(self, view: SavedView) -> None:
+        """Dismiss with an apply request, unless the view cannot be applied.
+
+        Refused *here* as well as in the app, and the duplication is the point:
+        the app's check is the invariant — the tree row dismisses straight into
+        it — while this one puts the reason in the modal the operator is looking
+        at, instead of as a toast after it has closed.
+
+        Rename and delete are deliberately still allowed. The view is intact and
+        it is theirs; what it cannot do is run.
+        """
+
+        absent = unsatisfied(view.requires)
+        if absent:
+            self._hint(f"'{view.name}' {describe_missing(absent)}.", warning=True)
+            return
+        self.dismiss(ViewRequest("apply", view.name))
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:  # type: ignore[override]
         if event.input.id != "rename-input":
@@ -373,7 +403,7 @@ class ViewPickerDialog(ModalScreen[ViewRequest | None]):
             event.stop()
             view = self._current()
             if view is not None:
-                self.dismiss(ViewRequest("apply", view.name))
+                self._apply(view)
 
     # --- rename and delete --------------------------------------------------
 

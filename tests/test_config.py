@@ -24,11 +24,14 @@ from clv.services.config import (
     RemoteHost,
     bundled_config_path,
     config_version_of,
+    ensure_user_plugin_dir,
     ensure_user_settings_file,
     host_options,
     load_config,
     parse_log_dirs,
+    plugin_settings_for,
     user_config_path,
+    user_plugin_dir,
     validate_host_name,
     validate_identity_file,
     validate_port,
@@ -938,6 +941,7 @@ def test_the_shipped_file_parses_into_the_documented_defaults(monkeypatch) -> No
     assert config.cluster_lookback == 200
     assert config.enable_journald is False
     assert config.enable_ssh is False
+    assert config.plugins == ()
 
 
 def test_the_shipped_file_names_no_hosts_and_reports_nothing(monkeypatch) -> None:
@@ -1026,3 +1030,328 @@ def test_the_second_commented_host_example_still_parses(tmp_path, monkeypatch) -
     assert config.hosts[0].name == "db02"
     assert config.hosts[0].host == "10.0.0.12"
     assert config.hosts[0].log_dirs == ("/var/log/postgresql",)
+
+
+# --- the plugin enable-list -------------------------------------------------
+
+
+def test_plugins_is_empty_by_default(tmp_path) -> None:
+    config = load_config(_write(tmp_path / "settings.conf", "[log_viewer]\n"))
+
+    assert config.plugins == ()
+    assert config.issues == ()
+
+
+def test_plugins_tolerates_the_shapes_an_operator_writes(tmp_path) -> None:
+    """Whitespace, a trailing comma, a duplicate and the wrong case."""
+
+    body = "[log_viewer]\nplugins =  redact_secrets , Nginx_Format,, redact_secrets,\n"
+
+    config = load_config(_write(tmp_path / "settings.conf", body))
+
+    assert config.plugins == ("redact_secrets", "nginx_format")
+    assert config.issues == ()
+
+
+def test_an_unusable_plugin_name_is_dropped_and_the_rest_still_load(tmp_path) -> None:
+    """Per-entry, like `log_dirs` — one stray character must not void the list.
+
+    Voiding it would silently disable a working set of plugins, which is the
+    failure an operator is least able to diagnose: nothing loads, and the file
+    they are reading looks right.
+    """
+
+    body = "[log_viewer]\nplugins = good_one, my-plugin, foo.bar, other_one\n"
+
+    config = load_config(_write(tmp_path / "settings.conf", body))
+
+    assert config.plugins == ("good_one", "other_one")
+    assert [issue.origin for issue in config.issues] == ["plugins", "plugins"]
+    assert "'my-plugin'" in str(config.issues[0])
+    assert "'foo.bar'" in str(config.issues[1])
+
+
+def test_an_underscored_plugin_name_says_why_it_cannot_work(tmp_path) -> None:
+    """It parses as a module name, so the generic message would be wrong."""
+
+    body = "[log_viewer]\nplugins = _private\n"
+
+    config = load_config(_write(tmp_path / "settings.conf", body))
+
+    assert config.plugins == ()
+    assert "underscore" in config.issues[0].message
+
+
+def test_an_empty_plugins_value_reports_nothing(tmp_path) -> None:
+    config = load_config(_write(tmp_path / "settings.conf", "[log_viewer]\nplugins =\n"))
+
+    assert config.plugins == ()
+    assert config.issues == ()
+
+
+# --- the user plugin directory ----------------------------------------------
+
+
+def test_the_plugin_directory_sits_beside_the_settings_file() -> None:
+    """One place, already in the operator's muscle memory."""
+
+    assert user_plugin_dir().parent == user_config_path().parent
+
+
+def test_the_plugin_directory_is_created_with_a_readme() -> None:
+    created = ensure_user_plugin_dir()
+
+    assert created == user_plugin_dir()
+    assert created.is_dir()
+    readme = created / "README.txt"
+    assert readme.exists()
+    # The two things an empty folder cannot say for itself.
+    text = readme.read_text(encoding="utf-8")
+    assert "plugins" in text and "settings.conf" in text
+    assert "trusted code" in text
+
+
+def test_creating_the_plugin_directory_is_idempotent() -> None:
+    ensure_user_plugin_dir()
+    readme = user_plugin_dir() / "README.txt"
+    readme.write_text("edited by the operator", encoding="utf-8")
+
+    ensure_user_plugin_dir()
+
+    assert readme.read_text(encoding="utf-8") == "edited by the operator", (
+        "an operator's own note in their own directory was overwritten"
+    )
+
+
+def test_an_unwritable_home_is_not_a_startup_failure(monkeypatch, tmp_path) -> None:
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(locked))
+    try:
+        assert ensure_user_plugin_dir() is None
+    finally:
+        locked.chmod(0o700)
+
+
+# --- [plugin:<name>] sections -----------------------------------------------
+#
+# `config.py` parses these and never interprets them. What a key means is the
+# plugin's business, so the only things asserted here are that a well-formed
+# section arrives intact and that a malformed one costs itself and nothing else.
+
+
+def test_a_plugin_section_is_parsed_verbatim(tmp_path) -> None:
+    config = load_config(
+        _write(
+            tmp_path / "settings.conf",
+            "[log_viewer]\nlog_dirs = /var/log\n\n"
+            "[plugin:redact_secrets]\npatterns = password, api_key\n"
+            "replacement = ******\n",
+        )
+    )
+
+    assert config.plugin_settings == {
+        "redact_secrets": {
+            "patterns": "password, api_key",
+            "replacement": "******",
+        }
+    }
+    assert config.issues == ()
+
+
+def test_plugin_sections_are_matched_case_insensitively(tmp_path) -> None:
+    """A settings file is operator prose, exactly as the enable-list argues."""
+
+    config = load_config(
+        _write(
+            tmp_path / "settings.conf",
+            "[log_viewer]\nlog_dirs = /var/log\n\n[plugin:Redact]\na = 1\n",
+        )
+    )
+
+    assert set(config.plugin_settings) == {"redact"}
+
+
+def test_no_plugin_section_is_an_empty_mapping_not_an_issue(tmp_path) -> None:
+    config = load_config(
+        _write(tmp_path / "settings.conf", "[log_viewer]\nlog_dirs = /var/log\n")
+    )
+
+    assert config.plugin_settings == {}
+    assert config.issues == ()
+
+
+def test_a_malformed_plugin_section_costs_only_itself(tmp_path) -> None:
+    """The rule `config.py` follows everywhere: skip it, say so, keep going.
+
+    Voiding the neighbouring section would silently stop a working plugin from
+    being configured while the file the operator is staring at looks correct.
+    """
+
+    config = load_config(
+        _write(
+            tmp_path / "settings.conf",
+            "[log_viewer]\nlog_dirs = /var/log\n\n"
+            "[plugin:]\na = 1\n\n"
+            "[plugin:my-plugin]\na = 1\n\n"
+            "[plugin:_hidden]\na = 1\n\n"
+            "[plugin:good]\na = 1\n",
+        )
+    )
+
+    assert set(config.plugin_settings) == {"good"}
+    origins = [issue.origin for issue in config.issues]
+    assert origins == ["[plugin:]", "[plugin:my-plugin]", "[plugin:_hidden]"]
+    assert "has no plugin name" in config.issues[0].message
+
+
+def test_a_duplicated_plugin_section_is_reported_and_skipped(tmp_path) -> None:
+    config = load_config(
+        _write(
+            tmp_path / "settings.conf",
+            "[log_viewer]\nlog_dirs = /var/log\n\n"
+            "[plugin:twice]\na = first\n\n"
+            "[plugin:Twice]\na = second\n",
+        )
+    )
+
+    assert config.plugin_settings == {"twice": {"a": "first"}}
+    assert "already configured" in config.issues[-1].message
+
+
+def test_a_bad_plugin_section_is_never_a_startup_failure(tmp_path) -> None:
+    config = load_config(
+        _write(
+            tmp_path / "settings.conf",
+            "[log_viewer]\nlog_dirs = /var/log\n\n[plugin:my-plugin]\na = 1\n",
+        )
+    )
+
+    assert config.log_dirs == [Path("/var/log")]
+
+
+# --- the legacy alias -------------------------------------------------------
+
+
+def test_enable_journald_is_read_into_the_journald_section() -> None:
+    """The key stays where every operator's file and the drawer already put it.
+
+    Renaming it would buy tidiness at the cost of a config migration and a
+    drawer change. Folding it in costs one table entry and changes nobody's
+    settings file.
+    """
+
+    on = plugin_settings_for(LogConfig(enable_journald=True))
+    off = plugin_settings_for(LogConfig(enable_journald=False))
+
+    assert on["journald"]["enabled"] == "true"
+    assert off["journald"]["enabled"] == "false"
+
+
+def test_an_explicit_section_wins_over_the_legacy_alias() -> None:
+    settings = plugin_settings_for(
+        LogConfig(
+            enable_journald=False,
+            plugin_settings={"journald": {"enabled": "true"}},
+        )
+    )
+
+    assert settings["journald"]["enabled"] == "true"
+
+
+def test_plugin_settings_for_hands_out_copies() -> None:
+    """The registry owns its dicts for the session and mutates them in place."""
+
+    config = LogConfig(plugin_settings={"x": {"a": "1"}})
+    settings = plugin_settings_for(config)
+    settings["x"]["a"] = "changed"
+
+    assert config.plugin_settings["x"]["a"] == "1"
+
+
+def test_the_shipped_template_documents_a_plugin_section() -> None:
+    assert "[plugin:" in DEFAULT_SETTINGS_TEMPLATE
+
+
+# --- the read-path budget ---------------------------------------------------
+
+
+def test_the_read_budget_defaults_and_clamps_like_the_render_one(tmp_path) -> None:
+    """Two budgets, one policy. Zero is the documented escape hatch, not a typo."""
+
+    assert LogConfig().plugin_read_budget_ms == 50
+
+    path = tmp_path / "settings.conf"
+    path.write_text(
+        "[log_viewer]\nplugin_read_budget_ms = 0\n", encoding="utf-8"
+    )
+    assert load_config(path).plugin_read_budget_ms == 0
+
+    path.write_text(
+        "[log_viewer]\nplugin_read_budget_ms = 9999999\n", encoding="utf-8"
+    )
+    assert load_config(path).plugin_read_budget_ms == 60_000
+
+
+def test_the_template_documents_the_read_budget() -> None:
+    """A key with no prose beside it is a key nobody will ever set on purpose."""
+
+    assert "plugin_read_budget_ms = 50" in DEFAULT_SETTINGS_TEMPLATE
+    assert "once per line *read*" in DEFAULT_SETTINGS_TEMPLATE
+
+
+# --- the worked example -----------------------------------------------------
+
+
+def test_the_worked_example_is_written_but_not_discoverable() -> None:
+    """One level down, so a fresh install still reports nothing installed.
+
+    Written into the plugin directory itself the example would be *discovered*,
+    and every machine with no plugins at all would report "1 not enabled"
+    forever — against a plugin CLV put there. `pkgutil.iter_modules` does not
+    descend and `examples/` is not a package, so it is shipped, readable and
+    invisible.
+    """
+
+    import pkgutil
+
+    created = ensure_user_plugin_dir()
+    example = created / "examples" / "nginx_error.py"
+
+    assert example.exists()
+    assert "class NginxErrorFormat" in example.read_text(encoding="utf-8")
+    assert [info.name for info in pkgutil.iter_modules([str(created)])] == []
+    assert "examples/nginx_error.py" in (created / "README.txt").read_text(
+        encoding="utf-8"
+    )
+
+    # Driven off the table rather than naming one file, so an example added to
+    # SEEDED_EXAMPLES that fails to seed — or that seeds without being written
+    # up — fails here rather than being discovered by whoever went looking for
+    # it in a fresh install.
+    from clv.services.config import SEEDED_EXAMPLES
+
+    readme = (created / "README.txt").read_text(encoding="utf-8")
+    for filename in SEEDED_EXAMPLES:
+        assert (created / "examples" / filename).exists(), filename
+        assert f"examples/{filename}" in readme, filename
+
+
+def test_the_worked_example_is_never_written_over() -> None:
+    """An operator who edited it, or deleted it, keeps that decision."""
+
+    created = ensure_user_plugin_dir()
+    example = created / "examples" / "nginx_error.py"
+    example.write_text("# mine now", encoding="utf-8")
+
+    ensure_user_plugin_dir()
+    assert example.read_text(encoding="utf-8") == "# mine now"
+
+    example.unlink()
+    ensure_user_plugin_dir()
+    # Deleting it is not a decision CLV gets to undo either... except that a
+    # missing file is indistinguishable from a first run. Seeding it again is
+    # the lesser wrong: it costs a file, where refusing to would need a marker
+    # this directory has no other reason to carry.
+    assert example.exists()

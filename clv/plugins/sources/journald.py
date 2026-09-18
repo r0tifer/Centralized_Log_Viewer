@@ -34,13 +34,13 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Iterable, Iterator, Mapping, Optional
 
 from ...services.config import load_config
 from ...services.parsing import normalize_level
 from ...services.reader import TailRead
 from ...services.refs import JournalRef, RemoteRef, SourceRef, parse_ref
-from .. import LogSourceProvider, ProviderSource
+from .. import LogSourceProvider, ProviderSource, setting_bool
 
 #: The identifier scheme. Not a real path, and deliberately not one: nothing on
 #: disk answers to it.
@@ -469,7 +469,15 @@ class JournaldProvider(LogSourceProvider):
     def __init__(self, *, runner=None, max_lines: int = DEFAULT_LINES) -> None:
         #: Injected so unit enumeration can be tested against captured output
         #: rather than against whatever the machine running the suite has.
-        self._runner = runner or _run
+        #:
+        #: The default is wrapped rather than passed by name so that
+        #: `query_timeout` reaches it without widening the contract an injected
+        #: runner has to satisfy: a test still writes `lambda argv: ...`, and the
+        #: only caller that knows about a timeout is the one that owns the
+        #: subprocess.
+        self._runner = runner or (
+            lambda argv: _run(argv, timeout=self.query_timeout)
+        )
         self._max_lines = max_lines
         self.status = "disabled"
         #: Why the last unit enumeration came back empty, when it did. Empty
@@ -489,6 +497,76 @@ class JournaldProvider(LogSourceProvider):
         #: Per host, why it offers no journal — a missing `journalctl`, an
         #: unreachable machine, a failed enumeration. Reported, never raised.
         self.host_notes: dict[str, str] = {}
+        #: This plugin's `[plugin:journald]` section, or None when it was
+        #: constructed directly rather than loaded — which is what the tests and
+        #: any other in-process caller do.
+        self._settings: Optional[Mapping[str, str]] = None
+
+    # --- configuration -------------------------------------------------------
+
+    def configure(self, settings: Mapping[str, str]) -> None:
+        """Adopt this plugin's own settings section.
+
+        **The worked example for the whole hook**, and worth reading as one: the
+        opt-in that gates every subprocess this file spawns arrives here, from
+        a section named after this module, with no import of the settings
+        parser. A third-party plugin that needs an operator's consent before it
+        touches the network writes exactly this and nothing more.
+
+        *settings* is a live view rather than a copy, so it is kept rather than
+        read out of. That is what preserves the property the drawer's switch
+        depends on: flipping it rewrites `settings.conf`, CLV refreshes the
+        mapping behind this view, and the next `discover()` sees the new value
+        with no restart and no re-reading of the file from here.
+
+        ``enabled`` is `enable_journald` under its section name. The key stayed
+        in `[log_viewer]` because it is in every operator's file and it is what
+        the Advanced drawer writes; `config.plugin_settings_for` folds it in, so
+        this reads one place while the operator's file changes not at all.
+        """
+
+        self._settings = settings
+
+    def _enabled(self) -> bool:
+        """Whether the operator has opted in, read fresh every time.
+
+        Through the configured mapping when there is one, and through the
+        module-level :func:`enabled` when there is not. The fallback is not a
+        second mechanism competing with the first: it is what a provider
+        constructed directly — by a test, or by anything else in process that
+        never went through the loader — has instead of a `configure()` call.
+        """
+
+        if self._settings is None:
+            return enabled()
+        return setting_bool(self._settings, "enabled", False)
+
+    def _setting_int(self, key: str, default: int) -> int:
+        """An optional numeric tuning key, or *default*.
+
+        Out of range or unreadable is *default*, never an error. These are
+        conveniences; a typo in one must not cost the operator their journal.
+        """
+
+        if self._settings is None:
+            return default
+        try:
+            value = int(str(self._settings.get(key, "")).strip())
+        except (TypeError, ValueError):
+            return default
+        return value if value > 0 else default
+
+    @property
+    def max_lines(self) -> int:
+        """Records the initial read asks for. ``max_lines`` in the section."""
+
+        return self._setting_int("max_lines", self._max_lines)
+
+    @property
+    def query_timeout(self) -> int:
+        """Seconds a one-shot enumeration may take. ``query_timeout``."""
+
+        return self._setting_int("query_timeout", QUERY_TIMEOUT)
 
     def use_remote(self, resolver, hosts) -> None:
         """Adopt the app's connection resolver and host list.
@@ -512,7 +590,7 @@ class JournaldProvider(LogSourceProvider):
         """
 
         self.host_notes = {}
-        if not enabled():
+        if not self._enabled():
             self.status = "disabled (set enable_journald to turn it on)"
             return []
 
@@ -696,7 +774,7 @@ class JournaldProvider(LogSourceProvider):
         from .ssh import quote_all
 
         script = quote_all("journalctl", "--no-pager", "--field=_SYSTEMD_UNIT")
-        body = connection.run(f"{script} 2>/dev/null", timeout=QUERY_TIMEOUT)
+        body = connection.run(f"{script} 2>/dev/null", timeout=self.query_timeout)
         units = sorted(
             {
                 line.strip()
@@ -750,7 +828,7 @@ class JournaldProvider(LogSourceProvider):
         asked to stop.
         """
 
-        reader = self.open_reader(path, max_lines=self._max_lines)
+        reader = self.open_reader(path, max_lines=self.max_lines)
         try:
             yield from reader.prime().lines
         finally:
@@ -765,7 +843,7 @@ class JournaldProvider(LogSourceProvider):
         so the dependency runs one way.
         """
 
-        bound = min(max_lines, self._max_lines)
+        bound = min(max_lines, self.max_lines)
         node = path.node if isinstance(path, JournalRef) else ""
         if node:
             connection = self._connection_for_node(node)
@@ -792,7 +870,7 @@ class JournaldProvider(LogSourceProvider):
         return self._connection_for(host)
 
 
-def _run(argv: list[str]) -> tuple[str, str]:
+def _run(argv: list[str], *, timeout: int = QUERY_TIMEOUT) -> tuple[str, str]:
     """Run a short, bounded journalctl query as ``(stdout, why it failed)``.
 
     Never raises, but no longer swallows the reason either: a query that timed
@@ -805,12 +883,12 @@ def _run(argv: list[str]) -> tuple[str, str]:
             argv,
             capture_output=True,
             text=True,
-            timeout=QUERY_TIMEOUT,
+            timeout=timeout,
             check=False,
             env=child_environment(),
         )
     except subprocess.TimeoutExpired:
-        return "", f"journalctl timed out after {QUERY_TIMEOUT}s"
+        return "", f"journalctl timed out after {timeout}s"
     except (OSError, subprocess.SubprocessError) as exc:
         return "", f"journalctl could not be run: {exc}"
     if completed.returncode != 0:

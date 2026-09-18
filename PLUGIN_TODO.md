@@ -14,11 +14,13 @@ bug report from people who cannot read the source to work out what happened.
 Correctness and the contract come first; the door opens third; the seams that
 make the door worth walking through come after that.
 
-Seventeen phases is a lot. The alternative was to declare half of them out of
+Eighteen phases is a lot. The alternative was to declare half of them out of
 scope, which is what the first draft of this file did — and the objection to
 that draft was correct: a plugin system that cannot touch the query language,
 the watch rules, the clustering, the timeline or the screen is not an
-ecosystem, it is three hooks and a directory.
+ecosystem, it is three hooks and a directory. Seventeen of the eighteen are
+that argument; Phase 7b is the exception, and it is here because designing the
+`LogFormat` seam is what proved one particular format could not go through it.
 
 ## Status
 
@@ -27,15 +29,16 @@ ecosystem, it is three hooks and a directory.
 | **Stage A — Foundations** | | |
 | 0 — Doctrine | Withdraw the sandbox claim; reverse three stated non-goals | ✅ Done |
 | 1 — Loader correctness | The six defects, before anyone depends on them | ✅ Done |
-| 2 — The contract | `clv/api.py`, `PLUGIN_API_VERSION`, the entry wire form | ⬜ Not started |
+| 2 — The contract | `clv/api.py`, `PLUGIN_API_VERSION`, the entry wire form | ✅ Done |
 | **Stage B — Reach** | | |
-| 3 — Installation | `~/.config/clv/plugins/`, `CLV_PLUGIN_PATH`, the enable-list | ⬜ Not started |
-| 4 — Management UI | A plugin surface, not a status string | ⬜ Not started |
-| 5 — Ordering, config, lifecycle | `priority`, `[plugin:<name>]`, `setup`/`teardown` | ⬜ Not started |
-| 6 — Performance guard | A slow plugin costs itself, not the pane | ⬜ Not started |
+| 3 — Installation | `~/.config/clv/plugins/`, `CLV_PLUGIN_PATH`, the enable-list | ✅ Done |
+| 4 — Management UI | A plugin surface, not a status string | ✅ Done |
+| 5 — Ordering, config, lifecycle | `priority`, `[plugin:<name>]`, `setup`/`teardown` | ✅ Done |
+| 6 — Performance guard | A slow plugin costs itself, not the pane | ✅ Done |
 | **Stage C — Core seams** | | |
-| 7 — Parsing | `LogFormat`, and a plugin that teaches CLV a format | ⬜ Not started |
-| 8 — Query | `QueryOperator`, `ComputedField`, and the degradation rule | ⬜ Not started |
+| 7a — Parsing | `LogFormat`, and a plugin that teaches CLV a format | ✅ Done |
+| 7b — logfmt | `key=value` parsing, built in because a plugin cannot | ✅ Done |
+| 8 — Query | `QueryOperator`, `ComputedField`, and the degradation rule | ✅ Done |
 | 9 — Watch | `WatchMatcher`, `WatchSink`, off the event loop | ⬜ Not started |
 | 10 — Clustering | `ClusterRule`, `ShapeContributor`, and the shape cache | ⬜ Not started |
 | 11 — Timeline | `TimelineAnnotation`, `TimelineMetric`, foldable only | ⬜ Not started |
@@ -59,11 +62,12 @@ viewer down.
 
 The bar is **a plugin extends a core feature on equal terms with a built-in**.
 Not "beside" it: a plugin-supplied log format must be searchable by field query,
-bucketed by the timeline and folded by the clusterer with no special-casing
-anywhere; a plugin-supplied query operator must work in a saved view and in a
-watch rule; a plugin-supplied command must appear in the help overlay next to
-`?`. Where a seam cannot offer equal terms, the phase says so in the same
-sentence it offers the seam.
+bucketed by the timeline, folded by the clusterer, and drawn as a structured row
+with its own source cell and chips, with no special-casing anywhere; a
+plugin-supplied query operator must work in a saved view and in a watch rule; a
+plugin-supplied command must appear in the help overlay next to `?`. Where a
+seam cannot offer equal terms, the phase says so in the same sentence it offers
+the seam.
 
 Three things follow that bound every phase below.
 
@@ -181,7 +185,7 @@ rather than one at a time.
 | `LogSourceProvider` | exists | Where lines come from | ✅ |
 | `FilterStage` | exists | Transform or drop an entry | ❌ per-entry |
 | `Exporter` | exists | Send the filtered set somewhere | ✅ |
-| `LogFormat` | 7 | Teach CLV to parse a line | ❌ per-line |
+| `LogFormat` | 7a | Teach CLV to parse a line | ❌ per-line |
 | `QueryOperator` | 8 | A new comparison token | ❌ per-entry |
 | `ComputedField` | 8 | A queryable field derived, not parsed | ❌ per-entry |
 | `WatchMatcher` | 9 | A rule kind beyond pattern | ❌ per-entry |
@@ -215,10 +219,15 @@ Phase 16's documentation pass is where it gets rewritten.
 
 **Ordering between the two files is mostly free.** Stage A here is strictly
 additive and can land during SSH_TODO's Phase 0–2 without interference. Two
-couplings, both one-directional:
+couplings, both one-directional, and one of them already discharged:
 
-- **Phase 7 should follow SSH_TODO Phase 1** if both are in flight: a format
-  plugin's `field_names` interacts with the `node` field that phase introduces.
+- **Phase 7a's coupling to SSH_TODO Phase 1 is spent.** That phase has landed
+  and `node` is already in `NORMALISED_FIELD_KEYS`
+  ([query.py:114-120](clv/services/query.py#L114-L120)), so a format's
+  `field_names` now meets it as an existing key rather than a moving one. Kept
+  rather than deleted because the constraint was real: a format declaring `node`
+  would have collided with the one key that means *where CLV read the line*
+  rather than what the line says about itself.
 - **Phase 12's drawer sections should follow SSH_TODO Phase 7**, which adds the
   host-management dialog and is the larger claim on the drawer's layout budget.
 
@@ -517,7 +526,51 @@ rewritten to import from `clv.api`.
 
 **Gate.** A plugin file whose only CLV import is `from clv.api import ...`
 loads and runs every interface. An entry survives a wire round trip unchanged
-for every format CLV parses. Suite green on 3.11 and 3.14.
+for every format CLV parses. Suite green on 3.11 and 3.14: 1625 passed on both.
+
+**As shipped.** Four decisions worth recording, none a change of scope.
+
+*`PLUGIN_API_VERSION` lives in `clv/plugins/__init__.py`, not in `clv/api.py`.*
+`api.py` imports the interfaces from `plugins`, so a constant defined in `api.py`
+and checked in `PluginRegistry.add` would be a cycle. The loader owns the check,
+so the loader owns the constant; `clv.api` re-exports it as the name authors
+see. `add()` takes it as a defaulted `api_version=` keyword — a parameter only so
+a test can pin it, and defaulted so every existing call site is untouched.
+
+*Both constraints are checked by one loop, and it does not short-circuit.*
+`requires_clv` satisfied is not a reason to skip `requires_api`; each fails on
+its own account with the same two shapes Phase 1 settled — `bad requires_api:`
+naming an unreadable constraint, and `requires plugin API X, running Y` for an
+unsatisfied one. Pinned by a test that runs it both ways round.
+
+*Three names beyond the list above are published.* `SourceRef`, because
+`ProviderSource.path` is one and `discover()` may return one, so every provider
+author needs the type; and the severity helpers `level_matches`,
+`highest_level`, `LEVEL_ORDER` and `SEVERITY_BUCKETS`, on the same argument that
+already published `normalize_level` and `level_rank` — the alternative is every
+plugin reimplementing the level vocabulary and making CLV disagree with itself
+about what an operator filtered for. Additive, so the API is still 1.0.
+
+*`==` cannot test the wire round trip on its own.* `LogEntry.fields` is
+`compare=False`, so `entry_from_wire(entry_to_wire(e)) == e` passes even when
+the fields are dropped entirely. Every round-trip assertion in
+`tests/test_api_surface.py` pairs it with an explicit `dict(...) == dict(...)`
+and a read-only check, and a decoded entry with no fields comes back on the
+*shared* empty mapping rather than a fresh one.
+
+**Also swept here.** [README.md](README.md)'s test count (791, five phases
+stale) and its copy of the provider-source claim that
+`tests/test_plugin_docs.py` already forbids in `clv/plugins/AGENTS.md` —
+"starring … tests for a real `Path`" stopped being true when `JournalRef` became
+a ref. `AGENTS.md` carried the same sentence under different wording and is
+corrected too.
+
+**A note for Phase 7a.** `tests/test_api_surface.py` asserts out of process that
+importing `clv.api` pulls in no Textual widget and no Rich renderable, so a
+plugin's own unit tests need no screen. Phase 7a plans to re-export
+`FormatProfile` from [columns.py](clv/widgets/columns.py), which imports both.
+That type has to move, or be mirrored, before it can join `clv.api` — the test
+is the constraint, and it is the right one.
 
 **Commit.** `feat(api): a published, versioned plugin API and an entry wire form`
 
@@ -607,7 +660,84 @@ model in two sentences. The plugin bullet at
 **Gate.** On a machine with CLV installed from the tarball and no Python
 toolchain: copy a `.py` into `~/.config/clv/plugins/`, add one word to
 `settings.conf`, restart, and the plugin is in the drawer's count. Checked by
-hand on a real frozen build. Suite green on 3.11 and 3.14.
+hand on a real frozen build. Suite green on 3.11 and 3.14: 1660 passed on both.
+
+**Outstanding: the frozen build has not been checked by hand.** The gate above
+asks for a tarball install on a machine with no Python toolchain, and that has
+not been done — there is no build spec in the tree and no PyInstaller here, so
+the check belongs to whoever cuts the next artifact. What was done instead is a
+test pinning the property whose loss would cause it
+(`test_the_user_root_does_not_depend_on_where_the_package_lives`): the user root
+comes from `$XDG_CONFIG_HOME` and never from `__file__`, asserted with
+`sys._MEIPASS` set. That is a proxy for a frozen build and not a substitute for
+one — recorded here because `Path.is_dir()` silently removing the journal from
+the shipped binary is precisely the failure a source checkout cannot see.
+
+**As shipped.** Six decisions worth recording, none a change of scope.
+
+*User plugins are imported under a synthetic package, not off `sys.path`.* A
+module in `~/.config/clv/plugins/` is not reachable by dotted import, and the
+obvious fix — prepend the directory to `sys.path` — is the wrong one: a user
+file called `json.py` would then shadow the standard library for the whole
+process, and a plugin directory is exactly where an unremarkable name like that
+gets used. Instead a namespace package (`clv_user_plugins`) is installed in
+`sys.modules` with the search roots as its `__path__`. That is not a workaround
+but the cheaper design: a bare `foo.py` and a package directory `foo/` load
+through one code path, relative imports inside a package plugin work, every
+module gets a stable `__name__` for `_extract_plugins`' namespace scan to
+compare against, and the walk is the same shape `_load_local` already used — so
+the per-module body is now **shared** by both (`_load_module`) rather than
+copied.
+
+*Only an **enabled** user module may shadow a bundled one.* The search order in
+this file, read literally, says a user root wins over `clv/plugins/`. Taken at
+face value that means dropping a file called `journald.py` into the plugin
+directory takes the shipped journal provider out of service — an install-time
+side effect from a file the operator never named, which is the precise thing
+Requirement 2 exists to prevent. An unlisted module is never imported and
+therefore claims nothing. Deliberately overriding a bundled plugin is still
+possible, still first-name-wins, and still reported; it now requires the same
+act of consent as running any other user plugin. Pinned by a test in both
+directions.
+
+*Two bundled subpackages may still share a module basename.* `sources/x.py` and
+`filters/x.py` have always been two different modules. The shadow rule consults
+a map of names claimed by *user* roots and never writes bundled names into it,
+so nothing about the bundled walk changed. Pinned, because the general version
+of the rule would have quietly broken it.
+
+*A malformed enable-list entry is dropped on its own account.* This file said
+the value "degrades to empty and is reported", which read strictly means one
+stray character voids the whole list. `parse_log_dirs` is the house pattern for
+a validated list key and it drops the entry it cannot read and keeps the rest;
+`plugins` follows it. Voiding the list would silently disable a working set of
+plugins while the file the operator is staring at looks correct — the failure
+they are least equipped to diagnose. "Degrades to empty" now applies only to a
+value that cannot be read at all. An underscore-prefixed name gets its own
+message rather than the generic one, because it *is* a legal module name and
+the generic message would be false.
+
+*Discovered-but-not-enabled is registry state, not an error.* `PluginErrors` has
+no severity, and [app.py:3589](clv/app.py#L3589) prints every entry into the log
+panel in amber as a *problem*. A plugin waiting to be named is not a problem —
+it is the designed resting state of an installed plugin — so it became a
+`DiscoveredPlugin` list on the registry, surfaced by `available()` and by one
+extra clause in the drawer's status string. Phase 4 replaces that whole string
+and inherits the state rather than inventing it.
+
+*Names are matched case-insensitively, and `config_version` moved to 2.* A
+settings file is operator prose; `Redact` where the file is `redact.py` is a
+typo class, not an intent. And the template's option set changed, which is the
+stated rule for bumping `CURRENT_CONFIG_VERSION` — so existing operators get the
+upgrade notice, and `clv --upgrade-config` merges the new `plugins` block into
+their file instead of leaving them a key with no prose.
+
+**Also swept here.** `plugin_search_roots()` de-duplicates by resolved path, so
+naming the user directory in `CLV_PLUGIN_PATH` does not make every plugin in it
+report itself as shadowing itself. `tests/test_plugins.py` gained an autouse
+fixture dropping the synthetic package from `sys.modules` between tests: without
+it a plugin loaded from one test's temp directory was handed to the next test
+that asked for the same name.
 
 **Commit.** `feat(plugins): user plugin directory and the enable-list`
 
@@ -671,7 +801,62 @@ The help overlay gains a line only if a binding is added.
 
 **Gate.** With four plugins installed — one working, one disabled, one raising
 on import, one requiring a future CLV — the drawer tells an operator which is
-which and what to do about each, at 80 columns. Suite green on 3.11 and 3.14.
+which and what to do about each, at 80 columns. Checked by hand against a real
+`CLV_PLUGIN_PATH` root, which also produced a fifth row this phase did not
+plan for: a name in `settings.conf` matching nothing on disk. Suite green on
+3.11 and 3.14: 1690 passed on both.
+
+**As shipped.** Five decisions worth recording, one of them a departure from the
+text above.
+
+*The rows are in a modal, not in the drawer.* This phase asked for "a plugin
+section in the Advanced drawer", and that section cannot exist. The drawer is
+capped at `max-height: 16` and
+[clv/widgets/AGENTS.md](clv/widgets/AGENTS.md) records the consequence in the
+imperative: a new **row** pushes what follows below the fold, where it lays out
+and paints nothing — join an existing row, or use `#drawer-actions`, which is
+horizontal and costs no rows. One row per installed plugin is precisely the
+shape that box has no room for, and four installed plugins is four rows before
+any of them has said anything. The SSH fleet hit the same wall and settled it
+the same way ([SSH_TODO.md](SSH_TODO.md) Phase 7): a summary line in the drawer,
+the detail in a modal. Plugins follow the precedent rather than inventing a
+second answer — a `Plugins` button beside `Rescan sources`, and `P`.
+
+*The row is the origin, not the plugin object.* The enable-list names modules
+and one module may export three stages, so a row is the thing an operator
+installs, names and deletes. Kinds aggregate over the plugins the module
+supplied, which is what makes "a row lists kinds rather than one kind" true
+rather than decorative.
+
+*`add()` now files a plugin under every interface it implements.* It used
+`if/elif/else`, so a plugin that was both a provider and a stage was stored as a
+provider alone and its `apply()` was never called — a plugin silently doing half
+of what it declares, with no diagnosis anywhere, because from the outside it had
+loaded. A row cannot honestly list two kinds while that is true. Strictly a
+fix, and `sources`, `filters` and `exporters` stay append-only-at-load so the
+positional `plugin:<index>` export key is untouched.
+
+*Disabling a bundled plugin lasts for the session.* The enable-list governs the
+user directory only, so a shipped drop-in has no name in it to remove. The
+alternative — a `disabled_plugins` key — was declined: it adds config surface
+Phase 3 deliberately did not create, and gives a plugin's fate two places to be
+decided. The dialog says which kind of disable it is offering, beside the
+control, before it is pressed.
+
+*`DiscoveredPlugin.enabled` is kept in step with the file.* Found in review, not
+in the plan: a plugin that raises on *import* has no live object to mark
+disabled, so switching it off removed the name from `settings.conf` and the row
+sprang straight back to `enabled` on the next redraw. `_adopt_enable_list`
+re-reads the decision onto the discovered entries after every write. Pinned by a
+test, because it is invisible in every other state.
+
+**Also swept here.** A disabled exporter is no longer offered by `Ctrl+E`.
+[app.py](clv/app.py)'s `_exporter_choices` kept disabled entries so that
+`plugin:<n>` stayed positional — but the index rides *in the key*, so omitting
+one renumbers nothing, and without this the disable control never reached the
+one kind an operator is most likely to aim it at. `_exporter_at` re-checks too:
+a request can outlive the list it was built from, because `P` is reachable while
+the export dialog is open.
 
 **Commit.** `feat(drawer): manage plugins instead of describing them`
 
@@ -746,8 +931,83 @@ plugin's own problem and why. `settings.conf` and the template gain a commented
   `tests/test_journald.py` unchanged.
 
 **Gate.** Two ordering-sensitive stages compose predictably; a configured plugin
-reads its own settings without importing anything from `clv.services`. Suite
-green on 3.11 and 3.14.
+reads its own settings without importing anything from `clv.services`. Checked
+by hand against a real `CLV_PLUGIN_PATH` root with two stages that fight over
+the same text: at `priority = 50` the redactor sees `password` and replaces it;
+at `950` the shouter has already uppercased the line and the redactor's pattern
+no longer matches. The composition flips, deterministically, and nothing else
+moves. Suite green on 3.11 and 3.14: 1767 passed on both.
+
+**As shipped.** Five decisions worth recording, one of them a bug this phase
+found rather than a choice it made.
+
+*`configure()` hands over a live mapping, not a snapshot.* The phase asked for
+"a read-only mapping" and for journald to keep "re-reading its opt-in on every
+`discover()`", and a frozen mapping cannot do both. What is handed over is a
+`MappingProxyType` over a dict the registry owns: CLV mutates the dict in place
+when it re-reads the settings file, and every view already handed out sees the
+new values. So a plugin keeps its mapping and reads through it, `configure()`
+stays a one-shot that nobody has to make idempotent, and the drawer's switch
+still takes effect without a restart. `LogEntry.fields` is the same mechanism,
+which is why `refresh_settings` clears and repopulates rather than replacing:
+replacing a dict strands every view onto it.
+
+*`enable_journald` stayed in `[log_viewer]`, aliased into `[plugin:journald]`.*
+Moving it was the tidier end state and was declined. It is in every operator's
+settings file, it is what the Advanced drawer writes, and it is in the README —
+so renaming it buys tidiness at the cost of a config migration and a drawer
+change. `config._LEGACY_PLUGIN_KEYS` is one entry, and it makes the provider's
+`configure()` exactly what a third party would write, which is the whole of what
+the phase wanted proved. A section that sets `enabled` itself still wins.
+
+*The module-level `journald.enabled()` survives, and is not a second mechanism.*
+It is what the drawer's `_sync_journald_status` calls and what a directly
+constructed provider falls back to — which is every test in
+`tests/test_journald.py`, unchanged, as the phase required. What changed is
+which of the two is the *plugin's* route to its own settings: it is
+`configure()`, and `test_a_configured_provider_never_reads_the_settings_file`
+pins that by making `load_config` raise.
+
+*`setup()` runs from the app, not from the loader.* "Before first use" has no
+single meaning here, and putting it inside `load_plugins()` would make a
+function that half this suite and every plugin author's unit tests call start
+acquiring resources on their behalf. `PluginRegistry.start()` is called from
+`on_mount` after the remote wiring, so a provider's `setup()` sees a fully
+assembled plugin rather than one still waiting for its resolver. `shutdown()` is
+the mirror, from `on_unmount`, between the readers closing and the session being
+saved — pinned as an exact three-element sequence rather than a pair of
+inequalities, because "after the readers" and "before the save" are two claims
+and a test that checked one would pass while the other rotted.
+
+*A hanging `teardown()` still hangs exit, and the docs say so.* Exceptions are
+contained; time is not. Bounding plugin *time* is Phase 6, and building a second
+time-bounding mechanism here is exactly what having a Phase 6 is meant to
+prevent. `clv/plugins/AGENTS.md` states the limit in the same paragraph that
+offers the hook, per Requirement 3 — which applies to CLV's own documentation
+about itself, not only to the isolation chapter.
+
+**Also swept here.** `clv --upgrade-config` deleted `[plugin:<name>]` sections.
+`config_upgrade._merge` copied `[log_viewer]` options and `[ssh:<name>]` sections
+and dropped everything else, so the first upgrade after this phase shipped would
+have silently removed an operator's plugin configuration — silently, because
+nothing else in the file changes and the plugin simply starts running on its
+defaults. The section loop is now driven by a prefix table rather than by `ssh:`
+alone, and the rule it encodes is the general one: a section this module does not
+understand is *copied*, not judged unused. `UpgradeResult` gained `plugins`
+alongside `hosts` and `describe()` names them. Found in planning, so the
+regression test fails against the previous code rather than merely passing
+against the new.
+
+*`setting_bool` and `setting_list` joined `clv.api`.* Beyond the phase text, on
+the argument that already published `normalize_level`: `configure()` hands over
+the raw strings `configparser` read, and without these every plugin writes
+`value.lower() == "true"` and CLV ends up disagreeing with the operator's own
+file about what `yes` means. Additive, so the API is still 1.0.
+
+*`_set_enable_ssh` needed no refresh call.* It persists and then delegates to
+`action_reload_sources`, which re-reads the config and refreshes there. Noted
+because the plan listed it as a third call site and it would have been a second
+refresh of the same values.
 
 **Commit.** `feat(plugins): stage ordering, per-plugin config and lifecycle`
 
@@ -782,7 +1042,7 @@ per-entry query path and the memoised shape path.
   drawer, re-enablable from Phase 4's control.
 - **Two budgets, not one.** A render-path budget for anything called per entry
   during filtering, and a **read-path budget** measured per line for
-  `LogFormat` and `ClusterRule` in Phase 7 and 10. The read path is where an
+  `LogFormat` and `ClusterRule` in Phase 7a and 10. The read path is where an
   expensive plugin does the most damage and where the operator has the least
   evidence that a plugin is responsible.
 - **The buffer ceiling is the stated risk.** `max_buffer_lines` is configurable
@@ -815,24 +1075,147 @@ drawer names the culprit. The benchmark shows a measurable improvement from
 removing the double call and no regression with zero plugins. Suite green on
 3.11 and 3.14.
 
+Checked by hand against a 300-line buffer with two stages installed, one
+sleeping 1 ms per line and one doing the redaction the README documents. Renders
+1, 2 and 3 cost 332, 329 and 333 ms; render 4 costs 5.2 ms, and the `P` dialog
+reads:
+
+```
+cheap.py      ('filter',)  loaded
+sluggish.py   ('filter',)  failed   over the render budget (328 ms against
+                                    250 ms) on 3 consecutive passes
+```
+
+The redactor is still running and still redacting. At
+`plugin_time_budget_ms = 0` the same six renders all cost ~330 ms and nothing is
+disabled, which is the escape hatch doing exactly what it says.
+
+Suite green on 3.11 and 3.14: 1803 passed on both.
+
+Benchmarks, 5 000 entries, one stage:
+
+| | |
+| --- | --- |
+| staged view, uncached | 30.44 ms |
+| staged view, cached repeat | 0.01 ms |
+| `apply_filters`, untimed | 18.27 ms |
+| `apply_filters`, timed | 18.35 ms |
+| zero plugins, uncached | 0.52 ms |
+
+**As shipped.** Six decisions worth recording, two of them reversals of what
+this phase's own text said.
+
+*The filter loop was inverted to stage-outer, and measurement is what decided
+it.* The plan for this phase argued for keeping the entry-outer loop: inverting
+it changes the order third-party code sees its entries in and costs an
+intermediate list per stage. That was the wrong trade, and the benchmark said
+so. Entry-outer needs two clock reads **per call** — entries times stages — and
+against a stage that does almost nothing the measurement cost 2.5 ms where the
+work cost 0.6 ms. At the `max_buffer_lines` ceiling that is a fifth of a second
+of pure measurement per pass, which the budget would then charge to the plugin:
+a guard that disables plugins for the cost of guarding them. Stage-outer needs
+two reads per stage per pass, and the measured overhead is 0.08 ms on an 18 ms
+pass — the cost of the guard stops depending on the size of the buffer. What it
+buys back is one list of pointers per stage, two live at a time. The composition
+is unchanged in every respect that is observable: a dropped entry is invisible
+to later stages, a raising stage still lets the entry it choked on through
+untouched and is still skipped by everything after it, and order within a stage
+is still the buffer's.
+
+*`set_entries` did not bump `revision`, and a cache keyed on revision would have
+been wrong from the first render.* `SourceBuffer.revision` was bumped by
+`prime`, `poll` and rotation — but not by the one path that replaces a buffer's
+deque wholesale, which is what `app._entries = ...` does and what several
+hundred tests in this suite use to seed a pane. It bumps now, on its own
+account: it is the largest change a buffer's contents can undergo, and the merge
+cache one level down was keyed on the same number. The residual hole is stated
+rather than closed — a deque mutated in place behind the session's back still
+moves nothing — so the cache key pairs the revision with the line count, which
+catches it.
+
+*A relative time window had to be anchored before any cache could hit.*
+`parse_relative_window` reads `datetime.now()`, so `_filter_spec()` returned a
+window a few microseconds narrower on every call. With `15m` selected the cache
+key could never repeat and the whole phase would have been a no-op for the case
+with the most entries to filter. Worse, and true before this phase: the pane,
+the status line and the histogram were each filtering against a *different*
+window inside one render. The instant a relative window counts back from is now
+held still and re-anchored when the lines change, when the open source changes,
+or when the operator picks a different window — so it is exactly as fresh as the
+data it describes, and nothing on screen can have moved without one of those
+three having happened.
+
+*`refresh_settings` bumps the generation, and leaving it out would have been a
+bug.* The phase text lists enable, disable and failure. But Phase 5 hands a
+plugin a **live** mapping it reads *through*, so editing a redaction pattern in
+`settings.conf` changes what a stage returns without any call reaching the
+registry — and a staged view keyed only on enable/disable would have gone on
+serving the old text. Pinned by a test that changes a section and asserts the
+output changes.
+
+*One budget class, one wired instance.* The phase asked for "two budgets, not
+one" — a render-path budget and a read-path budget for `LogFormat` and
+`ClusterRule`. Those kinds do not exist until Phases 7a and 10, and shipping
+`plugin_read_budget_ms` now would be a documented config key that does nothing
+for three phases, which is the "half-wired seam" this file's own preamble
+refuses. What landed is the general `PluginBudget` — a ceiling, a label and a
+strike count — with exactly one instance constructed. Phase 7a builds its own
+from the same class and adds its key beside its first caller. The policy is
+stated once and neither path can drift from it.
+
+*Coarse kinds are not timed, and the reason is Phase 1's.* "Per call for coarse
+ones" is not implemented for `LogSourceProvider` and `Exporter`. Phase 1
+recorded the argument already: those are operator-initiated one-shots, and
+disabling an exporter for the session because one export was slow would be a
+worse bug than any this fixes, with no way back but the `P` dialog. A timing
+that can lead to no action is a number nobody reads. What a slow `discover()`
+actually needs is a *report* — "this provider took 4 s" — which is a different
+mechanism with a different surface, and is not smuggled in here.
+
+**Also swept here.** `apply_filters` used to test `is_disabled` once per entry
+per stage; the check is hoisted to one list built per pass. `PluginBudget.settle`
+re-checks `active` itself rather than trusting its caller, so a budget set to
+`0` is off however it is driven. `CURRENT_CONFIG_VERSION` moved to 3 — the
+template's option set changed, which is the stated rule — and `clv
+--upgrade-config` was checked by hand against a v2 file carrying a
+`[plugin:redact_secrets]` section: the new key is merged in, the section, the
+host block and the operator's own values all survive.
+
 **Commit.** `perf(plugins): cache the staged view and budget every plugin kind`
 
 ---
 
 # Stage C — Core seams
 
-Five phases, one per core feature a plugin could not previously reach. Each ends
+Five seams, one per core feature a plugin could not previously reach. Each ends
 with the same kind of gate: a plugin-supplied thing working through a core
 feature that knows nothing about plugins (Requirement 9).
 
-## Phase 7 — Parsing
+Six phases, though, and only five of them are seams. Designing the parsing seam
+is what found the format it cannot carry: logfmt needs a built-in matcher to
+stand down in its favour, and *"replacing a built-in format"* is refused to
+plugins in *Still deliberately out of scope*. Phase 7b is therefore core work
+with no plugin in it. Where a seam cannot offer equal terms the phase says so in
+the same sentence it offers the seam; here the phase after it does the work.
 
-`_parse_structured` ([parsing.py:545-630](clv/services/parsing.py#L545-L630))
+## Phase 7a — Parsing
+
+`_parse_structured` ([parsing.py:545-632](clv/services/parsing.py#L545-L632))
 dispatches through hardcoded formats on cheap first-character checks and falls
 through to `raw`. There is no registry and no hook, so "CLV does not know my
 format" has no plugin-shaped answer — and a `FilterStage` is not one: it can
 rewrite `fields` after the fact but cannot make a line parse, cannot claim a
 `format_name`, and cannot supply the timestamp the timeline buckets on.
+
+A `format_name` is four registrations, though, and only the first is in
+`parsing.py`: the dispatch that sets the name, `FORMAT_LABELS` and
+`NO_FIELD_REASONS` ([detail_pane.py:40-66](clv/widgets/detail_pane.py#L40-L66)),
+`FORMAT_PROFILES` ([columns.py:128](clv/widgets/columns.py#L128)) and
+`_JSON_CONSUMED` ([columns.py:179](clv/widgets/columns.py#L179)). The last two
+postdate this phase's first draft and are the ones that fail quietly: a format
+with no profile gets `DEFAULT_PROFILE`, which is a row with no source cell and
+no chips. No test imports any of the three tables, and there is no canonical
+list of format names to check them against.
 
 **Expected outcomes**
 
@@ -844,6 +1227,16 @@ rewrite `fields` after the fact but cannot make a line parse, cannot claim a
       #: before a matching line has been seen.
       field_names: frozenset[str] = frozenset()
 
+      #: What an operator calls this format in the detail pane. Without
+      #: one the pane falls back to the bare `format_name` identifier.
+      label: str = ""
+
+      #: Which of `field_names` earns the source cell, a pinned chip or a
+      #: varying chip in a structured row. `FormatProfile()` is a legal
+      #: answer and means "message only" — but it has to be the author's
+      #: answer rather than a default they never saw.
+      columns: FormatProfile = FormatProfile()
+
       @abstractmethod
       def parse(self, line: str) -> Optional[LogEntry]: ...
   ```
@@ -851,45 +1244,84 @@ rewrite `fields` after the fact but cannot make a line parse, cannot claim a
 - **Built-ins first, plugins second, `raw` last.** Two load-bearing reasons: a
   line that already parses costs a plugin nothing, and a third-party format
   cannot shadow syslog. A plugin wanting to *replace* a built-in is out of
-  scope and the documentation says so.
+  scope and the documentation says so — Phase 7b is what CLV does instead, on
+  its own account, when the format is worth the phase.
 - **Injection, not import.** `LogParser`
   ([parsing.py:699-741](clv/services/parsing.py#L699-L741)) gains a `formats=()`
   keyword, `Buffer` ([session.py:119](clv/services/session.py#L119)) passes what
   the session was given, and the app supplies the registry's formats.
   `parsing.py` keeps knowing nothing about plugins.
+- **A format declares its row, or it does not get one.** `FormatProfile`
+  ([columns.py:110-124](clv/widgets/columns.py#L110-L124)) is re-exported from
+  `clv.api` and gains one field, `consumed: frozenset[str] = frozenset()` — the
+  keys the format already spent on the time, level or message cell and must not
+  get back as chips. That set is `_JSON_CONSUMED` today, reached through
+  `if entry.format_name == "json"`
+  ([columns.py:381](clv/widgets/columns.py#L381)), and generalising it is not
+  tidying: a format whose keys are the writer's choice rather than a regex's
+  group names is exactly the case that needs it, and **every** plugin format is
+  one. The special case goes, `json`'s entry carries the set that used to be
+  hardcoded, and `_chips_for` reads it off the profile.
+- **Profiles are injected, like everything else.** `columns.py` does not import
+  `clv.plugins`; the app calls `columns.install_profiles(...)` once at startup
+  with the enabled formats' `columns` and `label`, and the two lookup sites
+  ([columns.py:603](clv/widgets/columns.py#L603),
+  [columns.py:647](clv/widgets/columns.py#L647)) resolve through it before
+  falling back to `FORMAT_PROFILES` and then `DEFAULT_PROFILE`. The same
+  asymmetry as Phase 8's `query.install_operators(...)`, for the same reason:
+  the renderer runs per row and cannot afford a registry walk.
 - **A format's entries are first-class.** This is Requirement 9 for this phase.
   An entry a plugin format produced must be searchable by field query — which
   means `field_names` feeds `NORMALISED_FIELD_KEYS`
-  ([query.py:99](clv/services/query.py#L99)) and `_known_fields`
-  ([app.py:2193](clv/app.py#L2193)) so completion offers the field before a
-  matching line is on screen — bucketed by the timeline, clustered by the repeat
-  folder, shown in the detail pane with its `format_name`, and exportable. None
-  of these need new code if the entry is well-formed, and the test is that none
-  of them need new code.
+  ([query.py:110-122](clv/services/query.py#L110-L122)) and `_known_fields`
+  ([app.py:3321-3328](clv/app.py#L3321-L3328)) so completion offers the field
+  before a matching line is on screen — bucketed by the timeline, clustered by
+  the repeat folder, shown in the detail pane, and exportable. Those five need
+  no new code if the entry is well-formed, and the test is that they need none.
+- **The structured row is the exception, and it is why the bullet above no
+  longer says "none of these".** `plan_columns` and `render_row` key off
+  `format_name` in tables `parsing.py` does not own, so an entry from a format
+  that declared no `label` and no `columns` renders without error and reads as a
+  downgrade: the right timestamp and level, the bare identifier where the format
+  name should be, no source cell, no chips. Equal terms there is a
+  *declaration*, not an inference — which is what the two new attributes buy,
+  and the reason they are not optional in the docs even though they are optional
+  in the type.
 - **Continuation still works.** A plugin format participates in carry-forward
   exactly as a built-in does: an unparsed line after a plugin-format line
   inherits its timestamp and level, and inherits no fields
   ([parsing.py:718-741](clv/services/parsing.py#L718-L741)).
 - **A format that raises is disabled**; a format returning a malformed
-  `LogEntry` — wrong types, `format_name` of `"raw"`, a non-string field value,
-  a non-`LogEntry` — is rejected with a message naming the rule it broke. The
-  read path cannot afford to trust this one: a stage that misbehaves costs a
-  render, a format that misbehaves corrupts the buffer.
+  `LogEntry` — wrong types, `format_name` of `"raw"`, a `format_name` already in
+  `FORMAT_NAMES`, a non-string field value, a non-`LogEntry` — is rejected with
+  a message naming the rule it broke. A `columns` naming a key outside
+  `field_names` is rejected the same way and at load, because a profile pointing
+  at a field the format never produces is a row that quietly loses its source
+  cell. The read path cannot afford to trust this one: a stage that misbehaves
+  costs a render, a format that misbehaves corrupts the buffer.
 - **A format is inside the read-path budget** from Phase 6, measured per line.
 - **A worked example ships**: `clv/plugins/formats/` as a live drop-in
   directory, with nginx `error_log` as the reference — genuinely common and
-  genuinely not covered by the five built-ins. It ships **disabled** and the
+  genuinely not covered by the built-ins. It ships **disabled** and the
   operator enables it like any other, so the drawer's count keeps meaning
   "plugins someone installed" ([TODO.md:243-246](TODO.md#L243-L246)).
 
 **Documentation changes.** `clv/plugins/AGENTS.md` gains a `LogFormat` section
 of equal weight to the others: the interface, the built-ins-first rule,
-`field_names` and why it exists, the `LogEntry` contract a format must honour,
-carry-forward, the per-line budget, and the note that `parse()` is the hottest
-third-party code in CLV. `README.md`'s multi-format bullet gains "and any format
-a plugin teaches it."
+`field_names`, `label` and `columns` and why each exists, the `LogEntry`
+contract a format must honour, carry-forward, the per-line budget, and the note
+that `parse()` is the hottest third-party code in CLV. `FORMAT_PROFILES`' own
+comment ([columns.py:126-127](clv/widgets/columns.py#L126-L127)) stops being a
+note about a dict and becomes the statement of the contract — what a format has
+to register, in which four places, and what `DEFAULT_PROFILE` means when it is
+reached by accident rather than on purpose. `parsing.py`'s module docstring
+gains `FORMAT_NAMES` beside its format/keys table
+([parsing.py:22-31](clv/services/parsing.py#L22-L31)) as the list all four are
+checked against. `README.md`'s multi-format bullet gains "and any format a
+plugin teaches it."
 
-**Testing** (new `tests/test_plugin_formats.py`, extend `tests/test_parsing.py`)
+**Testing** (new `tests/test_plugin_formats.py` and
+`tests/test_format_registration.py`)
 
 - A plugin format parses a line the built-ins return `raw` for; a line a
   built-in already handles is **never** offered to the plugin.
@@ -907,15 +1339,351 @@ a plugin teaches it."
 - Ordering across several plugin formats follows Phase 5's `priority`.
 - The nginx reference against a captured fixture, in the manner of
   `tests/test_journald.py`.
+- **The completeness test, and it is about built-ins as much as plugins.**
+  `FORMAT_NAMES` in `parsing.py` becomes the canonical list and carries one
+  fixture line per name. For every name: a real line parses to it, it has a
+  `FORMAT_LABELS` entry, and if that line recovered any fields it has a
+  `FORMAT_PROFILES` entry too. In the other direction, no key of
+  `FORMAT_LABELS`, `NO_FIELD_REASONS` or `FORMAT_PROFILES` is missing from
+  `FORMAT_NAMES`. Adding a format to the parser and nowhere else has to fail the
+  suite, because today it fails nothing.
+- A plugin format that declares neither `label` nor `columns` still renders, so
+  the degradation is defined rather than accidental; one that declares both gets
+  a source cell and chips, asserted through `render_row` rather than by reading
+  the profile table back.
+- A `columns` naming a key outside `field_names` is rejected at load, and so is
+  a format claiming a `format_name` already in `FORMAT_NAMES`.
+- `consumed` off the profile reproduces `_JSON_CONSUMED` exactly: the journald
+  allowlist test ([test_log_columns.py:125](tests/test_log_columns.py#L125))
+  passes unmodified with the `format_name == "json"` branch deleted.
 - Zero format plugins: `LogParser` behaves byte-identically to today, asserted
   against the existing parsing suite unchanged.
 
 **Gate.** A plugin file in `~/.config/clv/plugins/` teaches CLV a format it did
-not know, and every core feature works on the result with no core change beyond
-this phase's. `tests/test_parsing.py` passes unmodified. Suite green on 3.11 and
-3.14.
+not know, every core feature works on the result with no core change beyond this
+phase's, and its rows carry a source cell and chips rather than
+`DEFAULT_PROFILE`. Adding a format to the parser and to nothing else now fails
+the suite — which is the first thing Phase 7b leans on. `tests/test_parsing.py`
+passes unmodified. Suite green on 3.11 and 3.14: 1890 passed on both.
 
-**Commit.** `feat(plugins): a LogFormat seam and an nginx reference format`
+Checked by hand against a seeded `nginx_error.py` copied up into a real plugin
+root. Unnamed it reads `not enabled`; named in `settings.conf` it parses the
+error log, and the same lines that were eight identical raw rows before become:
+
+```
+09:25:01 ERROR shop.example.com[1234] connect() failed (111: Connection refused)
+                                      while connecting to upstream  host=10.0.0.5
+```
+
+`host:10.0.0.5` answers for it and for an access log in the same query, which is
+the normalisation rule doing what it is for. The completeness test was checked
+by breaking it both ways: a name added to `FORMAT_NAMES` alone fails five tests,
+and a `FORMAT_LABELS` entry with no parser behind it fails one.
+
+**As shipped.** Six decisions worth recording, two of them departures from this
+phase's own text.
+
+*`format_name` is a declared attribute, and the sketch above could not work
+without it.* The interface as written carries `field_names`, `label` and
+`columns` but no name to key them on — and all three are consumed *before* a
+line has been parsed: profiles and labels are installed at startup, and
+`field_names` has to reach the query vocabulary so a field completes against an
+empty buffer. So `format_name` joins them, is required in practice though
+defaulted in the type, and is what every entry `parse()` returns must carry.
+That last part is also the cheapest runtime check in the validator, and it
+catches the copy-paste mistake — a format returning another's entries — that
+nothing else would notice.
+
+*`formats` is a `FormatStack`, not a bare sequence.* The phase says `LogParser`
+gains a `formats=()` keyword, and it does; what it holds is one object rather
+than a list of plugins. The reason is the injection rule: `parsing.py` may not
+import `clv.plugins`, but a format that raises still has to go through
+`PluginRegistry.disable`, a malformed return still has to be reported by the
+rule it broke, and the read budget still has to be charged. Handing the parser
+bare plugins would mean handing it a fault callback and a budget as well, and
+spreading one plugin's guard across two modules that are not allowed to know
+about each other. `FormatStack` is a `Sequence`, so `()` and a live stack are
+the same kind of thing and the zero-plugin path is a falsiness test.
+
+*The worked example is seeded into `plugins/examples/`, not into the plugin
+directory.* The phase asked for `clv/plugins/formats/` as a live drop-in
+directory shipping *disabled* — and bundled drop-ins load without being named,
+so "disabled" would have needed a fourth classification that only this one
+plugin uses. Seeding it as a user plugin was the obvious fix and was wrong in a
+way the suite caught: it made every fresh install report `1 not enabled`
+forever, against a plugin CLV put there, which is exactly the count this file
+wanted to keep meaning "plugins someone installed". One directory down,
+`pkgutil.iter_modules` does not descend and a folder with no `__init__.py` is
+not a package, so the example is shipped, readable, and invisible. Copying it up
+one level is the same act as installing any other plugin — and is a better start
+for an author than an empty file.
+
+*`FormatProfile` moved, and so did `FORMAT_LABELS` and `NO_FIELD_REASONS`.* The
+phase's note for this phase predicted the first: `tests/test_api_surface.py`
+forbids `clv.api` from pulling in Rich, and `columns.py` imports it. The other
+two followed from a constraint that only appeared once `columns.format_label`
+existed — it needs `FORMAT_LABELS`, and `columns.py`'s own docstring is explicit
+that nothing in it imports Textual, which `detail_pane.py` does. All three are
+declarations about a format rather than about a widget, so
+`clv/services/formats.py` is where they live; both widget modules re-export what
+they used to define and every existing import site is untouched.
+
+*The read path is measured per call, and the render path's own finding is why it
+can be.* Phase 6 inverted the filter loop because two clock reads per call cost
+four times what a no-op stage costs. A batch of lines cannot be inverted the
+same way without restructuring carry-forward, which is the one piece of state
+`LogParser` exists to hold — so the reads are halved instead, by reusing each
+call's end stamp as the next one's start. It is affordable here for a reason the
+filter path did not have: a line only reaches a format after every built-in
+matcher has already declined it, so the guarded work is expensive by
+construction. Benchmarked in `tests/test_plugin_perf.py` rather than asserted.
+
+*One `install_profiles` call, not two.* A format's `label` and its `columns` are
+registered together because registering them apart is how a format ends up
+half-declared — the failure mode this whole phase exists to make visible. The
+detail pane reads the label back through `columns.format_label`.
+
+**Also swept here.** A bare `[991]` in the source cell. `_source_value` appended
+the PID to whatever source it had, including none — so a line with a PID and no
+program name rendered a PID as a cell of its own, which that method's own
+docstring rules out. Reachable with no plugin at all (a JSON line carrying `pid`
+and none of the `json` profile's source keys), and found here because a profile
+naming a source key a particular line did not carry is the ordinary case for a
+plugin format rather than the unlucky one.
+
+`CURRENT_CONFIG_VERSION` moved to 4: the template's option
+set changed, which is the stated rule. Re-enabling a plugin now clears its
+strike count on *both* budgets — a format is charged against the read one, and
+nothing else would have forgotten it, so Re-enable would have put a
+budget-disabled format back one slow batch away from being disabled again.
+`FORMAT_PROFILES`' comment stopped being a note about a dict and became the
+statement of the four-registration contract, which is what
+`tests/test_format_registration.py` now enforces.
+
+**Commit.** `feat(plugins): a LogFormat seam, column profiles and an nginx reference`
+
+---
+
+## Phase 7b — logfmt as a built-in
+
+`key=value key=value` is the densest format CLV cannot read, and it is what Go,
+Rust and most of the Prometheus-adjacent ecosystem write by default.
+`level=info msg="thing happened" dur=1.2ms` is `raw` today; so is
+`ts=2026-08-07T09:25:01Z level=error msg="boom" svc=api`; but
+`2026-08-07T09:25:01Z level=info msg="boom" svc=api` is **`iso`**, its whole
+logfmt remainder sitting in `message` with no fields and no level, because
+`_RE_ISO_PLAIN` ([parsing.py:449-452](clv/services/parsing.py#L449-L452)) got
+there first — all three verified against the live parser. Teaching a built-in
+branch to stand down is what a plugin is refused in *Still deliberately out of
+scope*, so logfmt is a phase rather than the reference plugin: Phase 7a's seam
+is sound; this is the one format it cannot carry.
+
+**Expected outcomes**
+
+- **A sixth built-in, `logfmt`, matched last.** After every anchored format has
+  declined — BSD syslog in particular — and before the fall-through to `raw`.
+  Ordering is the anti-false-positive mechanism, not a performance detail:
+  `key=value` is ordinary inside a syslog *message*. `Failed password for root
+  from 10.0.0.5 rhost=10.0.0.5 user=root` and `audit: type=1400
+  apparmor=DENIED pid=991` both parse as `syslog` today, verified, and this
+  phase's first requirement is that they still do.
+- **The guards are structural and deliberately hard to satisfy**, in the voice
+  of `payloads.py`'s detectors and for the reason `_csv` gives about commas in
+  prose:
+  * **The line opens with a pair** — `key=` at the start, a key being
+    `[A-Za-z_][A-Za-z0-9_.\-/]*`. Prose that mentions `rhost=` in the middle
+    never reaches the second guard.
+  * **Every token is a pair.** Pairs are consumed left to right; anything left
+    over that is not whitespace refuses the line, so `audit: type=1400 ...`
+    fails on its first token even with no syslog prefix in front of it.
+  * **Two pairs at least.** One `key=value` alone is a `.env` line, a
+    `.properties` entry or a shell assignment, and CLV opens *any readable text
+    file* ([README.md:39](README.md#L39)).
+  * **One anchor key** from `_JSON_TS_KEYS`, `_JSON_LEVEL_KEYS` or
+    `_JSON_MSG_KEYS` ([parsing.py:474-476](clv/services/parsing.py#L474-L476)).
+    A line with none of the three has nothing to put in the message cell, so
+    claiming it buys a structured row that says less than the raw one did. This
+    is the guard most likely to be revisited: `dur=1.2ms code=500 path=/x` is
+    real logfmt and is refused by it.
+- **Quoting and escaping, stated rather than inherited.** A value runs bare to
+  the next space or is double-quoted. Inside quotes `\"` and `\\` are honoured
+  and every other backslash stays literal, because `path="C:\Users\bob"` is the
+  common case and a deliberate `\n` is not. An unterminated quote refuses the
+  pair and therefore the line. `key=` with an empty value is **kept**, as
+  `_parse_json` keeps `{"err":""}` — a writer who typed `err=` said something,
+  and `_chips_for` already declines to draw an empty chip.
+- **Both ISO branches defer; nothing else does.** When `_RE_ISO_LEVEL` or
+  `_RE_ISO_PLAIN` matches, its `msg` remainder is offered to the collector under
+  the same guards, and on acceptance the entry is `logfmt` carrying that
+  branch's timestamp — and, from `iso-level`, the level it already recovered.
+  Syslog does **not** defer: a syslog line whose payload happens to be logfmt is
+  still a syslog line, and its `host`, `tag` and `pid` outrank the relabelling.
+- **`normalize_level()` on the parsed value, never `_scan_level`.**
+  `_RE_BARE_LEVEL` ([parsing.py:479](clv/services/parsing.py#L479)) is not
+  `re.IGNORECASE`, so the scanner reads `level=INFO` and misses `level=info` —
+  which is what the `iso` path does to these lines today. The branch resolves
+  the level from the value through `_JSON_LEVEL_KEYS` in order, as `_parse_json`
+  does, and the collector is `_flatten_json`'s shape
+  ([parsing.py:406-428](clv/services/parsing.py#L406-L428)) rather than
+  `_match_fields`' ([parsing.py:362-377](clv/services/parsing.py#L362-L377)),
+  which reads named regex groups against a fixed key list and has nothing to
+  offer a format whose keys are the writer's: build a dict, stop at
+  `_MAX_FIELDS = 64` in document order, freeze with `_freeze_fields`. Values are
+  strings and never coerced; a repeated key keeps the last, which is what
+  `json.loads` does with a repeated object key. **Every key is kept, including
+  the consumed ones** ([parsing.py:534-536](clv/services/parsing.py#L534-L536))
+  — `msg:` has to stay queryable on the line that carried it.
+- **Registered in all four places, or it is not done.** The dispatch sets the
+  name; `FORMAT_LABELS` gains `"logfmt": "logfmt (key=value)"`;
+  `FORMAT_PROFILES` gains an entry — `source_keys` of `("service", "logger",
+  "component", "app", "subsystem")`, `pid_key="pid"`, and a chip **allowlist,
+  never a sweep**, for the reason the `json` entry already argues
+  ([columns.py:150-156](clv/widgets/columns.py#L150-L156)) — whose `consumed` is
+  the set Phase 7a lifted off `_JSON_CONSUMED`, shared with `json` because
+  `msg=` and `"msg":` mean the same thing. `NO_FIELD_REASONS` needs no entry: a
+  line that cleared the guards carries two fields by construction.
+- **Logfmt lines stop being continuations, and that is the trade.**
+  `LogEntry.structured` is `format_name != "raw"`
+  ([parsing.py:237-239](clv/services/parsing.py#L237-L239)) and it gates
+  carry-forward in `parse_lines`
+  ([parsing.py:682](clv/services/parsing.py#L682)) and `LogParser.feed`
+  ([parsing.py:726](clv/services/parsing.py#L726)). In a mixed file a logfmt
+  line that today inherits the timestamp above it and renders dimmed becomes a
+  first-class row, with its own level and fields and — if it carries no `ts=` —
+  an **empty time cell where one used to appear**. Taken deliberately:
+  `parse_lines`' docstring already argues a continuation must not claim facts
+  its line never stated, and a line that said `level=error` stated plenty. It is
+  also why the anchor guard is not negotiable — a line claimed on `a=1 b=2`
+  alone would give up an inherited timestamp and return nothing for it.
+- **Field names behave exactly like JSON's, including where that stings.**
+  Logfmt keys are the writer's, so they do **not** join `NORMALISED_FIELD_KEYS`
+  ([query.py:110-122](clv/services/query.py#L110-L122)), which `README.md`
+  publishes as a fixed list. They reach completion through `collect_field_names`
+  ([query.py:198-209](clv/services/query.py#L198-L209)) the moment a line
+  carrying one is read — no change to `query.py` at all, which is the parity
+  claim rather than a convenience. `host=`, `status=`, `user=` and `size=` are
+  common logfmt keys that collide with normalised names, and the collision
+  resolves the way JSON's already does: the line's own value wins.
+
+**Documentation changes.** `parsing.py`'s module docstring gains a `logfmt` row
+in its format/keys table ([parsing.py:22-31](clv/services/parsing.py#L22-L31)) —
+*every `key=value` pair on the line* — and a paragraph on the guards and the ISO
+deferral, because *"why was my line not claimed"* is the question this format
+will generate and the answer has to be findable from the source. `README.md`'s
+multi-format bullet ([README.md:16-18](README.md#L16-L18)) names logfmt, and the
+field-vocabulary sentence becomes "every key a JSON or logfmt line carries". The
+new `FORMAT_PROFILES` entry carries its allowlist argument inline, as `json`'s
+does.
+
+**Testing** (new `tests/test_logfmt.py`, extend `tests/test_parsing.py`)
+
+- The detection table ([test_parsing.py:35-51](tests/test_parsing.py#L35-L51))
+  and the fields table
+  ([test_parsing.py:148-173](tests/test_parsing.py#L148-L173)) each gain all
+  three dialects: bare, `ts=`-first, and ISO-timestamp-first.
+- **The false-positive corpus is what `tests/test_logfmt.py` is for.** Both
+  syslog lines above still parse as `syslog` with `host`, `tag` and `pid`
+  intact; a one-pair line, a `KEY=value` `.env` line, a line with a trailing
+  bare word, an unterminated quote and a pair-free line all stay `raw`.
+- `level=info` and `level=INFO` both yield INFO — the test that fails the day
+  the branch reaches for `_scan_level`.
+- Quoting: spaces inside quotes survive, `\"` and `\\` unescape, a Windows path
+  keeps its backslashes, and `key=` yields an empty string that is kept.
+- Sixty-five pairs yield sixty-four fields, in document order.
+- **The four-table registration**, through Phase 7a's
+  `tests/test_format_registration.py` with no edit beyond one fixture line: this
+  phase is the first proof that the completeness test does its job.
+- A logfmt row renders with a source cell and chips and repeats neither `msg`,
+  `level` nor `ts` as a chip, with the journald allowlist test
+  ([test_log_columns.py:125](tests/test_log_columns.py#L125)) as the template;
+  the detail pane shows `logfmt (key=value)` and every pair, after the JSON
+  dotted-keys test ([test_detail_pane.py:299](tests/test_detail_pane.py#L299)).
+- `collect_field_names` reports a logfmt line's keys
+  ([test_field_query.py:257](tests/test_field_query.py#L257)); a colliding
+  `host=` keeps the line's value, mirroring
+  `test_a_json_key_colliding_with_a_normalised_name_keeps_the_json_value`
+  ([test_parsing.py:267](tests/test_parsing.py#L267)); and
+  `NORMALISED_FIELD_KEYS` is asserted unchanged.
+- **The carry-forward change is an assertion, not a discovery**: a logfmt line
+  after an ISO line is not a continuation, inherits no timestamp, and is counted
+  in `Timeline.undated` when it carries no `ts=`.
+
+**Gate.** A Go service's log reads as columns — time, level, source, message,
+chips — with no plugin installed and no setting touched; a syslog line
+mentioning `user=root` is still syslog; and every existing case in
+`tests/test_parsing.py` passes unchanged except the rows this phase added. Suite
+green on 3.11 and 3.14: 1943 passed on both.
+
+Checked by hand against a mixed file, rendered through the real column planner.
+The four logfmt rows carry time, level, a source cell and chips; `msg`, `level`
+and `ts` appear in none of them; and the one line with no `ts=` shows the empty
+time cell this phase traded for:
+
+```
+09:25:00       sshd[991]  Accepted publickey for root from 10.0.0.5 rhost=10.0.0.5 user=root  host=web01
+09:25:01 INFO  api[991]   server listening
+09:25:02 ERROR api        connect() failed  host=web01  status=500
+         DEBUG api        cache miss
+09:25:04       kernel     audit: type=1400 apparmor=DENIED pid=991  host=web01
+```
+
+The false-positive corpus was then checked against real logs rather than
+written ones: **122,269 lines** across every readable file in `/var/log`, and
+**20,000 syslog lines** out of the journal. Nothing was relabelled — the journal
+stayed 20,000 `syslog` — and of the 86 syslog lines on this machine whose
+message contains a `=`, none is *itself* valid logfmt, so the four guards are
+declining on structure rather than on luck. The completeness test was broken
+both ways: a name in `FORMAT_NAMES` with no parser behind it fails five tests,
+a `FORMAT_LABELS` entry with no format behind it fails one.
+
+**As shipped.** Four decisions worth recording, two of them departures from this
+phase's own text.
+
+*`svc` joined the source keys.* This phase names five — `service`, `logger`,
+`component`, `app`, `subsystem` — and its own worked example is
+`... msg="boom" svc=api`, which would have rendered with an empty source cell
+against them. `svc` is the commonest spelling in the Go and Rust ecosystems the
+format comes from, so the list would have been wrong on the first line anyone
+pointed at it. `service` still sorts first, so a writer who spells out both is
+unaffected.
+
+*`tests/test_format_registration.py` needed a second edit, not "one fixture
+line".* `test_a_profile_only_names_fields_its_format_recovers` checks a profile
+against what its fixture line was *seen* to produce, and an eighteen-key
+allowlist cannot ride on one realistic line. `json` already had exactly this
+problem and already solves it with a `known_json` seed; `logfmt` takes the same
+treatment for the same reason. The other five tests in the file passed on the
+fixture line alone, which is the part the phase got right — adding the format to
+the parser and nowhere else failed five of them before either edit landed.
+
+*The anchor guard is checked against the **stored** keys, not every pair on the
+line.* Storage stops at `_MAX_FIELDS = 64` the way `_walk_json` does, while the
+scan runs to the end of the line so guard 2 is not weakened by the cap. The
+consequence is that a line whose `msg=` is its 65th distinct pair is refused
+rather than claimed with no message. Bounded was preferred to complete: the
+alternative builds an unbounded intermediate dict for a pathological line, which
+is the thing `_MAX_FIELDS` exists to prevent.
+
+*The quoted and bare values need **separate groups**, and one alternation is a
+bug.* The obvious pattern is `"(?:\\.|[^"\\])*"|\S*`, and then the caller asks
+whether the value starts with a quote. It does not work: an *unterminated* quote
+also starts with one, so `msg="unterminated level=info` was claimed with its
+first and last characters stripped — `msg` came back as `unterminate`. Caught by
+an assertion that passed against the prototype and failed against the branch.
+"Was this properly closed" has to be something the pattern reports, so the two
+forms get their own groups and a bare value containing a `"` refuses the line.
+`tests/test_logfmt.py` pins the nastier shape too: a bare token that both starts
+and ends with a quote, `msg="ends with an escape\"`.
+
+**Also swept here.** `_JSON_CONSUMED` is a hand-copy of the parser's three key
+tuples, and two profiles now depend on it: it decides which chips `json` and
+`logfmt` withhold, while the same three tuples decide which keys the parser
+spends and which anchor a logfmt line. Nothing noticed if they drifted, so
+`tests/test_logfmt.py` asserts they agree. The suite counts in
+[AGENTS.md:496](AGENTS.md#L496) and [README.md:1363](README.md#L1363) are
+refreshed to 1943.
+
+**Commit.** `feat(parsing): logfmt as a sixth built-in format`
 
 ---
 
@@ -1013,7 +1781,91 @@ it needs. `query.py`'s module docstring records the narrow reversal.
 
 **Gate.** A plugin adds `~` for regex-match-a-field, it works in the query box,
 in a saved view and in a watch rule, and removing the plugin disables those
-without corrupting them. Suite green on 3.11 and 3.14.
+without corrupting them. Suite green on 3.11 and 3.14: 2042 passed on both.
+
+**As shipped.** Eight decisions worth recording, one of them a correction to
+this phase's own text.
+
+*There are two absences, not one, and this file said one.* The text above says a
+view whose `requires` names "a missing **or disabled** plugin" is marked
+unusable. Shipped as two states, because collapsing them punishes the wrong
+person: an operator who switches a plugin off in the `P` dialog for a minute
+would find every saved view that uses it marked broken, and switching it back on
+is the fix for a problem they did not have. So `unsatisfied()` asks only whether
+a plugin is **installed**. A plugin that is installed and merely out of service
+keeps its token registered and its terms raise `QueryError` naming it — which is
+not a softer version of the same report but the *stronger* one, because it is
+the case where the grammar still exists to complain with. Uninstalling is the
+case where nothing is left to notice, which is exactly why the record has to
+live on the saved thing.
+
+*A token stays reserved while its plugin is switched off.* The tempting
+implementation installs only the enabled plugins, and it is wrong in the one way
+this phase exists to prevent: dropping `~` from the alternation makes `svc~web`
+stop parsing as a term and fall through to `compile_query`, so switching a
+plugin off would silently convert every query using it into a regex over the raw
+line. `QueryStack` therefore builds a spec for every *loaded* plugin and sets the
+callable to `None` for the ones out of service.
+
+*The alternation with nothing installed is byte-identical to the one this module
+shipped with.* Not by accident and not by preserving a literal: the tokens are
+sorted by length *alone* and Python's sort is stable, so the built-ins keep their
+declared order. Two tokens of equal length cannot be a prefix of one another, so
+their relative order is free — which is what makes the stable sort correct and
+not merely convenient. `tests/test_plugin_query.py` pins the pattern string.
+
+*`_HAS_OPERATOR` is one character per token, and the last one.* The cheap
+pre-test that keeps a plain regex out of the tokeniser had to be derived too. Any
+single character of a token is a sound representative — the token cannot be
+present unless all of its characters are — and taking the last reproduces
+`[:=<>]` for the built-in set exactly, rather than adding `!` and sending
+`don't` through the tokeniser for nothing.
+
+*`FieldTerm` gained `compare()` rather than a bound predicate.* Resolving the
+operator at parse time and hanging the callable on the term would save a dict
+lookup per comparison and would break the type: `FieldTerm` is frozen and
+slotted and compares by value, so two identical terms carrying two closures
+would be unequal, and every existing test that compares a literal `FieldTerm`
+would have had to change. The lookup is on a dict that is empty unless a query
+plugin is installed.
+
+*A third `PluginBudget`, sharing the render ceiling and settling separately.*
+Query plugins are the same kind of work on the same trigger as `FilterStage` —
+a keystroke, over the whole buffer — so they take the same `plugin_time_budget_ms`.
+They get their own instance because a pass is `start()`/`settle()` and
+`apply_filters` opens and closes its own: a stage and an operator sharing one
+pass would have their strikes interleaved by whichever was measured first.
+
+*A computed field's name collides casefolded, and a token's does not.*
+`query._lookup` already matched a field key case-insensitively, so `Age` and
+`age` are one field to any query that could ask for either; compared exactly,
+the second plugin to claim one would load and then silently replace the first in
+the installed registry — a plugin doing nothing, with no diagnosis, from the
+outside having loaded fine. Tokens need no such rule, because a letter is a key
+character and a token may not contain one.
+
+*The `Query` section became three.* This file asked for one section in
+`clv/plugins/AGENTS.md`. The interfaces went into the numbered list where every
+other interface lives, because that is where an author looks for a signature;
+the `requires` rule went to a section of its own, because it belongs to neither
+interface alone and Phases 9 through 11 inherit it rather than restating it.
+
+**Also swept here.** [AGENTS.md](AGENTS.md)'s plugin table still said "Three
+interfaces" and listed the original three — it went stale when Phase 7a added
+`LogFormat` and nobody noticed, which is the failure a table maintained by hand
+beside a `_KINDS` tuple will keep having. Now six, with a pointer at `clv/api.py`
+as the thing a plugin actually imports. `tests/conftest.py` gained an autouse
+fixture resetting the installed grammar between tests — module state shared
+across a suite fails *quietly*, and a leaked `~` changes what `_TERM_RE`
+matches, so the compatibility test pinning "a plain regex is passed through
+untouched" would pass or fail on the order the files happened to run in. `tests/test_state_schema.py` gained a
+field-by-field round trip for `WatchRule`, which is a *third* hand-written copy
+of the "one bad record must not cost the list" convention and inherited nothing
+from the two that are annotation-driven — so a field added to it tomorrow now
+fails there rather than on someone's disk. `tests/test_config.py`'s seeding
+check is driven off `SEEDED_EXAMPLES` rather than naming one file, so the second
+worked example could not be added without also being written up in the plugin
+directory's `README.txt`.
 
 **Commit.** `feat(plugins): query operators, computed fields and the requires rule`
 
@@ -1695,7 +2547,7 @@ reason that survives the decision to include everything else.
 | **Widget injection into `compose()` and plugin CSS** | Requirement 11. Styling is CSS-only by doctrine and the breakpoint tests must stay unconditional on what is installed. Phase 12's vocabulary, drawer sections and modal screens cover the cases without handing out the layout. | A design for a plugin widget contract that survives the breakpoint rules — a real piece of design work, not a phase. |
 | **Isolating per-entry plugin kinds** | `FilterStage`, `LogFormat` and the rest are called per entry or per line. An IPC round trip there is not a slower version of the same program, it is a different one. Phase 13 refuses it out loud rather than shipping something unusable. | Nothing anticipated at CLV's scale. |
 | **`OR`, parentheses and precedence in the query grammar** | Still a stated non-goal, and Phase 0's reversal is written narrowly to keep it one. Operators and computed fields add vocabulary; they do not add structure. | A concrete case that implicit-AND genuinely cannot express — and it would be its own file. |
-| **Replacing a built-in format, operator or cluster rule** | Plugins extend; they do not override. A plugin that could shadow syslog parsing or redefine `:` would make every bug report unanswerable without knowing what was installed. | Nothing anticipated. |
+| **Replacing a built-in format, operator or cluster rule** | Plugins extend; they do not override. A plugin that could shadow syslog parsing or redefine `:` would make every bug report unanswerable without knowing what was installed. The escape hatch is CLV's to pull and not the author's: a format that needs a built-in branch to stand down in its favour gets absorbed as a built-in instead, which is what Phase 7b is and why logfmt is not the reference plugin. | Nothing anticipated. |
 | **Plugin-owned persisted session state** | `SessionState.PERSISTED_FIELDS` is closed on purpose — every field carries an argument about whether recording it leaks what someone was reading. A plugin's own file under its own directory has none of that ambiguity. | A case where a plugin's state genuinely belongs in CLV's session rather than beside it. |
 | **Hot reload** | A plugin swapped underneath a running viewer is a debugging surface nobody asked for. Enable and disable change what is *active*, which covers the real need. | Nothing anticipated. |
 | **Plugin-supplied CLI subcommands** | Requirement 13. An installed file must not change what a shell command does. | Nothing anticipated. |
@@ -1707,33 +2559,37 @@ reason that survives the decision to include everything else.
 | File | Phases | Change |
 | --- | --- | --- |
 | `clv/plugins/AGENTS.md` | 0–16 | Trust model, contract, and every seam |
-| `clv/plugins/__init__.py` | 1,3,5,6,7,13 | Loader, search roots, ordering, timing, registries, host |
+| `clv/plugins/__init__.py` | 1,3,5,6,7a,13 | Loader, search roots, ordering, timing, registries, host |
 | `clv/api.py` | 2, all seams | **New** — the published surface, extended per phase |
 | `clv/plugins/host.py` | 13 | **New** — the subprocess host and the wire protocol |
 | `clv/cli.py` | 14,15 | **New** — argv, `doctor`, `plugin` subcommands |
 | `clv/plugins/manifest.py` | 15 | **New** — manifest parsing, checksums, signatures |
 | `clv/services/config.py` | 3,5,6 | `plugins`, `[plugin:<name>]`, `plugin_time_budget_ms` |
-| `clv/services/parsing.py` | 7 | `LogParser(formats=...)`, injected dispatch |
+| `clv/services/parsing.py` | 7a,7b | `LogParser(formats=...)`, injected dispatch, `FORMAT_NAMES`, the logfmt matcher and the ISO deferral |
 | `clv/services/query.py` | 8 | Operator registry, computed fields, generated `_TERM_RE` |
 | `clv/services/filtering.py` | 8 | `FilterSpec.parse` routes through the operator registry |
 | `clv/services/watch.py` | 9 | `WatchRule.kind`, matcher dispatch, sink delivery |
 | `clv/services/clustering.py` | 10 | Plugin rules, shape contributors, cache generation |
 | `clv/services/timeline.py` | 11 | `Bucket.value`, annotations, foldable metrics |
-| `clv/services/session.py` | 7 | `Buffer` passes formats to its parser |
+| `clv/services/session.py` | 7a | `Buffer` passes formats to its parser |
 | `clv/storage.py` | 8 | `SavedView.requires` |
-| `clv/app.py` | 1,2,4,5,6,7,8,9,11,12,13 | Wiring, cache, dispatch, drawer, host lifecycle |
+| `clv/app.py` | 1,2,4,5,6,7a,8,9,11,12,13 | Wiring, cache, dispatch, drawer, host lifecycle |
 | `clv/widgets/advanced_drawer.py` | 4,12 | Plugin section; plugin-contributed sections |
+| `clv/widgets/columns.py` | 7a,7b | `FormatProfile.consumed`, `install_profiles`, the logfmt profile |
+| `clv/widgets/detail_pane.py` | 7a,7b | Plugin format labels; `FORMAT_LABELS` gains logfmt |
 | `clv/widgets/help_overlay.py` | 12 | Plugin command section |
 | `clv/widgets/timeline.py` | 11 | Annotation rendering and stepping |
 | `clv/__main__.py` | 13,14 | `freeze_support()`, argv entry |
-| `clv/plugins/formats/` | 7 | **New** — drop-in directory and the nginx reference |
+| `clv/plugins/formats/` | 7a | **New** — drop-in directory and the nginx reference |
 | `examples/plugins/` | 16 | **New** — one copyable example per interface |
 | `clv/plugins/README.md` | 16 | **New** — author-facing quick start. Covers the **shipped** sources too: journald, and the SSH transport `SSH_TODO.md` Phase 4 added (a backend rather than a provider — see `clv/plugins/AGENTS.md`, which holds that contract until this file exists). |
-| `settings.conf`, `README.md` | 3,5,6,8,9,10,11,12,14,15,16 | Keys, chapter, sweep |
+| `settings.conf`, `README.md` | 3,5,6,7b,8,9,10,11,12,14,15,16 | Keys, the format list, chapter, sweep |
 | `tests/test_api_surface.py` | 2 | **New** — the freeze |
 | `tests/test_plugin_drawer.py` | 4 | **New** |
 | `tests/test_plugin_perf.py` | 6 | **New** |
-| `tests/test_plugin_formats.py` | 7 | **New** |
+| `tests/test_plugin_formats.py` | 7a | **New** |
+| `tests/test_format_registration.py` | 7a | **New** — the four-table completeness test |
+| `tests/test_logfmt.py` | 7b | **New** — the three dialects, the guards, the false-positive corpus |
 | `tests/test_plugin_query.py` | 8 | **New** |
 | `tests/test_plugin_watch.py` | 9 | **New** |
 | `tests/test_plugin_clustering.py` | 10 | **New** |

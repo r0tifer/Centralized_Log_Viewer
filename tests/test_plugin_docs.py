@@ -136,3 +136,188 @@ def test_the_plugin_contract_does_not_claim_a_provider_source_cannot_be_starred(
     text = _read(PLUGIN_AGENTS)
 
     assert "starring, glob filtering and rotated-set grouping all test" not in text
+
+
+# --- the published API, documented where an author will look ----------------
+
+
+def test_the_api_surface_section_exists() -> None:
+    """A published contract nobody can find is not published.
+
+    `clv/api.py` is the promise; this section is where an author learns the
+    promise exists, what it covers, and — the part that only documentation can
+    carry — what it deliberately does not.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    for heading in (
+        "## API surface and stability",
+        "### What is published",
+        "### The deprecation policy",
+        "### The wire form",
+    ):
+        assert heading in text, f"clv/plugins/AGENTS.md lost its {heading!r} section"
+
+
+def test_the_deprecation_policy_states_what_is_not_covered() -> None:
+    """The load-bearing half.
+
+    "A published name is removed only on an API major" is the easy sentence and
+    the one nobody misreads. The sentence that does the work is the other one:
+    an import from `clv.services.*` has no promise behind it, and an author who
+    is not told that will assume the whole package is the API.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    policy = text.split("### The deprecation policy", 1)[1].split("\n### ", 1)[0]
+
+    assert "removed only on an API major" in policy
+    assert "DeprecationWarning" in policy
+    assert "internal and may move without notice" in policy
+    assert "clv.services" in policy
+
+
+def test_the_two_versions_are_documented_as_two() -> None:
+    """`requires_api` is the recommendation, and the docs have to say so.
+
+    The whole value of a separately versioned API is lost if authors keep
+    pinning `requires_clv` out of habit, and habit is what they will follow
+    unless the document tells them which one they mean.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    assert "requires_api" in text
+    assert "PLUGIN_API_VERSION" in text
+    assert "the one to reach for" in text or "the one to\ndeclare" in text
+
+
+def test_every_example_imports_from_the_published_module() -> None:
+    """`clv.plugins` still works; an example that uses it teaches the wrong path.
+
+    A worked example is what an author copies, so an example importing the
+    loader's own namespace hands out an import the deprecation policy explicitly
+    does not cover.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    offenders = [
+        f"{number}: {line.strip()}"
+        for number, line in enumerate(text.splitlines(), start=1)
+        if line.strip().startswith("from clv.plugins import")
+    ]
+    assert not offenders, (
+        "an example imports from clv.plugins instead of clv.api:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def test_the_wire_form_says_why_pickle_is_not_the_answer() -> None:
+    """The reason is the documentation.
+
+    "Use `entry_to_wire`" invites the obvious question and the obvious
+    workaround. `pickle` does not fail on unlucky entries; it fails on all of
+    them, and an author who knows that will not go looking for a way around it.
+    """
+
+    section = _read(PLUGIN_AGENTS).split("### The wire form", 1)[1]
+    assert "pickle" in section
+    assert "mappingproxy" in section
+    assert "WIRE_VERSION" in section
+
+
+def test_an_exporter_is_told_it_can_ask_for_a_destination() -> None:
+    """The attribute is useless undocumented — nobody guesses at a class attribute."""
+
+    text = _read(PLUGIN_AGENTS)
+    assert "wants_path" in text
+    assert "suggested_extension" in text
+    # And the compatibility rule, which is the part an existing author needs.
+    assert "only** when `wants_path` is set" in text
+
+
+def test_the_readme_points_authors_at_the_published_module() -> None:
+    """README is the only document most people read, this one included."""
+
+    readme = REPO_ROOT / "README.md"
+    if not readme.exists():  # pragma: no cover - installed package
+        pytest.skip("running from an installed package")
+    text = _read(readme)
+    assert "from clv.api import FilterStage" in text
+    assert "from clv.plugins import FilterStage" not in text
+
+
+def test_the_log_format_seam_is_documented_like_the_others() -> None:
+    """A seam with no chapter is a seam only someone who read the source can use.
+
+    Phase 7a's `LogFormat` is the first Stage C interface, and the four things
+    below are the ones an author cannot infer from the type: that built-ins go
+    first, that a `format_name` is four registrations rather than one, what
+    `parse()` is allowed to return, and that it is charged against a *different*
+    budget from a filter stage because it runs per line read.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+
+    assert "### 3. LogFormat" in text
+    assert "Built-ins first, plugins second" in text
+    assert "four registrations" in text
+    assert "plugin_read_budget_ms" in text
+    assert "`LogFormat.parse`" in text
+    # The honest limit, stated beside the feature rather than left to be found.
+    assert "does not re-parse what is already in the" in text
+
+
+# --- Phase 8: the query seam and its degradation rule -----------------------
+
+
+def test_the_query_interfaces_are_documented_where_the_others_are() -> None:
+    """In the numbered list, because that is where an author looks for a signature."""
+
+    text = _read(PLUGIN_AGENTS)
+    for heading in ("### 4. QueryOperator", "### 5. ComputedField"):
+        assert heading in text, f"clv/plugins/AGENTS.md lost its {heading!r} section"
+
+
+def test_the_reserved_tokens_are_documented_as_a_rule_not_a_list() -> None:
+    """An author should be able to check, not discover it from a load error."""
+
+    text = _read(PLUGIN_AGENTS)
+    assert "BUILTIN_OPERATORS" in text
+    assert "Longest token wins" in text
+    # The ambiguity rule is the one nobody guesses, so it is written out.
+    assert "could not be told from a key called" in text
+
+
+def test_the_resolution_order_for_a_computed_field_is_stated() -> None:
+    text = _read(PLUGIN_AGENTS)
+    assert "Parsed fields resolve first, per entry." in text
+    assert "it can never change what a line said" in text
+
+
+def test_the_two_absences_are_documented_separately() -> None:
+    """Collapsing them is the mistake this section exists to prevent.
+
+    An uninstalled plugin makes a saved thing *unusable*; a switched-off one
+    keeps its token reserved so the query still means what it meant. A document
+    that said only "the plugin is missing" would leave an operator unable to
+    tell why one case marked their views broken and the other did not.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    assert "## Saved views, watch rules and a missing plugin" in text
+    assert "not installed" in text
+    assert "switched off" in text
+    assert "is not in service" in text
+    assert "Nothing is ever rewritten." in text
+
+
+def test_the_query_dsl_reversal_is_on_the_record() -> None:
+    """Rewritten with its reversal rather than deleted — the rule from TODO.md."""
+
+    text = _read(PLUGIN_AGENTS)
+    assert '- **"No query DSL."** *Reversed' in text
+    # And the reversal stays narrow, in the same sentence that offers it.
+    reversal = text.split('- **"No query DSL."**', 1)[1].split("- **", 1)[0]
+    for word in ("OR", "parentheses", "precedence"):
+        assert word in reversal, f"the reversal must still decline {word}"
+    assert "vocabulary" in reversal and "structure" in reversal

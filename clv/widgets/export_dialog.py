@@ -20,7 +20,9 @@ The dialog knows nothing about exporters, and nothing about marks. The app
 hands it a list of :class:`ExportChoice` (built-ins plus whatever the plugin
 registry supplied) plus a count of marked lines, and gets back an
 :class:`ExportRequest`, so this widget never imports ``clv.app`` or the
-registry.
+registry. That division is what let plugin exporters start asking for a
+destination without a line changing here: whether a choice takes a path is a
+flag on the choice, and it always was.
 """
 
 from __future__ import annotations
@@ -47,8 +49,10 @@ class ExportChoice:
     label: str
     #: Suffix the default filename gets. Empty when the choice supplies no path.
     extension: str = ""
-    #: False for a plugin exporter: :meth:`clv.plugins.Exporter.export` is handed
-    #: no destination, so it chooses its own and the path input does not apply.
+    #: False for a self-routing exporter — :meth:`clv.api.Exporter.export` is
+    #: handed no destination, so it chooses its own and the path input does not
+    #: apply. A plugin exporter declaring ``wants_path`` arrives here with True
+    #: and is treated exactly like a built-in format.
     needs_path: bool = True
 
 

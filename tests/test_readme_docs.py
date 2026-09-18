@@ -139,3 +139,80 @@ def test_every_internal_link_resolves() -> None:
 
     assert links, "the anchors this guards have gone"
     assert links <= headings, f"README links to missing headings: {links - headings}"
+
+
+# --- installing a plugin ----------------------------------------------------
+
+
+def test_readme_says_where_a_plugin_is_installed() -> None:
+    """The whole point of Phase 3 is that this path is findable.
+
+    An operator on a frozen build has no `pip`, no source tree, and no reason
+    to guess at `~/.config/clv/plugins/`. If the README does not name it, the
+    install path exists and nobody can use it.
+    """
+
+    text = _read()
+
+    assert "~/.config/clv/plugins/" in text
+    assert "## Installing a plugin" in text
+
+
+def test_readme_says_a_dropped_file_does_not_run() -> None:
+    """The rule most likely to be lost in a tidy-up, and the one that matters.
+
+    An operator who believes copying a file in is enough will conclude the
+    feature is broken; one who believes it runs immediately will treat the
+    directory as more dangerous than it is. Both need the sentence.
+    """
+
+    text = _read()
+    section = text.split("## Installing a plugin", 1)[1].split("\n## ", 1)[0]
+
+    assert "plugins = redact_secrets" in section
+    assert "does not run it" in section.lower() or "not run" in section.lower()
+
+
+def test_readme_calls_a_plugin_trusted_code_where_it_says_to_install_one() -> None:
+    """Said at the point of the decision, not only in a document nobody opened.
+
+    `tests/test_plugin_docs.py` pins the trust model in `clv/plugins/AGENTS.md`;
+    this pins the two sentences of it that have to survive in the file an
+    operator actually reads before copying a stranger's file into their home
+    directory.
+    """
+
+    text = _read()
+    section = text.split("## Installing a plugin", 1)[1].split("\n## ", 1)[0]
+
+    assert "trusted code" in section
+    assert "your privileges" in section
+    assert "AGENTS.md" in section
+
+
+def test_readme_documents_the_plugins_setting() -> None:
+    """The settings table is the third copy of this key, and the one that drifts."""
+
+    text = _read()
+
+    assert "| `plugins` |" in text
+
+
+def test_readme_says_the_operator_set_is_extensible() -> None:
+    """Field queries is where someone reads what they can type."""
+
+    text = _read()
+    section = text.split("### Field queries", 1)[1].split("### Navigating", 1)[0]
+    assert "The operator set is extensible" in section
+    assert "field_regex" in section
+
+
+def test_readme_says_a_saved_view_records_what_its_query_needs() -> None:
+    """The degradation rule, where the operator meets its consequence."""
+
+    text = _read()
+    section = text.split("### Field queries", 1)[1].split("### Navigating", 1)[0]
+    assert "records which plugins its query needs" in section
+    assert "refused rather than applied" in section
+    # And says nothing was rewritten, which is the half people assume otherwise.
+    assert "nothing was rewritten" in section

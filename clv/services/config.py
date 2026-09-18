@@ -23,12 +23,14 @@ until ``enable_ssh`` is true.
 from __future__ import annotations
 
 import configparser
+import importlib
+import inspect
 import os
 import shutil
 import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Iterable, Literal, Optional
+from typing import Iterable, Literal, Mapping, Optional
 
 from .discovery import DEFAULT_EXCLUDE_GLOBS, DEFAULT_MAX_FILES, DiscoverySettings
 from .refs import SourceRef, format_ref, normalize_ref, scheme_of
@@ -45,12 +47,37 @@ CONFIG_VERSION_OPTION = "config_version"
 #: template's option set changes. Deliberately not ``__version__``: most
 #: releases do not touch the settings schema, and stamping the app version
 #: would re-migrate every operator's file for nothing.
-CURRENT_CONFIG_VERSION = 1
+CURRENT_CONFIG_VERSION = 4
 
 #: One remote host per section: ``[ssh:web01]``. The suffix is the host's name
 #: within CLV — what the tree shows, what ``node:`` matches, and the fallback
 #: for ``host`` when the operator does not give one.
 SSH_SECTION_PREFIX = "ssh:"
+
+#: One plugin's own settings per section: ``[plugin:redact_secrets]``. The
+#: suffix is the module name -- the same word the operator writes in the
+#: ``plugins`` enable-list, so there is one name for a plugin and not two.
+#:
+#: CLV parses these and never interprets them. What a key means is the plugin's
+#: business; what ``config.py`` guarantees is that the section is well-formed,
+#: that a malformed one costs only itself, and that the plugin is handed the
+#: values rather than left to import the settings parser.
+PLUGIN_SECTION_PREFIX = "plugin:"
+
+#: Keys that predate ``[plugin:<name>]`` and still live in ``[log_viewer]``,
+#: read into the section they would live in today.
+#:
+#: ``enable_journald`` is the whole list, and moving it was declined rather than
+#: overlooked: it is in every operator's settings file, it is what the Advanced
+#: drawer's switch writes, and it is documented in the README. Renaming it would
+#: buy tidiness at the cost of a config migration and a drawer change, and the
+#: point of the exercise is that the *plugin* stops importing the settings
+#: parser -- which this achieves without touching a single operator's file.
+#:
+#: A section that sets the key itself wins. The alias only fills a gap.
+_LEGACY_PLUGIN_KEYS: dict[str, dict[str, str]] = {
+    "journald": {"enabled": "enable_journald"},
+}
 
 #: The port range a TCP port can actually occupy. Out of it is a typo, and a
 #: typo is reported rather than clamped: clamping 70000 to 65535 would connect
@@ -85,6 +112,19 @@ _LIMITS: dict[str, tuple[int, int, int]] = {
     # is what stops one cluster spanning a whole session and swallowing an
     # event from an hour ago.
     "cluster_lookback": (200, 2, 100_000),
+    # Milliseconds of wall time one plugin may spend on one pass of the render
+    # path before it is taken out of service. The floor is **zero**, and zero
+    # means no guard at all -- unlike every other option here, where the low
+    # end is a typo to be clamped away, an operator who would rather have a
+    # slow plugin than a disabled one has a legitimate answer and this is it.
+    "plugin_time_budget_ms": (250, 0, 60_000),
+    # The same, for the *read* path: milliseconds one `LogFormat` may spend on
+    # one batch of lines from a reader. Lower than the render budget and
+    # measured against a different thing -- a batch is one `prime` or `poll`,
+    # not one keystroke, so a format that needs 50 ms of a single file read is
+    # already the slowest thing between opening a log and seeing it. Floor is
+    # zero and means no guard, exactly as above.
+    "plugin_read_budget_ms": (50, 0, 60_000),
 }
 
 DEFAULT_SETTINGS_TEMPLATE = f"""[{CONFIG_SECTION}]
@@ -162,6 +202,37 @@ cluster_lookback = 200
 # this on and writes it back here.
 enable_journald = false
 
+# Plugins to load from ~/.config/clv/plugins/, comma separated, named without
+# the .py. Empty by default. A file placed in that directory is listed but not
+# run until it is named here, so installing a plugin and running one are two
+# separate decisions.
+#
+# A plugin is trusted code: it runs in CLV's process with your privileges and
+# can read every log CLV can open. CLV does not sandbox one.
+#
+# Plugins that shipped with CLV are not listed here - they load on their own,
+# because trusting them is the trust you already placed in CLV.
+plugins =
+
+# How long one plugin may spend on a single pass of the render path, in
+# milliseconds. A filter stage runs over every buffered line on every render,
+# and a render happens on every keystroke in the query box - so a stage that is
+# merely slow is indistinguishable from CLV being broken. A plugin that goes
+# over this on three consecutive passes is disabled and named in the plugins
+# dialog (P), where it can be switched back on.
+#
+# Set to 0 to turn the guard off entirely and tolerate a slow plugin.
+plugin_time_budget_ms = 250
+
+# The same, for a plugin that teaches CLV a log format. A LogFormat's parse()
+# runs once per line *read* rather than once per render, and only for lines no
+# built-in format recognised - so this is measured over one batch of lines from
+# a file read, not over a render pass. A format that goes over this on three
+# consecutive batches is disabled and named in the plugins dialog (P).
+#
+# Set to 0 to turn this guard off too.
+plugin_read_budget_ms = 50
+
 # Read log folders on other machines over SSH. Off by default, and for a
 # stronger version of the reason above: a remote source spawns ssh, and a
 # network subprocess needs asking for more than a local one does. With this
@@ -192,6 +263,19 @@ enable_ssh = false
 # max_files = 2000
 # correct_clock_skew = false
 # enabled = true
+
+# One section per plugin that has settings of its own. The name after "plugin:"
+# is the plugin's file name without the .py - the same word you write in the
+# plugins line above, so a plugin has one name and not two.
+#
+# CLV parses these sections and never interprets them: what a key means is the
+# plugin's business, and its own documentation is what says which keys it reads.
+# A section for a plugin that is not installed, or not enabled, is reported in
+# the plugin dialog (P) rather than ignored.
+#
+# [plugin:redact_secrets]
+# patterns = password, api_key, token
+# replacement = ******
 """
 
 
@@ -335,6 +419,8 @@ class LogConfig:
     clipboard_max_bytes: int = _LIMITS["clipboard_max_bytes"][0]
     watch_rate_limit: int = _LIMITS["watch_rate_limit"][0]
     cluster_lookback: int = _LIMITS["cluster_lookback"][0]
+    plugin_time_budget_ms: int = _LIMITS["plugin_time_budget_ms"][0]
+    plugin_read_budget_ms: int = _LIMITS["plugin_read_budget_ms"][0]
     #: Ring the terminal bell when a watch rule notifies. Off by default: a
     #: bell is a thing an operator opts into, never a thing a log does to them.
     watch_bell: bool = False
@@ -348,6 +434,35 @@ class LogConfig:
     #: than lowering it. With this false nothing connects and nothing spawns,
     #: however many hosts are configured.
     enable_ssh: bool = False
+    #: Which plugins in the *user* plugin directory the operator has enabled,
+    #: casefolded and de-duplicated, in file order.
+    #:
+    #: A file in `~/.config/clv/plugins/` is discovered and listed but never
+    #: imported until its name appears here. That is the whole of the rule that
+    #: installing a plugin is not consent to run it: an unnamed module does not
+    #: execute, so dropping a file into the directory cannot run anything.
+    #:
+    #: A list rather than a boolean on purpose. "Enable everything in this
+    #: directory" is exactly the behaviour that makes a dropped file dangerous.
+    #:
+    #: Bundled drop-ins under `clv/plugins/` are not governed by this: they
+    #: shipped with CLV, and the operator's trust in them is the trust they
+    #: already placed in CLV.
+    plugins: tuple[str, ...] = ()
+    #: Every `[plugin:<name>]` section that parsed, keyed on the casefolded
+    #: plugin name, values exactly as `configparser` read them.
+    #:
+    #: Populated regardless of whether the plugin is enabled or even present,
+    #: for the same reason `hosts` is populated regardless of `enable_ssh`:
+    #: parsing is inert, and a mistake in a section should be reported the
+    #: launch it is *made*. Who is missing is the loader's question, not this
+    #: one's -- `plugins.load_plugins` reports a section that configures nothing,
+    #: because only it knows what loaded.
+    #:
+    #: The values are raw strings. `config.py` does not interpret a plugin's
+    #: keys and must not start: what `patterns` means is the plugin's business,
+    #: and a validator here would be CLV guessing at a schema it does not own.
+    plugin_settings: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
     #: Every `[ssh:<name>]` section that parsed, in file order.
     #:
     #: Populated regardless of :attr:`enable_ssh`. Parsing is inert, and a
@@ -377,6 +492,19 @@ def get_xdg_config_home() -> Path:
 
 def user_config_path() -> Path:
     return get_xdg_config_home() / "clv" / "settings.conf"
+
+
+def user_plugin_dir() -> Path:
+    """Where an operator installs a plugin: beside ``settings.conf``.
+
+    One place, already in their muscle memory, and writable without root on
+    every build — which the bundled ``clv/plugins/`` is not. On a `.deb` or
+    tarball install that directory is inside a root-owned tree a package
+    upgrade overwrites, so for the operator CLV is actually distributed to it
+    is not an install path at all.
+    """
+
+    return get_xdg_config_home() / "clv" / "plugins"
 
 
 def bundled_config_path() -> Path:
@@ -525,6 +653,151 @@ def ensure_user_settings_file() -> Optional[Path]:
         return template if template.exists() else None
 
 
+#: Dropped into ``~/.config/clv/plugins/`` the first time CLV runs, so the
+#: directory explains itself to an operator who found it before they found the
+#: documentation.
+#:
+#: It says the two things that are not guessable from an empty folder: that a
+#: file here does nothing until it is named in ``settings.conf``, and that
+#: naming it is an act of trust, because a plugin is ordinary Python running at
+#: CLV's privilege rather than something CLV can contain.
+PLUGIN_DIR_README = """\
+CLV plugins
+===========
+
+Put a plugin here: either a single `my_plugin.py`, or a directory
+`my_plugin/` containing an `__init__.py`.
+
+A file in this directory is NOT run just because it is here. CLV lists it,
+and nothing more, until you name it in the `plugins` line of
+
+    settings.conf
+
+under [log_viewer]:
+
+    plugins = my_plugin, another_plugin
+
+Names are the file (or directory) name without the `.py`, separated by
+commas, and matched without regard to case.
+
+A plugin is trusted code
+------------------------
+
+A plugin is Python that CLV imports into its own process. It runs with your
+privileges and can read every file you can read, including every log CLV has
+open. The plugin interfaces bound what CLV *asks* of a plugin; they do not
+bound what a plugin *can do*, and CLV does not sandbox one.
+
+Install a plugin the way you would install any other program: from someone
+you have reason to trust, after reading it if you can. The trust model, and
+what to look at when reviewing a third-party plugin, are written out in
+CLV's `clv/plugins/AGENTS.md`.
+
+Worked examples
+---------------
+
+Two complete, commented plugins, each walking through what its kind of plugin
+has to declare and why:
+
+    examples/nginx_error.py   teaches CLV to read nginx's error log, a format
+                              the built-in matchers do not recognise
+    examples/field_regex.py   adds `svc~^web[0-9]+` - a regex against one
+                              field - and `age<60`, seconds since the line
+                              was written
+
+Nothing in `examples/` is listed or run: it is one directory down, and CLV
+only looks here. To use one, copy it up and name it:
+
+    cp examples/field_regex.py .
+
+then add `field_regex` to the `plugins` line in settings.conf. Copying is
+also how you start your own - it is a better starting point than an empty
+file.
+"""
+
+#: Subdirectory of the plugin directory the worked examples are written to.
+#:
+#: **One level down, and that is the whole design of it.** Written into the
+#: plugin directory itself an example would be *discovered*, so a fresh install
+#: with nothing installed would report "1 not enabled" forever — and the plugin
+#: count, which is supposed to mean "plugins someone installed", would be
+#: counting one that CLV installed. ``pkgutil.iter_modules`` does not descend,
+#: and a directory with no ``__init__.py`` is not a package, so nothing here is
+#: listed, discovered or importable. Copying a file up one level is what turns
+#: an example into an installed plugin — which is the same act as installing any
+#: other, and is the sentence the README here ends on.
+PLUGIN_EXAMPLES_DIR = "examples"
+
+#: Worked examples written into that directory on first run, as
+#: ``{filename: module}``.
+SEEDED_EXAMPLES: dict[str, str] = {
+    "nginx_error.py": "clv.examples.nginx_error",
+    "field_regex.py": "clv.examples.field_regex",
+}
+
+
+def _seed_plugin_examples(target: Path) -> None:
+    """Write the worked examples into *target*, never over one already there.
+
+    Written from the packaged module's source rather than shipped as a data file
+    so there is exactly one copy in the tree: the example is imported by the
+    suite and parsed against a fixture, so it cannot rot into something that no
+    longer loads while still being handed to every new operator.
+
+    **Only when absent.** An operator who edited the example, or deleted it
+    because they did not want it, gets to keep that decision — rewriting it on
+    every start would undo both. Never raises: seeding an example is the least
+    important thing that happens at startup.
+    """
+
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+
+    for filename, module in SEEDED_EXAMPLES.items():
+        destination = target / filename
+        if destination.exists():
+            continue
+        try:
+            source = inspect.getsource(importlib.import_module(module))
+        except Exception:  # noqa: BLE001 - a stripped build has no source
+            continue
+        try:
+            destination.write_text(source, encoding="utf-8")
+        except OSError:
+            continue
+
+
+def ensure_user_plugin_dir() -> Optional[Path]:
+    """Create the user plugin directory and its README, returning the path.
+
+    Separate from :func:`ensure_user_settings_file` rather than folded into it,
+    which would have been the shorter edit and the wrong one: that function
+    returns early when ``settings.conf`` already exists, so every installation
+    that predates this directory would never get it.
+
+    Never raises. A read-only or unwritable ``$HOME`` means no user plugins,
+    which is a valid state and not worth a startup failure.
+    """
+
+    target = user_plugin_dir()
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+
+    _seed_plugin_examples(target / PLUGIN_EXAMPLES_DIR)
+
+    readme = target / "README.txt"
+    if not readme.exists():
+        try:
+            readme.write_text(PLUGIN_DIR_README, encoding="utf-8")
+        except OSError:
+            pass
+    return target
+
+
 def _names_sources(path: Path) -> bool:
     try:
         return _text_names_sources(path.read_text(encoding="utf-8"))
@@ -626,6 +899,55 @@ def _split_list(raw: str) -> list[str]:
         for text in (piece.strip().strip('"').strip("'") for piece in raw.split(","))
         if text
     ]
+
+
+def _read_plugin_list(section, issues: list[ConfigIssue]) -> tuple[str, ...]:
+    """Parse the ``plugins`` enable-list, reporting each name it cannot use.
+
+    Per-entry rather than all-or-nothing: this follows :func:`parse_log_dirs`,
+    which drops and reports the one entry it cannot read and keeps the rest.
+    Voiding the whole list on a single stray character would silently disable a
+    working set of plugins, which is the failure an operator is least equipped
+    to diagnose from the outside.
+
+    Matching is case-insensitive. A settings file is operator prose, and
+    ``Redact`` where the file on disk is ``redact.py`` is a typo class rather
+    than an intent -- so the name is casefolded here and compared casefolded by
+    the loader.
+    """
+
+    raw = section.get("plugins", fallback=None)
+    if raw is None:
+        return ()
+
+    names: list[str] = []
+    for text in _split_list(raw):
+        # A plugin name is a module name, so it is exactly what Python will
+        # accept as one. Rejecting `my-plugin`, `foo.bar` and `../evil` here
+        # means the loader never builds an import path out of operator text.
+        if not text.isidentifier():
+            issues.append(
+                ConfigIssue(
+                    "plugins",
+                    f"{text!r} is not a usable plugin name: name the file "
+                    "without its .py, using letters, digits and underscores",
+                )
+            )
+            continue
+        if text.startswith("_"):
+            issues.append(
+                ConfigIssue(
+                    "plugins",
+                    f"{text!r} is not loadable: CLV skips modules whose name "
+                    "starts with an underscore",
+                )
+            )
+            continue
+        names.append(text.casefold())
+
+    # Order-preserving de-duplication, as `persist_log_sources` does for the
+    # source list: naming a plugin twice is a harmless mistake, not an issue.
+    return tuple(dict.fromkeys(names))
 
 
 #: What to tell an operator whose ``log_dirs`` entry read as an identifier:
@@ -971,6 +1293,85 @@ def _parse_host(
     )
 
 
+def _parse_plugin_sections(
+    parser, issues: list[ConfigIssue]
+) -> dict[str, dict[str, str]]:
+    """Read every ``[plugin:<name>]`` section, skipping the ones it cannot use.
+
+    Modelled on :func:`_parse_hosts`, and for the same reason: a malformed
+    section costs itself and nothing else. A settings file is the operator's,
+    and one bad header must not be able to void the plugin next to it -- still
+    less to stop CLV starting.
+
+    The two name checks are ``_read_plugin_list``'s, deliberately. A name that
+    the enable-list would refuse is a name the loader will never import, so a
+    section for it can only ever configure nothing; catching it here means the
+    operator is told once, in terms that match what they wrote.
+    """
+
+    found: dict[str, dict[str, str]] = {}
+    for raw_section in parser.sections():
+        if not raw_section.startswith(PLUGIN_SECTION_PREFIX):
+            continue
+        origin = f"[{raw_section}]"
+        name = raw_section[len(PLUGIN_SECTION_PREFIX) :].strip()
+        if not name:
+            issues.append(
+                ConfigIssue(origin, "has no plugin name; use [plugin:<name>].")
+            )
+            continue
+        if not name.isidentifier() or name.startswith("_"):
+            issues.append(
+                ConfigIssue(
+                    origin,
+                    f"{name!r} is not a usable plugin name: name the plugin as "
+                    "its file is named, without the .py",
+                )
+            )
+            continue
+        key = name.casefold()
+        if key in found:
+            issues.append(
+                ConfigIssue(origin, f"{name!r} is already configured; skipped.")
+            )
+            continue
+        try:
+            found[key] = dict(parser[raw_section])
+        except Exception as exc:  # pragma: no cover - defensive
+            issues.append(ConfigIssue(origin, f"could not be read: {exc}"))
+    return found
+
+
+def plugin_settings_for(config: "LogConfig") -> dict[str, dict[str, str]]:
+    """The settings each plugin should be handed, legacy keys folded in.
+
+    Takes the whole :class:`LogConfig` rather than the parser, and that is what
+    makes the aliasing correct rather than merely convenient: ``app.py`` turns
+    the journal on with ``replace(self._config, enable_journald=True)`` and
+    never re-reads the file, so an alias resolved at parse time would hand the
+    plugin the value from disk while the drawer showed the operator the value in
+    memory. Resolved from the config object, both agree by construction.
+
+    Copies, so mutating the result cannot reach into ``LogConfig``. The registry
+    then owns these dicts for the session and mutates them in place -- see
+    :meth:`~clv.plugins.PluginRegistry.refresh_settings`.
+    """
+
+    settings = {
+        name: dict(values) for name, values in config.plugin_settings.items()
+    }
+    for name, aliases in _LEGACY_PLUGIN_KEYS.items():
+        section = settings.setdefault(name, {})
+        for key, option in aliases.items():
+            if key in section:
+                continue
+            value = getattr(config, option, None)
+            if value is None:
+                continue
+            section[key] = str(value).lower() if isinstance(value, bool) else str(value)
+    return settings
+
+
 def _parse_hosts(parser, issues: list[ConfigIssue]) -> tuple[RemoteHost, ...]:
     hosts: list[RemoteHost] = []
     claimed: set[str] = set()
@@ -1076,8 +1477,12 @@ def load_config(path: Optional[Path] = None) -> LogConfig:
         clipboard_max_bytes=_read_int(section, "clipboard_max_bytes"),
         watch_rate_limit=_read_int(section, "watch_rate_limit"),
         cluster_lookback=_read_int(section, "cluster_lookback"),
+        plugin_time_budget_ms=_read_int(section, "plugin_time_budget_ms"),
+        plugin_read_budget_ms=_read_int(section, "plugin_read_budget_ms"),
         watch_bell=_read_bool(section, "watch_bell", False),
         enable_journald=_read_bool(section, "enable_journald", False),
+        plugins=_read_plugin_list(section, issues),
+        plugin_settings=_parse_plugin_sections(parser, issues),
         enable_ssh=_read_bool(section, "enable_ssh", False),
         hosts=_parse_hosts(parser, issues),
         issues=tuple(issues),

@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 import pytest
-from textual.widgets import Button, Input, Static, Switch
+from textual.widgets import Button, Input, OptionList, Static, Switch
 
 from clv.app import STARRED_GROUP, VIEWS_GROUP, LogTree, LogViewerApp
 from clv.services.config import LogConfig
@@ -697,5 +697,109 @@ def test_deleting_the_only_view_from_its_row_closes_the_picker(tmp_path: Path) -
             assert app.state.views == ()
             assert not isinstance(app.screen, ViewPickerDialog), "the picker stayed up"
             assert app._views_group(app.query_one("#source-tree", LogTree)) is None
+
+    _run(scenario)
+
+
+# --- a view whose query needs a plugin that is gone -------------------------
+#
+# Phase 8 of PLUGIN_TODO.md. `host~^web` with the operator uninstalled is not a
+# syntax error — nothing recognises `~`, so the whole string falls through to
+# the regex half and matches the literal text. A view that quietly did that
+# would be worse than one that refused, so it refuses. The full grammar is
+# exercised in `test_plugin_query.py`; what is tested here is the surface.
+
+
+def test_the_picker_marks_a_view_whose_plugin_is_missing() -> None:
+    async def scenario() -> None:
+        views = [
+            SavedView(name="plain", query="tag:sshd"),
+            SavedView(name="needs one", query="host~^web", requires=("field-regex",)),
+        ]
+        app = LogViewerApp(config=LogConfig(log_dirs=[], discovery=DiscoverySettings()))
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.push_screen(ViewPickerDialog(views))
+            await pilot.pause()
+
+            options = app.screen.query_one("#view-list", OptionList)
+            rendered = [options.get_option_at_index(i).prompt.plain for i in range(2)]
+
+        assert "⚠" not in rendered[0]
+        assert "⚠" in rendered[1]
+        assert "field-regex" in rendered[1]
+        assert "not installed" in rendered[1]
+
+    _run(scenario)
+
+
+def test_the_picker_refuses_to_apply_a_view_whose_plugin_is_missing() -> None:
+    """Refused in the modal the operator is looking at, not as a later toast."""
+
+    async def scenario() -> None:
+        results: list[ViewRequest | None] = []
+        view = SavedView(name="needs one", query="host~^web", requires=("field-regex",))
+        app = LogViewerApp(config=LogConfig(log_dirs=[], discovery=DiscoverySettings()))
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.push_screen(ViewPickerDialog([view]), callback=results.append)
+            await pilot.pause()
+
+            app.screen.query_one("#apply-view", Button).press()
+            await pilot.pause()
+
+            assert isinstance(app.screen, ViewPickerDialog), "it must not dismiss"
+            hint = app.screen.query_one("#view-hint", Static).render().plain
+            assert "field-regex" in hint and "not installed" in hint
+            assert results == []
+
+            # Rename and delete are still offered: the view is intact and it is
+            # theirs. What it cannot do is run.
+            await pilot.press("d")
+            await pilot.press("d")
+            await pilot.pause()
+            assert results == [ViewRequest("delete", "needs one")]
+
+    _run(scenario)
+
+
+def test_applying_a_view_with_a_missing_plugin_changes_nothing(tmp_path: Path) -> None:
+    """The app's own guard — the tree row dismisses straight into `_apply_view`."""
+
+    async def scenario() -> None:
+        _logs(tmp_path)
+        app = _app(tmp_path)
+        async with app.run_test(size=(120, 34)) as pilot:
+            await pilot.pause()
+            before = (app.state.query, app.state.severity, app.state.time_window)
+
+            app._apply_view(
+                SavedView(
+                    name="needs one",
+                    query="host~^web",
+                    severity="error",
+                    time_window="15m",
+                    requires=("field-regex",),
+                )
+            )
+            await pilot.pause()
+
+            assert (app.state.query, app.state.severity, app.state.time_window) == before
+
+    _run(scenario)
+
+
+def test_a_captured_view_records_no_requirement_without_query_plugins(
+    tmp_path: Path,
+) -> None:
+    """Requirement 10: a build with no query plugins records nothing new."""
+
+    async def scenario() -> None:
+        _logs(tmp_path)
+        app = _app(tmp_path)
+        async with app.run_test(size=(120, 34)) as pilot:
+            await pilot.pause()
+            app._update_state(query="tag:sshd status>=500")
+            assert app._capture_view("v").requires == ()
 
     _run(scenario)

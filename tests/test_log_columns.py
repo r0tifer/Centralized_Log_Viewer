@@ -153,6 +153,35 @@ def test_a_journald_row_does_not_render_forty_chips() -> None:
     assert "nginx.service" in plain, "the unit still reaches the source cell"
 
 
+def test_a_logfmt_row_gets_a_source_cell_and_chips_and_repeats_no_cell() -> None:
+    """The journald allowlist argument, applied to the other writer-keyed format.
+
+    A logfmt line's keys are the writer's, so `msg`, `level` and `ts` have to be
+    withheld by the profile's `consumed` -- there is no group name to recognise
+    them by. Asserted through `render_row` rather than by reading the profile
+    table back, because the table being right is not the claim; the row being
+    right is.
+    """
+
+    lines = [
+        'ts=2026-08-07T09:25:01Z level=error msg="connect refused" '
+        "svc=api host=web01 status=500 request_id=abc pid=991",
+        'ts=2026-08-07T09:25:02Z level=info msg="served" '
+        "svc=api host=web02 status=200 request_id=def pid=991",
+    ]
+    entries, layout = _plan(lines)
+    plain = render_row(entries[0], layout).plain
+
+    assert entries[0].format_name == "logfmt"
+    assert "api[991]" in plain, "the source cell, with the pid appended"
+    assert "status=500" in plain, "an allowlisted chip an operator is hunting for"
+    # The three the format already spent on a cell. Each would repeat the cell
+    # beside it, and each is in the profile's `consumed`.
+    assert "msg=" not in plain
+    assert "level=" not in plain
+    assert "ts=" not in plain
+
+
 def test_a_constant_field_earns_no_chip_and_a_varying_one_does() -> None:
     """One rule replaces a per-format decision about `host`."""
 
@@ -461,3 +490,30 @@ def test_the_cells_give_way_in_order_as_the_pane_narrows() -> None:
     assert sources == sorted(sources, reverse=True)
     assert levels == sorted(levels, reverse=True)
     assert sources[-1] == 0, "the source cell never gave way"
+
+
+def test_a_pid_with_no_source_to_ride_on_is_not_a_cell_of_its_own() -> None:
+    """`[991]` says the one thing the detail pane already says better.
+
+    The source cell's whole job is *which program*, and a PID rides along in it
+    when there is room. With no program name recovered there is nothing to ride
+    on, and what used to be rendered was a bare `[991]` — a PID as a cell of its
+    own, which `_source_value`'s own docstring rules out.
+
+    Reachable with no plugin at all: a JSON line carrying `pid` and none of the
+    `json` profile's source keys lands exactly here. Found while checking a
+    plugin format's rows, where a profile naming a source key that a particular
+    line did not carry is the ordinary case rather than the unlucky one.
+    """
+
+    entries, layout = _plan(
+        [
+            '{"pid": 991, "level": "error", "msg": "boom"}',
+            '{"unit": "nginx", "pid": 7, "level": "info", "msg": "started"}',
+        ]
+    )
+    rows = [render_row(entry, layout).plain for entry in entries]
+
+    assert rows[0] == "ERROR boom"
+    # And the case it exists for is untouched.
+    assert rows[1] == "INFO nginx[7] started"

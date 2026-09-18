@@ -33,37 +33,15 @@ from textual.app import ComposeResult
 from textual.containers import VerticalScroll
 from textual.widgets import Static
 
+from ..services.formats import FORMAT_LABELS, NO_FIELD_REASONS
 from ..services.parsing import LogEntry
+from .columns import format_label
 
-#: What each format is called in the property list. The parser's own names are
-#: terse identifiers; these are what an operator would call them.
-FORMAT_LABELS: dict[str, str] = {
-    "syslog": "BSD syslog",
-    "syslog-5424": "RFC 5424 syslog",
-    "access-log": "Common Log Format",
-    "json": "JSON",
-    "python-logging": "Python logging",
-    "iso-level": "ISO timestamp with level",
-    "iso": "ISO timestamp",
-    "raw": "unrecognised",
-}
-
-#: Why a matched line still has no fields. Keyed by format name; the fallback
-#: covers the raw case, which is a different statement entirely.
-NO_FIELD_REASONS: dict[str, str] = {
-    "python-logging": (
-        "The Python logging format carries a timestamp, a level and a message "
-        "and nothing else to name."
-    ),
-    "iso-level": (
-        "This line is a timestamp, a level and a message; there is no further "
-        "structure in it to recover."
-    ),
-    "iso": (
-        "This line is a timestamp and a message; there is no further structure "
-        "in it to recover."
-    ),
-}
+# `FORMAT_LABELS` and `NO_FIELD_REASONS` are re-exported from
+# `clv.services.formats`, which is where they live now. They moved because
+# `columns.format_label` needs the first of them and `columns.py` may not import
+# Textual -- and because what a format is *called* is a declaration about the
+# format, not about this widget. Every existing import site is unaffected.
 
 NO_FORMAT_REASON = (
     "No format matched this line, so only its raw text is available. "
@@ -188,7 +166,9 @@ class DetailPane(VerticalScroll):
 
         table.add_row("Timestamp", entry.timestamp.isoformat() if entry.timestamp else "—")
         table.add_row("Level", entry.level or "—")
-        table.add_row("Format", FORMAT_LABELS.get(entry.format_name, entry.format_name))
+        # Through `columns` so a plugin format's own `label` is honoured; it
+        # falls back to FORMAT_LABELS and then to the bare identifier.
+        table.add_row("Format", format_label(entry.format_name))
         table.add_row("Continuation", "yes" if entry.continuation else "no")
 
         # dict(): fields is a read-only mappingproxy.
@@ -216,4 +196,11 @@ class DetailPane(VerticalScroll):
         return " ".join(parts)
 
 
-__all__ = ["CONTINUATION_NOTE", "EMPTY_MESSAGE", "FORMAT_LABELS", "NO_FORMAT_REASON", "DetailPane"]
+__all__ = [
+    "CONTINUATION_NOTE",
+    "EMPTY_MESSAGE",
+    "FORMAT_LABELS",
+    "NO_FIELD_REASONS",
+    "NO_FORMAT_REASON",
+    "DetailPane",
+]

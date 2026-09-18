@@ -12,6 +12,7 @@ import asyncio
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 
@@ -25,6 +26,7 @@ from clv.plugins import (
     ProviderSource,
     load_plugins,
 )
+from clv.plugins import load_plugins
 from clv.plugins.sources import journald, ssh
 from clv.services import SourceManager, persist_setting
 from clv.services.config import RemoteHost, load_config, user_config_path
@@ -1270,3 +1272,107 @@ def test_a_starred_unit_opens_from_the_starred_group(tmp_path: Path) -> None:
             assert app._selected_source == unit
 
     asyncio.run(scenario())
+
+
+# --- the plugin reads its own settings --------------------------------------
+#
+# The worked example for `configure()`. What is being proved is not that the
+# journal works — the rest of this file does that — but that the *pattern* is
+# copyable: an opt-in that gates every subprocess this plugin spawns, arriving
+# through a hook, from a section named after the module, with no import of CLV's
+# settings parser anywhere in the path.
+
+
+def test_the_provider_takes_its_opt_in_through_configure(monkeypatch) -> None:
+    monkeypatch.setattr(journald, "availability", lambda: (True, ""))
+    provider = journald.JournaldProvider(runner=lambda argv: "")
+
+    provider.configure({"enabled": "false"})
+    assert list(provider.discover()) == []
+    assert "disabled" in provider.status
+
+    provider.configure({"enabled": "true"})
+    assert provider._enabled() is True
+
+
+def test_a_configured_provider_never_reads_the_settings_file(monkeypatch) -> None:
+    """The point of the exercise, asserted rather than asserted about.
+
+    A third party has no supported way to call `load_config`, so if the journal
+    provider still needed it the pattern would be a privilege rather than an
+    example.
+    """
+
+    def explode():  # pragma: no cover - the assertion is that this is not hit
+        raise AssertionError("the plugin reached for CLV's settings parser")
+
+    monkeypatch.setattr(journald, "load_config", explode)
+    monkeypatch.setattr(journald, "availability", lambda: (True, ""))
+
+    provider = journald.JournaldProvider(runner=lambda argv: "")
+    provider.configure({"enabled": "false"})
+
+    assert list(provider.discover()) == []
+
+
+def test_the_settings_view_is_live_so_the_drawer_switch_still_works() -> None:
+    """`enable_journald` is aliased into the section, and the section is a view.
+
+    Flipping the drawer's switch rewrites `settings.conf` and refreshes the
+    mapping behind this view; the next `discover()` sees it. That is the same
+    "no restart needed" property the module-level fresh read used to provide,
+    kept by a different mechanism.
+    """
+
+    backing = {"enabled": "false"}
+    provider = journald.JournaldProvider()
+    provider.configure(MappingProxyType(backing))
+    assert provider._enabled() is False
+
+    backing["enabled"] = "true"
+
+    assert provider._enabled() is True
+
+
+def test_a_provider_built_without_configure_still_reads_the_file() -> None:
+    """The fallback is for a provider that never went through the loader.
+
+    Not a second mechanism competing with the first: it is what a directly
+    constructed provider has instead of a `configure()` call, and it is what
+    keeps every test above this line working unchanged.
+    """
+
+    persist_setting(user_config_path(), "enable_journald", "true")
+
+    assert journald.JournaldProvider()._enabled() is True
+
+
+def test_the_tuning_keys_are_honoured_and_a_typo_costs_nothing() -> None:
+    provider = journald.JournaldProvider()
+    assert provider.max_lines == journald.DEFAULT_LINES
+    assert provider.query_timeout == journald.QUERY_TIMEOUT
+
+    provider.configure({"max_lines": "50", "query_timeout": "7"})
+    assert (provider.max_lines, provider.query_timeout) == (50, 7)
+
+    provider.configure({"max_lines": "lots", "query_timeout": "-1"})
+    assert provider.max_lines == journald.DEFAULT_LINES
+    assert provider.query_timeout == journald.QUERY_TIMEOUT
+
+
+def test_the_journald_section_reaches_the_journald_plugin() -> None:
+    """End to end through the real loader, with the real bundled plugin."""
+
+    registry = load_plugins(
+        clv_version="2.1.0",
+        include_user=False,
+        include_entry_points=False,
+        settings={"journald": {"enabled": "true", "max_lines": "11"}},
+    )
+    provider = next(
+        p for p in registry.sources if isinstance(p, journald.JournaldProvider)
+    )
+
+    assert provider._enabled() is True
+    assert provider.max_lines == 11
+    assert registry.errors == []

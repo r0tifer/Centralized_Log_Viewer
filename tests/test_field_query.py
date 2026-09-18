@@ -40,6 +40,8 @@ SYSLOG_OTHER = "Aug  7 09:25:02 db02 cron[91]: session opened"
 ACCESS = '10.0.0.7 - alice [07/Aug/2026:09:25:03 +0000] "GET /admin HTTP/1.1" 500 271'
 ACCESS_OK = '10.0.0.8 - bob [07/Aug/2026:09:25:04 +0000] "GET /health HTTP/1.1" 200 12'
 PLAIN = "no structure here at all"
+LOGFMT = 'ts=2026-08-07T09:25:05Z level=error msg="boom" svc=api request_id=abc'
+LOGFMT_OTHER = 'ts=2026-08-07T09:25:06Z level=info msg="served" svc=web request_id=def'
 
 
 # --- the grammar ------------------------------------------------------------
@@ -258,6 +260,26 @@ def test_collect_field_names_reports_only_what_is_there() -> None:
     names = collect_field_names(parse_lines(SYSLOG))
     assert names == frozenset({"host", "tag", "pid"})
     assert collect_field_names(parse_lines(PLAIN)) == frozenset()
+
+
+def test_a_logfmt_key_is_queryable_through_the_same_path_json_keys_use() -> None:
+    """The parity claim, and `query.py` needed no change to make it true.
+
+    A logfmt key is the writer's, so it does not join `NORMALISED_FIELD_KEYS` —
+    it reaches completion through `collect_field_names` the moment a line
+    carrying it is read, exactly as a JSON key does.
+    """
+
+    entries = parse_lines(LOGFMT, LOGFMT_OTHER)
+    names = collect_field_names(entries)
+    assert {"svc", "request_id", "msg", "level", "ts"} <= names
+    assert "svc" not in NORMALISED_FIELD_KEYS
+
+    result = filter_entries(
+        entries,
+        FilterSpec(query="svc:api", known_fields=NORMALISED_FIELD_KEYS | names),
+    )
+    assert [entry.raw for entry in result.entries] == [LOGFMT]
 
 
 # --- the compatibility bar --------------------------------------------------

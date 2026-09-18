@@ -502,11 +502,16 @@ def test_the_source_discovery_row_still_fits_just_above_the_compact_breakpoint()
                 switch = app.advanced_drawer.query_one("#drawer-ssh", Switch)
                 buffer = app.advanced_drawer.query_one("#max-buffer-lines", Input)
                 checks = [(switch, "#drawer-ssh"), (buffer, "#max-buffer-lines")]
-                # The actions row is `layout: horizontal` and never stacks, so a
-                # third button there is a width change at every one of these.
+                # The actions row is `layout: horizontal` and never stacks, so
+                # another button there is a width change at every one of these.
                 checks += [
                     (app.advanced_drawer.query_one(button_id), button_id)
-                    for button_id in ("#scan-ssh-config", "#rescan-sources", "#close-advanced")
+                    for button_id in (
+                        "#scan-ssh-config",
+                        "#manage-plugins",
+                        "#rescan-sources",
+                        "#close-advanced",
+                    )
                 ]
                 for widget, name in checks:
                     assert widget.region.width > 0, f"{name} laid out to nothing at {width}"
@@ -533,7 +538,12 @@ def test_the_drawer_actions_stay_on_screen_at_eighty_columns() -> None:
             assert drawer.region.right <= 80
             for widget_id in ("#drawer-ssh", "#ssh-status"):
                 assert drawer.query_one(widget_id).region.width > 0, widget_id
-            for widget_id in ("#scan-ssh-config", "#rescan-sources", "#close-advanced"):
+            for widget_id in (
+                "#scan-ssh-config",
+                "#manage-plugins",
+                "#rescan-sources",
+                "#close-advanced",
+            ):
                 region = drawer.query_one(widget_id).region
                 assert region.width > 0, widget_id
                 assert region.right <= 80, f"{widget_id} overflows 80 columns"
@@ -606,7 +616,11 @@ def test_the_third_action_button_costs_no_rows() -> None:
     The drawer is `max-height: 16` and this file records four times that a new
     *row* pushes what follows below the fold, where it lays out and paints
     nothing. `#drawer-actions` is `layout: horizontal`, so a button joins the
-    existing row instead — which is only true while all three share a `y`.
+    existing row instead — which is only true while all four share a `y`.
+
+    Four now, because the plugin surface took the same way out: `PLUGIN_TODO.md`
+    asked Phase 4 for a plugin *section* — one row per installed plugin — and
+    that is exactly the shape a `max-height: 16` box has no room for.
     """
 
     async def scenario() -> None:
@@ -620,11 +634,16 @@ def test_the_third_action_button_costs_no_rows() -> None:
             actions = app.advanced_drawer.query_one("#drawer-actions")
             regions = [
                 app.advanced_drawer.query_one(button_id).region
-                for button_id in ("#scan-ssh-config", "#rescan-sources", "#close-advanced")
+                for button_id in (
+                    "#scan-ssh-config",
+                    "#manage-plugins",
+                    "#rescan-sources",
+                    "#close-advanced",
+                )
             ]
             assert len({region.y for region in regions}) == 1, "a second row"
             # One button tall plus the container's own `padding-top: 1` -- i.e.
-            # exactly what two buttons cost, which is the point.
+            # exactly what one button costs, which is the point.
             tallest = max(region.height for region in regions)
             assert actions.region.height == tallest + 1, actions.region
 
@@ -733,3 +752,49 @@ def test_an_alias_already_configured_is_not_offered_again(tmp_path: Path) -> Non
             assert notes and "already configured" in notes[0][1]
 
     asyncio.run(scenario())
+
+
+# --- installed but not enabled ----------------------------------------------
+
+
+def test_the_drawer_says_how_many_plugins_are_installed_but_not_enabled() -> None:
+    """The hint an operator gets between copying a file in and naming it.
+
+    Not an error, so it does not go to the log panel's amber problem channel —
+    a plugin waiting to be enabled is the designed resting state, not a fault.
+    A count now rather than a sentence: `P` has the row, and `tests/
+    test_plugin_drawer.py` is where what the row says is asserted.
+    """
+
+    from clv.plugins import DiscoveredPlugin
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(120, 30)) as pilot:
+            app._plugins.discovered.append(
+                DiscoveredPlugin(
+                    name="redact_secrets", root=Path("/home/x"), enabled=False
+                )
+            )
+            app._refresh_plugin_status()
+            await pilot.pause()
+
+            text = str(app.advanced_drawer.query_one("#plugin-status").content)
+            assert "1 not enabled" in text
+
+    _run(scenario)
+
+
+def test_the_drawer_says_nothing_extra_when_every_plugin_is_enabled() -> None:
+    """Requirement 10: nothing installed means nothing new on screen."""
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(120, 30)) as pilot:
+            app._refresh_plugin_status()
+            await pilot.pause()
+
+            text = str(app.advanced_drawer.query_one("#plugin-status").content)
+            assert "not enabled" not in text
+
+    _run(scenario)

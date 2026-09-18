@@ -30,6 +30,12 @@ NGINX_OK = '10.0.0.1 - - [07/Aug/2026:09:25:01 +0000] "GET / HTTP/1.1" 200 123'
 JSONL = '{"ts":"2026-08-07T09:25:01Z","level":"error","msg":"boom"}'
 ISO_BRACKET = "[2026-08-07 09:25:01] [error] upstream timed out"
 ISO_PLAIN = "2026-08-07T09:25:01.123Z starting service"
+# The three logfmt dialects: bare, `ts=`-first, and ISO-timestamp-first. The
+# last one is why this is a phase and not a plugin -- `_RE_ISO_PLAIN` claimed it
+# first, and its whole payload sat unparsed in `message`.
+LOGFMT_BARE = 'level=info msg="thing happened" dur=1.2ms'
+LOGFMT_TS = 'ts=2026-08-07T09:25:01Z level=error msg="boom" svc=api'
+LOGFMT_ISO = '2026-08-07T09:25:01Z level=error msg="boom" svc=api'
 
 
 @pytest.mark.parametrize(
@@ -42,6 +48,12 @@ ISO_PLAIN = "2026-08-07T09:25:01.123Z starting service"
         (NGINX_OK, "access-log", LEVEL_INFO),
         (JSONL, "json", LEVEL_ERROR),
         (ISO_BRACKET, "iso-level", LEVEL_ERROR),
+        (LOGFMT_BARE, "logfmt", LEVEL_INFO),
+        (LOGFMT_TS, "logfmt", LEVEL_ERROR),
+        # The ISO branch defers, so this is `logfmt` and not `iso` -- and it
+        # has a level, which `_scan_level` could never have found in
+        # `level=error` because `_RE_BARE_LEVEL` is not case-insensitive.
+        (LOGFMT_ISO, "logfmt", LEVEL_ERROR),
     ],
 )
 def test_formats_are_recognised(line: str, expected_format: str, expected_level) -> None:
@@ -162,6 +174,24 @@ def test_bare_level_scan_only_looks_at_the_head_of_a_line() -> None:
             },
         ),
         (JSONL, {"ts": "2026-08-07T09:25:01Z", "level": "error", "msg": "boom"}),
+        # Every pair, including the ones spent on the level and the message:
+        # `msg:` has to stay queryable on the line that carried it.
+        (
+            LOGFMT_BARE,
+            {"level": "info", "msg": "thing happened", "dur": "1.2ms"},
+        ),
+        (
+            LOGFMT_TS,
+            {
+                "ts": "2026-08-07T09:25:01Z",
+                "level": "error",
+                "msg": "boom",
+                "svc": "api",
+            },
+        ),
+        # The ISO branch's timestamp is not a pair on the line, so it is not a
+        # field either -- only what the writer actually wrote is.
+        (LOGFMT_ISO, {"level": "error", "msg": "boom", "svc": "api"}),
         # Formats that capture nothing beyond timestamp and level.
         (PYTHON_LOGGING, {}),
         (ISO_BRACKET, {}),
@@ -270,6 +300,20 @@ def test_a_json_key_colliding_with_a_normalised_name_keeps_the_json_value() -> N
 
     assert fields["host"] == "from-json"
     assert fields["tag"] == "from-json"
+
+
+def test_a_logfmt_key_colliding_with_a_normalised_name_keeps_the_line_value() -> None:
+    """`host=` is a common logfmt key, and the line's own value wins.
+
+    The same rule JSON already follows, and the reason logfmt keys do not join
+    `NORMALISED_FIELD_KEYS`: they are the writer's vocabulary, not the parser's.
+    """
+
+    line = 'level=info msg=hi host=from-logfmt status=200'
+    fields = parse_line(line).fields
+
+    assert fields["host"] == "from-logfmt"
+    assert fields["status"] == "200"
 
 
 def test_log_entry_is_constructible_without_fields() -> None:

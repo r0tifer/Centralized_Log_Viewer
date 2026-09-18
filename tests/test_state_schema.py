@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from clv.services.watch import WatchRule
+from clv.services.watch import ACTION_NOTIFY, WatchRule
 from clv.storage import SavedView, SessionState, StateStore
 
 
@@ -42,9 +42,16 @@ _SAMPLES: dict[str, object] = {
     "int": 4242,
     "tuple[str, ...]": ("ssh:web01/var/log/syslog", "journal:all"),
     "tuple[SavedView, ...]": (
-        SavedView(name="a view", query="level:error", source="ssh:web01/var/log/syslog"),
+        SavedView(
+            name="a view",
+            query="level:error",
+            source="ssh:web01/var/log/syslog",
+            requires=("field-regex",),
+        ),
     ),
-    "tuple[WatchRule, ...]": (WatchRule(name="a rule", pattern="boom"),),
+    "tuple[WatchRule, ...]": (
+        WatchRule(name="a rule", pattern="boom", requires=("field-regex",)),
+    ),
 }
 
 
@@ -141,3 +148,42 @@ def test_a_saved_view_survives_a_restart_field_by_field(tmp_path: Path) -> None:
     assert restored.views == (view,)
     for name in declared:
         assert getattr(restored.views[0], name) == getattr(view, name), name
+
+
+#: Fields whose value is validated on load rather than taken as written, with a
+#: legal non-default to use instead. `action` is the only one: `from_dict`
+#: coerces anything outside `ACTIONS` back to the default, so the generic
+#: "any distinct string" sample would be silently corrected and the test would
+#: pass while proving nothing.
+_RULE_OVERRIDES: dict[str, object] = {"action": ACTION_NOTIFY}
+
+
+def test_a_watch_rule_survives_a_restart_field_by_field(tmp_path: Path) -> None:
+    """`WatchRule.from_dict` is a *third* copy of the same convention.
+
+    `SessionState`'s and `SavedView`'s dispatch on annotation text; this one is
+    written out by hand, so a rule added to it inherits nothing and a field
+    added to `WatchRule` without a clause is dropped on load with no diagnosis.
+    Driven off the dataclass so tomorrow's field is covered by today's test.
+    """
+
+    declared = {field.name: field for field in fields(WatchRule)}
+    rule = WatchRule(
+        **{
+            name: (
+                "a rule"
+                if name == "name"
+                else _RULE_OVERRIDES[name]
+                if name in _RULE_OVERRIDES
+                else _distinct_value(str(f.type), f.default)
+            )
+            for name, f in declared.items()
+        }
+    )
+
+    StateStore(root=tmp_path).save(SessionState(watch_rules=(rule,)))
+    restored = StateStore(root=tmp_path).load()
+
+    assert restored.watch_rules == (rule,)
+    for name in declared:
+        assert getattr(restored.watch_rules[0], name) == getattr(rule, name), name

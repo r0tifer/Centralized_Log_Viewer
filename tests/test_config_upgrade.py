@@ -563,3 +563,137 @@ def test_a_duplicated_log_viewer_section_is_refused(tmp_path: Path) -> None:
     assert "combine them into one" in result.error
     assert target.read_text(encoding="utf-8") == before
     assert list(tmp_path.glob("*.bak-*")) == [], "refusal must not leave a backup"
+
+
+# --- plugin sections survive an upgrade -------------------------------------
+
+
+def test_plugin_sections_survive_an_upgrade(tmp_path: Path) -> None:
+    """The bug this test exists for: the merge used to delete them.
+
+    `_merge` copied `[log_viewer]` options and `[ssh:<name>]` sections and
+    dropped everything else, so `clv --upgrade-config` silently removed a
+    `[plugin:<name>]` section — silently because nothing else in the file
+    changed and the operator's plugin simply started running on its defaults.
+
+    Copied byte-identical, including keys this version of CLV knows nothing
+    about: what a key means is the plugin's business, so the merge may not
+    decide it is unused.
+    """
+
+    sections = (
+        "\n[plugin:redact_secrets]\n"
+        "patterns = password, api_key\n"
+        "replacement = ******\n"
+        "# a note the operator wrote\n"
+        "\n[plugin:some_future_thing]\n"
+        "a_key_clv_has_never_heard_of = 1\n"
+    )
+    target = tmp_path / "settings.conf"
+    target.write_text(ANCIENT + sections, encoding="utf-8")
+    before = load_config(target)
+    assert set(before.plugin_settings) == {"redact_secrets", "some_future_thing"}
+
+    result = upgrade_user_settings(target)
+
+    assert result.status == "upgraded"
+    assert result.plugins == ("redact_secrets", "some_future_thing")
+
+    merged = target.read_text(encoding="utf-8")
+    for line in sections.strip().splitlines():
+        assert line in merged, f"lost {line!r}"
+
+    after = load_config(target)
+    assert after.plugin_settings == before.plugin_settings
+
+
+def test_hosts_and_plugins_keep_their_file_order(tmp_path: Path) -> None:
+    """Interleaved, because both are copied by one pass over the spans."""
+
+    target = tmp_path / "settings.conf"
+    target.write_text(
+        ANCIENT
+        + "\n[plugin:first]\na = 1\n"
+        + "\n[ssh:web01]\nlog_dirs = /var/log\n"
+        + "\n[plugin:second]\na = 2\n",
+        encoding="utf-8",
+    )
+
+    result = upgrade_user_settings(target)
+
+    assert result.plugins == ("first", "second")
+    assert result.hosts == ("web01",)
+    # Headers only. The shipped template carries commented `# [ssh:web01]` and
+    # `# [plugin:...]` examples, so an unanchored search finds the prose first.
+    headers = [
+        line for line in target.read_text(encoding="utf-8").splitlines()
+        if line.startswith("[") and line.endswith("]")
+    ]
+    assert headers == ["[log_viewer]", "[plugin:first]", "[ssh:web01]", "[plugin:second]"]
+
+
+def test_a_kept_plugin_section_is_named_in_the_summary(tmp_path: Path) -> None:
+    from clv.services.config_upgrade import describe
+
+    target = tmp_path / "settings.conf"
+    target.write_text(ANCIENT + "\n[plugin:redact_secrets]\na = 1\n", encoding="utf-8")
+
+    printed = describe(upgrade_user_settings(target))
+
+    assert "redact_secrets" in printed
+
+
+def test_a_plugin_section_is_not_reported_as_a_missing_setting(tmp_path: Path) -> None:
+    """Same argument as a host section: it is a thing the operator named."""
+
+    target = tmp_path / "settings.conf"
+    target.write_text(
+        default_config_text() + "\n[plugin:redact_secrets]\na = 1\n", encoding="utf-8"
+    )
+
+    assert undocumented_settings(target) == ()
+
+
+def test_a_v3_file_gains_the_read_budget_and_keeps_everything_else(
+    tmp_path: Path,
+) -> None:
+    """Phase 7a moved `config_version` to 4, so this is the upgrade it creates.
+
+    The check that matters is not that the new key arrives — the merge copies
+    the template — but that an operator's own values, their host blocks and
+    their `[plugin:...]` sections come through it untouched. A config upgrade
+    that silently drops a plugin's settings is the failure Phase 5 already found
+    once, and it is worth re-asserting on every version bump rather than
+    assuming the fix held.
+    """
+
+    path = tmp_path / "settings.conf"
+    path.write_text(
+        "[log_viewer]\n"
+        "config_version = 3\n"
+        "log_dirs = /srv/logs\n"
+        "plugin_time_budget_ms = 400\n"
+        "plugins = redact_secrets\n"
+        "\n"
+        "[plugin:redact_secrets]\n"
+        "patterns = password, api_key\n"
+        "\n"
+        "[ssh:web01]\n"
+        "hostname = web01.example.com\n",
+        encoding="utf-8",
+    )
+
+    result = upgrade_user_settings(path)
+    text = path.read_text(encoding="utf-8")
+    config = load_config(path)
+
+    assert result.status == "upgraded"
+
+    assert "plugin_read_budget_ms" in text
+    assert config.plugin_read_budget_ms == 50
+    # Everything the operator wrote.
+    assert config.plugin_time_budget_ms == 400
+    assert config.plugins == ("redact_secrets",)
+    assert list(config.log_dirs) == [Path("/srv/logs")]
+    assert "[plugin:redact_secrets]" in text and "api_key" in text
+    assert "[ssh:web01]" in text and "web01.example.com" in text
