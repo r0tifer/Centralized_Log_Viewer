@@ -109,6 +109,11 @@ _MARKER_STYLE = "bold #7aa3d1"
 
 #: Keys `_parse_json` already consumed into timestamp/level/message. Showing one
 #: as a chip would repeat the cell beside it.
+#:
+#: Shared with the `logfmt` profile, not copied into it: the parser resolves
+#: both formats through the same three key tuples, so `msg=` and `"msg":` are
+#: spent by the same rule and have to be withheld by one. `tests/test_logfmt.py`
+#: pins this set against those tuples, because it is a hand-copy of them.
 _JSON_CONSUMED = frozenset(
     {
         "timestamp", "@timestamp", "time", "ts", "asctime", "eventTime", "date",
@@ -161,6 +166,31 @@ FORMAT_PROFILES: dict[str, FormatProfile] = {
     # answer and `SYSLOG_IDENTIFIER` is the unit-less fallback.
     "json": FormatProfile(
         source_keys=("unit", "logger", "service", "component", "tag", "name"),
+        pid_key="pid",
+        chips=(
+            "host",
+            "status",
+            "code",
+            "error",
+            "exception",
+            "method",
+            "path",
+            "duration_ms",
+            "latency_ms",
+            "request_id",
+            "trace_id",
+        ),
+        consumed=_JSON_CONSUMED,
+    ),
+    # **The same allowlist argument, and the same set.** A logfmt line's keys
+    # are the writer's choice exactly as a JSON line's are, so "show the
+    # leftover fields" fails here for the same reason -- and `msg=` and
+    # `"msg":` mean the same thing, which is why `consumed` is shared rather
+    # than copied. `service` sorts before `svc` because a writer who spells out
+    # both means the long one; `svc` is here at all because it is the commonest
+    # spelling in the Go and Rust ecosystems this format comes from.
+    "logfmt": FormatProfile(
+        source_keys=("service", "svc", "logger", "component", "app", "subsystem"),
         pid_key="pid",
         chips=(
             "host",

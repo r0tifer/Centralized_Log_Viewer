@@ -10,8 +10,9 @@ everything around them.
 
 So :data:`clv.services.parsing.FORMAT_NAMES` is the canonical list and this file
 checks the other three against it, in both directions, with a real line per
-name. Phase 7b of ``PLUGIN_TODO.md`` adds ``logfmt`` to the parser; this is what
-makes it impossible to add it there alone.
+name. Phase 7b of ``PLUGIN_TODO.md`` added ``logfmt`` to the parser, and adding
+it to the parser alone failed five of the tests below — which is the first
+evidence this file does the job it was written for.
 
 The fixtures are deliberately literal rather than generated. A test that derived
 the expected names from the tables it is checking would pass forever and mean
@@ -39,6 +40,9 @@ FORMAT_LINES: dict[str, str] = {
         '"GET /pay HTTP/1.1" 500 123'
     ),
     "json": '{"ts": "2026-08-21T09:25:01Z", "level": "error", "msg": "boom"}',
+    "logfmt": (
+        'ts=2026-08-21T09:25:01Z level=error msg="connect refused" svc=api'
+    ),
     "python-logging": "2026-08-21 09:25:01,123 - WARNING - disk almost full",
     "iso-level": "2026-08-21T09:25:01Z ERROR upstream refused the connection",
     "iso": "2026-08-21T09:25:01Z upstream refused the connection",
@@ -131,6 +135,15 @@ def test_a_profile_only_names_fields_its_format_recovers() -> None:
         "latency_ms", "request_id", "trace_id",
     }
     produced.setdefault("json", set()).update(known_json)
+    # And logfmt's, for the same reason: its keys are the writer's, so its
+    # profile is an allowlist over lines this file does not generate. One
+    # realistic fixture line cannot carry eighteen of them.
+    known_logfmt = {
+        "service", "svc", "logger", "component", "app", "subsystem", "pid",
+        "host", "status", "code", "error", "exception", "method", "path",
+        "duration_ms", "latency_ms", "request_id", "trace_id",
+    }
+    produced.setdefault("logfmt", set()).update(known_logfmt)
 
     for name, profile in FORMAT_PROFILES.items():
         # `consumed` names keys the format spends rather than recovers, so it is

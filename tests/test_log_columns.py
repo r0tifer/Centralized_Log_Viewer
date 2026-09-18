@@ -153,6 +153,35 @@ def test_a_journald_row_does_not_render_forty_chips() -> None:
     assert "nginx.service" in plain, "the unit still reaches the source cell"
 
 
+def test_a_logfmt_row_gets_a_source_cell_and_chips_and_repeats_no_cell() -> None:
+    """The journald allowlist argument, applied to the other writer-keyed format.
+
+    A logfmt line's keys are the writer's, so `msg`, `level` and `ts` have to be
+    withheld by the profile's `consumed` -- there is no group name to recognise
+    them by. Asserted through `render_row` rather than by reading the profile
+    table back, because the table being right is not the claim; the row being
+    right is.
+    """
+
+    lines = [
+        'ts=2026-08-07T09:25:01Z level=error msg="connect refused" '
+        "svc=api host=web01 status=500 request_id=abc pid=991",
+        'ts=2026-08-07T09:25:02Z level=info msg="served" '
+        "svc=api host=web02 status=200 request_id=def pid=991",
+    ]
+    entries, layout = _plan(lines)
+    plain = render_row(entries[0], layout).plain
+
+    assert entries[0].format_name == "logfmt"
+    assert "api[991]" in plain, "the source cell, with the pid appended"
+    assert "status=500" in plain, "an allowlisted chip an operator is hunting for"
+    # The three the format already spent on a cell. Each would repeat the cell
+    # beside it, and each is in the profile's `consumed`.
+    assert "msg=" not in plain
+    assert "level=" not in plain
+    assert "ts=" not in plain
+
+
 def test_a_constant_field_earns_no_chip_and_a_varying_one_does() -> None:
     """One rule replaces a per-format decision about `host`."""
 

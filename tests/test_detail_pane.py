@@ -26,6 +26,7 @@ JSON_LINE = '{"ts":"2026-08-07T09:25:01Z","level":"error","msg":"boom","svc":{"n
 #: Matches a format outright and still has no fields to show — the case that
 #: makes "no properties" the common outcome rather than an edge one.
 PY_LOGGING = "2026-08-07 09:25:01,123 - WARNING - slow"
+LOGFMT = 'ts=2026-08-07T09:25:01Z level=error msg="boom" svc=api request_id=abc'
 
 
 # --- LogView, on its own ----------------------------------------------------
@@ -308,6 +309,30 @@ def test_detail_pane_flattens_json_fields_to_dotted_keys() -> None:
             assert "svc.name" in painted
             assert "api" in painted
             assert "ERROR" in painted
+
+    asyncio.run(scenario())
+
+
+def test_detail_pane_names_the_logfmt_format_and_lists_every_pair() -> None:
+    """Including the pairs the row already spent on a cell.
+
+    The row withholds `msg`, `level` and `ts` as chips because the cells beside
+    them already say it. The pane is where the line is read whole, so it says
+    everything -- and it says *which* format claimed the line, which is the
+    question a refused-or-claimed guard will make people ask.
+    """
+
+    async def scenario() -> None:
+        app = _PaneHarness()
+        async with app.run_test(size=(80, 30)) as pilot:
+            await pilot.pause()
+            _show(app, LOGFMT)
+            await pilot.pause()
+
+            painted = _pane_text(app)
+            assert "logfmt (key=value)" in painted
+            for expected in ("svc", "api", "request_id", "abc", "msg", "boom"):
+                assert expected in painted, f"{expected!r} missing from the detail pane"
 
     asyncio.run(scenario())
 

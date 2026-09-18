@@ -14,9 +14,9 @@ desktop terminal and on a headless 80-column SSH session.
   parse are still searchable rather than silently dropped. Smart case: a
   lowercase query is case-insensitive, an uppercase character opts back in.
 - 🧬 **Multi-format parsing.** syslog (RFC 3164 and 5424), ISO-8601/bracketed
-  levels, Python `logging`, JSON lines, Common Log Format access logs — and any
-  format a plugin teaches it. Anything else is kept as a raw line with its text
-  intact.
+  levels, Python `logging`, JSON lines, logfmt (`level=info msg="..."`, what Go
+  and Rust services write), Common Log Format access logs — and any format a
+  plugin teaches it. Anything else is kept as a raw line with its text intact.
 - 🧵 **Stack traces stay attached.** A line no format recognises inherits the
   timestamp and severity of the entry above it, so a traceback survives a
   "show me only errors" filter along with the ERROR that produced it.
@@ -1131,10 +1131,11 @@ Quote a value to keep spaces or colons inside it: `msg:"disk full"`.
 
 Which names work depends on the source. The parser's own vocabulary — `host`,
 `tag`, `pid`, `msgid`, `ident`, `user`, `request`, `status`, `size` — is always
-available, and every key a JSON line carries is added as soon as one is read.
-Start typing a name and the field list drops down under the input: `Tab` takes
-the first suggestion, `↓` steps into the list, `Esc` dismisses it. The Advanced
-drawer keeps a one-line reminder of the syntax under Search options.
+available, and every key a JSON or logfmt line carries is added as soon as one
+is read. Start typing a name and the field list drops down under the input:
+`Tab` takes the first suggestion, `↓` steps into the list, `Esc` dismisses it.
+The Advanced drawer keeps a one-line reminder of the syntax under Search
+options.
 
 **Nothing you already search for changes.** A word that is not a known field
 name is text, so `sshd:` and `kernel: oom-killer` search for exactly what they
@@ -1359,6 +1360,6 @@ worth starring and comparing across a fleet.
 ```bash
 python -m pip install -e .
 python -m pip install pytest
-python -m pytest            # 1890 passed, 1 skipped, 11 deselected
+python -m pytest            # 1943 passed, 1 skipped, 11 deselected
 python -m textual run clv/app.py --dev
 ```

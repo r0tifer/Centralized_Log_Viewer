@@ -37,7 +37,7 @@ that argument; Phase 7b is the exception, and it is here because designing the
 | 6 — Performance guard | A slow plugin costs itself, not the pane | ✅ Done |
 | **Stage C — Core seams** | | |
 | 7a — Parsing | `LogFormat`, and a plugin that teaches CLV a format | ✅ Done |
-| 7b — logfmt | `key=value` parsing, built in because a plugin cannot | ⬜ Not started |
+| 7b — logfmt | `key=value` parsing, built in because a plugin cannot | ✅ Done |
 | 8 — Query | `QueryOperator`, `ComputedField`, and the degradation rule | ⬜ Not started |
 | 9 — Watch | `WatchMatcher`, `WatchSink`, off the event loop | ⬜ Not started |
 | 10 — Clustering | `ClusterRule`, `ShapeContributor`, and the shape cache | ⬜ Not started |
@@ -1612,7 +1612,76 @@ does.
 chips — with no plugin installed and no setting touched; a syslog line
 mentioning `user=root` is still syslog; and every existing case in
 `tests/test_parsing.py` passes unchanged except the rows this phase added. Suite
-green on 3.11 and 3.14.
+green on 3.11 and 3.14: 1943 passed on both.
+
+Checked by hand against a mixed file, rendered through the real column planner.
+The four logfmt rows carry time, level, a source cell and chips; `msg`, `level`
+and `ts` appear in none of them; and the one line with no `ts=` shows the empty
+time cell this phase traded for:
+
+```
+09:25:00       sshd[991]  Accepted publickey for root from 10.0.0.5 rhost=10.0.0.5 user=root  host=web01
+09:25:01 INFO  api[991]   server listening
+09:25:02 ERROR api        connect() failed  host=web01  status=500
+         DEBUG api        cache miss
+09:25:04       kernel     audit: type=1400 apparmor=DENIED pid=991  host=web01
+```
+
+The false-positive corpus was then checked against real logs rather than
+written ones: **122,269 lines** across every readable file in `/var/log`, and
+**20,000 syslog lines** out of the journal. Nothing was relabelled — the journal
+stayed 20,000 `syslog` — and of the 86 syslog lines on this machine whose
+message contains a `=`, none is *itself* valid logfmt, so the four guards are
+declining on structure rather than on luck. The completeness test was broken
+both ways: a name in `FORMAT_NAMES` with no parser behind it fails five tests,
+a `FORMAT_LABELS` entry with no format behind it fails one.
+
+**As shipped.** Four decisions worth recording, two of them departures from this
+phase's own text.
+
+*`svc` joined the source keys.* This phase names five — `service`, `logger`,
+`component`, `app`, `subsystem` — and its own worked example is
+`... msg="boom" svc=api`, which would have rendered with an empty source cell
+against them. `svc` is the commonest spelling in the Go and Rust ecosystems the
+format comes from, so the list would have been wrong on the first line anyone
+pointed at it. `service` still sorts first, so a writer who spells out both is
+unaffected.
+
+*`tests/test_format_registration.py` needed a second edit, not "one fixture
+line".* `test_a_profile_only_names_fields_its_format_recovers` checks a profile
+against what its fixture line was *seen* to produce, and an eighteen-key
+allowlist cannot ride on one realistic line. `json` already had exactly this
+problem and already solves it with a `known_json` seed; `logfmt` takes the same
+treatment for the same reason. The other five tests in the file passed on the
+fixture line alone, which is the part the phase got right — adding the format to
+the parser and nowhere else failed five of them before either edit landed.
+
+*The anchor guard is checked against the **stored** keys, not every pair on the
+line.* Storage stops at `_MAX_FIELDS = 64` the way `_walk_json` does, while the
+scan runs to the end of the line so guard 2 is not weakened by the cap. The
+consequence is that a line whose `msg=` is its 65th distinct pair is refused
+rather than claimed with no message. Bounded was preferred to complete: the
+alternative builds an unbounded intermediate dict for a pathological line, which
+is the thing `_MAX_FIELDS` exists to prevent.
+
+*The quoted and bare values need **separate groups**, and one alternation is a
+bug.* The obvious pattern is `"(?:\\.|[^"\\])*"|\S*`, and then the caller asks
+whether the value starts with a quote. It does not work: an *unterminated* quote
+also starts with one, so `msg="unterminated level=info` was claimed with its
+first and last characters stripped — `msg` came back as `unterminate`. Caught by
+an assertion that passed against the prototype and failed against the branch.
+"Was this properly closed" has to be something the pattern reports, so the two
+forms get their own groups and a bare value containing a `"` refuses the line.
+`tests/test_logfmt.py` pins the nastier shape too: a bare token that both starts
+and ends with a quote, `msg="ends with an escape\"`.
+
+**Also swept here.** `_JSON_CONSUMED` is a hand-copy of the parser's three key
+tuples, and two profiles now depend on it: it decides which chips `json` and
+`logfmt` withhold, while the same three tuples decide which keys the parser
+spends and which anchor a logfmt line. Nothing noticed if they drifted, so
+`tests/test_logfmt.py` asserts they agree. The suite counts in
+[AGENTS.md:496](AGENTS.md#L496) and [README.md:1363](README.md#L1363) are
+refreshed to 1943.
 
 **Commit.** `feat(parsing): logfmt as a sixth built-in format`
 

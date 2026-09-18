@@ -75,6 +75,7 @@ FORMAT_LABELS: dict[str, str] = {
     "syslog-5424": "RFC 5424 syslog",
     "access-log": "Common Log Format",
     "json": "JSON",
+    "logfmt": "logfmt (key=value)",
     "python-logging": "Python logging",
     "iso-level": "ISO timestamp with level",
     "iso": "ISO timestamp",
