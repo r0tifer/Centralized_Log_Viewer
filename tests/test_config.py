@@ -1272,3 +1272,75 @@ def test_plugin_settings_for_hands_out_copies() -> None:
 
 def test_the_shipped_template_documents_a_plugin_section() -> None:
     assert "[plugin:" in DEFAULT_SETTINGS_TEMPLATE
+
+
+# --- the read-path budget ---------------------------------------------------
+
+
+def test_the_read_budget_defaults_and_clamps_like_the_render_one(tmp_path) -> None:
+    """Two budgets, one policy. Zero is the documented escape hatch, not a typo."""
+
+    assert LogConfig().plugin_read_budget_ms == 50
+
+    path = tmp_path / "settings.conf"
+    path.write_text(
+        "[log_viewer]\nplugin_read_budget_ms = 0\n", encoding="utf-8"
+    )
+    assert load_config(path).plugin_read_budget_ms == 0
+
+    path.write_text(
+        "[log_viewer]\nplugin_read_budget_ms = 9999999\n", encoding="utf-8"
+    )
+    assert load_config(path).plugin_read_budget_ms == 60_000
+
+
+def test_the_template_documents_the_read_budget() -> None:
+    """A key with no prose beside it is a key nobody will ever set on purpose."""
+
+    assert "plugin_read_budget_ms = 50" in DEFAULT_SETTINGS_TEMPLATE
+    assert "once per line *read*" in DEFAULT_SETTINGS_TEMPLATE
+
+
+# --- the worked example -----------------------------------------------------
+
+
+def test_the_worked_example_is_written_but_not_discoverable() -> None:
+    """One level down, so a fresh install still reports nothing installed.
+
+    Written into the plugin directory itself the example would be *discovered*,
+    and every machine with no plugins at all would report "1 not enabled"
+    forever — against a plugin CLV put there. `pkgutil.iter_modules` does not
+    descend and `examples/` is not a package, so it is shipped, readable and
+    invisible.
+    """
+
+    import pkgutil
+
+    created = ensure_user_plugin_dir()
+    example = created / "examples" / "nginx_error.py"
+
+    assert example.exists()
+    assert "class NginxErrorFormat" in example.read_text(encoding="utf-8")
+    assert [info.name for info in pkgutil.iter_modules([str(created)])] == []
+    assert "examples/nginx_error.py" in (created / "README.txt").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_the_worked_example_is_never_written_over() -> None:
+    """An operator who edited it, or deleted it, keeps that decision."""
+
+    created = ensure_user_plugin_dir()
+    example = created / "examples" / "nginx_error.py"
+    example.write_text("# mine now", encoding="utf-8")
+
+    ensure_user_plugin_dir()
+    assert example.read_text(encoding="utf-8") == "# mine now"
+
+    example.unlink()
+    ensure_user_plugin_dir()
+    # Deleting it is not a decision CLV gets to undo either... except that a
+    # missing file is indistinguishable from a first run. Seeding it again is
+    # the lesser wrong: it costs a file, where refusing to would need a marker
+    # this directory has no other reason to carry.
+    assert example.exists()

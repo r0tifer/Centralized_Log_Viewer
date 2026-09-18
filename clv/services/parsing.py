@@ -30,6 +30,15 @@ Format           Keys
 others           none
 ===============  ==========================================================
 
+:data:`FORMAT_NAMES` is the canonical list of the names in that first column,
+and it is load-bearing rather than documentary. A ``format_name`` is four
+registrations — the dispatch here, a label, a no-field reason where one is
+needed, and a column profile — and only the first is in this module. The other
+three fail *quietly*: a format with no profile renders with no source cell and
+no chips. ``tests/test_format_registration.py`` checks all four against this
+list in both directions, so adding a format to the parser and nowhere else
+fails the suite.
+
 RFC 5424's APP-NAME is deliberately filed under ``tag``, the same key BSD
 syslog uses for the program name, so ``tag:sshd`` answers the question against
 either dialect. A source that reports a genuinely different concept — systemd's
@@ -60,10 +69,31 @@ import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from types import MappingProxyType
-from typing import Iterable, Mapping, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 #: How far past "now" an inferred syslog year may land before we roll it back.
 _FUTURE_TOLERANCE = timedelta(days=1)
+
+
+#: Every ``format_name`` this module can produce, ``raw`` included.
+#:
+#: The canonical list the three registration tables outside this module are
+#: checked against, and the set a plugin-supplied ``LogFormat`` may not claim a
+#: name from: a third-party format that could call itself ``syslog`` would take
+#: over the row shape, the label and the field vocabulary of a built-in, which
+#: is *replacing* a built-in rather than adding one and is refused at load.
+FORMAT_NAMES: frozenset[str] = frozenset(
+    {
+        "syslog",
+        "syslog-5424",
+        "access-log",
+        "json",
+        "python-logging",
+        "iso-level",
+        "iso",
+        "raw",
+    }
+)
 
 
 # --- canonical severity vocabulary -----------------------------------------
@@ -727,12 +757,31 @@ def _scan_level(text: str, *, window: int = 80) -> Optional[str]:
     return normalize_level(match.group(1))
 
 
-def parse_line(line: str, *, now: Optional[datetime] = None) -> LogEntry:
-    """Parse one line, always returning an entry (``raw`` format on no match)."""
+def parse_line(
+    line: str, *, now: Optional[datetime] = None, formats: Any = ()
+) -> LogEntry:
+    """Parse one line, always returning an entry (``raw`` format on no match).
+
+    **Built-ins first, plugins second, ``raw`` last**, and the order carries two
+    arguments rather than one. A line a built-in already handles costs a plugin
+    nothing, however many formats are installed; and a third-party format cannot
+    shadow syslog, which is what makes "a plugin extends parsing" different from
+    "a plugin replaces parsing".
+
+    *formats* is the enabled ``LogFormat`` plugins, already guarded — a
+    ``clv.plugins.FormatStack``, or ``()`` when there are none, which is the
+    common case and is falsy so nothing below it is entered. It is passed in and
+    never imported: this module does not know that ``clv.plugins`` exists, and
+    the dependency runs the other way round on purpose.
+    """
 
     entry = _parse_structured(line, now=now)
     if entry is not None:
         return entry
+    if formats:
+        entry = formats.parse(line)
+        if entry is not None:
+            return entry
     return LogEntry(raw=line, message=line, format_name="raw", level=_scan_level(line))
 
 
@@ -741,6 +790,7 @@ def parse_lines(
     *,
     now: Optional[datetime] = None,
     carry_forward: bool = True,
+    formats: Any = (),
 ) -> list[LogEntry]:
     """Parse a block of lines, letting continuations inherit their parent entry.
 
@@ -759,8 +809,10 @@ def parse_lines(
     last_timestamp: Optional[datetime] = None
     last_level: Optional[str] = None
 
+    if formats:
+        formats.start()
     for line in lines:
-        entry = parse_line(line, now=now)
+        entry = parse_line(line, now=now, formats=formats)
         if entry.structured:
             if entry.timestamp is not None:
                 last_timestamp = entry.timestamp
@@ -775,6 +827,8 @@ def parse_lines(
             )
         entries.append(entry)
 
+    if formats:
+        formats.settle()
     return entries
 
 
@@ -786,10 +840,15 @@ class LogParser:
     across two polls still inherits correctly.
     """
 
-    def __init__(self, *, carry_forward: bool = True) -> None:
+    def __init__(self, *, carry_forward: bool = True, formats: Any = ()) -> None:
         self._carry_forward = carry_forward
         self._last_timestamp: Optional[datetime] = None
         self._last_level: Optional[str] = None
+        #: The enabled ``LogFormat`` plugins, guarded and budgeted by whoever
+        #: built them. ``()`` on a build with no format plugins, which is falsy
+        #: — so :meth:`feed` runs exactly the loop it ran before this parameter
+        #: existed and enters no measurement path at all.
+        self._formats = formats
 
     def reset(self) -> None:
         """Forget the trailing entry; call when switching source or reloading."""
@@ -801,10 +860,19 @@ class LogParser:
 
         Carry-forward covers timestamp and level only; see :func:`parse_lines`
         for why a continuation does not inherit ``fields``.
+
+        **The call is the read-path budget's pass.** A batch is one reader's
+        ``prime`` or ``poll``, which is the only boundary this path has: there
+        is no render to close, and charging a plugin per line would mean a
+        verdict on a sample of one. So the stack's pass opens here and settles
+        here, and a format's time is judged over everything one read gave it.
         """
+        formats = self._formats
+        if formats:
+            formats.start()
         entries: list[LogEntry] = []
         for line in lines:
-            entry = parse_line(line, now=now)
+            entry = parse_line(line, now=now, formats=formats)
             if entry.structured:
                 if entry.timestamp is not None:
                     self._last_timestamp = entry.timestamp
@@ -820,4 +888,6 @@ class LogParser:
                     continuation=True,
                 )
             entries.append(entry)
+        if formats:
+            formats.settle()
         return entries

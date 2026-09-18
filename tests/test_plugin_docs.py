@@ -244,3 +244,24 @@ def test_the_readme_points_authors_at_the_published_module() -> None:
     text = _read(readme)
     assert "from clv.api import FilterStage" in text
     assert "from clv.plugins import FilterStage" not in text
+
+
+def test_the_log_format_seam_is_documented_like_the_others() -> None:
+    """A seam with no chapter is a seam only someone who read the source can use.
+
+    Phase 7a's `LogFormat` is the first Stage C interface, and the four things
+    below are the ones an author cannot infer from the type: that built-ins go
+    first, that a `format_name` is four registrations rather than one, what
+    `parse()` is allowed to return, and that it is charged against a *different*
+    budget from a filter stage because it runs per line read.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+
+    assert "### 3. LogFormat" in text
+    assert "Built-ins first, plugins second" in text
+    assert "four registrations" in text
+    assert "plugin_read_budget_ms" in text
+    assert "`LogFormat.parse`" in text
+    # The honest limit, stated beside the feature rather than left to be found.
+    assert "does not re-parse what is already in the" in text

@@ -62,6 +62,7 @@ from rich.console import Console, ConsoleOptions, RenderResult
 from rich.segment import Segment
 from rich.text import Text
 
+from ..services.formats import DEFAULT_PROFILE, FORMAT_LABELS, FormatProfile
 from ..services.parsing import LogEntry
 from .severity import SEVERITY_COLORS
 
@@ -106,25 +107,32 @@ _CHIP_STYLE = "dim #94a3b8"
 _MARKER_STYLE = "bold #7aa3d1"
 
 
-@dataclass(frozen=True, slots=True)
-class FormatProfile:
-    """Which of a format's fields are worth a cell, and which a chip."""
+#: Keys `_parse_json` already consumed into timestamp/level/message. Showing one
+#: as a chip would repeat the cell beside it.
+_JSON_CONSUMED = frozenset(
+    {
+        "timestamp", "@timestamp", "time", "ts", "asctime", "eventTime", "date",
+        "level", "levelname", "severity", "lvl", "loglevel", "log_level", "priority",
+        "message", "msg", "event", "text", "log",
+    }
+)
 
-    #: Candidates for the source cell, best answer first.
-    source_keys: tuple[str, ...] = ()
-    #: Appended to the source cell as ``tag[pid]`` when there is room for it.
-    pid_key: str = ""
-    #: Always shown when present. For a chip to be pinned it has to carry
-    #: something the message cell cannot.
-    pinned_chips: tuple[str, ...] = ()
-    #: Shown only when the value actually varies across the rendered set.
-    chips: tuple[str, ...] = ()
-
-
-DEFAULT_PROFILE = FormatProfile()
-
-#: Keyed on ``LogEntry.format_name``, the same key ``detail_pane.FORMAT_LABELS``
-#: uses — a new format needs an entry in both.
+#: **The four registrations a format needs, and this is one of them.**
+#:
+#: A ``format_name`` is not a fact about the parser alone. A format has to be
+#: produced by :mod:`clv.services.parsing` and named in
+#: :data:`clv.services.parsing.FORMAT_NAMES`; it has to have a label in
+#: ``detail_pane.FORMAT_LABELS``; if it recovers no fields it has to say why in
+#: ``detail_pane.NO_FIELD_REASONS``; and if it recovers any it has to have an
+#: entry here. ``tests/test_format_registration.py`` checks all four against
+#: ``FORMAT_NAMES`` in both directions, because the three tables outside the
+#: parser fail *quietly*: a format with no entry here gets
+#: :data:`DEFAULT_PROFILE`, which renders without error and reads as a
+#: downgrade — the right timestamp and level, no source cell, no chips.
+#:
+#: A plugin-supplied format registers through ``LogFormat.columns`` and
+#: ``LogFormat.label`` instead, which :func:`install_profiles` folds in ahead of
+#: this table. Same contract, declared rather than hardcoded.
 FORMAT_PROFILES: dict[str, FormatProfile] = {
     # Which program spoke is the scanning axis for a syslog file, so `tag` takes
     # the cell. `host` is one value in a single-file view and earns nothing;
@@ -167,6 +175,7 @@ FORMAT_PROFILES: dict[str, FormatProfile] = {
             "request_id",
             "trace_id",
         ),
+        consumed=_JSON_CONSUMED,
     ),
     # python-logging, iso-level, iso and raw recover no fields at all -- the
     # detail pane says as much in NO_FIELD_REASONS -- so they take
@@ -174,15 +183,65 @@ FORMAT_PROFILES: dict[str, FormatProfile] = {
     # these makes `plan_columns` drop the source cell on its own.
 }
 
-#: Keys `_parse_json` already consumed into timestamp/level/message. Showing one
-#: as a chip would repeat the cell beside it.
-_JSON_CONSUMED = frozenset(
-    {
-        "timestamp", "@timestamp", "time", "ts", "asctime", "eventTime", "date",
-        "level", "levelname", "severity", "lvl", "loglevel", "log_level", "priority",
-        "message", "msg", "event", "text", "log",
-    }
-)
+#: What a plugin format declared, installed once at startup by the app.
+#:
+#: **Injected, never imported.** This module does not know that `clv.plugins`
+#: exists and must not learn: the dependency already runs the other way. The app
+#: calls :func:`install_profiles` after `load_plugins`, and the two lookup sites
+#: below read these dicts first.
+#:
+#: Two dicts rather than one walk of a registry, and they are read per rendered
+#: row: `plan_columns` runs over the whole set and `render_row` runs per line, so
+#: neither can afford to ask a registry anything. Empty on a build with no format
+#: plugins, which is the common case and costs one `if` -- Requirement 10.
+_INSTALLED_PROFILES: dict[str, FormatProfile] = {}
+_INSTALLED_LABELS: dict[str, str] = {}
+
+
+def install_profiles(
+    profiles: Mapping[str, FormatProfile], labels: Mapping[str, str]
+) -> None:
+    """Register what the enabled `LogFormat` plugins declared. Replaces, not merges.
+
+    Called once at mount and again whenever the set of enabled formats changes,
+    so a format switched off in the `P` dialog stops claiming a row shape it no
+    longer parses lines for.
+    """
+
+    _INSTALLED_PROFILES.clear()
+    _INSTALLED_PROFILES.update(profiles)
+    _INSTALLED_LABELS.clear()
+    _INSTALLED_LABELS.update(labels)
+
+
+def profile_for(format_name: str) -> FormatProfile:
+    """The row shape for *format_name*: installed, then built-in, then default.
+
+    Plugin formats resolve first because a built-in's name is refused to them at
+    load, so the two sets cannot collide and the order is a statement about cost
+    rather than about precedence.
+    """
+
+    if _INSTALLED_PROFILES:
+        profile = _INSTALLED_PROFILES.get(format_name)
+        if profile is not None:
+            return profile
+    return FORMAT_PROFILES.get(format_name, DEFAULT_PROFILE)
+
+
+def format_label(format_name: str) -> str:
+    """What an operator calls *format_name*, falling back to the bare identifier.
+
+    Lives here rather than in `detail_pane` so that a plugin's `label` and its
+    `columns` are installed by one call and cannot end up half-registered. The
+    detail pane reads it from here.
+    """
+
+    if _INSTALLED_LABELS:
+        label = _INSTALLED_LABELS.get(format_name)
+        if label:
+            return label
+    return FORMAT_LABELS.get(format_name, format_name)
 
 
 class _Widths(NamedTuple):
@@ -378,8 +437,7 @@ def _chips_for(
         offer(*_source_pair(fields, profile))
     else:
         seen.update(profile.source_keys)
-    if entry.format_name == "json":
-        seen.update(_JSON_CONSUMED)
+    seen.update(profile.consumed)
     if profile.pid_key:
         seen.add(profile.pid_key)
 
@@ -491,6 +549,15 @@ class ColumnarLine:
 
         if self._continuation:
             return ""
+        # A PID *rides along*, so with nothing to ride on there is nothing to
+        # show: `[991]` alone is the cell of its own this docstring rules out,
+        # and it says the one thing about a line that the detail pane already
+        # says better. Reachable without any plugin -- a JSON line carrying
+        # `pid` and none of the `json` profile's source keys lands here -- and
+        # newly common with plugin formats, where a profile may name a source
+        # key that a particular line did not carry.
+        if not self._source:
+            return ""
         if self._pid:
             combined = f"{self._source}[{self._pid}]"
             if len(combined) <= width - 1:
@@ -600,7 +667,7 @@ def plan_columns(
         if entry.level:
             show_level = True
 
-        profile = FORMAT_PROFILES.get(entry.format_name, DEFAULT_PROFILE)
+        profile = profile_for(entry.format_name)
         if not entry.fields:
             continue
         if len(sources) < 2:
@@ -644,7 +711,7 @@ def render_row(
     cluster row states its count and its span.
     """
 
-    profile = FORMAT_PROFILES.get(entry.format_name, DEFAULT_PROFILE)
+    profile = profile_for(entry.format_name)
     pid = ""
     if layout.merged:
         source = source_label
@@ -680,6 +747,9 @@ __all__ = [
     "MIN_MESSAGE",
     "NEVER_A_CHIP",
     "NOTHING_PARSED_NOTE",
+    "format_label",
+    "install_profiles",
     "plan_columns",
+    "profile_for",
     "render_row",
 ]

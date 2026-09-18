@@ -18,7 +18,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from dataclasses import dataclass, replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from time import monotonic
 from pathlib import Path
 from typing import Iterable, Iterator, Literal, Optional, Sequence
@@ -42,6 +42,7 @@ from .plugins import (
     OPERATOR_DISABLE_REASON,
     Exporter,
     FilterContext,
+    PluginBudget,
     PluginError,
     PluginRegistry,
     PluginStatus,
@@ -58,6 +59,7 @@ from .services.clustering import (
     ClusterStream,
     cluster_entries,
     describe as describe_clusters,
+    normalise,
     summarise,
 )
 from .services.settings_file import SettingsDocument
@@ -87,6 +89,7 @@ from .services.export import (
     write_atomically,
 )
 from .services.filtering import (
+    FilterResult,
     FilterSpec,
     QueryError,
     TimeWindow,
@@ -173,6 +176,7 @@ from .widgets.columns import (
     ColumnLayout,
     EMPTY_LAYOUT,
     NOTHING_PARSED_NOTE,
+    install_profiles,
     plan_columns,
     render_row,
 )
@@ -819,6 +823,25 @@ class LogViewerApp(App[None]):
         #: move would re-run the query regex over every visible line on every
         #: arrow keypress; the set only changes when the pane is rebuilt.
         self._navigation_cache: tuple[list[int], str] | None = None
+        #: (key, result) from the last `_visible_view`. The whole buffer run
+        #: through every plugin stage and then the filters, held against the
+        #: several calls that make up one render.
+        self._visible_cache: tuple[tuple, FilterResult] | None = None
+        #: The plugin generation every cache below the registry was built
+        #: against. See `_sync_plugin_generation`.
+        self._plugin_generation = self._plugins.generation
+        #: Wall time one plugin may spend on one pass of the render path.
+        #: Rebuilt in `on_mount` when the real registry replaces the empty one.
+        self._plugin_budget = self._new_plugin_budget()
+        #: The same, for one `LogFormat` over one batch of lines read.
+        self._read_budget = self._new_read_budget()
+        #: The instant a relative time window ("15m") counts back from, held
+        #: still until the buffer changes. `parse_relative_window` reads
+        #: `datetime.now()`, so without this every call to `_filter_spec`
+        #: produces a window a few microseconds narrower than the last -- which
+        #: makes the status line and the pane disagree about what is in view,
+        #: and makes any cache over the filtered set unable to hit at all.
+        self._window_anchor: datetime | None = None
         #: Marked lines, keyed by content. Session-only and never written to
         #: disk — see clv/services/marks.py for why that is a constraint rather
         #: than a gap.
@@ -831,9 +854,22 @@ class LogViewerApp(App[None]):
         self._watch_notifier = WatchNotifier(window=self._config.watch_rate_limit)
         #: Field names present in the buffer, offered as query completions.
         self._field_names: frozenset[str] = frozenset()
-        #: Names a query term may use: the parser's normalised vocabulary plus
-        #: whatever this source turned out to carry. Anything else stays a
-        #: regex, which is what keeps `sshd:` searching for text.
+        #: What the enabled `LogFormat` plugins said they can produce. Unioned
+        #: into the vocabulary below rather than added to
+        #: `NORMALISED_FIELD_KEYS`, which is a published frozen constant and
+        #: stays one -- and unioned at all so a plugin format's field completes
+        #: and answers a query *before* a line carrying it has been read, which
+        #: is the same promise the normalised keys already make.
+        self._plugin_fields: frozenset[str] = frozenset()
+        #: What was last handed to the query bar -- the buffer's names union the
+        #: plugins'. Tracked here because enabling a format changes it without
+        #: any line having arrived, and the early return above is keyed on the
+        #: buffer's names alone.
+        self._offered_fields: frozenset[str] = frozenset()
+        #: Names a query term may use: the parser's normalised vocabulary, what
+        #: any installed format declared, plus whatever this source turned out
+        #: to carry. Anything else stays a regex, which is what keeps `sshd:`
+        #: searching for text.
         self._known_fields: frozenset[str] = NORMALISED_FIELD_KEYS
 
         self.query_bar = QueryBar()
@@ -930,6 +966,13 @@ class LogViewerApp(App[None]):
             settings=plugin_settings_for(self._config),
         )
         self._wire_remote_providers()
+        # Rebound: `load_plugins` returned a new registry, and a budget still
+        # pointing at the empty one built in `__init__` would disable plugins
+        # into a registry nothing reads.
+        self._plugin_budget = self._new_plugin_budget()
+        self._read_budget = self._new_read_budget()
+        self._plugin_generation = self._plugins.generation
+        self._install_formats()
         # After the wiring, so a provider's `setup()` sees a fully assembled
         # plugin rather than one still waiting for its resolver.
         self._plugins.start()
@@ -1837,6 +1880,7 @@ class LogViewerApp(App[None]):
                 max_lines=self._session.max_lines,
                 reader=self._open_reader(ref, max_lines=self._session.max_lines),
                 facts=self._source_facts(ref),
+                formats=self._session.formats,
             )
             buffer.prime()
             return buffer
@@ -1888,6 +1932,7 @@ class LogViewerApp(App[None]):
                     max_lines=self._session.max_lines,
                     reader=reader,
                     facts=self._source_facts(rotated_set.head),
+                    formats=self._session.formats,
                 )
                 buffer.prime()
                 return buffer
@@ -2929,9 +2974,36 @@ class LogViewerApp(App[None]):
             window = parse_absolute_window(self.state.custom_start, self.state.custom_end)
             return window or TimeWindow()
         try:
-            return parse_relative_window(self.state.time_window)
+            return parse_relative_window(self.state.time_window, now=self._window_now())
         except ValueError:
             return TimeWindow()
+
+    def _window_now(self) -> datetime:
+        """The instant "the last 15 minutes" counts back from.
+
+        Held still until the buffer changes, rather than read fresh per call.
+        `_filter_spec` is called several times over one render -- the pane, the
+        status line, the histogram -- and `datetime.now()` moves between them,
+        so the same render was filtering against three windows a few
+        microseconds apart. Cheap and invisible on its own; fatal to any cache
+        over the filtered set, because the key never repeats.
+
+        Re-anchored by `_visible_view`, which is the one place that knows
+        whether anything the window depends on has moved: the lines changed, the
+        open source changed, or the operator picked a different window. A
+        relative window is therefore as fresh as the data it is describing --
+        which is the only definition of fresh that matters here, because nothing
+        on screen can have moved without one of those three having happened.
+        """
+
+        if self._window_anchor is None:
+            self._window_anchor = datetime.now()
+        return self._window_anchor
+
+    def _invalidate_window(self) -> None:
+        """Let the next relative window re-anchor. See `_window_now`."""
+
+        self._window_anchor = None
 
     def _plugin_context(self) -> FilterContext:
         return FilterContext(spec=self._filter_spec(), source=self._selected_source)
@@ -2987,11 +3059,176 @@ class LogViewerApp(App[None]):
         return sources or [None]
 
     def _visible_entries(self, entries: Iterable[LogEntry]):
-        """Apply plugin stages, then the user's filters."""
+        """Apply plugin stages, then the user's filters. Uncached.
+
+        The path for a *slice* of the buffer -- the lines a tail poll just
+        produced. :meth:`_visible_view` is the one for the whole of it, and is
+        what almost every caller wants; this one exists because the incremental
+        render must go on costing what arrived rather than what is buffered.
+        """
 
         context = self._plugin_context()
-        staged = self._plugins.apply_filters(list(entries), context)
+        staged = self._plugins.apply_filters(
+            list(entries), context, budget=self._plugin_budget
+        )
         return filter_entries(staged, context.spec)
+
+    def _visible_view(self) -> FilterResult:
+        """The whole buffer, staged and filtered, memoised.
+
+        This used to be :meth:`_visible_entries` called afresh at seven sites, two
+        of which -- :meth:`_render_log` and :meth:`_update_status` -- run on
+        every single render. Every filter stage over every buffered line, twice,
+        for each keystroke in the query box, with ``max_buffer_lines``
+        configurable to half a million.
+
+        Keyed on ``(what the buffer is, the spec, the plugin generation)`` --
+        the shape :attr:`SourceSession._merge_cache` already uses one level
+        down. "What the buffer is" is the session revision, the line count and
+        the open source, plus the time-window selection, which is there because
+        it decides where a relative window is anchored (see :meth:`_window_now`)
+        rather than because the spec would not catch it. The line count earns
+        its place too: ``revision`` covers every supported way of changing the
+        buffer but not a deque mutated in place behind the session's back, which
+        is how parts of this project's own suite seed a pane.
+
+        The result is **shared, not copied**. Nothing downstream mutates
+        ``FilterResult.entries``: every reader slices it, iterates it, takes its
+        length, or copies it with ``list()``. That is the invariant this rests
+        on, and breaking it would be a bug in the caller rather than here.
+
+        A :class:`QueryError` propagates and is not cached -- an invalid query
+        is cheap to fail and every caller already handles it.
+        """
+
+        self._sync_plugin_generation()
+        entries = self._entries
+        # Everything a relative time window should re-anchor on: the lines
+        # changed, the open source changed, or the operator picked a different
+        # window. Read before `_filter_spec`, because the spec is what the
+        # anchor feeds.
+        anchored_on = (
+            self._session.revision,
+            len(entries),
+            self._selected_source,
+            self.state.time_window,
+            self.state.custom_start,
+            self.state.custom_end,
+        )
+        cached = self._visible_cache
+        if cached is None or cached[0][0] != anchored_on:
+            self._invalidate_window()
+
+        spec = self._filter_spec()
+        key = (anchored_on, spec, self._plugins.generation)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+
+        context = FilterContext(spec=spec, source=self._selected_source)
+        staged = self._plugins.apply_filters(
+            list(entries), context, budget=self._plugin_budget
+        )
+        result = filter_entries(staged, spec)
+        self._visible_cache = (key, result)
+        return result
+
+    def _install_formats(self) -> None:
+        """Put the enabled `LogFormat` plugins where the three readers of them look.
+
+        Three, and they are three because a format is not one registration. The
+        read path gets a guarded stack to parse with; the renderer and the
+        detail pane get the row shape and the label the format declared; and the
+        query vocabulary gets its field names, so a field completes and a field
+        query matches before a line carrying one has been read.
+
+        Injection in all three directions: `parsing`, `columns` and `query` each
+        take what they need as a parameter or from a registry this method fills.
+        None of them imports `clv.plugins`.
+        """
+
+        registry = self._plugins
+        active = [
+            plugin for plugin in registry.formats if not registry.is_disabled(plugin)
+        ]
+        self._session.formats = registry.format_stack(budget=self._read_budget)
+        install_profiles(
+            {plugin.format_name: plugin.columns for plugin in active},
+            {
+                plugin.format_name: plugin.label
+                for plugin in active
+                if plugin.label
+            },
+        )
+        fields: set[str] = set()
+        for plugin in active:
+            fields.update(plugin.field_names)
+        if fields != self._plugin_fields:
+            self._plugin_fields = frozenset(fields)
+            # The vocabulary gate and the completion list both move, and the
+            # buffer's own names are unioned back in rather than dropped.
+            self._sync_field_names()
+
+    def _new_plugin_budget(self) -> PluginBudget:
+        """A render-path budget bound to whatever registry is current.
+
+        A method rather than an inline construction because ``on_mount``
+        replaces :attr:`_plugins` wholesale, and a budget left pointing at the
+        empty registry it was built against would disable plugins into a
+        registry nobody reads.
+        """
+
+        return PluginBudget(
+            self._plugins,
+            limit_ms=self._config.plugin_time_budget_ms,
+            label="render",
+        )
+
+    def _new_read_budget(self) -> PluginBudget:
+        """The read-path budget: one `LogFormat` over one batch of read lines.
+
+        Phase 6 shipped one :class:`PluginBudget` class with one instance and
+        said the second would be built "beside its first caller". This is it —
+        the same class, the same three-strike policy, a different ceiling and a
+        different label, so the two paths cannot drift apart on what being over
+        budget means.
+        """
+
+        return PluginBudget(
+            self._plugins,
+            limit_ms=self._config.plugin_read_budget_ms,
+            label="read",
+        )
+
+    def _sync_plugin_generation(self) -> None:
+        """Invalidate what a plugin change makes stale, wherever it lives.
+
+        The staged view is one, and it is keyed on the generation directly. The
+        clustering shape cache is the one that needs this method to exist:
+        :func:`clv.services.clustering.normalise` is an ``lru_cache`` on a
+        module-level function, so there is no instance to key and nothing to
+        pass a generation to. ``PLUGIN_TODO.md`` Phase 10 feeds it
+        plugin-supplied normalisation rules, at which point a cache left alone
+        across an enable would serve shapes computed under the old rules --
+        entries folded into the wrong cluster, which is a wrong answer and not
+        merely a stale one.
+
+        ``clustering`` learns nothing about plugins by this: the dependency runs
+        the way it already did, and the app -- which imports both -- is what
+        joins them. Cheap enough to call per render: an integer comparison.
+        """
+
+        generation = self._plugins.generation
+        if generation == self._plugin_generation:
+            return
+        self._plugin_generation = generation
+        self._visible_cache = None
+        normalise.cache_clear()
+        # A format switched off must stop claiming a row shape and a field
+        # vocabulary it no longer parses lines for. What is already in the
+        # buffer keeps the `format_name` it was parsed with -- re-opening the
+        # source is what re-parses it -- so this changes the next lines read and
+        # what the query box will answer, not the history on screen.
+        self._install_formats()
 
     def _render_log(self, *, scroll_end: bool = False) -> None:
         if self._is_shutting_down:
@@ -3030,7 +3267,7 @@ class LogViewerApp(App[None]):
             return
 
         try:
-            result = self._visible_entries(self._entries)
+            result = self._visible_view()
         except QueryError as exc:
             self.log_panel.write(Text(f"Invalid query: {exc}", style="bold #f87171"))
             self._clear_timeline()
@@ -3378,7 +3615,7 @@ class LogViewerApp(App[None]):
         extended = self._timeline.extend(entries)
         if extended is None:
             try:
-                result = self._visible_entries(self._entries)
+                result = self._visible_view()
             except QueryError:
                 return
             self._rebuild_timeline(result.entries)
@@ -3416,7 +3653,7 @@ class LogViewerApp(App[None]):
         # Rebuilt rather than restored: it was not being maintained while it
         # was hidden, which is the point of hiding it.
         try:
-            result = self._visible_entries(self._entries)
+            result = self._visible_view()
         except QueryError:
             self._clear_timeline()
             return
@@ -3433,7 +3670,7 @@ class LogViewerApp(App[None]):
         if not self.state.timeline or self._is_shutting_down:
             return
         try:
-            result = self._visible_entries(self._entries)
+            result = self._visible_view()
         except QueryError:
             return
         self._rebuild_timeline(result.entries)
@@ -3666,7 +3903,7 @@ class LogViewerApp(App[None]):
             return
 
         try:
-            result = self._visible_entries(self._entries)
+            result = self._visible_view()
             shown = min(len(result.entries), self._show_lines)
             total = result.stats.total
             detail = f"{shown} shown / {result.stats.matched} matched / {total} buffered"
@@ -3792,11 +4029,18 @@ class LogViewerApp(App[None]):
             if arrived is None
             else self._field_names | collect_field_names(arrived)
         )
-        if names == self._field_names:
+        offered = names | self._plugin_fields
+        if names == self._field_names and offered == self._offered_fields:
             return
         self._field_names = names
-        self._known_fields = NORMALISED_FIELD_KEYS | names
-        self.query_bar.set_field_names(names)
+        self._offered_fields = offered
+        self._known_fields = NORMALISED_FIELD_KEYS | offered
+        # A format's own names are offered as completions even against an empty
+        # buffer: `collect_field_names` deliberately omits the normalised keys
+        # because offering `msgid` against a source that never reports one is
+        # noise, and a format the operator enabled is the opposite case -- they
+        # installed it precisely to ask about those fields.
+        self.query_bar.set_field_names(offered)
 
     # --- state --------------------------------------------------------------
 
@@ -4113,6 +4357,12 @@ class LogViewerApp(App[None]):
             if row.reinstate:
                 for record in records:
                     self._plugins.enable(record.plugin)
+                    # A plugin put back into service starts again on a clean
+                    # strike count. Left as it was, one slow pass would take a
+                    # re-enabled plugin straight back out, and Re-enable would
+                    # be a control that appears not to work.
+                    self._plugin_budget.forget(record.plugin)
+                    self._read_budget.forget(record.plugin)
                 # The fault goes with the decision to forgive it. Left on the
                 # record it would keep the row reading `failed` after the plugin
                 # was put back -- and, worse, the *next* genuine failure would
@@ -4129,6 +4379,8 @@ class LogViewerApp(App[None]):
             if row.enabled:
                 for record in records:
                     self._plugins.enable(record.plugin)
+                    self._plugin_budget.forget(record.plugin)
+                    self._read_budget.forget(record.plugin)
                 if not records:
                     # Loading is import-time and single-shot (`PLUGIN_TODO.md`,
                     # "Loading model"), so naming a plugin CLV has never
@@ -5028,7 +5280,7 @@ class LogViewerApp(App[None]):
             lines = [cursor_entry.raw]
         else:
             try:
-                result = self._visible_entries(self._entries)
+                result = self._visible_view()
             except QueryError as exc:
                 self._notify(f"Cannot copy while the query is invalid: {exc}", "error")
                 return
@@ -5294,7 +5546,7 @@ class LogViewerApp(App[None]):
             # The whole filtered set, deliberately not the `_show_lines` window:
             # an export is the answer to "save what I filtered", not "save what
             # happens to fit on screen".
-            result = self._visible_entries(self._entries)
+            result = self._visible_view()
         except QueryError as exc:
             self._notify(f"Cannot export while the query is invalid: {exc}", "error")
             return

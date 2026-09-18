@@ -34,9 +34,9 @@ that argument; Phase 7b is the exception, and it is here because designing the
 | 3 — Installation | `~/.config/clv/plugins/`, `CLV_PLUGIN_PATH`, the enable-list | ✅ Done |
 | 4 — Management UI | A plugin surface, not a status string | ✅ Done |
 | 5 — Ordering, config, lifecycle | `priority`, `[plugin:<name>]`, `setup`/`teardown` | ✅ Done |
-| 6 — Performance guard | A slow plugin costs itself, not the pane | ⬜ Not started |
+| 6 — Performance guard | A slow plugin costs itself, not the pane | ✅ Done |
 | **Stage C — Core seams** | | |
-| 7a — Parsing | `LogFormat`, and a plugin that teaches CLV a format | ⬜ Not started |
+| 7a — Parsing | `LogFormat`, and a plugin that teaches CLV a format | ✅ Done |
 | 7b — logfmt | `key=value` parsing, built in because a plugin cannot | ⬜ Not started |
 | 8 — Query | `QueryOperator`, `ComputedField`, and the degradation rule | ⬜ Not started |
 | 9 — Watch | `WatchMatcher`, `WatchSink`, off the event loop | ⬜ Not started |
@@ -1075,6 +1075,112 @@ drawer names the culprit. The benchmark shows a measurable improvement from
 removing the double call and no regression with zero plugins. Suite green on
 3.11 and 3.14.
 
+Checked by hand against a 300-line buffer with two stages installed, one
+sleeping 1 ms per line and one doing the redaction the README documents. Renders
+1, 2 and 3 cost 332, 329 and 333 ms; render 4 costs 5.2 ms, and the `P` dialog
+reads:
+
+```
+cheap.py      ('filter',)  loaded
+sluggish.py   ('filter',)  failed   over the render budget (328 ms against
+                                    250 ms) on 3 consecutive passes
+```
+
+The redactor is still running and still redacting. At
+`plugin_time_budget_ms = 0` the same six renders all cost ~330 ms and nothing is
+disabled, which is the escape hatch doing exactly what it says.
+
+Suite green on 3.11 and 3.14: 1803 passed on both.
+
+Benchmarks, 5 000 entries, one stage:
+
+| | |
+| --- | --- |
+| staged view, uncached | 30.44 ms |
+| staged view, cached repeat | 0.01 ms |
+| `apply_filters`, untimed | 18.27 ms |
+| `apply_filters`, timed | 18.35 ms |
+| zero plugins, uncached | 0.52 ms |
+
+**As shipped.** Six decisions worth recording, two of them reversals of what
+this phase's own text said.
+
+*The filter loop was inverted to stage-outer, and measurement is what decided
+it.* The plan for this phase argued for keeping the entry-outer loop: inverting
+it changes the order third-party code sees its entries in and costs an
+intermediate list per stage. That was the wrong trade, and the benchmark said
+so. Entry-outer needs two clock reads **per call** — entries times stages — and
+against a stage that does almost nothing the measurement cost 2.5 ms where the
+work cost 0.6 ms. At the `max_buffer_lines` ceiling that is a fifth of a second
+of pure measurement per pass, which the budget would then charge to the plugin:
+a guard that disables plugins for the cost of guarding them. Stage-outer needs
+two reads per stage per pass, and the measured overhead is 0.08 ms on an 18 ms
+pass — the cost of the guard stops depending on the size of the buffer. What it
+buys back is one list of pointers per stage, two live at a time. The composition
+is unchanged in every respect that is observable: a dropped entry is invisible
+to later stages, a raising stage still lets the entry it choked on through
+untouched and is still skipped by everything after it, and order within a stage
+is still the buffer's.
+
+*`set_entries` did not bump `revision`, and a cache keyed on revision would have
+been wrong from the first render.* `SourceBuffer.revision` was bumped by
+`prime`, `poll` and rotation — but not by the one path that replaces a buffer's
+deque wholesale, which is what `app._entries = ...` does and what several
+hundred tests in this suite use to seed a pane. It bumps now, on its own
+account: it is the largest change a buffer's contents can undergo, and the merge
+cache one level down was keyed on the same number. The residual hole is stated
+rather than closed — a deque mutated in place behind the session's back still
+moves nothing — so the cache key pairs the revision with the line count, which
+catches it.
+
+*A relative time window had to be anchored before any cache could hit.*
+`parse_relative_window` reads `datetime.now()`, so `_filter_spec()` returned a
+window a few microseconds narrower on every call. With `15m` selected the cache
+key could never repeat and the whole phase would have been a no-op for the case
+with the most entries to filter. Worse, and true before this phase: the pane,
+the status line and the histogram were each filtering against a *different*
+window inside one render. The instant a relative window counts back from is now
+held still and re-anchored when the lines change, when the open source changes,
+or when the operator picks a different window — so it is exactly as fresh as the
+data it describes, and nothing on screen can have moved without one of those
+three having happened.
+
+*`refresh_settings` bumps the generation, and leaving it out would have been a
+bug.* The phase text lists enable, disable and failure. But Phase 5 hands a
+plugin a **live** mapping it reads *through*, so editing a redaction pattern in
+`settings.conf` changes what a stage returns without any call reaching the
+registry — and a staged view keyed only on enable/disable would have gone on
+serving the old text. Pinned by a test that changes a section and asserts the
+output changes.
+
+*One budget class, one wired instance.* The phase asked for "two budgets, not
+one" — a render-path budget and a read-path budget for `LogFormat` and
+`ClusterRule`. Those kinds do not exist until Phases 7a and 10, and shipping
+`plugin_read_budget_ms` now would be a documented config key that does nothing
+for three phases, which is the "half-wired seam" this file's own preamble
+refuses. What landed is the general `PluginBudget` — a ceiling, a label and a
+strike count — with exactly one instance constructed. Phase 7a builds its own
+from the same class and adds its key beside its first caller. The policy is
+stated once and neither path can drift from it.
+
+*Coarse kinds are not timed, and the reason is Phase 1's.* "Per call for coarse
+ones" is not implemented for `LogSourceProvider` and `Exporter`. Phase 1
+recorded the argument already: those are operator-initiated one-shots, and
+disabling an exporter for the session because one export was slow would be a
+worse bug than any this fixes, with no way back but the `P` dialog. A timing
+that can lead to no action is a number nobody reads. What a slow `discover()`
+actually needs is a *report* — "this provider took 4 s" — which is a different
+mechanism with a different surface, and is not smuggled in here.
+
+**Also swept here.** `apply_filters` used to test `is_disabled` once per entry
+per stage; the check is hoisted to one list built per pass. `PluginBudget.settle`
+re-checks `active` itself rather than trusting its caller, so a budget set to
+`0` is off however it is driven. `CURRENT_CONFIG_VERSION` moved to 3 — the
+template's option set changed, which is the stated rule — and `clv
+--upgrade-config` was checked by hand against a v2 file carrying a
+`[plugin:redact_secrets]` section: the new key is merged in, the section, the
+host block and the operator's own values all survive.
+
 **Commit.** `perf(plugins): cache the staged view and budget every plugin kind`
 
 ---
@@ -1258,7 +1364,101 @@ not know, every core feature works on the result with no core change beyond this
 phase's, and its rows carry a source cell and chips rather than
 `DEFAULT_PROFILE`. Adding a format to the parser and to nothing else now fails
 the suite — which is the first thing Phase 7b leans on. `tests/test_parsing.py`
-passes unmodified. Suite green on 3.11 and 3.14.
+passes unmodified. Suite green on 3.11 and 3.14: 1890 passed on both.
+
+Checked by hand against a seeded `nginx_error.py` copied up into a real plugin
+root. Unnamed it reads `not enabled`; named in `settings.conf` it parses the
+error log, and the same lines that were eight identical raw rows before become:
+
+```
+09:25:01 ERROR shop.example.com[1234] connect() failed (111: Connection refused)
+                                      while connecting to upstream  host=10.0.0.5
+```
+
+`host:10.0.0.5` answers for it and for an access log in the same query, which is
+the normalisation rule doing what it is for. The completeness test was checked
+by breaking it both ways: a name added to `FORMAT_NAMES` alone fails five tests,
+and a `FORMAT_LABELS` entry with no parser behind it fails one.
+
+**As shipped.** Six decisions worth recording, two of them departures from this
+phase's own text.
+
+*`format_name` is a declared attribute, and the sketch above could not work
+without it.* The interface as written carries `field_names`, `label` and
+`columns` but no name to key them on — and all three are consumed *before* a
+line has been parsed: profiles and labels are installed at startup, and
+`field_names` has to reach the query vocabulary so a field completes against an
+empty buffer. So `format_name` joins them, is required in practice though
+defaulted in the type, and is what every entry `parse()` returns must carry.
+That last part is also the cheapest runtime check in the validator, and it
+catches the copy-paste mistake — a format returning another's entries — that
+nothing else would notice.
+
+*`formats` is a `FormatStack`, not a bare sequence.* The phase says `LogParser`
+gains a `formats=()` keyword, and it does; what it holds is one object rather
+than a list of plugins. The reason is the injection rule: `parsing.py` may not
+import `clv.plugins`, but a format that raises still has to go through
+`PluginRegistry.disable`, a malformed return still has to be reported by the
+rule it broke, and the read budget still has to be charged. Handing the parser
+bare plugins would mean handing it a fault callback and a budget as well, and
+spreading one plugin's guard across two modules that are not allowed to know
+about each other. `FormatStack` is a `Sequence`, so `()` and a live stack are
+the same kind of thing and the zero-plugin path is a falsiness test.
+
+*The worked example is seeded into `plugins/examples/`, not into the plugin
+directory.* The phase asked for `clv/plugins/formats/` as a live drop-in
+directory shipping *disabled* — and bundled drop-ins load without being named,
+so "disabled" would have needed a fourth classification that only this one
+plugin uses. Seeding it as a user plugin was the obvious fix and was wrong in a
+way the suite caught: it made every fresh install report `1 not enabled`
+forever, against a plugin CLV put there, which is exactly the count this file
+wanted to keep meaning "plugins someone installed". One directory down,
+`pkgutil.iter_modules` does not descend and a folder with no `__init__.py` is
+not a package, so the example is shipped, readable, and invisible. Copying it up
+one level is the same act as installing any other plugin — and is a better start
+for an author than an empty file.
+
+*`FormatProfile` moved, and so did `FORMAT_LABELS` and `NO_FIELD_REASONS`.* The
+phase's note for this phase predicted the first: `tests/test_api_surface.py`
+forbids `clv.api` from pulling in Rich, and `columns.py` imports it. The other
+two followed from a constraint that only appeared once `columns.format_label`
+existed — it needs `FORMAT_LABELS`, and `columns.py`'s own docstring is explicit
+that nothing in it imports Textual, which `detail_pane.py` does. All three are
+declarations about a format rather than about a widget, so
+`clv/services/formats.py` is where they live; both widget modules re-export what
+they used to define and every existing import site is untouched.
+
+*The read path is measured per call, and the render path's own finding is why it
+can be.* Phase 6 inverted the filter loop because two clock reads per call cost
+four times what a no-op stage costs. A batch of lines cannot be inverted the
+same way without restructuring carry-forward, which is the one piece of state
+`LogParser` exists to hold — so the reads are halved instead, by reusing each
+call's end stamp as the next one's start. It is affordable here for a reason the
+filter path did not have: a line only reaches a format after every built-in
+matcher has already declined it, so the guarded work is expensive by
+construction. Benchmarked in `tests/test_plugin_perf.py` rather than asserted.
+
+*One `install_profiles` call, not two.* A format's `label` and its `columns` are
+registered together because registering them apart is how a format ends up
+half-declared — the failure mode this whole phase exists to make visible. The
+detail pane reads the label back through `columns.format_label`.
+
+**Also swept here.** A bare `[991]` in the source cell. `_source_value` appended
+the PID to whatever source it had, including none — so a line with a PID and no
+program name rendered a PID as a cell of its own, which that method's own
+docstring rules out. Reachable with no plugin at all (a JSON line carrying `pid`
+and none of the `json` profile's source keys), and found here because a profile
+naming a source key a particular line did not carry is the ordinary case for a
+plugin format rather than the unlucky one.
+
+`CURRENT_CONFIG_VERSION` moved to 4: the template's option
+set changed, which is the stated rule. Re-enabling a plugin now clears its
+strike count on *both* budgets — a format is charged against the read one, and
+nothing else would have forgotten it, so Re-enable would have put a
+budget-disabled format back one slow batch away from being disabled again.
+`FORMAT_PROFILES`' comment stopped being a note about a dict and became the
+statement of the four-registration contract, which is what
+`tests/test_format_registration.py` now enforces.
 
 **Commit.** `feat(plugins): a LogFormat seam, column profiles and an nginx reference`
 

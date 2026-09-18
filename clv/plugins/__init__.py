@@ -35,6 +35,7 @@ import os
 import pkgutil
 import re
 import sys
+import time
 import types
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -42,7 +43,8 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
 
 from ..services.filtering import FilterSpec
-from ..services.parsing import LogEntry
+from ..services.formats import DEFAULT_PROFILE, FormatProfile
+from ..services.parsing import FORMAT_NAMES, LogEntry
 from ..services.refs import SourceRef
 
 #: The version of the published plugin API — the surface re-exported by
@@ -276,6 +278,86 @@ class FilterStage(Plugin):
     @abstractmethod
     def apply(self, entry: LogEntry, context: FilterContext) -> Optional[LogEntry]:
         """Return the entry to keep, or None to drop it."""
+
+
+class LogFormat(Plugin):
+    """Teaches CLV to parse a line no built-in matcher recognises.
+
+    **Built-ins first, plugins second, ``raw`` last.** :meth:`parse` is offered
+    only the lines every built-in matcher already declined, so a syslog file
+    costs an installed format nothing, and a format cannot take over a name CLV
+    already answers to. *Replacing* a built-in is out of scope: when a format is
+    worth CLV's own attention it is added to
+    :mod:`clv.services.parsing`, which is what Phase 7b of ``PLUGIN_TODO.md``
+    does for logfmt.
+
+    **This is the hottest third-party code in CLV.** ``apply()`` runs per entry
+    per render; ``parse()`` runs per *line read*, once, and on a source that
+    nothing recognises it runs for every line of the file. Make the cheap
+    rejection first — a length test, a character at a fixed offset — and compile
+    the regex once at class level, never inside ``parse``. The read-path budget
+    (``plugin_read_budget_ms``) disables a format that cannot hold to that.
+
+    Four declarations, and three of them exist because a ``format_name`` is not
+    a fact about the parser alone. Without them an entry renders as a downgrade:
+    the right timestamp and level, the bare identifier where the format name
+    should be, no source cell and no chips. Equal terms with a built-in is a
+    *declaration* here, not an inference::
+
+        class NginxError(LogFormat):
+            name = "nginx-error"
+            format_name = "nginx-error"
+            label = "nginx error log"
+            field_names = frozenset({"pid", "tid", "client", "request"})
+            columns = FormatProfile(source_keys=("client",), pid_key="pid")
+
+            def parse(self, line):
+                ...
+    """
+
+    #: The ``format_name`` every entry :meth:`parse` returns must carry. Not
+    #: optional in practice: it is how the detail pane, the column profile and
+    #: the query vocabulary find what this format declared, all of which happen
+    #: before any line has been read. Rejected at load when empty, when it is
+    #: ``"raw"``, when it is a name in
+    #: :data:`clv.services.parsing.FORMAT_NAMES`, or when another loaded format
+    #: has already claimed it.
+    format_name: str = ""
+
+    #: Field names this format can produce, so field queries and the query
+    #: box's completions know them before a matching line has been seen.
+    field_names: frozenset[str] = frozenset()
+
+    #: What an operator calls this format in the detail pane. Without one the
+    #: pane falls back to the bare :attr:`format_name` identifier.
+    label: str = ""
+
+    #: Which of :attr:`field_names` earns the source cell, a pinned chip or a
+    #: varying chip in a structured row. ``FormatProfile()`` is a legal answer
+    #: and means "message only" — but it has to be the author's answer rather
+    #: than a default they never saw. A profile naming a key outside
+    #: :attr:`field_names` is rejected at load, because a profile pointing at a
+    #: field the format never produces is a row that quietly loses its source
+    #: cell.
+    columns: FormatProfile = DEFAULT_PROFILE
+
+    @abstractmethod
+    def parse(self, line: str) -> Optional[LogEntry]:
+        """Return an entry for *line*, or None to leave it to the next format.
+
+        The entry must carry this format's :attr:`format_name`, and its
+        ``fields`` must be a mapping of strings to strings — values are compared
+        as the parser stored them and nothing downstream coerces. Returning
+        anything else takes the format out of service with a message naming the
+        rule it broke: the read path cannot afford to trust this one, because a
+        stage that misbehaves costs a render and a format that misbehaves
+        corrupts the buffer.
+
+        ``raw`` should be the line as it arrived. Continuation carry-forward
+        needs no cooperation: an entry with a ``format_name`` other than
+        ``"raw"`` is structured, so the unparsed line after it inherits its
+        timestamp and level exactly as it would after a built-in's.
+        """
 
 
 @dataclass(frozen=True, slots=True)
@@ -889,6 +971,7 @@ class PluginStatus:
 #: kinds exist.
 _KINDS: tuple[tuple[str, type], ...] = (
     ("source", LogSourceProvider),
+    ("format", LogFormat),
     ("filter", FilterStage),
     ("exporter", Exporter),
 )
@@ -924,11 +1007,142 @@ def _origin_label(origin: str, source: str) -> str:
     return Path(origin).name if os.sep in origin or "/" in origin else origin
 
 
+#: Passes in a row a plugin must run over its budget before it is taken out of
+#: service.
+#:
+#: Consecutive, not cumulative, and not one. The first render after a source
+#: opens pays every cold cost a plugin has — a ``re.compile``, a file read, an
+#: import a lazy author deferred — and a large paste or a loaded CI box can put
+#: an otherwise healthy stage over the line for a pass or two. Disabling on the
+#: first breach would take those plugins out of service and leave Phase 4's
+#: Re-enable as the only way back. Three in a row is a plugin that is slow, not
+#: a plugin that was unlucky.
+_BUDGET_STRIKES = 3
+
+
+class PluginBudget:
+    """Cumulative wall time per plugin per pass, judged against a ceiling.
+
+    One instance per *path*, not per plugin. The render path — every
+    :class:`FilterStage` over every buffered entry, once per keystroke in the
+    query box — gets one, built by the app from ``plugin_time_budget_ms``.
+    ``PLUGIN_TODO.md``'s Stage C adds a second for the read path, where
+    ``LogFormat`` and ``ClusterRule`` are called per *line*; it is this class
+    with a different label and a different key, so neither path restates the
+    policy and they cannot drift apart.
+
+    A pass is ``start()``, some number of ``charge()`` calls, ``settle()``.
+    Time is attributed to the plugin rather than to the call, because "which
+    plugin is costing me this" is the question an operator has and "which of
+    five thousand calls" is not.
+
+    Exceeding the budget is not itself a fault: :attr:`_over` counts *consecutive*
+    passes and any pass under the line clears it. When the count reaches
+    :data:`_BUDGET_STRIKES` the plugin goes through :meth:`PluginRegistry.disable`
+    — the same mechanism a raising stage has used since Phase 1, recording once,
+    surfacing in the plugins modal as ``failed`` with a ``runtime`` category, and
+    reachable by Re-enable. A time budget is a reason to disable a plugin, not a
+    reason to invent a second way of disabling one.
+
+    A ``limit_ms`` of zero or less turns the guard off entirely. That is the
+    documented escape hatch for an operator who would rather have a slow plugin
+    than a disabled one, and callers check :attr:`active` first, so switching it
+    off also costs no measurement.
+    """
+
+    __slots__ = ("_registry", "limit_ms", "label", "_strikes", "_pass", "_seen", "_over")
+
+    def __init__(
+        self,
+        registry: "PluginRegistry",
+        *,
+        limit_ms: float,
+        label: str,
+        strikes: int = _BUDGET_STRIKES,
+    ) -> None:
+        self._registry = registry
+        self.limit_ms = float(limit_ms)
+        self.label = label
+        self._strikes = max(1, int(strikes))
+        #: Seconds charged to each plugin in the pass currently open.
+        self._pass: dict[int, float] = {}
+        #: ``id(plugin) -> plugin`` for the pass currently open, so
+        #: :meth:`settle` can name what it is disabling. Keyed on identity for
+        #: the reason :attr:`PluginRegistry._disabled` is: a plugin is
+        #: third-party code and may define ``__eq__`` without ``__hash__``.
+        self._seen: dict[int, Any] = {}
+        #: Consecutive over-budget passes per plugin. Survives a pass; cleared
+        #: for a plugin the moment one of its passes comes in under the line.
+        self._over: dict[int, int] = {}
+
+    @property
+    def active(self) -> bool:
+        """Whether this budget measures anything at all."""
+
+        return self.limit_ms > 0
+
+    def start(self) -> None:
+        """Open a pass."""
+
+        self._pass.clear()
+        self._seen.clear()
+
+    def charge(self, plugin: Any, seconds: float) -> None:
+        """Attribute *seconds* of the open pass to *plugin*."""
+
+        key = id(plugin)
+        self._pass[key] = self._pass.get(key, 0.0) + seconds
+        self._seen[key] = plugin
+
+    def settle(self) -> None:
+        """Close the pass, and disable anything that has now struck out."""
+
+        if not self.active:
+            # Callers check `active` before they measure, so this is normally
+            # unreachable -- but a budget that is switched off has to be off
+            # however it is driven, not only when the caller remembers.
+            self._pass.clear()
+            self._seen.clear()
+            return
+
+        limit = self.limit_ms / 1000.0
+        for key, elapsed in self._pass.items():
+            plugin = self._seen[key]
+            if elapsed <= limit:
+                self._over.pop(key, None)
+                continue
+            strikes = self._over.get(key, 0) + 1
+            if strikes < self._strikes:
+                self._over[key] = strikes
+                continue
+            # Cleared rather than left at the limit: if the operator re-enables
+            # this plugin it starts again with a clean count, which is the only
+            # reading of Re-enable that is not a lie.
+            self._over.pop(key, None)
+            self._registry.disable(
+                plugin,
+                f"over the {self.label} budget "
+                f"({elapsed * 1000:.0f} ms against {self.limit_ms:.0f} ms) "
+                f"on {self._strikes} consecutive passes",
+                origin=_plugin_name(plugin),
+            )
+        self._pass.clear()
+        self._seen.clear()
+
+    def forget(self, plugin: Any) -> None:
+        """Drop *plugin*'s strike count. Called when it is put back in service."""
+
+        self._over.pop(id(plugin), None)
+
+
 @dataclass
 class PluginRegistry:
     """Everything successfully loaded, plus everything that failed to load."""
 
     sources: list[LogSourceProvider] = field(default_factory=list)
+    #: Plugin-supplied parsers, in :func:`plugin_sort_key` order. Consulted only
+    #: for a line every built-in matcher declined — see :class:`LogFormat`.
+    formats: list[LogFormat] = field(default_factory=list)
     filters: list[FilterStage] = field(default_factory=list)
     exporters: list[Exporter] = field(default_factory=list)
     errors: PluginErrors = field(default_factory=PluginErrors)
@@ -974,10 +1188,42 @@ class PluginRegistry:
     #: Whether :meth:`shutdown` has run. ``teardown()`` is once per session, and
     #: ``on_unmount`` is not guaranteed to fire exactly once.
     _stopped: bool = field(default=False, repr=False)
+    #: Bumped whenever what this registry would *do* to an entry changes.
+    #: See :attr:`generation`.
+    _generation: int = field(default=0, repr=False)
 
     @property
     def total(self) -> int:
-        return len(self.sources) + len(self.filters) + len(self.exporters)
+        return (
+            len(self.sources)
+            + len(self.formats)
+            + len(self.filters)
+            + len(self.exporters)
+        )
+
+    @property
+    def generation(self) -> int:
+        """A counter that moves whenever the plugins' output could change.
+
+        Every cache downstream of a plugin keys on this. The staged view in
+        ``app.py`` is one; the clustering shape cache
+        (:func:`clv.services.clustering.normalise`) is the one that makes it
+        necessary, because it is an ``lru_cache`` on a module-level function and
+        ``PLUGIN_TODO.md`` Phase 10 feeds it plugin-supplied rules — without a
+        generation it would go on serving pre-plugin shapes after a rule was
+        switched on, which is a wrong answer rather than a stale one.
+
+        Moves on: a plugin being disabled or re-enabled, the end of a load, and
+        a settings refresh. That last one is easy to leave out and would be a
+        bug: ``[plugin:<name>]`` sections are handed over as live mappings a
+        plugin reads *through* (see :attr:`_settings`), so editing a redaction
+        pattern changes what a stage returns without touching the stage.
+
+        It does not move for a :meth:`disable` that hit the idempotence guard —
+        nothing changed, so nothing downstream needs rebuilding.
+        """
+
+        return self._generation
 
     # --- ordering ------------------------------------------------------------
 
@@ -995,8 +1241,12 @@ class PluginRegistry:
         """
 
         self.sources.sort(key=plugin_sort_key)
+        self.formats.sort(key=plugin_sort_key)
         self.filters.sort(key=plugin_sort_key)
         self.exporters.sort(key=plugin_sort_key)
+        # The end of a load: whatever a downstream cache holds was computed
+        # before these plugins existed.
+        self._generation += 1
 
     # --- configuration -------------------------------------------------------
 
@@ -1028,6 +1278,9 @@ class PluginRegistry:
         for name, current in self._settings.items():
             if name not in settings:
                 current.clear()
+        # A plugin reads through the view it was handed, so a changed section
+        # changes what it returns without any call reaching this module.
+        self._generation += 1
 
     # --- lifecycle -----------------------------------------------------------
 
@@ -1281,6 +1534,7 @@ class PluginRegistry:
         if key in self._disabled:
             return
         self._disabled[key] = reason
+        self._generation += 1
         if record:
             self.errors.append(
                 PluginError(
@@ -1291,7 +1545,10 @@ class PluginRegistry:
     def enable(self, plugin: Any) -> bool:
         """Put a disabled plugin back into service. True if it was disabled."""
 
-        return self._disabled.pop(id(plugin), None) is not None
+        if self._disabled.pop(id(plugin), None) is None:
+            return False
+        self._generation += 1
+        return True
 
     def is_disabled(self, plugin: Any) -> bool:
         return id(plugin) in self._disabled
@@ -1322,7 +1579,7 @@ class PluginRegistry:
                 self.errors.append(PluginError(origin, f"could not be instantiated: {exc}"))
                 return False
 
-        if not isinstance(plugin, (LogSourceProvider, FilterStage, Exporter)):
+        if not isinstance(plugin, (LogSourceProvider, LogFormat, FilterStage, Exporter)):
             self.errors.append(
                 PluginError(origin, "does not implement a CLV plugin interface")
             )
@@ -1357,6 +1614,12 @@ class PluginRegistry:
                 )
                 return False
 
+        if isinstance(plugin, LogFormat):
+            problem = self._format_fault(plugin)
+            if problem is not None:
+                self.errors.append(PluginError(origin, problem))
+                return False
+
         # Every interface it implements, not the first one that matched. The
         # previous `if/elif/else` filed a plugin that was both a provider and a
         # stage as a provider alone, and its `apply()` was never called -- a
@@ -1389,9 +1652,75 @@ class PluginRegistry:
         self._run_hook(plugin, "configure", self.settings_for(section))
         return True
 
+    def _format_fault(self, plugin: LogFormat) -> Optional[str]:
+        """Why *plugin* may not be registered as a format, or None if it may.
+
+        **At load, never at the first line.** Everything here is knowable
+        without parsing anything, and every one of these mistakes is silent at
+        runtime: a format claiming ``json`` would take over a built-in's row
+        shape, and a profile naming a field the format never produces renders a
+        row with no source cell and no diagnosis anywhere. A read path that
+        discovered these per line would be paying for them forever and reporting
+        them once the buffer was already wrong.
+        """
+
+        name = getattr(plugin, "format_name", "")
+        if not isinstance(name, str) or not name.strip():
+            return "declares no format_name, so nothing can find what it registered"
+        if name != name.strip():
+            return f"format_name {name!r} has leading or trailing whitespace"
+        if name in FORMAT_NAMES:
+            # `raw` is in FORMAT_NAMES, so this covers it and says something
+            # truer than "raw is reserved" would.
+            return (
+                f"format_name {name!r} is a built-in format. A plugin adds a "
+                "format, it does not replace one"
+            )
+        for other in self.formats:
+            if getattr(other, "format_name", "") == name:
+                return (
+                    f"format_name {name!r} is already registered by "
+                    f"{_plugin_name(other)}"
+                )
+
+        names = getattr(plugin, "field_names", frozenset())
+        if isinstance(names, (str, bytes)) or not isinstance(names, Iterable):
+            return "field_names must be a set of strings"
+        try:
+            declared = frozenset(names)
+        except TypeError:
+            return "field_names must be a set of strings"
+        if any(not isinstance(key, str) or not key for key in declared):
+            return "field_names must be a set of non-empty strings"
+
+        profile = getattr(plugin, "columns", DEFAULT_PROFILE)
+        if not isinstance(profile, FormatProfile):
+            return "columns must be a FormatProfile"
+        unknown = sorted(profile.keys() - declared)
+        if unknown:
+            return (
+                "columns names "
+                + ", ".join(unknown)
+                + ", which is not in field_names — the row would lose the cell "
+                "it points at"
+            )
+        return None
+
+    def format_stack(self, *, budget: Optional[PluginBudget] = None) -> "FormatStack":
+        """The enabled formats, guarded and budgeted, for the read path.
+
+        Handed to :class:`clv.services.parsing.LogParser` as its ``formats``.
+        The guard travels *with* the formats rather than being fetched
+        separately, because ``parsing.py`` may not import this module and a
+        format that raises still has to be disabled and reported by name.
+        """
+
+        return FormatStack(self, budget=budget)
+
     def _list_for(self, kind: str) -> list[Any]:
         return {
             "source": self.sources,
+            "format": self.formats,
             "filter": self.filters,
             "exporter": self.exporters,
         }[kind]
@@ -1568,35 +1897,221 @@ class PluginRegistry:
             return None
         return next(iter(candidates.values()))
 
-    def apply_filters(self, entries: Sequence[LogEntry], context: FilterContext) -> list[LogEntry]:
+    def apply_filters(
+        self,
+        entries: Sequence[LogEntry],
+        context: FilterContext,
+        *,
+        budget: Optional[PluginBudget] = None,
+    ) -> list[LogEntry]:
         """Run every filter stage over *entries*, skipping stages that raise.
 
         A stage that raises is disabled for the **session**, not for the pass.
         Disabling it per pass meant retrying it on the next render and recording
         the same failure again, so a broken stage cost one error per render
         rather than one error.
+
+        *budget*, when given and :attr:`~PluginBudget.active`, charges each
+        stage the wall time of its own calls and judges the totals when the pass
+        closes. It is optional and defaults to ``None`` so that every existing
+        caller — and every plugin author's unit test — gets exactly the function
+        that was here before. Zero installed stages returns above without
+        touching any of it, which is Requirement 10: a build with no plugins
+        enters no measurement path at all.
+
+        The loop is **stage-outer**: each stage sees the whole surviving set in
+        buffer order, then hands what it kept to the next one. It used to be
+        entry-outer, and that was changed here rather than earlier because
+        measurement is what made the difference visible. Entry-outer needs two
+        clock reads *per call* — entries times stages — and a no-op stage over
+        five thousand entries then costs four times more to time than to run,
+        which at ``max_buffer_lines = 500_000`` is a fifth of a second of pure
+        measurement that the budget would then charge to the plugin. Stage-outer
+        needs two reads per stage per pass, and the cost of the guard stops
+        depending on how big the buffer is.
+
+        What it costs in exchange is one intermediate list per stage — pointers,
+        not entries, and only two are ever live at once. The composition itself
+        is unchanged: a dropped entry is still invisible to later stages, a
+        raising stage still lets the entry it choked on through untouched and is
+        still skipped by everything after it, and the order within any one stage
+        is still the buffer's.
         """
 
         if not self.filters:
             return list(entries)
 
-        result: list[LogEntry] = []
-        for entry in entries:
-            current: Optional[LogEntry] = entry
-            for stage in self.filters:
-                if current is None:
-                    break
-                if self.is_disabled(stage):
-                    continue
+        # Hoisted out of what used to be an inner loop: this was an identity
+        # lookup per entry per stage.
+        active = [stage for stage in self.filters if not self.is_disabled(stage)]
+        if not active:
+            return list(entries)
+
+        timing = budget is not None and budget.active
+        if timing:
+            budget.start()
+
+        clock = time.perf_counter
+        current: list[LogEntry] = list(entries)
+        for stage in active:
+            if not current:
+                # Everything has been dropped. Nothing left to hand on, and a
+                # stage called with nothing has nothing to say.
+                break
+            started = clock() if timing else 0.0
+            kept: list[LogEntry] = []
+            for index, entry in enumerate(current):
                 try:
-                    current = stage.apply(current, context)
+                    survivor = stage.apply(entry, context)
                 except Exception as exc:  # noqa: BLE001 - third-party code
-                    # The pane keeps working with the remaining stages; the
-                    # operator re-enables the stage once they have fixed it.
+                    # The pane keeps working with the remaining stages. This
+                    # entry and every one after it passes through untouched,
+                    # which is what the per-entry check used to arrive at by
+                    # skipping a stage that had already been disabled.
                     self.disable(stage, f"raised: {exc}", origin=_plugin_name(stage))
-            if current is not None:
-                result.append(current)
-        return result
+                    kept.extend(current[index:])
+                    break
+                if survivor is not None:
+                    kept.append(survivor)
+            if timing:
+                budget.charge(stage, clock() - started)
+            current = kept
+
+        if timing:
+            budget.settle()
+        return current
+
+
+class FormatStack(Sequence):
+    """The enabled :class:`LogFormat` plugins, wrapped in everything CLV owes them.
+
+    A ``Sequence`` so that the read path's ``formats=()`` default and a live
+    stack are the same kind of thing: :class:`~clv.services.parsing.LogParser`
+    tests it for truth and calls :meth:`parse` only when there is something to
+    call, so a build with no format plugins enters none of this.
+
+    **Why the guard travels with the formats.** ``parsing.py`` may not import
+    this module — the dependency runs the other way and every seam in
+    ``PLUGIN_TODO.md`` is injected rather than imported. But a format that
+    raises has to be disabled through :meth:`PluginRegistry.disable`, and one
+    that returns a malformed entry has to be reported by the rule it broke.
+    Handing the parser bare plugins would mean handing it a fault callback and a
+    budget as well, and spreading one plugin's guard across two modules. So the
+    guard is one object and the parser holds one reference.
+
+    **The clock is read once per call, not twice.** The read before the loop is
+    reused as the previous call's end stamp, which halves the measurement on the
+    path where it matters most: this runs per line, and Phase 6 already found
+    that a guard costing more than the work it guards is a guard that disables
+    healthy plugins.
+    """
+
+    __slots__ = ("_registry", "_formats", "_budget")
+
+    def __init__(
+        self, registry: "PluginRegistry", *, budget: Optional[PluginBudget] = None
+    ) -> None:
+        self._registry = registry
+        #: Snapshotted at construction: the set of *loaded* formats is settled
+        #: at the end of `load_plugins` and never grows afterwards. Whether one
+        #: is in service is asked per line, because that does change.
+        self._formats = tuple(registry.formats)
+        self._budget = budget
+
+    def __len__(self) -> int:
+        return len(self._formats)
+
+    def __getitem__(self, index):  # type: ignore[override]
+        return self._formats[index]
+
+    def start(self) -> None:
+        """Open a budget pass. One read's batch of lines is one pass."""
+
+        budget = self._budget
+        if budget is not None and budget.active:
+            budget.start()
+
+    def settle(self) -> None:
+        """Close the pass, disabling anything that has struck out."""
+
+        budget = self._budget
+        if budget is not None and budget.active:
+            budget.settle()
+
+    def parse(self, line: str) -> Optional[LogEntry]:
+        """The first valid entry any enabled format returns, or None.
+
+        Never raises. A format that throws, or that hands back something the
+        :class:`LogEntry` contract does not allow, is taken out of service for
+        the session through the same :meth:`PluginRegistry.disable` a raising
+        filter stage has used since Phase 1 — recorded once, shown in the ``P``
+        dialog as ``failed``, and reachable by Re-enable.
+        """
+
+        registry = self._registry
+        budget = self._budget
+        timing = budget is not None and budget.active
+        clock = time.perf_counter
+        mark = clock() if timing else 0.0
+
+        for plugin in self._formats:
+            if registry.is_disabled(plugin):
+                continue
+            try:
+                entry = plugin.parse(line)
+            except Exception as exc:  # noqa: BLE001 - third-party code
+                registry.disable(
+                    plugin, f"raised: {exc}", origin=_plugin_name(plugin)
+                )
+                continue
+            finally:
+                if timing:
+                    now = clock()
+                    budget.charge(plugin, now - mark)
+                    mark = now
+            if entry is None:
+                continue
+            problem = _entry_fault(entry, plugin.format_name)
+            if problem is not None:
+                registry.disable(
+                    plugin,
+                    f"parse() {problem}",
+                    origin=_plugin_name(plugin),
+                )
+                continue
+            return entry
+        return None
+
+
+def _entry_fault(entry: Any, format_name: str) -> Optional[str]:
+    """Why *entry* is not a usable :class:`LogEntry`, or None if it is.
+
+    Checked on every line a format claims, which is the one place in this file
+    that validates third-party output per item rather than per pass. It is worth
+    it here and nowhere else: a filter stage that misbehaves costs a render, and
+    a format that misbehaves writes a wrong entry into the buffer that every
+    query, bucket and cluster downstream then believes.
+
+    Cheap by construction — an ``isinstance``, a string compare, and a walk of a
+    mapping that ``_MAX_FIELDS`` already bounds at 64 and that is empty for most
+    formats.
+    """
+
+    if not isinstance(entry, LogEntry):
+        return f"returned {type(entry).__name__}, not a LogEntry"
+    if entry.format_name != format_name:
+        return (
+            f"returned an entry with format_name {entry.format_name!r}, "
+            f"not the {format_name!r} it declared"
+        )
+    for key, value in entry.fields.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            return (
+                f"returned a non-string field ({key!r}: {type(value).__name__}). "
+                "Values are compared as the parser stored them and nothing "
+                "downstream coerces"
+            )
+    return None
 
 
 def _plugin_name(plugin: Any) -> str:
@@ -2209,8 +2724,10 @@ __all__ = [
     "ExportResult",
     "FilterContext",
     "FilterStage",
+    "FormatStack",
     "IteratorReader",
     "LoadedPlugin",
+    "LogFormat",
     "LogSourceProvider",
     "ProviderSource",
     "Plugin",

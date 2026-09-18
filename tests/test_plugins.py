@@ -22,6 +22,7 @@ from clv.plugins import (
     FilterContext,
     FilterStage,
     LogSourceProvider,
+    PluginBudget,
     PluginError,
     PluginErrors,
     PluginRegistry,
@@ -2050,3 +2051,298 @@ def test_a_broken_stage_is_not_torn_down() -> None:
     registry.shutdown()
 
     assert plugin.events == ["configure", "setup"]
+
+
+# --- the time budget --------------------------------------------------------
+#
+# `PluginBudget` is exercised two ways on purpose. Through `charge()` directly,
+# where the arithmetic is deterministic and a shared CI box cannot make it
+# flake; and once through `apply_filters` with a stage that really is slow, to
+# prove the wiring. Testing only the first would pass with the budget
+# disconnected, and testing only the second would be a timing test.
+
+
+class Slow(FilterStage):
+    """A stage that costs real wall time, for the one wiring test."""
+
+    name = "slow"
+
+    def __init__(self, seconds: float = 0.005) -> None:
+        self.seconds = seconds
+
+    def apply(self, entry, context):
+        time.sleep(self.seconds)
+        return entry
+
+
+def _budget(registry, *, limit_ms=10.0, strikes=3):
+    return PluginBudget(registry, limit_ms=limit_ms, label="test", strikes=strikes)
+
+
+def _pass(budget, plugin, ms):
+    budget.start()
+    budget.charge(plugin, ms / 1000.0)
+    budget.settle()
+
+
+def test_three_consecutive_over_budget_passes_disable_a_plugin() -> None:
+    stage = Redactor()
+    registry = _registry(stage)
+    budget = _budget(registry)
+
+    _pass(budget, stage, 40)
+    assert not registry.is_disabled(stage), "one slow pass is not a verdict"
+    _pass(budget, stage, 40)
+    assert not registry.is_disabled(stage), "two is not either"
+    _pass(budget, stage, 40)
+
+    assert registry.is_disabled(stage)
+    reason = registry.disabled_reason(stage)
+    assert "budget" in reason
+    # Both numbers, so the operator can see how far over it was rather than
+    # only that it was over.
+    assert "40 ms" in reason and "10 ms" in reason
+    assert "3 consecutive" in reason
+
+
+def test_a_pass_under_budget_clears_the_strike_count() -> None:
+    """The whole reason the rule is *consecutive*."""
+
+    stage = Redactor()
+    registry = _registry(stage)
+    budget = _budget(registry)
+
+    for _ in range(2):
+        _pass(budget, stage, 40)
+        _pass(budget, stage, 40)
+        _pass(budget, stage, 1)
+
+    assert not registry.is_disabled(stage)
+    assert registry.errors == []
+
+
+def test_a_plugin_under_budget_is_never_disabled() -> None:
+    stage = Redactor()
+    registry = _registry(stage)
+    budget = _budget(registry)
+
+    for _ in range(200):
+        _pass(budget, stage, 9)
+
+    assert not registry.is_disabled(stage)
+
+
+def test_time_is_accumulated_across_a_pass_not_judged_per_call() -> None:
+    """Five thousand entries at 20 us each is 100 ms, and that is the number."""
+
+    stage = Redactor()
+    registry = _registry(stage)
+    budget = _budget(registry)
+
+    for _ in range(3):
+        budget.start()
+        for _ in range(5_000):
+            budget.charge(stage, 0.000_02)
+        budget.settle()
+
+    assert registry.is_disabled(stage)
+
+
+def test_a_zero_budget_turns_the_guard_off_entirely() -> None:
+    stage = Redactor()
+    registry = _registry(stage)
+    budget = _budget(registry, limit_ms=0)
+
+    assert not budget.active
+    for _ in range(50):
+        _pass(budget, stage, 5_000)
+
+    assert not registry.is_disabled(stage)
+
+
+def test_one_slow_plugin_does_not_take_a_fast_one_with_it() -> None:
+    slow, quick = Redactor(), DropDebug()
+    registry = _registry(slow, quick)
+    budget = _budget(registry)
+
+    for _ in range(3):
+        budget.start()
+        budget.charge(slow, 0.040)
+        budget.charge(quick, 0.001)
+        budget.settle()
+
+    assert registry.is_disabled(slow)
+    assert not registry.is_disabled(quick)
+
+
+def test_a_budget_disable_reads_as_a_runtime_fault_the_operator_can_undo() -> None:
+    """The row Phase 4's Re-enable applies to, reached by a new route."""
+
+    stage = Redactor()
+    registry = _registry(stage)
+    budget = _budget(registry)
+    for _ in range(3):
+        _pass(budget, stage, 40)
+
+    (row,) = registry.status()
+    assert row.state == "failed"
+    assert row.category == "runtime", "Re-enable keys on this"
+
+
+def test_forget_gives_a_re_enabled_plugin_a_clean_count() -> None:
+    """Otherwise the next slow pass takes it straight back out."""
+
+    stage = Redactor()
+    registry = _registry(stage)
+    budget = _budget(registry)
+    for _ in range(3):
+        _pass(budget, stage, 40)
+    assert registry.is_disabled(stage)
+
+    registry.enable(stage)
+    budget.forget(stage)
+
+    _pass(budget, stage, 40)
+    assert not registry.is_disabled(stage)
+
+
+def test_the_budget_records_one_error_however_many_passes_follow() -> None:
+    stage = Redactor()
+    registry = _registry(stage)
+    budget = _budget(registry)
+
+    for _ in range(200):
+        _pass(budget, stage, 40)
+
+    assert len(registry.errors) == 1
+    assert registry.errors[0].count == 1
+
+
+def test_apply_filters_charges_the_budget_it_is_given() -> None:
+    """The wiring, with a stage that really does take the time."""
+
+    entries = parse_lines([f"line {index}" for index in range(20)])
+    stage = Slow(seconds=0.002)
+    registry = _registry(stage)
+    # 20 entries x 2 ms is 40 ms of sleeping against a 5 ms ceiling, so the
+    # margin is wide enough that a loaded box cannot flip the answer.
+    budget = _budget(registry, limit_ms=5)
+
+    for _ in range(3):
+        result = registry.apply_filters(entries, CONTEXT, budget=budget)
+
+    assert registry.is_disabled(stage)
+    # The pane kept rendering the whole way through.
+    assert len(result) == 20
+
+
+def test_apply_filters_without_a_budget_is_the_function_it_always_was() -> None:
+    entries = parse_lines(
+        [
+            "2026-08-07 09:25:01 - INFO - password=hunter2",
+            "2026-08-07 09:25:02 - DEBUG - noisy",
+        ]
+    )
+    registry = _registry(Redactor(), DropDebug())
+
+    assert len(registry.apply_filters(entries, CONTEXT)) == 1
+
+
+def test_no_stages_means_the_clock_is_never_read(monkeypatch) -> None:
+    """Requirement 10, asserted by making measurement impossible.
+
+    A build with no plugins must not merely be *fast*; it must not enter the
+    measurement path at all.
+    """
+
+    def forbidden():  # pragma: no cover - the assertion is that it never runs
+        raise AssertionError("a build with no plugins timed something")
+
+    monkeypatch.setattr(time, "perf_counter", forbidden)
+    registry = PluginRegistry()
+    budget = _budget(registry)
+    entries = parse_lines(["one", "two"])
+
+    assert len(registry.apply_filters(entries, CONTEXT, budget=budget)) == 2
+
+
+def test_a_disabled_budget_costs_no_measurement_either(monkeypatch) -> None:
+    def forbidden():  # pragma: no cover - the assertion is that it never runs
+        raise AssertionError("a switched-off budget timed something")
+
+    registry = _registry(Redactor())
+    budget = _budget(registry, limit_ms=0)
+    entries = parse_lines(["one", "two"])
+
+    monkeypatch.setattr(time, "perf_counter", forbidden)
+    assert len(registry.apply_filters(entries, CONTEXT, budget=budget)) == 2
+
+
+def test_a_stage_disabled_mid_pass_is_skipped_by_the_entries_after_it() -> None:
+    """The hoisted `active` list preserving what the per-entry check did."""
+
+    class CountingExploder(FilterStage):
+        name = "counting-exploder"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def apply(self, entry, context):
+            self.calls += 1
+            raise RuntimeError("boom")
+
+    stage = CountingExploder()
+    registry = _registry(stage, Redactor())
+    entries = parse_lines([f"line {index}" for index in range(50)])
+
+    result = registry.apply_filters(entries, CONTEXT)
+
+    assert stage.calls == 1, "the first entry pays for it; the other 49 do not"
+    assert len(result) == 50
+    assert len(registry.errors) == 1
+
+
+# --- the generation counter -------------------------------------------------
+
+
+def test_the_generation_moves_on_a_disable_and_on_a_re_enable() -> None:
+    stage = Redactor()
+    registry = _registry(stage)
+
+    start = registry.generation
+    registry.disable(stage, "because")
+    disabled = registry.generation
+    assert disabled > start
+
+    registry.enable(stage)
+    assert registry.generation > disabled
+
+
+def test_the_generation_does_not_move_for_a_disable_that_changed_nothing() -> None:
+    """Idempotence reaches the counter too, or every render invalidates."""
+
+    stage = Redactor()
+    registry = _registry(stage)
+    registry.disable(stage, "because")
+
+    settled = registry.generation
+    registry.disable(stage, "because")
+    registry.disable(stage, "a different reason")
+    assert registry.generation == settled
+
+    assert registry.enable(stage) is True
+    put_back = registry.generation
+    assert registry.enable(stage) is False
+    assert registry.generation == put_back
+
+
+def test_the_generation_moves_when_a_plugin_section_is_re_read() -> None:
+    """A live mapping means settings change output without a call landing here."""
+
+    registry = _registry(Redactor())
+    registry.settings_for("redactor")
+
+    before = registry.generation
+    registry.refresh_settings({"redactor": {"patterns": "token"}})
+
+    assert registry.generation > before

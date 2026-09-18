@@ -461,3 +461,30 @@ def test_the_cells_give_way_in_order_as_the_pane_narrows() -> None:
     assert sources == sorted(sources, reverse=True)
     assert levels == sorted(levels, reverse=True)
     assert sources[-1] == 0, "the source cell never gave way"
+
+
+def test_a_pid_with_no_source_to_ride_on_is_not_a_cell_of_its_own() -> None:
+    """`[991]` says the one thing the detail pane already says better.
+
+    The source cell's whole job is *which program*, and a PID rides along in it
+    when there is room. With no program name recovered there is nothing to ride
+    on, and what used to be rendered was a bare `[991]` — a PID as a cell of its
+    own, which `_source_value`'s own docstring rules out.
+
+    Reachable with no plugin at all: a JSON line carrying `pid` and none of the
+    `json` profile's source keys lands exactly here. Found while checking a
+    plugin format's rows, where a profile naming a source key that a particular
+    line did not carry is the ordinary case rather than the unlucky one.
+    """
+
+    entries, layout = _plan(
+        [
+            '{"pid": 991, "level": "error", "msg": "boom"}',
+            '{"unit": "nginx", "pid": 7, "level": "info", "msg": "started"}',
+        ]
+    )
+    rows = [render_row(entry, layout).plain for entry in entries]
+
+    assert rows[0] == "ERROR boom"
+    # And the case it exists for is untouched.
+    assert rows[1] == "INFO nginx[7] started"

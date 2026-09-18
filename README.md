@@ -14,8 +14,9 @@ desktop terminal and on a headless 80-column SSH session.
   parse are still searchable rather than silently dropped. Smart case: a
   lowercase query is case-insensitive, an uppercase character opts back in.
 - 🧬 **Multi-format parsing.** syslog (RFC 3164 and 5424), ISO-8601/bracketed
-  levels, Python `logging`, JSON lines, and Common Log Format access logs.
-  Anything else is kept as a raw line with its text intact.
+  levels, Python `logging`, JSON lines, Common Log Format access logs — and any
+  format a plugin teaches it. Anything else is kept as a raw line with its text
+  intact.
 - 🧵 **Stack traces stay attached.** A line no format recognises inherits the
   timestamp and severity of the entry above it, so a traceback survives a
   "show me only errors" filter along with the ERROR that produced it.
@@ -181,6 +182,8 @@ use.
 | `cluster_lookback` | How far back, in entries, `c` may reach to fold a repeated line into a cluster. A bound, not a taste: it keeps one cluster from spanning a session. | `200` |
 | `enable_journald` | Offer the systemd journal as a source. Off by default: reading it runs `journalctl`, and CLV spawns no subprocess unasked. The drawer's switch writes this line for you. | `false` |
 | `plugins` | Plugins to load from `~/.config/clv/plugins/`, comma separated, named without the `.py`. A file in that directory is listed but **not imported** until it is named here — installing a plugin and running one are two decisions. Plugins bundled with CLV are not listed here. | *(empty)* |
+| `plugin_time_budget_ms` | Wall time one plugin may spend on a single pass of the render path. A plugin over it on three consecutive passes is disabled and named in the `P` dialog. `0` turns the guard off. | `250` |
+| `plugin_read_budget_ms` | The same, for a plugin-supplied log format, measured over one batch of lines read from a file rather than over a render. `0` turns the guard off. | `50` |
 | `enable_ssh` | Read log folders on machines named in `[ssh:<name>]` sections. Off by default, and for a stronger version of the same reason: a remote source spawns a *network* subprocess. With it false nothing connects, however many hosts are configured. | `false` |
 
 Invalid values fall back to safe defaults; the app never fails to start because
@@ -1208,6 +1211,27 @@ Advanced drawer says how many are installed but not enabled; a name you list
 that isn't there is reported by name, so a typo says so rather than doing
 nothing.
 
+### A worked example, already on your machine
+
+`~/.config/clv/plugins/examples/nginx_error.py` is a complete, commented plugin
+that teaches CLV to read nginx's error log — a format the built-in matchers do
+not recognise, so every line of one is a raw line today. Copy it up a level to
+use it, or as the starting point for your own:
+
+```bash
+cd ~/.config/clv/plugins && cp examples/nginx_error.py .
+```
+
+then add `nginx_error` to `plugins`. Nothing in `examples/` is listed or run:
+it is one directory down and CLV only looks in the directory itself, so the
+plugin count keeps meaning *plugins you installed*.
+
+**Teaching CLV a format is a plugin's job like any other.** A `LogFormat` gets
+offered every line the built-ins declined; what it returns is an entry on equal
+terms with a built-in's — searchable by field query, bucketed by the timeline,
+folded by `c`, shown in the detail pane and exportable, with its own source cell
+and chips in the structured view. `clv/plugins/AGENTS.md` has the interface.
+
 ### Managing what is installed
 
 `P` — or the **Plugins** button in the Advanced drawer (`f`) — opens a list of
@@ -1238,6 +1262,18 @@ symmetrical:
 
 Plugin failures are summarised in one line in the log panel rather than listed
 there — the detail, in full, is in this dialog.
+
+**A plugin that is merely slow is disabled too.** A filter stage runs over every
+buffered line on every render, and a render happens on every keystroke in the
+query box — so one that is slow is indistinguishable from CLV being broken, and
+it used to say nothing at all. Each stage is now timed; one that goes over
+`plugin_time_budget_ms` (250 ms by default) on three consecutive passes turns up
+here as `failed`, with how long it took and what the ceiling was, and **r** puts
+it back. Set the key to `0` if you would rather have the slow plugin. A plugin
+that teaches CLV a *format* is timed the same way against
+`plugin_read_budget_ms`, measured over one batch of lines read rather than over
+a render — its `parse` runs once per line as the file is read, not once per
+keystroke.
 
 **A plugin is trusted code.** It is Python imported into CLV's own process: it
 runs with your privileges and can read every file you can, including every log
@@ -1323,6 +1359,6 @@ worth starring and comparing across a fleet.
 ```bash
 python -m pip install -e .
 python -m pip install pytest
-python -m pytest            # 1767 passed, 1 skipped, 11 deselected
+python -m pytest            # 1890 passed, 1 skipped, 11 deselected
 python -m textual run clv/app.py --dev
 ```

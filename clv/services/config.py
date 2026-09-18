@@ -23,6 +23,8 @@ until ``enable_ssh`` is true.
 from __future__ import annotations
 
 import configparser
+import importlib
+import inspect
 import os
 import shutil
 import sys
@@ -45,7 +47,7 @@ CONFIG_VERSION_OPTION = "config_version"
 #: template's option set changes. Deliberately not ``__version__``: most
 #: releases do not touch the settings schema, and stamping the app version
 #: would re-migrate every operator's file for nothing.
-CURRENT_CONFIG_VERSION = 2
+CURRENT_CONFIG_VERSION = 4
 
 #: One remote host per section: ``[ssh:web01]``. The suffix is the host's name
 #: within CLV — what the tree shows, what ``node:`` matches, and the fallback
@@ -110,6 +112,19 @@ _LIMITS: dict[str, tuple[int, int, int]] = {
     # is what stops one cluster spanning a whole session and swallowing an
     # event from an hour ago.
     "cluster_lookback": (200, 2, 100_000),
+    # Milliseconds of wall time one plugin may spend on one pass of the render
+    # path before it is taken out of service. The floor is **zero**, and zero
+    # means no guard at all -- unlike every other option here, where the low
+    # end is a typo to be clamped away, an operator who would rather have a
+    # slow plugin than a disabled one has a legitimate answer and this is it.
+    "plugin_time_budget_ms": (250, 0, 60_000),
+    # The same, for the *read* path: milliseconds one `LogFormat` may spend on
+    # one batch of lines from a reader. Lower than the render budget and
+    # measured against a different thing -- a batch is one `prime` or `poll`,
+    # not one keystroke, so a format that needs 50 ms of a single file read is
+    # already the slowest thing between opening a log and seeing it. Floor is
+    # zero and means no guard, exactly as above.
+    "plugin_read_budget_ms": (50, 0, 60_000),
 }
 
 DEFAULT_SETTINGS_TEMPLATE = f"""[{CONFIG_SECTION}]
@@ -198,6 +213,25 @@ enable_journald = false
 # Plugins that shipped with CLV are not listed here - they load on their own,
 # because trusting them is the trust you already placed in CLV.
 plugins =
+
+# How long one plugin may spend on a single pass of the render path, in
+# milliseconds. A filter stage runs over every buffered line on every render,
+# and a render happens on every keystroke in the query box - so a stage that is
+# merely slow is indistinguishable from CLV being broken. A plugin that goes
+# over this on three consecutive passes is disabled and named in the plugins
+# dialog (P), where it can be switched back on.
+#
+# Set to 0 to turn the guard off entirely and tolerate a slow plugin.
+plugin_time_budget_ms = 250
+
+# The same, for a plugin that teaches CLV a log format. A LogFormat's parse()
+# runs once per line *read* rather than once per render, and only for lines no
+# built-in format recognised - so this is measured over one batch of lines from
+# a file read, not over a render pass. A format that goes over this on three
+# consecutive batches is disabled and named in the plugins dialog (P).
+#
+# Set to 0 to turn this guard off too.
+plugin_read_budget_ms = 50
 
 # Read log folders on other machines over SSH. Off by default, and for a
 # stronger version of the reason above: a remote source spawns ssh, and a
@@ -385,6 +419,8 @@ class LogConfig:
     clipboard_max_bytes: int = _LIMITS["clipboard_max_bytes"][0]
     watch_rate_limit: int = _LIMITS["watch_rate_limit"][0]
     cluster_lookback: int = _LIMITS["cluster_lookback"][0]
+    plugin_time_budget_ms: int = _LIMITS["plugin_time_budget_ms"][0]
+    plugin_read_budget_ms: int = _LIMITS["plugin_read_budget_ms"][0]
     #: Ring the terminal bell when a watch rule notifies. Off by default: a
     #: bell is a thing an operator opts into, never a thing a log does to them.
     watch_bell: bool = False
@@ -656,7 +692,73 @@ Install a plugin the way you would install any other program: from someone
 you have reason to trust, after reading it if you can. The trust model, and
 what to look at when reviewing a third-party plugin, are written out in
 CLV's `clv/plugins/AGENTS.md`.
+
+A worked example
+----------------
+
+`examples/nginx_error.py` is a complete, commented plugin. It teaches CLV to
+read nginx's error log - a format the built-in matchers do not recognise -
+and it walks through what a log format plugin has to declare and why.
+
+Nothing in `examples/` is listed or run: it is one directory down, and CLV
+only looks here. To use it, copy it up and name it:
+
+    cp examples/nginx_error.py .
+
+then add `nginx_error` to the `plugins` line in settings.conf. Copying is
+also how you start your own - it is a better starting point than an empty
+file.
 """
+
+#: Subdirectory of the plugin directory the worked examples are written to.
+#:
+#: **One level down, and that is the whole design of it.** Written into the
+#: plugin directory itself an example would be *discovered*, so a fresh install
+#: with nothing installed would report "1 not enabled" forever — and the plugin
+#: count, which is supposed to mean "plugins someone installed", would be
+#: counting one that CLV installed. ``pkgutil.iter_modules`` does not descend,
+#: and a directory with no ``__init__.py`` is not a package, so nothing here is
+#: listed, discovered or importable. Copying a file up one level is what turns
+#: an example into an installed plugin — which is the same act as installing any
+#: other, and is the sentence the README here ends on.
+PLUGIN_EXAMPLES_DIR = "examples"
+
+#: Worked examples written into that directory on first run, as
+#: ``{filename: module}``.
+SEEDED_EXAMPLES: dict[str, str] = {"nginx_error.py": "clv.examples.nginx_error"}
+
+
+def _seed_plugin_examples(target: Path) -> None:
+    """Write the worked examples into *target*, never over one already there.
+
+    Written from the packaged module's source rather than shipped as a data file
+    so there is exactly one copy in the tree: the example is imported by the
+    suite and parsed against a fixture, so it cannot rot into something that no
+    longer loads while still being handed to every new operator.
+
+    **Only when absent.** An operator who edited the example, or deleted it
+    because they did not want it, gets to keep that decision — rewriting it on
+    every start would undo both. Never raises: seeding an example is the least
+    important thing that happens at startup.
+    """
+
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+
+    for filename, module in SEEDED_EXAMPLES.items():
+        destination = target / filename
+        if destination.exists():
+            continue
+        try:
+            source = inspect.getsource(importlib.import_module(module))
+        except Exception:  # noqa: BLE001 - a stripped build has no source
+            continue
+        try:
+            destination.write_text(source, encoding="utf-8")
+        except OSError:
+            continue
 
 
 def ensure_user_plugin_dir() -> Optional[Path]:
@@ -676,6 +778,8 @@ def ensure_user_plugin_dir() -> Optional[Path]:
         target.mkdir(parents=True, exist_ok=True)
     except OSError:
         return None
+
+    _seed_plugin_examples(target / PLUGIN_EXAMPLES_DIR)
 
     readme = target / "README.txt"
     if not readme.exists():
@@ -1365,6 +1469,8 @@ def load_config(path: Optional[Path] = None) -> LogConfig:
         clipboard_max_bytes=_read_int(section, "clipboard_max_bytes"),
         watch_rate_limit=_read_int(section, "watch_rate_limit"),
         cluster_lookback=_read_int(section, "cluster_lookback"),
+        plugin_time_budget_ms=_read_int(section, "plugin_time_budget_ms"),
+        plugin_read_budget_ms=_read_int(section, "plugin_read_budget_ms"),
         watch_bell=_read_bool(section, "watch_bell", False),
         enable_journald=_read_bool(section, "enable_journald", False),
         plugins=_read_plugin_list(section, issues),

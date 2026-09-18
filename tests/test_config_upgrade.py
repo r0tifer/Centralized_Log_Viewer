@@ -652,3 +652,48 @@ def test_a_plugin_section_is_not_reported_as_a_missing_setting(tmp_path: Path) -
     )
 
     assert undocumented_settings(target) == ()
+
+
+def test_a_v3_file_gains_the_read_budget_and_keeps_everything_else(
+    tmp_path: Path,
+) -> None:
+    """Phase 7a moved `config_version` to 4, so this is the upgrade it creates.
+
+    The check that matters is not that the new key arrives — the merge copies
+    the template — but that an operator's own values, their host blocks and
+    their `[plugin:...]` sections come through it untouched. A config upgrade
+    that silently drops a plugin's settings is the failure Phase 5 already found
+    once, and it is worth re-asserting on every version bump rather than
+    assuming the fix held.
+    """
+
+    path = tmp_path / "settings.conf"
+    path.write_text(
+        "[log_viewer]\n"
+        "config_version = 3\n"
+        "log_dirs = /srv/logs\n"
+        "plugin_time_budget_ms = 400\n"
+        "plugins = redact_secrets\n"
+        "\n"
+        "[plugin:redact_secrets]\n"
+        "patterns = password, api_key\n"
+        "\n"
+        "[ssh:web01]\n"
+        "hostname = web01.example.com\n",
+        encoding="utf-8",
+    )
+
+    result = upgrade_user_settings(path)
+    text = path.read_text(encoding="utf-8")
+    config = load_config(path)
+
+    assert result.status == "upgraded"
+
+    assert "plugin_read_budget_ms" in text
+    assert config.plugin_read_budget_ms == 50
+    # Everything the operator wrote.
+    assert config.plugin_time_budget_ms == 400
+    assert config.plugins == ("redact_secrets",)
+    assert list(config.log_dirs) == [Path("/srv/logs")]
+    assert "[plugin:redact_secrets]" in text and "api_key" in text
+    assert "[ssh:web01]" in text and "web01.example.com" in text

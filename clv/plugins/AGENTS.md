@@ -46,8 +46,10 @@ Judge it the same way: by who wrote it and whether you read it.
 ### What isolation does and does not do
 
 **Today there is none.** Every plugin runs in CLV's process. A plugin that
-hangs, leaks memory or spins the CPU cannot be stopped — CLV can catch an
-exception, and that is the whole of the containment that exists.
+hangs or leaks memory cannot be stopped. CLV can catch an exception, and it can
+disable a stage that is repeatedly *slow* on the render path (see
+[Performance](#performance)) — but a budget only works on code that returns, and
+neither of those is isolation.
 
 When isolation arrives it will be **failure containment, not safety**: a
 subprocess host can be killed on crash, hang or timeout, which is the first
@@ -269,7 +271,103 @@ class DropDebug(FilterStage):
 
 Stages run *before* the user's query, severity and time filters.
 
-### 3. Exporter
+### 3. LogFormat
+
+Teaches CLV to parse a line no built-in matcher recognises.
+
+**Built-ins first, plugins second, `raw` last.** `parse()` is offered only the
+lines every built-in already declined, so a syslog file costs an installed
+format nothing and a plugin cannot take over a name CLV already answers to.
+*Replacing* a built-in is out of scope and always will be: when a format is
+worth CLV's own attention it goes into `clv.services.parsing` on CLV's account.
+
+**A `format_name` is four registrations, and only one of them is parsing.** The
+others are a label, a column profile and — where a format recovers nothing — a
+sentence saying why. Miss them and nothing raises: the entry renders with the
+right timestamp and level, the bare identifier where the format name should be,
+no source cell and no chips. That is a worse row than a built-in gets for the
+same line, with no diagnosis anywhere. So a format *declares* them:
+
+```python
+from clv.api import FormatProfile, LogEntry, LogFormat, normalize_level
+
+class NginxError(LogFormat):
+    name = "nginx-error"
+    requires_api = ">=1.0,<2.0"
+
+    #: What every entry this format returns must carry. Not a display name.
+    format_name = "nginx-error"
+    #: What an operator calls it in the detail pane.
+    label = "nginx error log"
+    #: What it can produce, so a field query and the query box's completions
+    #: know the word before a matching line has been read.
+    field_names = frozenset({"pid", "host", "server", "request", "upstream"})
+    #: Which of those earn the source cell and the chips.
+    columns = FormatProfile(
+        source_keys=("server", "host"), pid_key="pid", chips=("host", "upstream")
+    )
+
+    def parse(self, line):
+        if len(line) < 20 or line[4] != "/":   # the cheap rejection, first
+            return None
+        match = _LINE.match(line)
+        if match is None:
+            return None
+        return LogEntry(
+            raw=line,
+            timestamp=...,
+            level=normalize_level(match.group("level")),
+            message=match.group("msg"),
+            format_name=self.format_name,
+            fields={"host": match.group("client")},
+        )
+```
+
+`clv/examples/nginx_error.py` is that plugin in full, commented; CLV writes a
+copy into `~/.config/clv/plugins/examples/` on first run.
+
+**Normalise onto CLV's vocabulary.** `NORMALISED_FIELD_KEYS` names the keys the
+parser already uses across formats — `host`, `tag`, `pid`, `request`, `status`
+and the rest. File your equivalent under the existing key rather than inventing
+a synonym: `host:10.0.0.5` should answer for your format the way it answers for
+syslog and for an access log. A genuinely new concept gets a key of its own.
+
+**What `parse()` must return.** An entry whose `format_name` is the one the class
+declared, and whose `fields` map strings to strings — values are compared as the
+parser stored them and nothing downstream coerces, so an HTTP status is `"500"`
+and not `500`. A plain `dict` is a fine `fields`; CLV treats it as read-only and
+never writes to it, and omitting it entirely gets the shared empty mapping that
+costs nothing. Return `None` to pass the line to the next format.
+
+**Anything else takes the format out of service**, named by the rule it broke —
+not a `LogEntry`, a `format_name` other than the declared one, a non-string
+field value. The read path is stricter than the render path on purpose: a stage
+that misbehaves costs a render, and a format that misbehaves writes a wrong
+entry into the buffer that every query, bucket and cluster downstream then
+believes.
+
+**Refused at load**, before a line is read, because each of these is silent at
+runtime: no `format_name`; a `format_name` that is a built-in's, including
+`raw`; one another loaded format already claimed; `field_names` that is not a
+set of non-empty strings; a `columns` naming a key outside `field_names`.
+
+**Continuation needs no cooperation.** An entry whose `format_name` is not
+`"raw"` is structured, so the unparsed line after it inherits its timestamp and
+level exactly as it would after a built-in's — and inherits no fields, because a
+stack trace frame has no host or PID of its own to report.
+
+**What you get for free, and it is the point of the seam.** An entry a plugin
+format produced is searchable by field query, bucketed by the timeline, folded
+by the repeat clusterer, shown in the detail pane, markable, watchable and
+exportable. None of that needed a line of code: it follows from the entry being
+well-formed, and `tests/test_plugin_formats.py` has one test per feature to keep
+it that way.
+
+**A format disabled mid-session does not re-parse what is already in the
+buffer.** Lines keep the `format_name` they were read with; re-opening the
+source is what re-reads them. New lines stop being offered to it immediately.
+
+### 4. Exporter
 
 Saves or transmits the entries the filters kept.
 
@@ -483,10 +581,12 @@ shutdown path acquires bugs of its own.
 
 **An exception in `teardown()` is contained. A hang is not.** CLV records the
 exception and carries on, but a `teardown()` that blocks forever blocks exit,
-and nothing here stops it. Bounding plugin *time* rather than plugin
-*exceptions* is a separate piece of work (`PLUGIN_TODO.md` Phase 6); until it
-lands, a plugin author is being trusted not to block on the way out, and that
-is a convention rather than a protection like every other one on this page.
+and nothing here stops it. The [budget](#the-budget) bounds a stage's time on
+the render path and deliberately does not reach the lifecycle hooks: a hook that
+never returns cannot be timed out from inside the process it is hanging, which
+needs a process CLV can kill (`PLUGIN_TODO.md` Phase 13). Until that lands a
+plugin author is being trusted not to block on the way out, and that is a
+convention rather than a protection, like every other one on this page.
 
 **`setup()` and `teardown()` are session lifecycle, not the enable switch.**
 Turning a plugin off in the `P` dialog and back on does not re-run `setup()`.
@@ -622,6 +722,102 @@ runs, never where.
 
 ---
 
+## Performance
+
+CLV contains a plugin's *exceptions*. Until now it did nothing about a plugin's
+*time*, and the two failures look completely different from the operator's
+chair: a stage that raises is named in the `P` dialog with its traceback, while
+a stage that is merely slow makes CLV look broken and says nothing at all.
+
+### How often each kind is called
+
+| Kind | Called | Per what |
+| --- | --- | --- |
+| `LogSourceProvider.discover` | on startup and on rescan | once |
+| `LogSourceProvider.open` | when a source is opened | once |
+| `LogFormat.parse` | **every read** | **once per unrecognised line** |
+| `FilterStage.apply` | **every render** | **once per buffered entry** |
+| `Exporter.export` | on `Ctrl+E` | once |
+
+The two bold rows are the ones to design against, and they are bold for
+different reasons. `apply` is called *often*: a render happens on every keystroke
+in the query box. `parse` is called once per line, but on a source nothing
+recognises that is every line of the file, arriving in one batch while the
+operator waits for the pane to appear — and it runs before anything is on screen
+to show for it. A render happens on every keystroke
+in the query box, and `max_buffer_lines` is configurable up to **500 000** — so
+a stage doing one regex match per entry at that ceiling is running half a
+million regexes between one character and the next. Make the cheap rejection
+first:
+
+```python
+def apply(self, entry, context):
+    if "password" not in entry.raw:      # a substring scan, not a regex
+        return entry
+    return replace(entry, raw=_SECRET.sub("******", entry.raw))
+```
+
+The same rule in a `LogFormat`, where the rejection is the common case rather
+than the exception — and compile the pattern once at class level, never inside
+`parse`:
+
+```python
+def parse(self, line):
+    if len(line) < 20 or line[4] != "/":   # two character tests
+        return None
+    ...
+```
+
+### The budget
+
+Every stage is charged the wall time of its own calls, accumulated per render
+pass. A pass over `plugin_time_budget_ms` is a strike; a pass under it clears
+the count. **Three strikes in a row and the plugin is disabled** for the
+session, through the same `disable()` a raising stage goes through — so it turns
+up in the `P` dialog as `failed`, with the elapsed number and the ceiling in the
+message, and **Re-enable** puts it back with a clean count.
+
+Three consecutive passes rather than one, because the first render after a
+source opens pays every cold cost a plugin has, and a large paste or a loaded
+machine can put a healthy stage over the line for a pass or two. A plugin that
+is genuinely slow still strikes out within about a second and a half of typing.
+
+**Two budgets, one policy.** `LogFormat.parse` is charged against a separate
+ceiling, because it is measured against a different thing: a pass on the read
+path is one batch of lines from a reader's `prime` or `poll`, not one render.
+Everything else is identical — three consecutive batches over the line and the
+format is disabled, named in `P`, and reachable by **Re-enable**.
+
+```ini
+[log_viewer]
+plugin_time_budget_ms = 250     # the render path: FilterStage.apply
+plugin_read_budget_ms = 50      # the read path: LogFormat.parse
+```
+
+Setting either to `0` turns that guard off entirely, for an operator who would rather
+have a slow plugin than a disabled one. There is no per-plugin override: a
+budget a plugin could raise for itself is not a budget.
+
+**Being disabled by the budget is the intended outcome, not a bug to work
+around.** If your stage cannot do its work per entry at the operator's buffer
+size, the fix is a cheaper stage — not a larger ceiling.
+
+### What is not bounded
+
+Time inside `apply()` is measured; nothing else is. In particular:
+
+- **`setup()`, `configure()` and `teardown()` are outside every budget.** A
+  plugin that *hangs* in one of them hangs CLV, and on `teardown()` that means
+  hanging exit. Exceptions there are contained; time is not. Bounding it needs a
+  process CLV can kill, which is `PLUGIN_TODO.md` Phase 13 and not a timer.
+- **Memory is not bounded at all.** A plugin that accumulates every entry it
+  sees will exhaust the process, and nothing here will notice.
+
+Both are consequences of a plugin running in CLV's own process — see
+[Trust model](#trust-model).
+
+---
+
 ## Conventions for plugin authors
 
 These are **conventions, not protections**. Each says who is trusting whom, and
@@ -675,11 +871,13 @@ lesser version of the core than the core writes against itself.
 | Group | Names |
 | --- | --- |
 | Version | `PLUGIN_API_VERSION` |
-| Interfaces | `Plugin`, `LogSourceProvider`, `FilterStage`, `Exporter` |
+| Interfaces | `Plugin`, `LogSourceProvider`, `LogFormat`, `FilterStage`, `Exporter` |
 | Handed to you | `LogEntry`, `FilterContext`, `FilterSpec`, `TimeWindow`, `ProviderSource`, `SourceRef` |
+| Declaring a format | `FormatProfile`, `DEFAULT_PROFILE`, `FORMAT_NAMES` |
 | Handed back | `ExportResult` |
 | Severity | `normalize_level`, `level_rank`, `level_matches`, `highest_level`, `LEVEL_TRACE` … `LEVEL_CRITICAL`, `LEVEL_ORDER`, `SEVERITY_BUCKETS` |
 | Fields | `NORMALISED_FIELD_KEYS` |
+| Settings | `setting_bool`, `setting_list` |
 | Process boundary | `WIRE_VERSION`, `entry_to_wire`, `entry_from_wire` |
 
 The severity helpers are published because the alternative is every plugin
@@ -688,6 +886,10 @@ syslog's numeric `4` are one severity, and a plugin that decides otherwise makes
 CLV disagree with itself about what the operator filtered for.
 `SEVERITY_BUCKETS` is a plain dict and is read-only **by convention** — mutating
 it changes what every severity filter in the process means.
+
+`FORMAT_NAMES` is published for the same kind of reason: it is the set of names
+a `LogFormat` may *not* claim, and an author should be able to check that rather
+than discover it from a load error.
 
 ### Two versions, and they are not the same version
 

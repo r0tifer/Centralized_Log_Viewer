@@ -56,6 +56,7 @@ from .plugins import (
     ExportResult,
     FilterContext,
     FilterStage,
+    LogFormat,
     LogSourceProvider,
     Plugin,
     ProviderSource,
@@ -63,7 +64,9 @@ from .plugins import (
     setting_list,
 )
 from .services.filtering import FilterSpec, TimeWindow
+from .services.formats import DEFAULT_PROFILE, FormatProfile
 from .services.parsing import (
+    FORMAT_NAMES,
     LEVEL_CRITICAL,
     LEVEL_DEBUG,
     LEVEL_ERROR,
@@ -91,6 +94,7 @@ __all__ = [
     # --- interfaces ---------------------------------------------------------
     "Plugin",
     "LogSourceProvider",
+    "LogFormat",
     "FilterStage",
     "Exporter",
     # --- data handed to a plugin --------------------------------------------
@@ -103,6 +107,17 @@ __all__ = [
     # `LogSourceProvider.discover` may return one, so a provider author needs
     # the type even though CLV accepts a bare `Path` as shorthand.
     "SourceRef",
+    # --- declaring a format --------------------------------------------------
+    # A `format_name` is four registrations and only one of them is the parser.
+    # `FormatProfile` says which of a format's fields earn the source cell and
+    # the chips, so a plugin format's rows are structured on the same terms a
+    # built-in's are rather than falling back to a bare message line.
+    "FormatProfile",
+    "DEFAULT_PROFILE",
+    # The names CLV already answers to, and therefore the ones a plugin format
+    # may not claim. Published so an author can check rather than discover it
+    # from a load error.
+    "FORMAT_NAMES",
     # --- data a plugin hands back -------------------------------------------
     "ExportResult",
     # --- the severity vocabulary --------------------------------------------

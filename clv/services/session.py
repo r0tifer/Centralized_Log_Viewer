@@ -26,7 +26,7 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Optional, Sequence
+from typing import Any, Callable, Iterable, Iterator, Optional, Sequence
 
 from .backend import cheap_only
 from .filtering import sortable_moment
@@ -202,11 +202,16 @@ class SourceBuffer:
         reader: AnyReader | None = None,
         tag_origin: bool = False,
         facts: SourceFacts | None = None,
+        formats: Any = (),
     ) -> None:
         self.path = path
         self.reader = reader
         self.max_lines = max_lines
-        self.parser = LogParser()
+        #: Plugin-supplied parsers, already guarded and budgeted -- `()` when
+        #: none are enabled, which is what keeps the parser exactly as it was.
+        #: Handed to the parser rather than held here: carry-forward is per
+        #: source and so is everything else about how a line becomes an entry.
+        self.parser = LogParser(formats=formats)
         self.entries: deque[LogEntry] = deque(maxlen=max_lines)
         #: Record this buffer's path on every entry it produces. Set when the
         #: buffer is one of several, so a merged view can say where a line came
@@ -358,6 +363,11 @@ class SourceSession:
         self._buffers: list[SourceBuffer] = []
         self._max_lines = max_lines
         self._reader_factory = reader_factory
+        #: The enabled `LogFormat` plugins, handed to every buffer this session
+        #: opens. An attribute rather than a constructor argument because the
+        #: app builds its session in `__init__` and loads plugins in `on_mount`:
+        #: there is no buffer yet at construction, so nothing can miss them.
+        self.formats: Any = ()
         #: What machine a source is on, and what that means for ordering it.
         #: Injected for the same reason `reader_factory` is: this module may not
         #: know that SSH exists, and the answer for a remote source comes from
@@ -370,6 +380,11 @@ class SourceSession:
         #: in the query box; a merge must not.
         self._merge_cache: Optional[tuple[tuple[int, ...], list[LogEntry]]] = None
         self._anchored = 0
+        #: This session's own share of :attr:`revision`. Bumped by
+        #: :meth:`set_entries`, which is the one way the lines can change
+        #: without any buffer's ``poll`` running — and, when nothing is open,
+        #: without there being a buffer to bump at all.
+        self._revision = 0
 
     # --- membership ---------------------------------------------------------
 
@@ -408,7 +423,9 @@ class SourceSession:
             return
         buffer = self.primary
         if buffer is None:
-            self._buffers.append(SourceBuffer(path, max_lines=self._max_lines))
+            self._buffers.append(
+                SourceBuffer(path, max_lines=self._max_lines, formats=self.formats)
+            )
         else:
             buffer.path = path
 
@@ -426,6 +443,7 @@ class SourceSession:
             max_lines=self._max_lines,
             reader=reader,
             facts=self._facts(path),
+            formats=self.formats,
         )
         buffer.prime()
         self.close()
@@ -458,6 +476,7 @@ class SourceSession:
             max_lines=self._max_lines,
             reader=reader,
             facts=self._facts(reader.path),
+            formats=self.formats,
         )
         buffer.prime()
         self.close()
@@ -508,6 +527,7 @@ class SourceSession:
                     # constant answer, so every line records its own.
                     tag_origin=len(paths) > 1,
                     facts=self._facts(path),
+                    formats=self.formats,
                 )
                 buffer.prime()
             except OSError as exc:
@@ -570,6 +590,7 @@ class SourceSession:
             # `node`, so `node:web01` would not answer for it and a cross-host
             # merge would order it by this machine's clock.
             facts=self._facts(path),
+            formats=self.formats,
         )
         buffer.prime()
         self.close()
@@ -629,6 +650,24 @@ class SourceSession:
             return self._buffers[0].entries
         return self._merged()
 
+    @property
+    def revision(self) -> tuple[int, ...]:
+        """A value that changes whenever :attr:`entries` could have.
+
+        What a cache over the filtered view keys on, in the shape
+        :attr:`_merge_cache` already used one level down. The session's own
+        counter leads, then one entry per buffer, so a member being added or
+        removed changes it by length as well as by content.
+
+        The guarantee is one-directional and worth stating: every *supported*
+        way of changing the lines moves this. Reaching past it — mutating a
+        buffer's deque in place, which some of this project's own tests do to
+        seed a pane — does not, and a cache keyed on this alone would go stale.
+        Callers pair it with ``len(entries)`` for that reason.
+        """
+
+        return (self._revision, *(buffer.revision for buffer in self._buffers))
+
     def set_entries(self, entries: Iterable[LogEntry]) -> None:
         """Replace the primary buffer's lines wholesale."""
 
@@ -636,11 +675,18 @@ class SourceSession:
             replacement = entries
         else:
             replacement = deque(entries, maxlen=self._max_lines)
+        # The largest change a buffer's contents can undergo, so it counts as
+        # one — for the merge cache one level down as much as for the filtered
+        # view above. Bumped before the `primary is None` branch, because
+        # replacing `_empty` is still a replacement and there is no buffer to
+        # record it on.
+        self._revision += 1
         buffer = self.primary
         if buffer is None:
             self._empty = replacement
             return
         buffer.entries = replacement
+        buffer.revision += 1
 
     def _merged(self) -> list[LogEntry]:
         """Every member's lines as one timestamp-ordered stream.

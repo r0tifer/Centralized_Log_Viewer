@@ -40,6 +40,7 @@ EXPECTED_API = frozenset(
         # interfaces
         "Plugin",
         "LogSourceProvider",
+        "LogFormat",
         "FilterStage",
         "Exporter",
         # data handed to a plugin
@@ -49,6 +50,10 @@ EXPECTED_API = frozenset(
         "TimeWindow",
         "ProviderSource",
         "SourceRef",
+        # declaring a format
+        "FormatProfile",
+        "DEFAULT_PROFILE",
+        "FORMAT_NAMES",
         # data a plugin hands back
         "ExportResult",
         # the severity vocabulary
@@ -91,6 +96,8 @@ EXPECTED_SIGNATURES: dict[str, str] = {
     "LogSourceProvider.open_reader": (
         "(self, path: 'Path', *, max_lines: 'int') -> 'Optional[Any]'"
     ),
+    "LogFormat.parse": "(self, line: 'str') -> 'Optional[LogEntry]'",
+    "FormatProfile.keys": "(self) -> 'frozenset[str]'",
     "FilterStage.apply": (
         "(self, entry: 'LogEntry', context: 'FilterContext') -> 'Optional[LogEntry]'"
     ),
