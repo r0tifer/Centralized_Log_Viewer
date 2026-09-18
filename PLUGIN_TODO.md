@@ -38,7 +38,7 @@ that argument; Phase 7b is the exception, and it is here because designing the
 | **Stage C — Core seams** | | |
 | 7a — Parsing | `LogFormat`, and a plugin that teaches CLV a format | ✅ Done |
 | 7b — logfmt | `key=value` parsing, built in because a plugin cannot | ✅ Done |
-| 8 — Query | `QueryOperator`, `ComputedField`, and the degradation rule | ⬜ Not started |
+| 8 — Query | `QueryOperator`, `ComputedField`, and the degradation rule | ✅ Done |
 | 9 — Watch | `WatchMatcher`, `WatchSink`, off the event loop | ⬜ Not started |
 | 10 — Clustering | `ClusterRule`, `ShapeContributor`, and the shape cache | ⬜ Not started |
 | 11 — Timeline | `TimelineAnnotation`, `TimelineMetric`, foldable only | ⬜ Not started |
@@ -1781,7 +1781,91 @@ it needs. `query.py`'s module docstring records the narrow reversal.
 
 **Gate.** A plugin adds `~` for regex-match-a-field, it works in the query box,
 in a saved view and in a watch rule, and removing the plugin disables those
-without corrupting them. Suite green on 3.11 and 3.14.
+without corrupting them. Suite green on 3.11 and 3.14: 2042 passed on both.
+
+**As shipped.** Eight decisions worth recording, one of them a correction to
+this phase's own text.
+
+*There are two absences, not one, and this file said one.* The text above says a
+view whose `requires` names "a missing **or disabled** plugin" is marked
+unusable. Shipped as two states, because collapsing them punishes the wrong
+person: an operator who switches a plugin off in the `P` dialog for a minute
+would find every saved view that uses it marked broken, and switching it back on
+is the fix for a problem they did not have. So `unsatisfied()` asks only whether
+a plugin is **installed**. A plugin that is installed and merely out of service
+keeps its token registered and its terms raise `QueryError` naming it — which is
+not a softer version of the same report but the *stronger* one, because it is
+the case where the grammar still exists to complain with. Uninstalling is the
+case where nothing is left to notice, which is exactly why the record has to
+live on the saved thing.
+
+*A token stays reserved while its plugin is switched off.* The tempting
+implementation installs only the enabled plugins, and it is wrong in the one way
+this phase exists to prevent: dropping `~` from the alternation makes `svc~web`
+stop parsing as a term and fall through to `compile_query`, so switching a
+plugin off would silently convert every query using it into a regex over the raw
+line. `QueryStack` therefore builds a spec for every *loaded* plugin and sets the
+callable to `None` for the ones out of service.
+
+*The alternation with nothing installed is byte-identical to the one this module
+shipped with.* Not by accident and not by preserving a literal: the tokens are
+sorted by length *alone* and Python's sort is stable, so the built-ins keep their
+declared order. Two tokens of equal length cannot be a prefix of one another, so
+their relative order is free — which is what makes the stable sort correct and
+not merely convenient. `tests/test_plugin_query.py` pins the pattern string.
+
+*`_HAS_OPERATOR` is one character per token, and the last one.* The cheap
+pre-test that keeps a plain regex out of the tokeniser had to be derived too. Any
+single character of a token is a sound representative — the token cannot be
+present unless all of its characters are — and taking the last reproduces
+`[:=<>]` for the built-in set exactly, rather than adding `!` and sending
+`don't` through the tokeniser for nothing.
+
+*`FieldTerm` gained `compare()` rather than a bound predicate.* Resolving the
+operator at parse time and hanging the callable on the term would save a dict
+lookup per comparison and would break the type: `FieldTerm` is frozen and
+slotted and compares by value, so two identical terms carrying two closures
+would be unequal, and every existing test that compares a literal `FieldTerm`
+would have had to change. The lookup is on a dict that is empty unless a query
+plugin is installed.
+
+*A third `PluginBudget`, sharing the render ceiling and settling separately.*
+Query plugins are the same kind of work on the same trigger as `FilterStage` —
+a keystroke, over the whole buffer — so they take the same `plugin_time_budget_ms`.
+They get their own instance because a pass is `start()`/`settle()` and
+`apply_filters` opens and closes its own: a stage and an operator sharing one
+pass would have their strikes interleaved by whichever was measured first.
+
+*A computed field's name collides casefolded, and a token's does not.*
+`query._lookup` already matched a field key case-insensitively, so `Age` and
+`age` are one field to any query that could ask for either; compared exactly,
+the second plugin to claim one would load and then silently replace the first in
+the installed registry — a plugin doing nothing, with no diagnosis, from the
+outside having loaded fine. Tokens need no such rule, because a letter is a key
+character and a token may not contain one.
+
+*The `Query` section became three.* This file asked for one section in
+`clv/plugins/AGENTS.md`. The interfaces went into the numbered list where every
+other interface lives, because that is where an author looks for a signature;
+the `requires` rule went to a section of its own, because it belongs to neither
+interface alone and Phases 9 through 11 inherit it rather than restating it.
+
+**Also swept here.** [AGENTS.md](AGENTS.md)'s plugin table still said "Three
+interfaces" and listed the original three — it went stale when Phase 7a added
+`LogFormat` and nobody noticed, which is the failure a table maintained by hand
+beside a `_KINDS` tuple will keep having. Now six, with a pointer at `clv/api.py`
+as the thing a plugin actually imports. `tests/conftest.py` gained an autouse
+fixture resetting the installed grammar between tests — module state shared
+across a suite fails *quietly*, and a leaked `~` changes what `_TERM_RE`
+matches, so the compatibility test pinning "a plain regex is passed through
+untouched" would pass or fail on the order the files happened to run in. `tests/test_state_schema.py` gained a
+field-by-field round trip for `WatchRule`, which is a *third* hand-written copy
+of the "one bad record must not cost the list" convention and inherited nothing
+from the two that are annotation-driven — so a field added to it tomorrow now
+fails there rather than on someone's disk. `tests/test_config.py`'s seeding
+check is driven off `SEEDED_EXAMPLES` rather than naming one file, so the second
+worked example could not be added without also being written up in the plugin
+directory's `README.txt`.
 
 **Commit.** `feat(plugins): query operators, computed fields and the requires rule`
 

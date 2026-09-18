@@ -1326,6 +1326,17 @@ def test_the_worked_example_is_written_but_not_discoverable() -> None:
         encoding="utf-8"
     )
 
+    # Driven off the table rather than naming one file, so an example added to
+    # SEEDED_EXAMPLES that fails to seed — or that seeds without being written
+    # up — fails here rather than being discovered by whoever went looking for
+    # it in a fresh install.
+    from clv.services.config import SEEDED_EXAMPLES
+
+    readme = (created / "README.txt").read_text(encoding="utf-8")
+    for filename in SEEDED_EXAMPLES:
+        assert (created / "examples" / filename).exists(), filename
+        assert f"examples/{filename}" in readme, filename
+
 
 def test_the_worked_example_is_never_written_over() -> None:
     """An operator who edited it, or deleted it, keeps that decision."""

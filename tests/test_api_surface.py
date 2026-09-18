@@ -41,6 +41,8 @@ EXPECTED_API = frozenset(
         "Plugin",
         "LogSourceProvider",
         "LogFormat",
+        "QueryOperator",
+        "ComputedField",
         "FilterStage",
         "Exporter",
         # data handed to a plugin
@@ -75,6 +77,8 @@ EXPECTED_API = frozenset(
         "setting_list",
         # the field vocabulary
         "NORMALISED_FIELD_KEYS",
+        # extending the query
+        "BUILTIN_OPERATORS",
         # crossing a process boundary
         "WIRE_VERSION",
         "entry_to_wire",
@@ -97,6 +101,8 @@ EXPECTED_SIGNATURES: dict[str, str] = {
         "(self, path: 'Path', *, max_lines: 'int') -> 'Optional[Any]'"
     ),
     "LogFormat.parse": "(self, line: 'str') -> 'Optional[LogEntry]'",
+    "QueryOperator.test": "(self, stored: 'str', value: 'str') -> 'bool'",
+    "ComputedField.value": "(self, entry: 'LogEntry') -> 'Optional[str]'",
     "FormatProfile.keys": "(self) -> 'frozenset[str]'",
     "FilterStage.apply": (
         "(self, entry: 'LogEntry', context: 'FilterContext') -> 'Optional[LogEntry]'"

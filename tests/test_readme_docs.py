@@ -196,3 +196,23 @@ def test_readme_documents_the_plugins_setting() -> None:
     text = _read()
 
     assert "| `plugins` |" in text
+
+
+def test_readme_says_the_operator_set_is_extensible() -> None:
+    """Field queries is where someone reads what they can type."""
+
+    text = _read()
+    section = text.split("### Field queries", 1)[1].split("### Navigating", 1)[0]
+    assert "The operator set is extensible" in section
+    assert "field_regex" in section
+
+
+def test_readme_says_a_saved_view_records_what_its_query_needs() -> None:
+    """The degradation rule, where the operator meets its consequence."""
+
+    text = _read()
+    section = text.split("### Field queries", 1)[1].split("### Navigating", 1)[0]
+    assert "records which plugins its query needs" in section
+    assert "refused rather than applied" in section
+    # And says nothing was rewritten, which is the half people assume otherwise.
+    assert "nothing was rewritten" in section

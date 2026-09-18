@@ -76,8 +76,9 @@ desktop terminal and on a headless 80-column SSH session.
   do on a single file. A set may span machines: with SSH configured, local and
   remote logs interleave in one pane, and `node:` says which machine each line
   came from.
-- 🧩 **Plugins.** `LogSourceProvider`, `FilterStage` and `Exporter` interfaces,
-  published as a versioned API in `clv.api`. Install one by copying a file into
+- 🧩 **Plugins.** Seven interfaces — sources, log formats, query operators,
+  computed fields, filter stages and exporters — published as a versioned API
+  in `clv.api`. Install one by copying a file into
   `~/.config/clv/plugins/` — no root, no Python toolchain, and it survives a
   package upgrade. A file there is listed but **not run** until you name it in
   the `plugins` setting, so installing a plugin and running one stay two
@@ -1129,6 +1130,22 @@ always been, matched against the whole raw line.
 
 Quote a value to keep spaces or colons inside it: `msg:"disk full"`.
 
+**The operator set is extensible, and so is the list of names.** A plugin can
+add a comparison token of its own and a field that is *derived* rather than
+parsed — the shipped `examples/field_regex.py` adds `~` for "this field matches
+this regex" and `age` for seconds since the line was written, so `host~^web[0-9]+`
+and `age<60 level:error` become things you can type. They work everywhere a
+built-in term does, including in a saved view and in a watch rule. CLV's own
+seven tokens are reserved and a computed field never overrides what a line
+actually said, so nothing you already search for changes. See
+`clv/plugins/AGENTS.md` for the interfaces.
+
+**A saved view or watch rule records which plugins its query needs.** If one is
+not installed the record is kept exactly as you wrote it, marked `⚠` with the
+plugin named, and refused rather than applied — because `host~^web` without its
+operator is not a narrower search, it is a regex that happens to parse. Install
+the plugin again and it works again; nothing was rewritten in the meantime.
+
 Which names work depends on the source. The parser's own vocabulary — `host`,
 `tag`, `pid`, `msgid`, `ident`, `user`, `request`, `status`, `size` — is always
 available, and every key a JSON or logfmt line carries is added as soon as one
@@ -1232,6 +1249,11 @@ offered every line the built-ins declined; what it returns is an entry on equal
 terms with a built-in's — searchable by field query, bucketed by the timeline,
 folded by `c`, shown in the detail pane and exportable, with its own source cell
 and chips in the structured view. `clv/plugins/AGENTS.md` has the interface.
+
+**So is teaching the query box a new word.** A `QueryOperator` adds a comparison
+token and a `ComputedField` adds a queryable field derived rather than parsed —
+see [Field queries](#field-queries). Both add vocabulary and neither adds
+grammar: there is still no `OR`, no parentheses and no precedence.
 
 ### Managing what is installed
 
@@ -1360,6 +1382,6 @@ worth starring and comparing across a fleet.
 ```bash
 python -m pip install -e .
 python -m pip install pytest
-python -m pytest            # 1943 passed, 1 skipped, 11 deselected
+python -m pytest            # 2042 passed, 1 skipped, 11 deselected
 python -m textual run clv/app.py --dev
 ```

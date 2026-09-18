@@ -265,3 +265,59 @@ def test_the_log_format_seam_is_documented_like_the_others() -> None:
     assert "`LogFormat.parse`" in text
     # The honest limit, stated beside the feature rather than left to be found.
     assert "does not re-parse what is already in the" in text
+
+
+# --- Phase 8: the query seam and its degradation rule -----------------------
+
+
+def test_the_query_interfaces_are_documented_where_the_others_are() -> None:
+    """In the numbered list, because that is where an author looks for a signature."""
+
+    text = _read(PLUGIN_AGENTS)
+    for heading in ("### 4. QueryOperator", "### 5. ComputedField"):
+        assert heading in text, f"clv/plugins/AGENTS.md lost its {heading!r} section"
+
+
+def test_the_reserved_tokens_are_documented_as_a_rule_not_a_list() -> None:
+    """An author should be able to check, not discover it from a load error."""
+
+    text = _read(PLUGIN_AGENTS)
+    assert "BUILTIN_OPERATORS" in text
+    assert "Longest token wins" in text
+    # The ambiguity rule is the one nobody guesses, so it is written out.
+    assert "could not be told from a key called" in text
+
+
+def test_the_resolution_order_for_a_computed_field_is_stated() -> None:
+    text = _read(PLUGIN_AGENTS)
+    assert "Parsed fields resolve first, per entry." in text
+    assert "it can never change what a line said" in text
+
+
+def test_the_two_absences_are_documented_separately() -> None:
+    """Collapsing them is the mistake this section exists to prevent.
+
+    An uninstalled plugin makes a saved thing *unusable*; a switched-off one
+    keeps its token reserved so the query still means what it meant. A document
+    that said only "the plugin is missing" would leave an operator unable to
+    tell why one case marked their views broken and the other did not.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    assert "## Saved views, watch rules and a missing plugin" in text
+    assert "not installed" in text
+    assert "switched off" in text
+    assert "is not in service" in text
+    assert "Nothing is ever rewritten." in text
+
+
+def test_the_query_dsl_reversal_is_on_the_record() -> None:
+    """Rewritten with its reversal rather than deleted — the rule from TODO.md."""
+
+    text = _read(PLUGIN_AGENTS)
+    assert '- **"No query DSL."** *Reversed' in text
+    # And the reversal stays narrow, in the same sentence that offers it.
+    reversal = text.split('- **"No query DSL."**', 1)[1].split("- **", 1)[0]
+    for word in ("OR", "parentheses", "precedence"):
+        assert word in reversal, f"the reversal must still decline {word}"
+    assert "vocabulary" in reversal and "structure" in reversal

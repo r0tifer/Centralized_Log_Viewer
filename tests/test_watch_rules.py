@@ -5,15 +5,18 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+import re
 from time import monotonic
 
 import pytest
-from textual.widgets import Input, Switch
+from textual.widgets import Input, OptionList, Switch
 
 from clv.app import LogViewerApp
+from clv.plugins import PluginRegistry, QueryOperator
 from clv.services.config import LogConfig
 from clv.services.discovery import DiscoverySettings
 from clv.services.parsing import LogParser
+from clv.services.query import NORMALISED_FIELD_KEYS, install_query_plugins
 from clv.services.refs import RemoteRef, format_ref
 from clv.services.watch import (
     ACTION_HIGHLIGHT,
@@ -691,3 +694,172 @@ def test_a_rule_persists_unchanged_while_a_remote_source_is_open(
 
     assert restored.watch_rules == rules
     assert restored.starred == (remote,)
+
+
+# --- a rule whose pattern needs a plugin that is gone -----------------------
+#
+# Phase 8 of PLUGIN_TODO.md. Without `requires`, `host~^web` with the operator
+# uninstalled compiles as a regex and starts highlighting lines containing that
+# literal text — quietly marking the wrong lines, which is worse than marking
+# none. The grammar itself is exercised in `test_plugin_query.py`.
+
+
+class _RegexMatch(QueryOperator):
+    name = "field-regex"
+    token = "~"
+
+    def test(self, stored: str, value: str) -> bool:
+        return re.search(value, stored) is not None
+
+
+def _load_operator(app) -> None:
+    """Add a `~` operator to a running app's registry and install it."""
+
+    assert app._plugins.add(
+        _RegexMatch(), origin="/tmp/field_regex.py", clv_version="2.9.0"
+    ), [str(error) for error in app._plugins.errors]
+    app._plugins.order()
+    app._install_query_plugins()
+
+
+@pytest.fixture
+def regex_operator():
+    """Install a `~` operator for the duration of one test."""
+
+    registry = PluginRegistry()
+    assert registry.add(
+        _RegexMatch(), origin="/tmp/field_regex.py", clv_version="2.9.0"
+    ), [str(error) for error in registry.errors]
+    registry.order()
+    stack = registry.query_stack()
+    install_query_plugins(stack.operators, stack.computed)
+    try:
+        yield registry
+    finally:
+        install_query_plugins()
+
+
+def test_a_rule_using_a_plugin_operator_matches(regex_operator) -> None:
+    parser = LogParser()
+    entry = parser.feed(["Aug 21 09:25:01 web01 sshd[42]: refused"])[0]
+    rule = WatchRule(name="web", pattern="host~^web", requires=("field-regex",))
+
+    index = WatchIndex((rule,), NORMALISED_FIELD_KEYS)
+    index.evaluate(None, [entry])
+    assert index.hits(None, entry) == ("web",)
+
+
+def test_a_rule_never_matches_once_its_plugin_is_uninstalled() -> None:
+    parser = LogParser()
+    entry = parser.feed(["Aug 21 09:25:01 web01 sshd[42]: refused"])[0]
+    rule = WatchRule(name="web", pattern="host~^web", requires=("field-regex",))
+
+    index = WatchIndex((rule,), NORMALISED_FIELD_KEYS)
+    index.evaluate(None, [entry])
+    assert index.hits(None, entry) == ()
+    assert rule.missing_plugins == ("field-regex",)
+
+
+def test_a_rule_without_requires_is_unaffected() -> None:
+    """Requirement 10: a rule from before this phase behaves exactly as it did."""
+
+    parser = LogParser()
+    entry = parser.feed(["Aug 21 09:25:01 web01 sshd[42]: refused"])[0]
+    rule = WatchRule(name="plain", pattern="refused")
+
+    index = WatchIndex((rule,), NORMALISED_FIELD_KEYS)
+    index.evaluate(None, [entry])
+    assert index.hits(None, entry) == ("plain",)
+
+
+def test_validate_pattern_names_the_missing_plugin() -> None:
+    assert validate_pattern("host~^web", NORMALISED_FIELD_KEYS) is None
+    problem = validate_pattern("host~^web", NORMALISED_FIELD_KEYS, ("field-regex",))
+    assert problem == "Rule needs the 'field-regex' plugin, which is not installed."
+
+
+def test_the_rules_dialog_marks_a_rule_whose_plugin_is_missing(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        rules = [
+            WatchRule(name="plain", pattern="refused"),
+            WatchRule(name="web", pattern="host~^web", requires=("field-regex",)),
+        ]
+        app = _app(tmp_path)
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.push_screen(WatchRulesDialog(rules))
+            await pilot.pause()
+
+            options = app.screen.query_one("#watch-list", OptionList)
+            rendered = [options.get_option_at_index(i).prompt.plain for i in range(2)]
+
+        assert "⚠" not in rendered[0]
+        assert "⚠" in rendered[1]
+        assert "field-regex" in rendered[1]
+        # Still `[on]`: it *is* enabled, and showing it as off would point the
+        # operator at a switch that would change nothing.
+        assert rendered[1].startswith("[on]")
+
+    _run(scenario)
+
+
+def test_the_rules_dialog_records_what_a_new_pattern_needs(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        results: list[tuple[WatchRule, ...] | None] = []
+        app = _app(tmp_path)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            # Into the *app's* registry: `on_mount` installs its own plugins, so
+            # a grammar installed before the app started is replaced by an empty
+            # one. This is the path an operator takes too — enabling a plugin in
+            # the `P` dialog moves the generation and re-installs.
+            _load_operator(app)
+            app.push_screen(WatchRulesDialog((), NORMALISED_FIELD_KEYS), callback=results.append)
+            await pilot.pause()
+
+            await pilot.press("a")
+            await pilot.pause()
+            dialog = app.screen
+            for char in "web":
+                await pilot.press(char)
+            pattern = dialog.query_one("#watch-pattern", Input)
+            pattern.value = "host~^web"
+            pattern.focus()
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+
+        assert results == [
+            (WatchRule(name="web", pattern="host~^web", requires=("field-regex",)),)
+        ]
+
+    _run(scenario)
+
+
+def test_the_rules_dialog_records_nothing_without_query_plugins(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        results: list[tuple[WatchRule, ...] | None] = []
+        app = _app(tmp_path)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app.push_screen(WatchRulesDialog((), NORMALISED_FIELD_KEYS), callback=results.append)
+            await pilot.pause()
+
+            await pilot.press("a")
+            await pilot.pause()
+            for char in "oom":
+                await pilot.press(char)
+            pattern = app.screen.query_one("#watch-pattern", Input)
+            pattern.value = "oom-killer"
+            pattern.focus()
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+
+        assert results == [(WatchRule(name="oom", pattern="oom-killer"),)]
+
+    _run(scenario)

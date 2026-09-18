@@ -50,6 +50,18 @@ class SavedView:
     #: other field here — a view records what you were looking at, never what
     #: was in it.
     merged: tuple[str, ...] = ()
+    #: Query plugins :attr:`query` depends on, recorded when the view was saved.
+    #: A view naming a plugin that is not installed is **kept byte-intact,
+    #: marked unusable and reported with the plugin it needs** — never rewritten
+    #: and never applied, because ``svc~web`` without its operator is not a
+    #: narrower query, it is a regex over the raw line that happens to parse.
+    #:
+    #: Deliberately unlike a missing :attr:`source`, which applies anyway: a
+    #: rotated-away log still leaves the filters meaning what they meant.
+    #:
+    #: Empty for every view written before this existed, and the annotation text
+    #: matters — :meth:`from_dict` dispatches on it.
+    requires: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, raw: Any) -> Optional["SavedView"]:

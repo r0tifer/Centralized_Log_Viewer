@@ -112,7 +112,11 @@ from .services.parsing import (
 from .services.query import (
     NORMALISED_FIELD_KEYS,
     collect_field_names,
+    computed_field_names,
     entry_matches,
+    install_query_plugins,
+    requirements,
+    unsatisfied,
 )
 from .services.refs import (
     JournalRef,
@@ -147,9 +151,11 @@ from .services.session import (
 from .services.timeline import Timeline, build_timeline
 from .services.timeline import EMPTY as EMPTY_TIMELINE
 from .services.watch import (
+    UNUSABLE_MARK,
     WatchIndex,
     WatchNotifier,
     WatchRule,
+    describe_missing,
     describe_rules,
     notifying,
     toggled,
@@ -227,6 +233,9 @@ STARRED_GROUP = f"{ICON_STAR} Starred"
 #: cost a walk down the hierarchy on every launch.
 ICON_VIEW = "📑"
 VIEWS_GROUP = f"{ICON_VIEW} Views"
+#: A view whose query needs an uninstalled plugin is marked rather than hidden.
+#: The glyph is `services.watch.UNUSABLE_MARK`, imported rather than repeated —
+#: the picker and the rules dialog show the same mark for the same state.
 #: A rotated set: several files, one log. Distinct from the folder icon
 #: because expanding it lists members rather than a directory's contents.
 ICON_ROTATED = "🗂"
@@ -835,6 +844,8 @@ class LogViewerApp(App[None]):
         self._plugin_budget = self._new_plugin_budget()
         #: The same, for one `LogFormat` over one batch of lines read.
         self._read_budget = self._new_read_budget()
+        #: The same again, for the query plugins over one filter of the buffer.
+        self._query_budget = self._new_query_budget()
         #: The instant a relative time window ("15m") counts back from, held
         #: still until the buffer changes. `parse_relative_window` reads
         #: `datetime.now()`, so without this every call to `_filter_spec`
@@ -861,6 +872,17 @@ class LogViewerApp(App[None]):
         #: and answers a query *before* a line carrying it has been read, which
         #: is the same promise the normalised keys already make.
         self._plugin_fields: frozenset[str] = frozenset()
+        #: Field names the installed `ComputedField` plugins answer to, whether
+        #: or not they are in service. Out-of-service names stay in the
+        #: vocabulary deliberately: dropping one turns `age>300` back into free
+        #: text, and a term that quietly becomes a regex is the failure this
+        #: whole seam is built to prevent. A switched-off plugin reports itself
+        #: through the query bar's validation line instead.
+        self._computed_fields: frozenset[str] = frozenset()
+        #: The guarded, budgeted query plugins, as `install_query_plugins` took
+        #: them. Held so the render path can open and close a budget pass around
+        #: the filter that runs them.
+        self._query_stack = self._plugins.query_stack(budget=self._query_budget)
         #: What was last handed to the query bar -- the buffer's names union the
         #: plugins'. Tracked here because enabling a format changes it without
         #: any line having arrived, and the early return above is keyed on the
@@ -971,8 +993,10 @@ class LogViewerApp(App[None]):
         # into a registry nothing reads.
         self._plugin_budget = self._new_plugin_budget()
         self._read_budget = self._new_read_budget()
+        self._query_budget = self._new_query_budget()
         self._plugin_generation = self._plugins.generation
         self._install_formats()
+        self._install_query_plugins()
         # After the wiring, so a provider's `setup()` sees a fully assembled
         # plugin rather than one still waiting for its resolver.
         self._plugins.start()
@@ -2308,12 +2332,17 @@ class LogViewerApp(App[None]):
         def marker(glyph: str, action: str) -> tuple[str, Style]:
             return glyph, Style.from_meta({ACTION_META: action}) + ACTION_STYLE
 
+        # A view whose query needs a plugin that is not installed still gets
+        # its row and its verbs -- it can be renamed and deleted, because it is
+        # intact and it is theirs. What it cannot do is apply, so the row says
+        # so where they will read it before pressing it.
+        suffix = f"  {UNUSABLE_MARK}" if unsatisfied(view.requires) else ""
         return Text.assemble(
             f"{ICON_VIEW} ",
             marker(ICON_NAME_SET, ACTION_VIEW_RENAME),
             " ",
             marker(ICON_CLEAR_SET, ACTION_VIEW_DELETE),
-            f" {view.name}",
+            f" {view.name}{suffix}",
         )
 
     def _merged_display_paths(self) -> list[Path]:
@@ -3128,7 +3157,19 @@ class LogViewerApp(App[None]):
         staged = self._plugins.apply_filters(
             list(entries), context, budget=self._plugin_budget
         )
-        result = filter_entries(staged, spec)
+        # The pass the query plugins are charged against. Bracketed here and
+        # not inside `filter_entries`, which is a pure function of its arguments
+        # and stays one -- and here rather than in `_visible_entries` because
+        # this is the path that runs the whole buffer on every keystroke. The
+        # other callers -- the incremental slice, the hit counter, `n`/`N` --
+        # open no pass, and what they charge rolls into the next one. That is
+        # the same per-entry work measured a beat late, not work going unmeasured.
+        stack = self._query_stack
+        stack.start()
+        try:
+            result = filter_entries(staged, spec)
+        finally:
+            stack.settle()
         self._visible_cache = (key, result)
         return result
 
@@ -3168,6 +3209,32 @@ class LogViewerApp(App[None]):
             # buffer's own names are unioned back in rather than dropped.
             self._sync_field_names()
 
+    def _install_query_plugins(self) -> None:
+        """Put the query plugins where `clv.services.query` looks for them.
+
+        Injection, like `_install_formats` beside it: `query.py` takes its
+        operators and computed fields from a module registry this method fills
+        and never imports `clv.plugins`. What it receives are specs whose
+        callables are already wrapped — the guard has to travel with the plugin,
+        because a raising operator must go through `PluginRegistry.disable` and
+        the service has no registry to reach.
+
+        **Loaded, not enabled, is what gets installed.** A plugin that is out of
+        service still contributes its token and its field name, with a null
+        callable: that is what keeps `svc~web` parsing as a term and reporting
+        the plugin by name, instead of falling through to the regex and quietly
+        meaning something else.
+        """
+
+        self._query_stack = self._plugins.query_stack(budget=self._query_budget)
+        install_query_plugins(
+            self._query_stack.operators, self._query_stack.computed
+        )
+        names = computed_field_names()
+        if names != self._computed_fields:
+            self._computed_fields = names
+            self._sync_field_names()
+
     def _new_plugin_budget(self) -> PluginBudget:
         """A render-path budget bound to whatever registry is current.
 
@@ -3197,6 +3264,23 @@ class LogViewerApp(App[None]):
             self._plugins,
             limit_ms=self._config.plugin_read_budget_ms,
             label="read",
+        )
+
+    def _new_query_budget(self) -> PluginBudget:
+        """The query path's budget: the operators and computed fields per filter.
+
+        The third instance of one class. It shares the render path's ceiling
+        because it is the same kind of work on the same trigger — a keystroke in
+        the query box, over the whole buffer — but it is a separate instance so
+        the two settle independently: a `FilterStage` and a `QueryOperator`
+        running in the same pass would have their strikes interleaved by
+        whichever happened to be measured first.
+        """
+
+        return PluginBudget(
+            self._plugins,
+            limit_ms=self._config.plugin_time_budget_ms,
+            label="query",
         )
 
     def _sync_plugin_generation(self) -> None:
@@ -3229,6 +3313,10 @@ class LogViewerApp(App[None]):
         # source is what re-parses it -- so this changes the next lines read and
         # what the query box will answer, not the history on screen.
         self._install_formats()
+        # And the query grammar, for the same reason one step further on: a
+        # switched-off operator has to start reporting itself, and a re-enabled
+        # one has to start answering again, before the next filter runs.
+        self._install_query_plugins()
 
     def _render_log(self, *, scroll_end: bool = False) -> None:
         if self._is_shutting_down:
@@ -4029,7 +4117,7 @@ class LogViewerApp(App[None]):
             if arrived is None
             else self._field_names | collect_field_names(arrived)
         )
-        offered = names | self._plugin_fields
+        offered = names | self._plugin_fields | self._computed_fields
         if names == self._field_names and offered == self._offered_fields:
             return
         self._field_names = names
@@ -4810,6 +4898,12 @@ class LogViewerApp(App[None]):
             # Recorded only when a merge is actually open, so a view saved on
             # one log does not quietly carry someone else's set around.
             merged=tuple(self.state.merged) if self._session.is_merged else (),
+            # Recorded here because this is the *only* place a view is built,
+            # which is what keeps the record honest: a view the operator did not
+            # touch never has its requirements recomputed, and recomputing one
+            # while its plugin was uninstalled would erase the very thing that
+            # marks it unusable.
+            requires=requirements(self.state.query, self._known_fields),
         )
 
     def _view_named(self, name: str) -> Optional[SavedView]:
@@ -4854,6 +4948,20 @@ class LogViewerApp(App[None]):
         controls are synced with their own messages suppressed, and exactly one
         render happens at the end — either `_select_source`'s or this method's.
         """
+
+        absent = unsatisfied(view.requires)
+        if absent:
+            # Refused, not applied-with-a-warning. That is deliberately unlike
+            # the missing-source case below: a rotated-away log still leaves the
+            # filters meaning what they meant, while a missing operator makes
+            # `svc~web` fall through to `compile_query` and become a regex over
+            # the raw line -- a different query that happens to parse. The view
+            # is untouched on disk and stays applicable the moment the plugin
+            # is back.
+            self._notify(
+                f"View '{view.name}' {describe_missing(absent)}.", "warning"
+            )
+            return
 
         settings = self.advanced_drawer.settings
         updated = replace(
@@ -6229,6 +6337,10 @@ class LogViewerApp(App[None]):
         # out; before the save, so a teardown that raises still leaves the
         # session persisted.
         self._plugins.shutdown()
+        # The query grammar is module state, so it outlives this app object.
+        # Left installed it would be a dead registry holding a reference to a
+        # registry that has already torn its plugins down.
+        install_query_plugins()
         if self._persist_state:
             # Persist as-is: the selected source is deliberately kept so the
             # next launch reopens it.

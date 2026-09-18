@@ -52,6 +52,7 @@ from __future__ import annotations
 
 from .plugins import (
     PLUGIN_API_VERSION,
+    ComputedField,
     Exporter,
     ExportResult,
     FilterContext,
@@ -60,6 +61,7 @@ from .plugins import (
     LogSourceProvider,
     Plugin,
     ProviderSource,
+    QueryOperator,
     setting_bool,
     setting_list,
 )
@@ -85,7 +87,7 @@ from .services.parsing import (
     level_rank,
     normalize_level,
 )
-from .services.query import NORMALISED_FIELD_KEYS
+from .services.query import BUILTIN_OPERATORS, NORMALISED_FIELD_KEYS
 from .services.refs import SourceRef
 
 __all__ = [
@@ -95,6 +97,8 @@ __all__ = [
     "Plugin",
     "LogSourceProvider",
     "LogFormat",
+    "QueryOperator",
+    "ComputedField",
     "FilterStage",
     "Exporter",
     # --- data handed to a plugin --------------------------------------------
@@ -152,6 +156,11 @@ __all__ = [
     # The keys the parser normalises across formats, recognised as field terms
     # even before a line carrying one has been read.
     "NORMALISED_FIELD_KEYS",
+    # --- extending the query -------------------------------------------------
+    # The comparison tokens CLV owns, and therefore the ones a `QueryOperator`
+    # may not claim. Published on the same argument as `FORMAT_NAMES`: an author
+    # should be able to check rather than discover it from a load error.
+    "BUILTIN_OPERATORS",
     # --- crossing a process boundary ----------------------------------------
     # Published now, though nothing in-process needs it, precisely so the wire
     # form is part of the frozen contract rather than an artefact of whichever

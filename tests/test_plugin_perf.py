@@ -22,9 +22,17 @@ import pytest
 
 from clv import __version__
 from clv.app import LogViewerApp
-from clv.plugins import FilterStage, LogFormat, PluginBudget, PluginRegistry
+from clv.plugins import (
+    FilterStage,
+    LogFormat,
+    PluginBudget,
+    PluginRegistry,
+    QueryOperator,
+)
 from clv.services.clustering import normalise
+from clv.services.filtering import FilterSpec, filter_entries
 from clv.services.parsing import LogParser, parse_lines
+from clv.services.query import NORMALISED_FIELD_KEYS, install_query_plugins
 from clv.services.session import SourceBuffer
 from clv.storage import SessionState
 from clv.widgets.log_view import LogView
@@ -483,5 +491,93 @@ def test_timing_a_format_costs_a_fraction_of_offering_it_the_line() -> None:
 
     assert timed < untimed * 2.0 + 0.005, (
         f"timing 5000 offered lines cost {timed * 1000:.2f} ms "
+        f"against {untimed * 1000:.2f} ms untimed"
+    )
+
+
+# --- the query path ---------------------------------------------------------
+#
+# Phase 8's operators and computed fields are per entry, on the same trigger as
+# a filter stage: a keystroke in the query box, over the whole buffer. So they
+# owe the same two things the other two paths owe — nothing when nothing is
+# installed, and a guard that costs less than the work it guards.
+
+_QUERY_LINES = [
+    f"Aug 21 09:25:{index % 60:02d} web{index % 8:02d} sshd[{index}]: connection refused"
+    for index in range(5000)
+]
+
+
+class _Matches(QueryOperator):
+    name = "bench-operator"
+    token = "~"
+
+    def test(self, stored: str, value: str) -> bool:
+        return stored.startswith(value)
+
+
+def test_zero_query_plugins_costs_what_filtering_cost_before() -> None:
+    """Requirement 10, on the hot path: an empty registry is two dict tests."""
+
+    entries = parse_lines(_QUERY_LINES)
+    install_query_plugins()
+    spec = FilterSpec(query="host:web0", known_fields=NORMALISED_FIELD_KEYS)
+
+    # Warm whatever the first pass pays for, then measure two identical passes.
+    filter_entries(entries, spec)
+    start = time.perf_counter()
+    filter_entries(entries, spec)
+    bare = time.perf_counter() - start
+
+    registry = PluginRegistry()
+    registry.add(_Matches(), origin="/tmp/bench.py", clv_version="2.9.0")
+    registry.order()
+    stack = registry.query_stack()
+    install_query_plugins(stack.operators, stack.computed)
+    try:
+        start = time.perf_counter()
+        filter_entries(entries, spec)
+        loaded = time.perf_counter() - start
+    finally:
+        install_query_plugins()
+
+    # The query does not use the plugin's token, so an installed-but-unused
+    # operator must not be charged to a query that never asks for it.
+    assert loaded < bare * 1.5 + 0.005, (
+        f"a query using no plugin token cost {loaded * 1000:.2f} ms with one "
+        f"installed against {bare * 1000:.2f} ms with none"
+    )
+
+
+def test_guarding_an_operator_costs_a_fraction_of_calling_it() -> None:
+    """The wrapper is a disabled-check, a try and two clock reads per call."""
+
+    entries = parse_lines(_QUERY_LINES)
+    registry = PluginRegistry()
+    registry.add(_Matches(), origin="/tmp/bench.py", clv_version="2.9.0")
+    registry.order()
+    spec = FilterSpec(query="host~web0", known_fields=NORMALISED_FIELD_KEYS)
+
+    try:
+        stack = registry.query_stack()
+        install_query_plugins(stack.operators, stack.computed)
+        filter_entries(entries, spec)
+        start = time.perf_counter()
+        filter_entries(entries, spec)
+        untimed = time.perf_counter() - start
+
+        budget = PluginBudget(registry, limit_ms=60_000, label="bench")
+        stack = registry.query_stack(budget=budget)
+        install_query_plugins(stack.operators, stack.computed)
+        start = time.perf_counter()
+        stack.start()
+        filter_entries(entries, spec)
+        stack.settle()
+        timed = time.perf_counter() - start
+    finally:
+        install_query_plugins()
+
+    assert timed < untimed * 3.0 + 0.005, (
+        f"timing 5000 comparisons cost {timed * 1000:.2f} ms "
         f"against {untimed * 1000:.2f} ms untimed"
     )

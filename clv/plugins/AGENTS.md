@@ -367,7 +367,94 @@ it that way.
 buffer.** Lines keep the `format_name` they were read with; re-opening the
 source is what re-reads them. New lines stop being offered to it immediately.
 
-### 4. Exporter
+### 4. QueryOperator
+
+Adds a comparison token to the query grammar.
+
+```python
+import re
+from clv.api import QueryOperator
+
+class RegexMatch(QueryOperator):
+    name = "field-regex"
+    token = "~"
+
+    def test(self, stored, value):
+        return re.search(value, stored) is not None
+```
+
+`host~^web[0-9]+` then works in the query box, in a saved view and in a watch
+rule, because all three route through `parse_query` and none of them knows a
+plugin exists.
+
+**Vocabulary, not structure.** This adds a word; it does not add a sentence
+shape. There is still no `OR`, no parentheses and no precedence — terms stay
+implicit-AND and flat. `clv/services/query.py`'s module docstring records how
+narrow that reversal is and why it stops where it does.
+
+**`test` receives two strings and returns a bool.** `stored` is the field value
+exactly as the parser stored it, `value` is what the operator typed. Nothing
+downstream coerces either, which is why `>=` has to decide numeric versus
+lexicographic per comparison rather than per field — your operator makes the
+same decision for itself.
+
+#### Which tokens are legal
+
+Checked at load, so a bad token is a message in the `P` dialog rather than a
+mystery at the first term:
+
+| Rule | Why |
+| --- | --- |
+| Not one of `>=` `<=` `!=` `>` `<` `=` `:` | Redefining `:` would change what every saved query already means. The list is published as `clv.api.BUILTIN_OPERATORS` so you can check rather than discover it from a load error. |
+| No character a *key* may contain — letters, digits, `_`, `.`, `-` | `key~avalue` could not be told from a key called `key~avalue`. The tokeniser has no way to prefer one reading, so the ambiguity is refused instead of resolved by accident. |
+| No whitespace, no `"` or `'` | A space ends a token and a quote groups a value. |
+| Not already claimed by another loaded plugin | Reported once, naming both. |
+
+**Longest token wins.** The alternation is rebuilt from the installed set,
+sorted longest first, so registering `~` cannot break `>=` and registering `~=`
+cannot break `~`. `!~` is found before a bare `~` for the same reason.
+
+### 5. ComputedField
+
+Adds a queryable field that is *derived* rather than parsed.
+
+```python
+from datetime import datetime, timezone
+from clv.api import ComputedField
+
+class EntryAge(ComputedField):
+    name = "entry-age"
+    field_name = "age"
+
+    def value(self, entry):
+        if entry.timestamp is None:
+            return None
+        now = datetime.now(timezone.utc) if entry.timestamp.tzinfo else datetime.now()
+        return str(int((now - entry.timestamp).total_seconds()))
+```
+
+`age<60 level:error` is then "what has gone wrong in the last minute", without
+touching the time window. The name joins the query vocabulary and the
+completion list immediately, before any line has been read — the same promise
+the parser's normalised keys make.
+
+**Parsed fields resolve first, per entry.** `match_terms` asks the entry's own
+`fields` first and only calls a plugin when the entry has no field of that name.
+So a computed `field_name` may collide with a parsed key and is *not* rejected
+for it: on a line that carries the key, the line wins. A plugin can add to what
+CLV can be asked; it can never change what a line said.
+
+**Return a string, or `None`.** `None` means "this entry has no such field",
+which is a different outcome from "did not match": the entry is hidden and
+counted into `hidden_missing_field`, and the UI explains it by name. Returning
+anything that is not a string takes the plugin out of service with a message
+saying so — a number compared against a string would quietly never match.
+
+`field_name` must be a legal query key: it starts with a letter or underscore
+and uses only letters, digits, `_`, `.` and `-`. Anything else could never be
+typed as a term.
+
+### 6. Exporter
 
 Saves or transmits the entries the filters kept.
 
@@ -722,6 +809,42 @@ runs, never where.
 
 ---
 
+## Saved views, watch rules and a missing plugin
+
+A `QueryOperator` or `ComputedField` is the first kind of plugin whose absence
+can change what a **saved** thing *means*, and that is a different problem from
+a plugin that is merely not there.
+
+`host~^web` without the operator is not a syntax error. The token is unknown, so
+nothing in the string is recognised as a term, the whole query falls through to
+the regex half, and it matches lines containing the literal text `host~^web` —
+a different query that happens to parse. A saved view that quietly did that
+would be worse than one that refused.
+
+So a `SavedView` and a `WatchRule` each carry `requires`: the plugins their
+query depends on, recorded **when the view or rule is saved** and never
+recomputed afterwards. Recomputing while a plugin was missing would erase the
+record that marks it unusable, which is why only the record an operator just
+typed is ever stamped.
+
+**There are two absences and they are reported differently.**
+
+| State | What happens | Where the operator sees it |
+| --- | --- | --- |
+| The plugin is **not installed** | The view or rule is kept byte-intact, marked unusable, and named with the plugin it needs. A view refuses to apply; a rule never matches. | `⚠ needs the 'x' plugin, which is not installed` — on the tree row, in the view picker, in the rules dialog |
+| The plugin is installed but **switched off** (a fault, the time budget, or the `P` dialog) | Its token stays reserved and the query reports it. The saved record is untouched and still applicable the moment the plugin is back. | The query bar's validation line: `~ needs the 'x' plugin, which is not in service` |
+
+Collapsing the two would mean an operator who switched a plugin off for a minute
+found their saved views marked broken; keeping the token reserved in the second
+case is what stops the query silently becoming a regex in the meantime.
+
+**Nothing is ever rewritten.** A state file written before `requires` existed
+loads with an empty one; a file written after it stays readable on a build
+without the plugin. A view or rule is preserved, disabled and explained — in
+that order, and never reinterpreted into meaning something else.
+
+---
+
 ## Performance
 
 CLV contains a plugin's *exceptions*. Until now it did nothing about a plugin's
@@ -736,10 +859,12 @@ a stage that is merely slow makes CLV look broken and says nothing at all.
 | `LogSourceProvider.discover` | on startup and on rescan | once |
 | `LogSourceProvider.open` | when a source is opened | once |
 | `LogFormat.parse` | **every read** | **once per unrecognised line** |
+| `QueryOperator.test` | **every render** | **once per buffered entry, per term** |
+| `ComputedField.value` | **every render** | **once per buffered entry whose own fields lack the key** |
 | `FilterStage.apply` | **every render** | **once per buffered entry** |
 | `Exporter.export` | on `Ctrl+E` | once |
 
-The two bold rows are the ones to design against, and they are bold for
+The bold rows are the ones to design against, and they are bold for
 different reasons. `apply` is called *often*: a render happens on every keystroke
 in the query box. `parse` is called once per line, but on a source nothing
 recognises that is every line of the file, arriving in one batch while the
@@ -768,6 +893,21 @@ def parse(self, line):
     ...
 ```
 
+A `QueryOperator` is the one where the cheap work is usually a *cache*: the
+query box re-filters the whole buffer on every keystroke, so compiling the same
+pattern per entry means compiling it once per line per keypress. Cache on the
+value the operator typed, and cache the failure too — a half-finished `svc~(`
+should not re-raise and re-catch half a million times:
+
+```python
+@lru_cache(maxsize=256)
+def _compiled(pattern):
+    try:
+        return re.compile(pattern)
+    except re.error:
+        return None            # matches nothing; never raises at the operator
+```
+
 ### The budget
 
 Every stage is charged the wall time of its own calls, accumulated per render
@@ -782,15 +922,19 @@ source opens pays every cold cost a plugin has, and a large paste or a loaded
 machine can put a healthy stage over the line for a pass or two. A plugin that
 is genuinely slow still strikes out within about a second and a half of typing.
 
-**Two budgets, one policy.** `LogFormat.parse` is charged against a separate
+**Three budgets, one policy.** `LogFormat.parse` is charged against a separate
 ceiling, because it is measured against a different thing: a pass on the read
 path is one batch of lines from a reader's `prime` or `poll`, not one render.
-Everything else is identical — three consecutive batches over the line and the
-format is disabled, named in `P`, and reachable by **Re-enable**.
+The query plugins get a third instance, sharing the render path's ceiling
+because they are the same kind of work on the same trigger — but settling
+separately, so a slow `FilterStage` and a slow `QueryOperator` do not have their
+strikes interleaved by whichever happened to be measured first. Everything else
+is identical in all three: three consecutive passes over the line, disabled,
+named in `P`, and reachable by **Re-enable**.
 
 ```ini
 [log_viewer]
-plugin_time_budget_ms = 250     # the render path: FilterStage.apply
+plugin_time_budget_ms = 250     # FilterStage.apply, and the query plugins
 plugin_read_budget_ms = 50      # the read path: LogFormat.parse
 ```
 
@@ -871,12 +1015,13 @@ lesser version of the core than the core writes against itself.
 | Group | Names |
 | --- | --- |
 | Version | `PLUGIN_API_VERSION` |
-| Interfaces | `Plugin`, `LogSourceProvider`, `LogFormat`, `FilterStage`, `Exporter` |
+| Interfaces | `Plugin`, `LogSourceProvider`, `LogFormat`, `QueryOperator`, `ComputedField`, `FilterStage`, `Exporter` |
 | Handed to you | `LogEntry`, `FilterContext`, `FilterSpec`, `TimeWindow`, `ProviderSource`, `SourceRef` |
 | Declaring a format | `FormatProfile`, `DEFAULT_PROFILE`, `FORMAT_NAMES` |
 | Handed back | `ExportResult` |
 | Severity | `normalize_level`, `level_rank`, `level_matches`, `highest_level`, `LEVEL_TRACE` … `LEVEL_CRITICAL`, `LEVEL_ORDER`, `SEVERITY_BUCKETS` |
 | Fields | `NORMALISED_FIELD_KEYS` |
+| Extending the query | `BUILTIN_OPERATORS` |
 | Settings | `setting_bool`, `setting_list` |
 | Process boundary | `WIRE_VERSION`, `entry_to_wire`, `entry_from_wire` |
 
@@ -889,7 +1034,8 @@ it changes what every severity filter in the process means.
 
 `FORMAT_NAMES` is published for the same kind of reason: it is the set of names
 a `LogFormat` may *not* claim, and an author should be able to check that rather
-than discover it from a load error.
+than discover it from a load error. `BUILTIN_OPERATORS` is the same idea one
+seam along: the comparison tokens a `QueryOperator` may not claim.
 
 ### Two versions, and they are not the same version
 
@@ -1084,6 +1230,17 @@ the rule stated at the head of [TODO.md](../../TODO.md).
   stands and **no index is planned**. What is planned is a user plugin
   directory, an explicit enable-list, and manifests a `clv plugin install` can
   verify from a path, a tarball or a URL that anyone may host.
+- **"No query DSL."** *Reversed 2026-08-14* by
+  [PLUGIN_TODO.md](../../PLUGIN_TODO.md) Phase 8, and the reversal is narrow
+  enough to state exactly. The objection was to a query *language* — `OR`,
+  parentheses, precedence — and it stands: none of the three exists, and all
+  three remain out of scope in [TODO.md](../../TODO.md). What a plugin may now
+  add is a `QueryOperator` (a comparison token) and a `ComputedField` (a
+  queryable field derived rather than parsed). Both add vocabulary; neither adds
+  structure. The grammar is still implicit-AND and still flat — a plugin can
+  teach it a new word, not a new sentence shape. CLV's own tokens stay reserved,
+  and a computed field resolves *after* the parsed ones, so neither can change
+  what an existing query means.
 - **"A provider source cannot be starred or merged."** *Reversed 2026-08-19* by
   [SSH_TODO.md](../../SSH_TODO.md) Phase 9. The objection was that a provider
   source is not a file — nothing on disk answers to `journal:unit/sshd.service`

@@ -1,9 +1,12 @@
 """CLV plugin interfaces and loader.
 
-Three extension points, matching the three things operators keep asking CLV to
-do that core should not hard-code:
+Six extension points, each matching a thing operators keep asking CLV to do that
+core should not hard-code:
 
 * :class:`LogSourceProvider` — where log lines come from.
+* :class:`LogFormat` — how a line CLV does not recognise is parsed.
+* :class:`QueryOperator` — a comparison token the query box does not have.
+* :class:`ComputedField` — a queryable field derived rather than parsed.
 * :class:`FilterStage` — what happens to a line on its way to the pane.
 * :class:`Exporter` — where the current view can be sent.
 
@@ -45,6 +48,13 @@ from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
 from ..services.filtering import FilterSpec
 from ..services.formats import DEFAULT_PROFILE, FormatProfile
 from ..services.parsing import FORMAT_NAMES, LogEntry
+from ..services.query import (
+    BUILTIN_OPERATORS,
+    KEY_CHARS,
+    ComputedSpec,
+    OperatorSpec,
+    is_query_key,
+)
 from ..services.refs import SourceRef
 
 #: The version of the published plugin API — the surface re-exported by
@@ -357,6 +367,108 @@ class LogFormat(Plugin):
         needs no cooperation: an entry with a ``format_name`` other than
         ``"raw"`` is structured, so the unparsed line after it inherits its
         timestamp and level exactly as it would after a built-in's.
+        """
+
+
+class QueryOperator(Plugin):
+    r"""Teaches the query box a new comparison token.
+
+    The grammar has always been a closed set --
+    :data:`~clv.services.query.BUILTIN_OPERATORS` and an if-chain over it -- so a
+    plugin could produce a *field* and say nothing new *about* one. This is the
+    token::
+
+        class RegexMatch(QueryOperator):
+            name = "field-regex"
+            token = "~"
+
+            def test(self, stored, value):
+                return _compiled(value).search(stored) is not None
+
+    ``svc~web\d+`` then works in the query box, in a saved view and in a watch
+    rule, because all three route through ``parse_query``.
+
+    **Vocabulary, not structure.** This adds a word, never a sentence shape.
+    There is still no ``OR``, no parentheses and no precedence; see
+    :mod:`clv.services.query`'s docstring for how narrow the reversal is.
+
+    **The token is checked at load, and most of the rules are about ambiguity.**
+    It may not be one of CLV's own -- redefining ``:`` would change what every
+    saved query already means -- and it may not contain a character a *key* may
+    contain (:data:`~clv.services.query.KEY_CHARS`), because ``foo`` + ``a`` +
+    ``bar`` is indistinguishable from the key ``fooabar`` and the tokeniser has
+    no way to prefer one reading. Whitespace and quote characters are out for
+    the same reason. Longest token wins, so registering ``~`` cannot break
+    ``>=`` and registering ``~=`` cannot break ``~``.
+
+    **This runs per entry per render**, beside :class:`FilterStage`. Compile
+    once and cache; the render budget (``plugin_time_budget_ms``) takes out a
+    plugin that cannot hold to that.
+    """
+
+    #: The token that introduces this comparison, e.g. ``"~"`` or ``"!~"``.
+    #: Rejected at load when empty, when it is a built-in, when it contains a
+    #: key character, whitespace or a quote, or when another loaded operator has
+    #: already claimed it.
+    token: str = ""
+
+    @abstractmethod
+    def test(self, stored: str, value: str) -> bool:
+        """Whether the field's *stored* value satisfies the query's *value*.
+
+        Both are strings exactly as they were stored and typed -- nothing
+        downstream coerces, which is why ``>=`` has to decide numeric versus
+        lexicographic per comparison rather than per field.
+
+        Raising takes the operator out of service for the session and is
+        recorded once; terms using it then report the plugin by name rather
+        than quietly matching nothing.
+        """
+
+
+class ComputedField(Plugin):
+    """A queryable field derived rather than parsed.
+
+    What gives the grammar genuinely new power without adding a DSL: the log
+    line never said ``age``, but every entry has one::
+
+        class Age(ComputedField):
+            name = "entry-age"
+            field_name = "age"
+
+            def value(self, entry):
+                if entry.timestamp is None:
+                    return None
+                return str(int((datetime.now() - entry.timestamp).total_seconds()))
+
+    ``age<60`` then works everywhere a parsed field does, and the name is
+    offered in the query box's completions before a line has been read.
+
+    **Parsed fields resolve first, always.** :func:`~clv.services.query.match_terms`
+    consults this only when the entry has no field of that name, per entry. So a
+    computed field *may* share a name with a parsed one -- it is not rejected at
+    load -- and on any line that actually carries the key the line wins. A plugin
+    can add to what CLV can be asked; it can never change what a line said.
+
+    Returning ``None`` means "this entry has no such field", which is a
+    different answer from "does not match": the entry is hidden and counted into
+    ``FilterStats.hidden_missing_field``, and the UI explains it.
+
+    **Per entry, like** :class:`QueryOperator`, and under the same budget.
+    """
+
+    #: The name this field answers to in a query. Rejected at load when empty,
+    #: when it is not a legal query key, or when another loaded plugin has
+    #: already claimed it.
+    field_name: str = ""
+
+    @abstractmethod
+    def value(self, entry: LogEntry) -> Optional[str]:
+        """This field's value for *entry*, or ``None`` when it has none.
+
+        Must be a string: values are compared as the parser stores them and
+        nothing downstream coerces. Returning anything else takes the plugin out
+        of service with a message naming the rule it broke.
         """
 
 
@@ -972,6 +1084,8 @@ class PluginStatus:
 _KINDS: tuple[tuple[str, type], ...] = (
     ("source", LogSourceProvider),
     ("format", LogFormat),
+    ("operator", QueryOperator),
+    ("computed field", ComputedField),
     ("filter", FilterStage),
     ("exporter", Exporter),
 )
@@ -1143,6 +1257,11 @@ class PluginRegistry:
     #: Plugin-supplied parsers, in :func:`plugin_sort_key` order. Consulted only
     #: for a line every built-in matcher declined — see :class:`LogFormat`.
     formats: list[LogFormat] = field(default_factory=list)
+    #: Plugin-supplied comparison tokens and derived fields, in
+    #: :func:`plugin_sort_key` order. Consulted per entry, and only through the
+    #: specs :meth:`query_stack` hands to ``clv.services.query``.
+    operators: list[QueryOperator] = field(default_factory=list)
+    computed: list[ComputedField] = field(default_factory=list)
     filters: list[FilterStage] = field(default_factory=list)
     exporters: list[Exporter] = field(default_factory=list)
     errors: PluginErrors = field(default_factory=PluginErrors)
@@ -1197,6 +1316,8 @@ class PluginRegistry:
         return (
             len(self.sources)
             + len(self.formats)
+            + len(self.operators)
+            + len(self.computed)
             + len(self.filters)
             + len(self.exporters)
         )
@@ -1242,6 +1363,8 @@ class PluginRegistry:
 
         self.sources.sort(key=plugin_sort_key)
         self.formats.sort(key=plugin_sort_key)
+        self.operators.sort(key=plugin_sort_key)
+        self.computed.sort(key=plugin_sort_key)
         self.filters.sort(key=plugin_sort_key)
         self.exporters.sort(key=plugin_sort_key)
         # The end of a load: whatever a downstream cache holds was computed
@@ -1579,7 +1702,17 @@ class PluginRegistry:
                 self.errors.append(PluginError(origin, f"could not be instantiated: {exc}"))
                 return False
 
-        if not isinstance(plugin, (LogSourceProvider, LogFormat, FilterStage, Exporter)):
+        if not isinstance(
+            plugin,
+            (
+                LogSourceProvider,
+                LogFormat,
+                QueryOperator,
+                ComputedField,
+                FilterStage,
+                Exporter,
+            ),
+        ):
             self.errors.append(
                 PluginError(origin, "does not implement a CLV plugin interface")
             )
@@ -1616,6 +1749,12 @@ class PluginRegistry:
 
         if isinstance(plugin, LogFormat):
             problem = self._format_fault(plugin)
+            if problem is not None:
+                self.errors.append(PluginError(origin, problem))
+                return False
+
+        if isinstance(plugin, (QueryOperator, ComputedField)):
+            problem = self._query_fault(plugin)
             if problem is not None:
                 self.errors.append(PluginError(origin, problem))
                 return False
@@ -1706,6 +1845,84 @@ class PluginRegistry:
             )
         return None
 
+    def _query_fault(self, plugin: Any) -> Optional[str]:
+        """Why *plugin* may not join the query grammar, or None if it may.
+
+        **At load, never at the first term.** Everything here is knowable
+        without parsing anything, and the consequence of missing it is not an
+        exception but an *ambiguity*: a token sharing a character with a field
+        key makes ``key~value`` and the key ``keyXvalue`` two readings of the
+        same string, and the tokeniser would settle it by accident.
+        """
+
+        if isinstance(plugin, QueryOperator):
+            token = getattr(plugin, "token", "")
+            if not isinstance(token, str) or not token.strip():
+                return "declares no token, so no query could ever reach it"
+            if token != token.strip() or any(char.isspace() for char in token):
+                return f"token {token!r} contains whitespace"
+            if token in BUILTIN_OPERATORS:
+                return (
+                    f"token {token!r} is one of CLV's own comparisons. A plugin "
+                    "adds an operator, it does not redefine one — every saved "
+                    "query already means something under this token"
+                )
+            clashing = "".join(sorted(KEY_CHARS.intersection(token)))
+            if clashing:
+                return (
+                    f"token {token!r} uses {clashing!r}, which a field key may "
+                    "also contain, so a term using it could not be told from a "
+                    "longer key"
+                )
+            if any(char in "\"'" for char in token):
+                return f"token {token!r} contains a quote, which groups a value"
+            for other in self.operators:
+                if getattr(other, "token", "") == token:
+                    return (
+                        f"token {token!r} is already registered by "
+                        f"{_plugin_name(other)}"
+                    )
+            return None
+
+        name = getattr(plugin, "field_name", "")
+        if not isinstance(name, str) or not name.strip():
+            return "declares no field_name, so no query could ever ask for it"
+        if name != name.strip():
+            return f"field_name {name!r} has leading or trailing whitespace"
+        if not is_query_key(name):
+            return (
+                f"field_name {name!r} is not a legal query key: it must start "
+                "with a letter or underscore and use only letters, digits, "
+                "underscore, dot and hyphen"
+            )
+        # Casefolded, because `query._lookup` matches a field key
+        # case-insensitively: `Age` and `age` are one field to every query that
+        # could ask for either, so two plugins claiming them are colliding even
+        # though the strings differ. Compared exactly, the second would load and
+        # then silently replace the first in the installed registry.
+        folded = name.casefold()
+        for other in self.computed:
+            if getattr(other, "field_name", "").casefold() == folded:
+                return (
+                    f"field_name {name!r} is already registered by "
+                    f"{_plugin_name(other)}"
+                )
+        # A name already in NORMALISED_FIELD_KEYS is deliberately *not* refused:
+        # a computed field is consulted only for an entry that has no such
+        # parsed field, so it cannot shadow one. See `ComputedField`.
+        return None
+
+    def query_stack(self, *, budget: Optional[PluginBudget] = None) -> "QueryStack":
+        """The loaded query plugins as specs ``clv.services.query`` can install.
+
+        The same shape :meth:`format_stack` has, for the same reason: the guard
+        travels *with* the plugins because ``query.py`` may not import this
+        module, and handing it bare plugins would mean handing it a fault
+        callback and a budget as well.
+        """
+
+        return QueryStack(self, budget=budget)
+
     def format_stack(self, *, budget: Optional[PluginBudget] = None) -> "FormatStack":
         """The enabled formats, guarded and budgeted, for the read path.
 
@@ -1721,6 +1938,8 @@ class PluginRegistry:
         return {
             "source": self.sources,
             "format": self.formats,
+            "operator": self.operators,
+            "computed field": self.computed,
             "filter": self.filters,
             "exporter": self.exporters,
         }[kind]
@@ -1980,6 +2199,125 @@ class PluginRegistry:
         if timing:
             budget.settle()
         return current
+
+
+class QueryStack:
+    """The loaded query plugins, wrapped in everything CLV owes them.
+
+    Produces the :class:`~clv.services.query.OperatorSpec` and
+    :class:`~clv.services.query.ComputedSpec` records that
+    ``query.install_query_plugins`` stores, with every third-party callable
+    already carrying its guard: an exception disables the plugin through
+    :meth:`PluginRegistry.disable`, a non-string return does the same with the
+    rule it broke, and wall time is charged to the budget.
+
+    **Loaded, not enabled.** Every loaded plugin gets a spec; one that is out of
+    service gets a spec whose callable is ``None``. That is what keeps its token
+    reserved while it is switched off, so ``svc~web`` reports the plugin by name
+    instead of silently becoming a regex — see
+    :class:`~clv.services.query.OperatorSpec`.
+
+    The wrappers re-check :meth:`PluginRegistry.is_disabled` per call as well,
+    because a plugin that raises mid-render is disabled immediately and the
+    specs are only rebuilt on the next generation change.
+    """
+
+    __slots__ = ("_registry", "operators", "computed", "_budget")
+
+    def __init__(
+        self, registry: "PluginRegistry", *, budget: Optional[PluginBudget] = None
+    ) -> None:
+        self._registry = registry
+        self._budget = budget
+        self.operators: tuple[OperatorSpec, ...] = tuple(
+            OperatorSpec(
+                token=plugin.token,
+                plugin=_plugin_name(plugin),
+                test=None if registry.is_disabled(plugin) else self._guard_test(plugin),
+            )
+            for plugin in registry.operators
+        )
+        self.computed: tuple[ComputedSpec, ...] = tuple(
+            ComputedSpec(
+                field_name=plugin.field_name,
+                plugin=_plugin_name(plugin),
+                value=None if registry.is_disabled(plugin) else self._guard_value(plugin),
+            )
+            for plugin in registry.computed
+        )
+
+    def start(self) -> None:
+        """Open a budget pass. One filter of the buffer is one pass."""
+
+        budget = self._budget
+        if budget is not None and budget.active:
+            budget.start()
+
+    def settle(self) -> None:
+        """Close the pass, disabling anything that has struck out."""
+
+        budget = self._budget
+        if budget is not None and budget.active:
+            budget.settle()
+
+    def _guard_test(self, plugin: QueryOperator):
+        registry = self._registry
+        budget = self._budget
+        clock = time.perf_counter
+
+        def test(stored: str, value: str) -> bool:
+            if registry.is_disabled(plugin):
+                return False
+            timing = budget is not None and budget.active
+            mark = clock() if timing else 0.0
+            try:
+                result = plugin.test(stored, value)
+            except Exception as exc:  # noqa: BLE001 - third-party code
+                registry.disable(
+                    plugin, f"raised: {exc}", origin=_plugin_name(plugin)
+                )
+                return False
+            finally:
+                if timing:
+                    budget.charge(plugin, clock() - mark)
+            return bool(result)
+
+        return test
+
+    def _guard_value(self, plugin: ComputedField):
+        registry = self._registry
+        budget = self._budget
+        clock = time.perf_counter
+
+        def value(entry: LogEntry) -> Optional[str]:
+            if registry.is_disabled(plugin):
+                return None
+            timing = budget is not None and budget.active
+            mark = clock() if timing else 0.0
+            try:
+                result = plugin.value(entry)
+            except Exception as exc:  # noqa: BLE001 - third-party code
+                registry.disable(
+                    plugin, f"raised: {exc}", origin=_plugin_name(plugin)
+                )
+                return None
+            finally:
+                if timing:
+                    budget.charge(plugin, clock() - mark)
+            if result is None or isinstance(result, str):
+                return result
+            # Values are compared as the parser stored them and nothing
+            # downstream coerces, so a non-string here would be compared against
+            # a string and quietly never match.
+            registry.disable(
+                plugin,
+                f"value() returned {type(result).__name__}; a computed field "
+                "must return a string or None",
+                origin=_plugin_name(plugin),
+            )
+            return None
+
+        return value
 
 
 class FormatStack(Sequence):
@@ -2728,6 +3066,9 @@ __all__ = [
     "IteratorReader",
     "LoadedPlugin",
     "LogFormat",
+    "QueryOperator",
+    "ComputedField",
+    "QueryStack",
     "LogSourceProvider",
     "ProviderSource",
     "Plugin",

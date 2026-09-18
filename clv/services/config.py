@@ -693,19 +693,24 @@ you have reason to trust, after reading it if you can. The trust model, and
 what to look at when reviewing a third-party plugin, are written out in
 CLV's `clv/plugins/AGENTS.md`.
 
-A worked example
-----------------
+Worked examples
+---------------
 
-`examples/nginx_error.py` is a complete, commented plugin. It teaches CLV to
-read nginx's error log - a format the built-in matchers do not recognise -
-and it walks through what a log format plugin has to declare and why.
+Two complete, commented plugins, each walking through what its kind of plugin
+has to declare and why:
+
+    examples/nginx_error.py   teaches CLV to read nginx's error log, a format
+                              the built-in matchers do not recognise
+    examples/field_regex.py   adds `svc~^web[0-9]+` - a regex against one
+                              field - and `age<60`, seconds since the line
+                              was written
 
 Nothing in `examples/` is listed or run: it is one directory down, and CLV
-only looks here. To use it, copy it up and name it:
+only looks here. To use one, copy it up and name it:
 
-    cp examples/nginx_error.py .
+    cp examples/field_regex.py .
 
-then add `nginx_error` to the `plugins` line in settings.conf. Copying is
+then add `field_regex` to the `plugins` line in settings.conf. Copying is
 also how you start your own - it is a better starting point than an empty
 file.
 """
@@ -725,7 +730,10 @@ PLUGIN_EXAMPLES_DIR = "examples"
 
 #: Worked examples written into that directory on first run, as
 #: ``{filename: module}``.
-SEEDED_EXAMPLES: dict[str, str] = {"nginx_error.py": "clv.examples.nginx_error"}
+SEEDED_EXAMPLES: dict[str, str] = {
+    "nginx_error.py": "clv.examples.nginx_error",
+    "field_regex.py": "clv.examples.field_regex",
+}
 
 
 def _seed_plugin_examples(target: Path) -> None:

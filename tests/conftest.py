@@ -73,3 +73,25 @@ def isolated_environment(tmp_path_factory, monkeypatch):
     )
 
     yield root
+
+
+@pytest.fixture(autouse=True)
+def query_plugins_are_not_shared_between_tests():
+    """Reset the query grammar between tests.
+
+    ``clv.services.query`` holds its operators and computed fields in module
+    state, installed by the app at mount and rebuilt whenever the plugin
+    generation moves. That is the right design — ``FilterSpec`` is frozen,
+    slotted and hashed into the render cache key, so a registry of live
+    callables cannot ride on it — but it means one test's ``~`` operator is
+    still installed when the next test runs.
+
+    A leak there is not a noisy failure but a quiet one: a leftover operator
+    changes what ``_TERM_RE`` matches, so a test asserting that a plain regex is
+    passed through untouched could pass or fail on the order the files ran in.
+    """
+
+    yield
+    from clv.services.query import install_query_plugins
+
+    install_query_plugins()
