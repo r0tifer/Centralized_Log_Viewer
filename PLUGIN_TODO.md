@@ -39,7 +39,7 @@ that argument; Phase 7b is the exception, and it is here because designing the
 | 7a — Parsing | `LogFormat`, and a plugin that teaches CLV a format | ✅ Done |
 | 7b — logfmt | `key=value` parsing, built in because a plugin cannot | ✅ Done |
 | 8 — Query | `QueryOperator`, `ComputedField`, and the degradation rule | ✅ Done |
-| 9 — Watch | `WatchMatcher`, `WatchSink`, off the event loop | ⬜ Not started |
+| 9 — Watch | `WatchMatcher`, `WatchSink`, off the event loop | ✅ Done |
 | 10 — Clustering | `ClusterRule`, `ShapeContributor`, and the shape cache | ⬜ Not started |
 | 11 — Timeline | `TimelineAnnotation`, `TimelineMetric`, foldable only | ⬜ Not started |
 | **Stage D — Surface** | | |
@@ -1952,7 +1952,103 @@ and destinations are extensible and that a rule records what it needs.
 
 **Gate.** A rule with a plugin-supplied kind fires, and a plugin sink delivers
 it once per window rather than once per line, without blocking the pane. Suite
-green on 3.11 and 3.14.
+green on 3.11 and 3.14: 2085 passed on both.
+
+**As shipped.** Eight decisions worth recording, two of them corrections to this
+phase's own text.
+
+*A missing matcher is named by its **kind**, not by its plugin.* This file said
+a rule whose `kind` names a missing matcher is "listed with the plugin it
+needs", and that is the wrong record to keep. The kind is the contract and a
+plugin is one implementation of it: a rule written on a machine carrying one
+`burst` matcher and opened on a machine carrying a different one is a rule that
+still runs, and a recorded plugin name would have marked it broken. So `kind`
+*is* the dependency record — `⚠ needs the 'burst' rule kind, which no installed
+plugin provides` — which is also the more actionable sentence, and which keeps
+`requires` meaning exactly what Phase 8 defined it to mean rather than acquiring
+a second sense.
+
+*"Absence" is not expressible against this seam, and the example list was wrong
+to say it was.* `matches(entry, rule)` is offered lines; a rule that must fire
+because *nothing* arrived is never called. A threshold or burst kind works —
+the matcher holds its own window state — and a silence rule needs a clock this
+seam does not hand out. Adding a `poll(now, rule)` tick was considered and
+declined for this phase: it is a second guarded call path, on a different
+trigger, with its own budget and its own disable route, for a kind nobody has
+asked for yet. `clv/plugins/AGENTS.md` says so in the interface's own section,
+where an author meets it before writing the plugin rather than after.
+
+*`WatchIndex` suspends its answer **reuse** when a plugin kind is in the rule
+set.* Found by the first test written against the seam, and it would have made
+the flagship example silently not work. The index caches by line *content*,
+which is sound for a pattern — a pure function of the text — and wrong for a
+matcher that is counting: five identical `oom-killer` lines are one cache key,
+so a `x5/60` rule saw one of them and never fired, with nothing to diagnose
+because from the outside the rule simply did nothing. Answers are still
+*stored*, so `hits()` stays the lookup that keeps re-rendering free; what is
+skipped is reading one back, and only for a rule set that actually contains a
+plugin kind. Every rule set that existed before this phase takes neither the
+flag nor the extra call, and a test pins that.
+
+*A matcher may return anything truthy, and is not faulted for it.* The plan for
+this phase said a non-`bool` return should disable the plugin, by analogy with
+`ComputedField.value`. The analogy does not hold. A computed field's wrong type
+is a silent never-matches, because the value is compared against a string; a
+truthy object here is exactly what an author writing
+`return self._pattern.search(entry.raw)` meant, and refusing it would be
+pedantry with a plugin taken out of service at the end of it. `bool(result)`,
+and the house convention is Python's.
+
+*A fourth `PluginBudget`, on the read ceiling — and sinks are on none of them.*
+A matcher pass is one poll's batch of newly arrived lines, which is the read
+path's unit and not the render's, so it takes `plugin_read_budget_ms` and its
+own instance. A `WatchSink` is deliberately not budgeted at all: it runs on a
+thread of its own, so "slow" costs the pane nothing and there is no pass to
+count three of. What can go wrong is a call that never comes back, and a
+stopwatch around a call that has already returned cannot see that.
+`plugin_sink_timeout_ms` is a **deadline** — one call, one limit — and it
+retires the sink rather than striking it.
+
+*The toast is a sink, and the lane is a field rather than a branch.*
+`SinkSpec.inline` marks CLV's own destination, which must run on the event loop
+because it paints; everything else is dispatched to a thread. `_poll_watch`
+therefore has one fan-out and no special case, which is what "the built-in path
+becomes the default sink" has to mean if it is to mean anything. The built-in
+destination is also given exactly what a plugin is given — a name and a count —
+and rebuilds its sentence from them, rather than being the one caller that gets
+more.
+
+*`due_hits` is the drain and `due` is its projection.* A sink needs the name and
+the count as data; the toast needs the sentence. Both come out of one coalescing,
+which is what makes "a sink cannot bypass the rate limiter" a property of the
+code rather than a promise. `due()` keeps returning the list of strings it always
+returned, because `tests/test_watch_rules.py` compares against those literals and
+this phase owed that file the right to be **literally** unmodified — which is
+Requirement 10's evidence rather than an assertion about it.
+
+*A sink that is out of service is simply absent; a matcher that is out of
+service is not.* The asymmetry is deliberate and is the one place this seam
+diverges from Phase 8's shape. A kind has to stay claimed while its plugin is
+switched off, because a saved rule *means* something under it and dropping it
+would send the rule back to the pattern path — where `oom-killer x5/60` parses
+as a query and starts matching the wrong lines. A destination reserves nothing
+and means nothing, so an out-of-service sink is left out of the list and nothing
+is delivered to it.
+
+**Also swept here.** `WatchRulesDialog._toggle_current` rebuilt a rule by listing
+its fields by hand, so pressing `space` on a rule dropped its `requires` — the
+Phase 8 record that marks it unusable — and the pattern went straight back to
+being matched as a regex, which is the exact failure Requirement 12 exists to
+prevent, reachable with one keystroke. It is a `replace()` now, and `kind` would
+have been the second field to go the same way. The worked example
+`clv/examples/watch_alerts.py` joins the two Phase 7a and 8 seeded, and
+`tests/test_config.py`'s seeding check is driven off `SEEDED_EXAMPLES`, so it
+could not be added without also being written up in the plugin directory's
+`README.txt`. `tests/conftest.py` gained the autouse fixture resetting the
+installed matchers and sinks between tests, on the same argument as the query
+one: a leaked `burst` makes `matcher_kinds()` report two kinds, and the test
+asserting that a build with no watch plugins composes no `Kind` control would
+then pass or fail on the order the files ran in.
 
 **Commit.** `feat(plugins): watch matchers and delivery sinks`
 

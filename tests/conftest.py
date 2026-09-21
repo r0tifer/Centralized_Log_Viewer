@@ -95,3 +95,22 @@ def query_plugins_are_not_shared_between_tests():
     from clv.services.query import install_query_plugins
 
     install_query_plugins()
+
+
+@pytest.fixture(autouse=True)
+def watch_plugins_are_not_shared_between_tests():
+    """Reset the installed watch matchers and sinks between tests.
+
+    The same argument as the query fixture above, one seam along.
+    ``clv.services.watch`` holds its matchers and sinks in module state for the
+    same reason ``query`` does — a ``WatchRule`` is frozen and persisted, so a
+    registry of live callables cannot ride on it — and a leak here fails just as
+    quietly: a leftover ``burst`` matcher makes ``matcher_kinds()`` report two
+    kinds, so the rules dialog composes a control that the test asserting a
+    build with no watch plugins renders nothing new was written to catch.
+    """
+
+    yield
+    from clv.services.watch import install_watch_plugins
+
+    install_watch_plugins()

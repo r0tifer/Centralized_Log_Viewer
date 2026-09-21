@@ -417,7 +417,7 @@ shared globals or reaching into another widget's tree.
 
 ## Plugins
 
-Six interfaces in `clv/plugins/__init__.py`:
+Eight interfaces in `clv/plugins/__init__.py`:
 
 | Interface | Method | Purpose |
 | --- | --- | --- |
@@ -426,6 +426,8 @@ Six interfaces in `clv/plugins/__init__.py`:
 | `QueryOperator` | `test(stored, value) -> bool` | A comparison token the query grammar does not have |
 | `ComputedField` | `value(entry) -> str \| None` | A queryable field derived rather than parsed |
 | `FilterStage` | `apply(entry, context) -> LogEntry \| None` | Transform or drop entries |
+| `WatchMatcher` | `matches(entry, rule) -> bool` | A watch rule kind that is not "this pattern matched" |
+| `WatchSink` | `deliver(name, count, context, entries)` | Where a watch hit goes, besides the toast |
 | `Exporter` | `export(entries, context) -> ExportResult` | Send the current view somewhere |
 
 Published as a versioned surface in `clv/api.py` — that, not this module, is

@@ -56,6 +56,12 @@ from ..services.query import (
     is_query_key,
 )
 from ..services.refs import SourceRef
+from ..services.watch import (
+    KIND_PATTERN,
+    MatcherSpec,
+    SinkSpec,
+    WatchRule,
+)
 
 #: The version of the published plugin API — the surface re-exported by
 #: :mod:`clv.api` — and **not** CLV's own version.
@@ -469,6 +475,111 @@ class ComputedField(Plugin):
         Must be a string: values are compared as the parser stores them and
         nothing downstream coerces. Returning anything else takes the plugin out
         of service with a message naming the rule it broke.
+        """
+
+
+class WatchMatcher(Plugin):
+    """Teaches CLV a kind of watch rule that is not "this pattern matched".
+
+    A rule declares a :attr:`~clv.services.watch.WatchRule.kind`; a matcher
+    claims one. When they meet, CLV stops treating the rule's ``pattern`` as a
+    query and hands it to this plugin untouched — it is **your** parameter
+    string, in whatever spelling you document, and CLV neither parses nor
+    validates it beyond asking :meth:`validate`.
+
+    ``kind`` is matched casefolded, must not contain whitespace, and may not be
+    ``"pattern"``: that one is CLV's and every rule ever saved already means
+    something under it.
+
+    **A matcher is offered lines.** :meth:`matches` is called once per newly
+    arrived entry per enabled rule of this kind, so a rule kind that must fire
+    because *nothing* arrived — a silence or absence rule — cannot be written
+    against this interface. There is no tick and no clock here; holding state
+    between calls is how a threshold or a burst kind is written, and that state
+    is yours to bound.
+
+    **Per entry, and charged for it.** The calls are measured against the read
+    budget and three consecutive passes over it take the plugin out of service,
+    exactly as a slow :class:`LogFormat` is. Make the cheap rejection first.
+    """
+
+    #: The rule kind this matcher claims, e.g. ``"burst"``. A matcher declaring
+    #: nothing here is rejected at load, because no rule could ever reach it.
+    kind: str = ""
+
+    @abstractmethod
+    def matches(self, entry: LogEntry, rule: WatchRule) -> bool:
+        """Whether *entry* should fire *rule*.
+
+        *rule* is the whole record, so ``rule.pattern`` is this matcher's
+        parameter string and ``rule.name`` is what the operator called it —
+        which is the key to use if this matcher keeps per-rule state.
+
+        Never raise for something the operator typed. A malformed parameter is
+        :meth:`validate`'s business; raising here disables the plugin for the
+        session over a rule that can be fixed in the dialog.
+        """
+
+    def validate(self, pattern: str) -> Optional[str]:
+        """Why *pattern* is not a usable parameter for this kind, or ``None``.
+
+        Optional, and worth implementing: it is what puts the complaint where
+        the operator typed it rather than leaving them a rule that silently
+        never fires. Returning ``None`` — the default — means "anything goes".
+        """
+
+        return None
+
+
+class WatchSink(Plugin):
+    """Somewhere a watch hit is delivered, besides the toast.
+
+    **You are fed the result of rate limiting, never the raw hits.** A rule
+    matching five hundred lines inside one window reaches you once, with
+    ``count=500``. That is not a convenience: a rule matching every line is the
+    behaviour that makes people switch a feature like this off, and a sink that
+    could bypass the coalescing would be able to do it to somebody else's
+    inbox.
+
+    **You do not run on the event loop.** Every sink gets a thread of its own,
+    so blocking on a socket is allowed here in a way it is allowed nowhere else
+    in CLV. There is a deadline: a sink that has not returned from one
+    :meth:`deliver` within ``plugin_sink_timeout_ms`` is taken out of service
+    and stops being fed. Its thread keeps running — CLV cannot kill a thread —
+    which is why a sink that talks to the network should set its own timeouts
+    rather than relying on this one.
+
+    **You get a name and a count, and nothing else, unless you say otherwise.**
+    Set :attr:`wants_entries` to receive a bounded sample of the matching lines.
+    That declaration is shown to the operator in the ``P`` dialog, because a
+    sink that reads log content and sends it somewhere is a thing they are
+    entitled to know about before they enable it.
+
+    **Egress is the operator's decision, not yours.** The convention for a sink
+    that leaves the machine is the one the journal provider follows for reading
+    it: ship inert, read your destination from your own ``[plugin:<name>]``
+    section, and deliver nothing until it is set.
+    """
+
+    #: Whether :meth:`deliver` should receive the matching lines. Default False,
+    #: and the default is the one to keep unless the sink genuinely cannot do
+    #: its job without them.
+    wants_entries: bool = False
+
+    @abstractmethod
+    def deliver(
+        self,
+        name: str,
+        count: int,
+        context: FilterContext,
+        entries: Sequence[LogEntry] = (),
+    ) -> None:
+        """Deliver one rule's window.
+
+        *name* is the rule's name and *count* is how many lines matched inside
+        the window — the true count, whatever ``entries`` holds. *entries* is
+        empty unless :attr:`wants_entries` is set, and is capped at
+        ``SINK_SAMPLE_LIMIT`` when it is.
         """
 
 
@@ -1071,6 +1182,12 @@ class PluginStatus:
     #: The category of the error driving :attr:`state`, so the dialog knows
     #: whether Re-enable applies without reading :attr:`detail`.
     category: str = ""
+    #: Whether this origin supplies a :class:`WatchSink` that asked to be handed
+    #: log lines. Shown in the row, because "this plugin reads your log content
+    #: and sends it where it is configured to" is the single fact an operator
+    #: most needs before enabling something, and it is knowable from the
+    #: declaration without running anything.
+    reads_content: bool = False
     #: Working copy. True when this plugin should be running.
     enabled: bool = True
     #: Working copy. Set when the operator asks for a fault-disabled plugin to
@@ -1087,6 +1204,8 @@ _KINDS: tuple[tuple[str, type], ...] = (
     ("operator", QueryOperator),
     ("computed field", ComputedField),
     ("filter", FilterStage),
+    ("matcher", WatchMatcher),
+    ("sink", WatchSink),
     ("exporter", Exporter),
 )
 
@@ -1263,6 +1382,11 @@ class PluginRegistry:
     operators: list[QueryOperator] = field(default_factory=list)
     computed: list[ComputedField] = field(default_factory=list)
     filters: list[FilterStage] = field(default_factory=list)
+    #: Plugin-supplied rule kinds and delivery destinations, in
+    #: :func:`plugin_sort_key` order. Reached only through the specs
+    #: :meth:`watch_stack` hands to ``clv.services.watch``.
+    matchers: list[WatchMatcher] = field(default_factory=list)
+    sinks: list[WatchSink] = field(default_factory=list)
     exporters: list[Exporter] = field(default_factory=list)
     errors: PluginErrors = field(default_factory=PluginErrors)
     #: Every plugin found in a user root, loaded or not, in search order.
@@ -1319,6 +1443,8 @@ class PluginRegistry:
             + len(self.operators)
             + len(self.computed)
             + len(self.filters)
+            + len(self.matchers)
+            + len(self.sinks)
             + len(self.exporters)
         )
 
@@ -1539,6 +1665,11 @@ class PluginRegistry:
                 for label, _ in _KINDS
                 if any(label in record.kinds for record in records)
             )
+            reads_content = any(
+                getattr(record.plugin, "wants_entries", False)
+                for record in records
+                if isinstance(record.plugin, WatchSink)
+            )
             errors = errors_for(origin, [record.name for record in records])
             categories = {error.category for error in errors}
             detail = "; ".join(
@@ -1597,6 +1728,7 @@ class PluginRegistry:
                     state=state,
                     detail=detail,
                     category=category,
+                    reads_content=reads_content,
                     enabled=named and not operator_off,
                 )
             )
@@ -1710,6 +1842,8 @@ class PluginRegistry:
                 QueryOperator,
                 ComputedField,
                 FilterStage,
+                WatchMatcher,
+                WatchSink,
                 Exporter,
             ),
         ):
@@ -1755,6 +1889,12 @@ class PluginRegistry:
 
         if isinstance(plugin, (QueryOperator, ComputedField)):
             problem = self._query_fault(plugin)
+            if problem is not None:
+                self.errors.append(PluginError(origin, problem))
+                return False
+
+        if isinstance(plugin, WatchMatcher):
+            problem = self._watch_fault(plugin)
             if problem is not None:
                 self.errors.append(PluginError(origin, problem))
                 return False
@@ -1912,6 +2052,49 @@ class PluginRegistry:
         # parsed field, so it cannot shadow one. See `ComputedField`.
         return None
 
+    def _watch_fault(self, plugin: "WatchMatcher") -> Optional[str]:
+        """Why *plugin* may not claim its rule kind, or None if it may.
+
+        **At load, never at the first rule**, on the same argument as
+        :meth:`_query_fault`: everything here is knowable without evaluating
+        anything, and the consequence of missing it is a matcher that loaded
+        cleanly and then never runs, because another one has the kind.
+        """
+
+        kind = getattr(plugin, "kind", "")
+        if not isinstance(kind, str) or not kind.strip():
+            return "declares no kind, so no watch rule could ever reach it"
+        if kind != kind.strip() or any(char.isspace() for char in kind):
+            return f"kind {kind!r} contains whitespace"
+        if kind.casefold() == KIND_PATTERN:
+            return (
+                f"kind {kind!r} is CLV\'s own. A plugin adds a rule kind, it "
+                "does not redefine one — every watch rule ever saved already "
+                "means something under this kind"
+            )
+        # Casefolded, because a stored `kind` is operator-facing text and
+        # `matcher_for` folds when it looks one up: compared exactly, the second
+        # plugin to claim `Burst` against `burst` would load and then never be
+        # reached, which from the outside is a plugin that is simply not working.
+        folded = kind.casefold()
+        for other in self.matchers:
+            if getattr(other, "kind", "").casefold() == folded:
+                return (
+                    f"kind {kind!r} is already registered by "
+                    f"{_plugin_name(other)}"
+                )
+        return None
+
+    def watch_stack(self, *, budget: Optional[PluginBudget] = None) -> "WatchStack":
+        """The loaded watch plugins as specs ``clv.services.watch`` can install.
+
+        The third of the same shape, for the third time for the same reason:
+        ``watch.py`` may not import this module, so the guard travels with the
+        plugin rather than being fetched alongside it.
+        """
+
+        return WatchStack(self, budget=budget)
+
     def query_stack(self, *, budget: Optional[PluginBudget] = None) -> "QueryStack":
         """The loaded query plugins as specs ``clv.services.query`` can install.
 
@@ -1941,6 +2124,8 @@ class PluginRegistry:
             "operator": self.operators,
             "computed field": self.computed,
             "filter": self.filters,
+            "matcher": self.matchers,
+            "sink": self.sinks,
             "exporter": self.exporters,
         }[kind]
 
@@ -2318,6 +2503,173 @@ class QueryStack:
             return None
 
         return value
+
+
+class WatchStack:
+    """The loaded watch plugins, wrapped in everything CLV owes them.
+
+    Produces the :class:`~clv.services.watch.MatcherSpec` and
+    :class:`~clv.services.watch.SinkSpec` records
+    ``watch.install_watch_plugins`` stores, with every third-party callable
+    already carrying its guard.
+
+    **Matchers: loaded, not enabled.** Every loaded matcher gets a spec; one out
+    of service gets ``matches=None``. That is what keeps its *kind* claimed
+    while it is switched off, so a rule declaring that kind reports the plugin
+    by name instead of falling back to the pattern path and matching its
+    parameter string as a query — the same reservation, and the same reason,
+    as :class:`~clv.services.query.OperatorSpec`.
+
+    **Sinks: only the enabled ones.** The asymmetry is deliberate. A kind has to
+    stay reserved because a saved rule *means* something under it; a
+    destination reserves nothing and means nothing, so a sink that is out of
+    service is simply not in the list and nothing is delivered to it.
+    """
+
+    __slots__ = ("_registry", "matchers", "sinks", "_budget")
+
+    def __init__(
+        self, registry: "PluginRegistry", *, budget: Optional[PluginBudget] = None
+    ) -> None:
+        self._registry = registry
+        self._budget = budget
+        self.matchers: tuple[MatcherSpec, ...] = tuple(
+            MatcherSpec(
+                kind=plugin.kind,
+                plugin=_plugin_name(plugin),
+                matches=(
+                    None
+                    if registry.is_disabled(plugin)
+                    else self._guard_matches(plugin)
+                ),
+                validate=(
+                    None
+                    if registry.is_disabled(plugin)
+                    else self._guard_validate(plugin)
+                ),
+            )
+            for plugin in registry.matchers
+        )
+        self.sinks: tuple[SinkSpec, ...] = tuple(
+            SinkSpec(
+                plugin=_plugin_name(plugin),
+                deliver=self._guard_deliver(plugin),
+                wants_entries=bool(getattr(plugin, "wants_entries", False)),
+                disable=self._disabler(plugin),
+            )
+            for plugin in registry.sinks
+            if not registry.is_disabled(plugin)
+        )
+
+    def start(self) -> None:
+        """Open a budget pass. One poll's batch of new lines is one pass."""
+
+        budget = self._budget
+        if budget is not None and budget.active:
+            budget.start()
+
+    def settle(self) -> None:
+        """Close the pass, disabling anything that has struck out."""
+
+        budget = self._budget
+        if budget is not None and budget.active:
+            budget.settle()
+
+    def _disabler(self, plugin: Any):
+        """A one-argument kill switch for *plugin*, closed over the registry.
+
+        Handed to a :class:`~clv.services.watch.SinkSpec` so the dispatcher can
+        retire a sink that *hangs* — which no wrapper around ``deliver`` can
+        detect, because a call that never returns never reaches its ``except``.
+        """
+
+        registry = self._registry
+
+        def disable(reason: str) -> None:
+            registry.disable(plugin, reason, origin=_plugin_name(plugin))
+
+        return disable
+
+    def _guard_matches(self, plugin: "WatchMatcher"):
+        registry = self._registry
+        budget = self._budget
+        clock = time.perf_counter
+
+        def matches(entry: LogEntry, rule: Any) -> bool:
+            if registry.is_disabled(plugin):
+                return False
+            timing = budget is not None and budget.active
+            mark = clock() if timing else 0.0
+            try:
+                result = plugin.matches(entry, rule)
+            except Exception as exc:  # noqa: BLE001 - third-party code
+                registry.disable(
+                    plugin, f"raised: {exc}", origin=_plugin_name(plugin)
+                )
+                return False
+            finally:
+                if timing:
+                    budget.charge(plugin, clock() - mark)
+            # Python's truth protocol rather than a type check, unlike
+            # `ComputedField.value`. A wrong *type* there is a silent
+            # never-matches, because the value is compared against a string; a
+            # truthy object here is what an author writing
+            # `return self._pattern.search(entry.raw)` plainly meant, and
+            # refusing it would be pedantry with a plugin taken out of service
+            # at the end of it.
+            return bool(result)
+
+        return matches
+
+    def _guard_validate(self, plugin: "WatchMatcher"):
+        registry = self._registry
+
+        def validate(pattern: str) -> Optional[str]:
+            if registry.is_disabled(plugin):
+                return None
+            try:
+                result = plugin.validate(pattern)
+            except Exception as exc:  # noqa: BLE001 - third-party code
+                registry.disable(
+                    plugin, f"validate() raised: {exc}", origin=_plugin_name(plugin)
+                )
+                return None
+            # Off the render path entirely -- this runs when the operator
+            # presses Save in the rules dialog -- so it is unbudgeted, and a
+            # non-string is read as "no complaint" rather than shown as one.
+            return result if isinstance(result, str) and result else None
+
+        return validate
+
+    def _guard_deliver(self, plugin: "WatchSink"):
+        """Wrap ``deliver`` so a raise disables the sink instead of the thread.
+
+        Deliberately **not** budgeted. A sink is one call per rule per window on
+        a thread of its own, so "slow" is not a symptom here and a
+        :class:`PluginBudget`'s three-strikes-per-pass policy has no pass to
+        count. What can actually go wrong is a call that never comes back, and
+        that is the dispatcher's deadline, not a stopwatch around a call that
+        has already returned.
+        """
+
+        registry = self._registry
+
+        def deliver(
+            name: str,
+            count: int,
+            context: Any,
+            entries: Sequence[LogEntry] = (),
+        ) -> None:
+            if registry.is_disabled(plugin):
+                return
+            try:
+                plugin.deliver(name, count, context, entries)
+            except Exception as exc:  # noqa: BLE001 - third-party code
+                registry.disable(
+                    plugin, f"raised: {exc}", origin=_plugin_name(plugin)
+                )
+
+        return deliver
 
 
 class FormatStack(Sequence):
@@ -3069,6 +3421,9 @@ __all__ = [
     "QueryOperator",
     "ComputedField",
     "QueryStack",
+    "WatchMatcher",
+    "WatchSink",
+    "WatchStack",
     "LogSourceProvider",
     "ProviderSource",
     "Plugin",

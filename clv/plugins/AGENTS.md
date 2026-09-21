@@ -454,7 +454,185 @@ saying so — a number compared against a string would quietly never match.
 and uses only letters, digits, `_`, `.` and `-`. Anything else could never be
 typed as a term.
 
-### 6. Exporter
+### 6. WatchMatcher
+
+Teaches CLV a kind of watch rule that is not "this pattern matched".
+
+A watch rule carries a `kind`. The default is `"pattern"` — CLV's own, where the
+rule's `pattern` field is a query in the field-query syntax. A matcher claims a
+different one, and for a rule declaring it the `pattern` field stops being a
+query and becomes **your parameter string**: CLV does not parse it, does not
+validate it, and does not interpret it in any way.
+
+```python
+from clv.api import WatchMatcher
+
+class Burst(WatchMatcher):
+    name = "watch-alerts"
+    kind = "burst"                      # "pattern" is reserved
+
+    def matches(self, entry, rule) -> bool:
+        ...                             # rule.pattern is yours to read
+
+    def validate(self, pattern):        # optional
+        return None if _OK.match(pattern) else "Looks like: oom-killer x5/60."
+```
+
+**Reachable from the UI:** `W` opens the rules dialog, which grows a `Kind`
+button as soon as one matcher is installed and cycles through the kinds that
+are. A viewer with no matcher installed has no such button.
+
+#### Which kinds are legal
+
+`kind` is matched **casefolded**, must contain no whitespace, and may not be
+`pattern`. That last one is not tidiness: every watch rule ever saved already
+means something under `pattern`, and a plugin redefining it would change what
+those rules do. Two matchers claiming one kind is refused at load, with the
+second one named — compared casefolded, because `Burst` and `burst` are one kind
+to every rule that could declare either.
+
+#### What a matcher can and cannot express
+
+`matches` is called **once per newly arrived entry** per enabled rule of your
+kind — including repeats of a line CLV has already seen, because a matcher may
+be counting and the answer cache that covers a pattern rule would be wrong for
+one that is.
+
+There is no tick. A matcher is offered lines and nothing else, so:
+
+- a **threshold** or **burst** kind works: hold your own state, keyed on
+  `rule.name`, and bound it yourself — the budget measures time, not memory;
+- an **absence** or **silence** kind cannot be written at all, because nothing
+  arriving means `matches` is never called. `PLUGIN_TODO.md` Phase 9 listed
+  "absence" as an example kind and was wrong to; the correction is recorded
+  there rather than quietly dropped.
+
+**Never raise for something the operator typed.** A malformed parameter is
+`validate`'s business, and `validate` is called when they press Save, where the
+complaint can be shown next to the field. Raising from `matches` disables the
+plugin for the session over a rule that could have been fixed in the dialog.
+
+### 7. WatchSink
+
+Where a watch hit is delivered, besides the toast.
+
+```python
+from clv.api import WatchSink
+
+class AlertFile(WatchSink):
+    name = "watch-alerts"
+    wants_entries = False               # the default; see below
+
+    def deliver(self, name, count, context, entries=()):
+        ...
+```
+
+**You are fed the result of rate limiting, never the raw hits.** A rule matching
+five hundred lines inside one window reaches you **once**, with `count=500`.
+That is not a convenience. A rule matching every line is the behaviour that
+makes people switch a feature like this off, and a sink that could bypass the
+coalescing would be able to do it to somebody else's inbox rather than to their
+own status bar.
+
+**CLV's own toast is a sink too.** It is in the same list, marked as running
+inline because it paints; there is one delivery path rather than a plugin path
+bolted beside a core one.
+
+#### You do not run on the event loop
+
+Every sink gets a thread of its own. Blocking on a socket is allowed here in a
+way it is allowed nowhere else in a plugin — and a sink that blocks holds up
+nothing but itself, because one shared worker would have let one sick sink
+starve every healthy one.
+
+There is a deadline. A sink that has not returned from one `deliver` within
+`plugin_sink_timeout_ms` (default 5000, `0` for none) is taken out of service,
+named in the `P` dialog and fed nothing further.
+
+**Being abandoned is not being stopped.** CLV cannot kill a thread, so the call
+goes on running for as long as it likes; all the deadline buys is that CLV stops
+waiting for it and stops queueing behind it. A sink that talks to the network
+should therefore set **its own** timeouts rather than relying on this one. The
+subprocess host in `PLUGIN_TODO.md` Phase 13 is what would make a hang genuinely
+stoppable; a thread never will be.
+
+#### What a sink is given, and what it is not
+
+A rule name and a count. That is the default and it is deliberately meagre:
+
+```python
+def deliver(self, name, count, context, entries=()):
+    # name  -- the rule's name, as the operator typed it
+    # count -- how many lines matched inside the window
+    # context -- the FilterContext: the active filter spec and the open source
+    # entries -- empty, unless you declared wants_entries
+```
+
+Set `wants_entries = True` and you receive a bounded sample of the matching
+lines — at most `SINK_SAMPLE_LIMIT` of them, most recent last, alongside the
+**true** count, which is not capped. Nothing is retained at all unless some
+installed sink has asked for it.
+
+That declaration is shown to the operator: a plugin supplying such a sink is
+flagged in the `P` dialog, with the sentence "reads your log lines and delivers
+them wherever it is configured to send them" on its row. This is the right price
+for the capability — and a sink that does not need it should not pay it. A name
+and a count are the whole of what an alert record usually needs.
+
+#### Egress is the operator's decision, not yours
+
+A sink that leaves the machine is the strongest case in this file for the
+consent convention, and the pattern is the one the journal provider already
+follows for *reading*: ship inert, read your destination from your own
+`[plugin:<name>]` section, and deliver nothing until it is set.
+
+```python
+import json
+import urllib.request
+from clv.api import WatchSink, setting_bool
+
+class Webhook(WatchSink):
+    """POSTs a rule name and a count. Inert until an endpoint is configured."""
+
+    name = "webhook"
+    # Deliberately not set: this sink has no need of the lines themselves, and
+    # a webhook that shipped log content by default would be the clearest
+    # possible example of a plugin deciding something that is not its to decide.
+    wants_entries = False
+
+    def configure(self, settings):
+        self._url = settings.get("endpoint", "").strip()
+        self._timeout = float(settings.get("timeout", "5"))
+
+    def deliver(self, name, count, context, entries=()):
+        if not self._url:
+            return                      # no endpoint, no egress, no complaint
+        payload = json.dumps({"rule": name, "count": count}).encode()
+        request = urllib.request.Request(
+            self._url, data=payload, headers={"Content-Type": "application/json"}
+        )
+        # Your own timeout, not CLV's: CLV's deadline stops it waiting for you,
+        # it does not stop you waiting for the network.
+        urllib.request.urlopen(request, timeout=self._timeout).close()
+```
+
+```ini
+[log_viewer]
+plugins = webhook
+
+[plugin:webhook]
+endpoint = https://hooks.example.invalid/clv
+timeout = 5
+```
+
+Nothing here is enforced. CLV does not inspect what a sink imports or intercept
+what it sends — see [Trust model](#trust-model). What CLV does is make the
+capability **visible** (the flag in `P`), make it **rate-limited** (you cannot be
+used for a storm), and make it **stoppable enough** (the deadline). The decision
+to install a plugin that posts anywhere is the operator's, made with those three
+facts in hand.
+
+### 8. Exporter
 
 Saves or transmits the entries the filters kept.
 
@@ -821,6 +999,12 @@ the regex half, and it matches lines containing the literal text `host~^web` —
 a different query that happens to parse. A saved view that quietly did that
 would be worse than one that refused.
 
+A watch rule has a second way to lose its meaning, and it is worse. A rule
+declaring `kind = "burst"` whose matcher is gone would fall back to the pattern
+path, and `oom-killer x5/60` is a perfectly good query — so the rule would start
+matching lines containing that literal text instead of doing nothing. Same
+failure, one level up.
+
 So a `SavedView` and a `WatchRule` each carry `requires`: the plugins their
 query depends on, recorded **when the view or rule is saved** and never
 recomputed afterwards. Recomputing while a plugin was missing would erase the
@@ -833,14 +1017,16 @@ typed is ever stamped.
 | --- | --- | --- |
 | The plugin is **not installed** | The view or rule is kept byte-intact, marked unusable, and named with the plugin it needs. A view refuses to apply; a rule never matches. | `⚠ needs the 'x' plugin, which is not installed` — on the tree row, in the view picker, in the rules dialog |
 | The plugin is installed but **switched off** (a fault, the time budget, or the `P` dialog) | Its token stays reserved and the query reports it. The saved record is untouched and still applicable the moment the plugin is back. | The query bar's validation line: `~ needs the 'x' plugin, which is not in service` |
+| A watch rule's **`kind`** names a matcher nothing provides | The rule is kept byte-intact, never matches, and is named with the kind. It is reported by *kind* and not by plugin on purpose: the kind is the contract and a plugin is one implementation of it, so a rule written against one `burst` matcher and opened where a different one is installed still runs. | `⚠ needs the 'burst' rule kind, which no installed plugin provides` — in the rules dialog |
 
 Collapsing the two would mean an operator who switched a plugin off for a minute
 found their saved views marked broken; keeping the token reserved in the second
 case is what stops the query silently becoming a regex in the meantime.
 
 **Nothing is ever rewritten.** A state file written before `requires` existed
-loads with an empty one; a file written after it stays readable on a build
-without the plugin. A view or rule is preserved, disabled and explained — in
+loads with an empty one, and one written before `kind` existed loads as a
+`pattern` rule; a file written after either stays readable on a build without
+the plugin. A view or rule is preserved, disabled and explained — in
 that order, and never reinterpreted into meaning something else.
 
 ---
@@ -862,6 +1048,8 @@ a stage that is merely slow makes CLV look broken and says nothing at all.
 | `QueryOperator.test` | **every render** | **once per buffered entry, per term** |
 | `ComputedField.value` | **every render** | **once per buffered entry whose own fields lack the key** |
 | `FilterStage.apply` | **every render** | **once per buffered entry** |
+| `WatchMatcher.matches` | **every poll** | **once per newly arrived entry, per rule of its kind** |
+| `WatchSink.deliver` | when a rate-limit window closes | once per rule per window, **on its own thread** |
 | `Exporter.export` | on `Ctrl+E` | once |
 
 The bold rows are the ones to design against, and they are bold for
@@ -922,21 +1110,31 @@ source opens pays every cold cost a plugin has, and a large paste or a loaded
 machine can put a healthy stage over the line for a pass or two. A plugin that
 is genuinely slow still strikes out within about a second and a half of typing.
 
-**Three budgets, one policy.** `LogFormat.parse` is charged against a separate
+**Four budgets, one policy.** `LogFormat.parse` is charged against a separate
 ceiling, because it is measured against a different thing: a pass on the read
 path is one batch of lines from a reader's `prime` or `poll`, not one render.
 The query plugins get a third instance, sharing the render path's ceiling
 because they are the same kind of work on the same trigger — but settling
 separately, so a slow `FilterStage` and a slow `QueryOperator` do not have their
-strikes interleaved by whichever happened to be measured first. Everything else
-is identical in all three: three consecutive passes over the line, disabled,
-named in `P`, and reachable by **Re-enable**.
+strikes interleaved by whichever happened to be measured first. `WatchMatcher`
+gets a fourth, on the **read** ceiling, because a matcher pass is one poll's
+batch of newly arrived lines and not one keystroke. Everything else is identical
+in all four: three consecutive passes over the line, disabled, named in `P`, and
+reachable by **Re-enable**.
 
 ```ini
 [log_viewer]
 plugin_time_budget_ms = 250     # FilterStage.apply, and the query plugins
-plugin_read_budget_ms = 50      # the read path: LogFormat.parse
+plugin_read_budget_ms = 50      # the read path: LogFormat.parse, WatchMatcher.matches
+plugin_sink_timeout_ms = 5000   # not a budget -- see below
 ```
+
+**A `WatchSink` is on none of them, and that is not an omission.** A sink runs
+on a thread of its own, so being slow costs the pane nothing and there is no
+render pass to count three of. What can actually go wrong is a call that never
+comes back, and a stopwatch around a call that has already returned cannot see
+that. `plugin_sink_timeout_ms` is a **deadline**, not a ceiling: one call, one
+limit, out of service if it is exceeded.
 
 Setting either to `0` turns that guard off entirely, for an operator who would rather
 have a slow plugin than a disabled one. There is no per-plugin override: a
@@ -954,8 +1152,15 @@ Time inside `apply()` is measured; nothing else is. In particular:
   plugin that *hangs* in one of them hangs CLV, and on `teardown()` that means
   hanging exit. Exceptions there are contained; time is not. Bounding it needs a
   process CLV can kill, which is `PLUGIN_TODO.md` Phase 13 and not a timer.
+- **A sink that hangs is abandoned, not killed.** The deadline stops CLV
+  waiting for it and stops CLV queueing behind it. The thread goes on running
+  for as long as the call takes, holding whatever it holds. This is the same
+  limit as above wearing different clothes: bounding it needs a process CLV can
+  kill.
 - **Memory is not bounded at all.** A plugin that accumulates every entry it
-  sees will exhaust the process, and nothing here will notice.
+  sees will exhaust the process, and nothing here will notice. A `WatchMatcher`
+  holding per-rule state is the easiest place to do this by accident — the
+  budget measures time, and a deque that only ever grows costs none.
 
 Both are consequences of a plugin running in CLV's own process — see
 [Trust model](#trust-model).
@@ -1015,13 +1220,14 @@ lesser version of the core than the core writes against itself.
 | Group | Names |
 | --- | --- |
 | Version | `PLUGIN_API_VERSION` |
-| Interfaces | `Plugin`, `LogSourceProvider`, `LogFormat`, `QueryOperator`, `ComputedField`, `FilterStage`, `Exporter` |
+| Interfaces | `Plugin`, `LogSourceProvider`, `LogFormat`, `QueryOperator`, `ComputedField`, `FilterStage`, `WatchMatcher`, `WatchSink`, `Exporter` |
 | Handed to you | `LogEntry`, `FilterContext`, `FilterSpec`, `TimeWindow`, `ProviderSource`, `SourceRef` |
 | Declaring a format | `FormatProfile`, `DEFAULT_PROFILE`, `FORMAT_NAMES` |
 | Handed back | `ExportResult` |
 | Severity | `normalize_level`, `level_rank`, `level_matches`, `highest_level`, `LEVEL_TRACE` … `LEVEL_CRITICAL`, `LEVEL_ORDER`, `SEVERITY_BUCKETS` |
 | Fields | `NORMALISED_FIELD_KEYS` |
 | Extending the query | `BUILTIN_OPERATORS` |
+| Extending the watch rules | `WatchRule`, `KIND_PATTERN`, `SINK_SAMPLE_LIMIT` |
 | Settings | `setting_bool`, `setting_list` |
 | Process boundary | `WIRE_VERSION`, `entry_to_wire`, `entry_from_wire` |
 
@@ -1035,7 +1241,11 @@ it changes what every severity filter in the process means.
 `FORMAT_NAMES` is published for the same kind of reason: it is the set of names
 a `LogFormat` may *not* claim, and an author should be able to check that rather
 than discover it from a load error. `BUILTIN_OPERATORS` is the same idea one
-seam along: the comparison tokens a `QueryOperator` may not claim.
+seam along: the comparison tokens a `QueryOperator` may not claim, and
+`KIND_PATTERN` is the third: the rule kind a `WatchMatcher` may not claim.
+`WatchRule` is published because a matcher is handed one, and
+`SINK_SAMPLE_LIMIT` because a sink that asked for content should size its
+payload against the real ceiling rather than against the count it is given.
 
 ### Two versions, and they are not the same version
 

@@ -151,14 +151,20 @@ from .services.session import (
 from .services.timeline import Timeline, build_timeline
 from .services.timeline import EMPTY as EMPTY_TIMELINE
 from .services.watch import (
+    SINK_SAMPLE_LIMIT,
     UNUSABLE_MARK,
+    SinkDispatcher,
+    SinkSpec,
+    WatchHit,
     WatchIndex,
     WatchNotifier,
     WatchRule,
     describe_missing,
     describe_rules,
+    install_watch_plugins,
     notifying,
     toggled,
+    wants_entry_samples,
 )
 from .storage import SavedView, SessionState, StateStore
 from .widgets.add_source_dialog import REMOTE_HOSTS, AddSourceDialog
@@ -214,6 +220,11 @@ BREAKPOINT_NARROW = 130
 #: at exactly this width — so widening that row again fails the build until the
 #: number is re-measured.
 BREAKPOINT_MERGE = 148
+
+#: The name CLV's own watch destination goes by in the dispatcher's sink list.
+#: Not a plugin and never disabled — it is here so that the built-in toast and a
+#: plugin sink are the same kind of thing to the code that delivers to them.
+_TOAST_SINK = "notifications"
 
 #: Watch rules shown as individual chips before they collapse into a count.
 MAX_WATCH_CHIPS = 3
@@ -846,6 +857,8 @@ class LogViewerApp(App[None]):
         self._read_budget = self._new_read_budget()
         #: The same again, for the query plugins over one filter of the buffer.
         self._query_budget = self._new_query_budget()
+        #: And once more, for the watch matchers over one poll's new lines.
+        self._watch_budget = self._new_watch_budget()
         #: The instant a relative time window ("15m") counts back from, held
         #: still until the buffer changes. `parse_relative_window` reads
         #: `datetime.now()`, so without this every call to `_filter_spec`
@@ -863,6 +876,12 @@ class LogViewerApp(App[None]):
         #: Coalesces watch notifications. Drained from the tail poll, so no
         #: second timer exists to keep in step with the first.
         self._watch_notifier = WatchNotifier(window=self._config.watch_rate_limit)
+        #: The guarded watch plugins, and the threads their sinks run on.
+        #: Rebuilt in `on_mount` and whenever the plugin generation moves.
+        self._watch_stack = self._plugins.watch_stack(budget=self._watch_budget)
+        self._sink_dispatcher = SinkDispatcher(
+            timeout_ms=self._config.plugin_sink_timeout_ms
+        )
         #: Field names present in the buffer, offered as query completions.
         self._field_names: frozenset[str] = frozenset()
         #: What the enabled `LogFormat` plugins said they can produce. Unioned
@@ -994,9 +1013,11 @@ class LogViewerApp(App[None]):
         self._plugin_budget = self._new_plugin_budget()
         self._read_budget = self._new_read_budget()
         self._query_budget = self._new_query_budget()
+        self._watch_budget = self._new_watch_budget()
         self._plugin_generation = self._plugins.generation
         self._install_formats()
         self._install_query_plugins()
+        self._install_watch_plugins()
         # After the wiring, so a provider's `setup()` sees a fully assembled
         # plugin rather than one still waiting for its resolver.
         self._plugins.start()
@@ -3235,6 +3256,54 @@ class LogViewerApp(App[None]):
             self._computed_fields = names
             self._sync_field_names()
 
+    def _install_watch_plugins(self) -> None:
+        """Put the watch plugins where `clv.services.watch` looks for them.
+
+        Injection, like `_install_formats` and `_install_query_plugins` beside
+        it: `watch.py` takes its matchers and sinks from a module registry this
+        method fills and never imports `clv.plugins`.
+
+        It also rebuilds the dispatcher's sink list, and **CLV's own toast is in
+        that list** -- marked `inline`, because it paints and painting happens on
+        the event loop. That is what makes the delivery path one path: the
+        difference between the built-in destination and a plugin one is a field
+        on the spec rather than a branch in `_poll_watch`.
+        """
+
+        self._watch_stack = self._plugins.watch_stack(budget=self._watch_budget)
+        install_watch_plugins(self._watch_stack.matchers, self._watch_stack.sinks)
+        self._sink_dispatcher.replace(
+            (self._toast_sink(),) + self._watch_stack.sinks
+        )
+        # Retention is switched on by the sinks that asked for content and by
+        # nothing else. With no such sink installed -- the overwhelming case,
+        # and every case before this phase -- the notifier holds counts and no
+        # lines at all.
+        self._watch_notifier.sample_limit = (
+            SINK_SAMPLE_LIMIT if wants_entry_samples() else 0
+        )
+
+    def _toast_sink(self) -> SinkSpec:
+        """CLV's own delivery: a toast, on the event loop, never disabled."""
+
+        return SinkSpec(plugin=_TOAST_SINK, deliver=self._deliver_toast, inline=True)
+
+    def _deliver_toast(
+        self,
+        name: str,
+        count: int,
+        context: FilterContext,
+        entries: Sequence[LogEntry] = (),
+    ) -> None:
+        """The built-in sink. Same signature as a plugin's, deliberately.
+
+        The message is rebuilt from the name and the count rather than carried
+        along, because that is all a sink is given and the built-in destination
+        should not be the one exception that gets more.
+        """
+
+        self._notify(self._watch_notifier.describe(name, count), "warning")
+
     def _new_plugin_budget(self) -> PluginBudget:
         """A render-path budget bound to whatever registry is current.
 
@@ -3283,6 +3352,29 @@ class LogViewerApp(App[None]):
             label="query",
         )
 
+    def _new_watch_budget(self) -> PluginBudget:
+        """The fourth instance: watch matchers over one poll's new lines.
+
+        It takes the *read* ceiling rather than the render one, because a
+        matcher pass is one batch of newly arrived lines -- the read path's unit
+        -- and not one keystroke. A re-render costs nothing here and there is
+        nothing to charge for: a redraw reads `WatchIndex`'s stored answers and
+        asks no rule anything. What a matcher *is* asked about is every line
+        that arrives, repeats included -- see `WatchIndex.evaluate` for why it
+        has to be.
+
+        Sinks are deliberately **not** on a budget. A sink runs on a thread of
+        its own, so slow costs the pane nothing and there is no pass to count
+        three of; what can go wrong is a call that never returns, and that is
+        `SinkDispatcher`'s deadline.
+        """
+
+        return PluginBudget(
+            self._plugins,
+            limit_ms=self._config.plugin_read_budget_ms,
+            label="watch",
+        )
+
     def _sync_plugin_generation(self) -> None:
         """Invalidate what a plugin change makes stale, wherever it lives.
 
@@ -3317,6 +3409,13 @@ class LogViewerApp(App[None]):
         # switched-off operator has to start reporting itself, and a re-enabled
         # one has to start answering again, before the next filter runs.
         self._install_query_plugins()
+        # And the watch plugins, which need one thing more than the other two: a
+        # rule is *compiled* against its matcher, so a matcher going out of
+        # service has to recompile the rules that named it. Without this the
+        # rule keeps the callable it was built with and goes on matching with a
+        # plugin the operator has switched off.
+        self._install_watch_plugins()
+        self._sync_watch_rules()
 
     def _render_log(self, *, scroll_end: bool = False) -> None:
         if self._is_shutting_down:
@@ -4751,24 +4850,36 @@ class LogViewerApp(App[None]):
         self._watch_index.set_rules(self.state.watch_rules, self._known_fields)
         self._watch_notifier.reset()
         if self._watch_index.active and self._session:
-            self._evaluate_watches(self._entries)
+            stack = self._watch_stack
+            stack.start()
+            try:
+                self._evaluate_watches(self._entries)
+            finally:
+                stack.settle()
         self._refresh_watch_status()
 
-    def _evaluate_watches(self, entries: Sequence[LogEntry]) -> list[tuple[str, ...]]:
+    def _evaluate_watches(
+        self, entries: Sequence[LogEntry]
+    ) -> list[tuple[LogEntry, tuple[str, ...]]]:
         """Ask the rules about *entries*, each keyed to the source it came from.
 
         Grouped by origin rather than evaluated one at a time, because
         `WatchIndex.evaluate` caches per distinct line within a source and
         calling it per entry would defeat that. In the ordinary case there is
         one group and this is the call it always was.
+
+        The **entry** comes back with the names it fired, not just the names: a
+        sink that declared `wants_entries` is handed a sample of the lines, and
+        the only place that sample can be collected is here, where the line and
+        the answer are both in hand.
         """
 
         grouped: dict[Optional[Path], list[LogEntry]] = {}
         for entry in entries:
             grouped.setdefault(self._origin(entry), []).append(entry)
-        fired: list[tuple[str, ...]] = []
+        fired: list[tuple[LogEntry, tuple[str, ...]]] = []
         for source, group in grouped.items():
-            fired += [names for _entry, names in self._watch_index.evaluate(source, group)]
+            fired += self._watch_index.evaluate(source, group)
         return fired
 
     def _refresh_watch_status(self) -> None:
@@ -4783,20 +4894,41 @@ class LogViewerApp(App[None]):
         """
 
         if not self._watch_index.active:
+            # Still settled: a sink can be mid-delivery from a poll that ran
+            # before the last rule was switched off, and a hang has to be
+            # noticed whether or not anything new is being watched.
+            self._sink_dispatcher.settle()
             return
-        for names in self._evaluate_watches(entries):
-            self._watch_notifier.record(notifying(names, self.state.watch_rules))
+        sampling = self._watch_notifier.sample_limit > 0
+        stack = self._watch_stack
+        stack.start()
+        try:
+            fired = self._evaluate_watches(entries)
+        finally:
+            stack.settle()
+        for entry, names in fired:
+            self._watch_notifier.record(
+                notifying(names, self.state.watch_rules),
+                entry=entry if sampling else None,
+            )
 
-        messages = self._watch_notifier.due(monotonic())
-        for message in messages:
-            self._notify(message, "warning")
-        if messages and self._config.watch_bell:
-            # Opt-in only, and guarded: a terminal that cannot ring is not a
-            # reason to lose the notification that went with it.
-            try:
-                self.bell()
-            except Exception:  # noqa: BLE001 - terminal-dependent
-                pass
+        # `due_hits`, not `due`: a sink is handed the name and the count as
+        # data, and the toast turns them back into a sentence. Both come out of
+        # the same coalescing, which is what makes "a sink cannot bypass the
+        # rate limiter" a property of the code rather than a promise.
+        hits: tuple[WatchHit, ...] = self._watch_notifier.due_hits(monotonic())
+        if hits:
+            self._sink_dispatcher.deliver(hits, self._plugin_context())
+            if self._config.watch_bell:
+                # Opt-in only, and guarded: a terminal that cannot ring is not a
+                # reason to lose the notification that went with it.
+                try:
+                    self.bell()
+                except Exception:  # noqa: BLE001 - terminal-dependent
+                    pass
+        # Every poll, not only the ones that delivered: the point of the check
+        # is the sink that has *not* come back.
+        self._sink_dispatcher.settle()
 
     def _sync_watch_highlights(self) -> None:
         """Set every visible row's highlight from the index.
@@ -6323,6 +6455,11 @@ class LogViewerApp(App[None]):
     async def on_unmount(self) -> None:
         self._is_shutting_down = True
         self._stop_tail()
+        # Before the plugins are torn down, so a sink cannot be mid-delivery
+        # into a plugin that has already released what it was using. Bounded,
+        # and deliberately impatient: leaving the viewer must not wait on
+        # third-party code deciding to return.
+        self._sink_dispatcher.stop()
         # Readers may hold more than a file handle — a provider-backed source
         # owns a subprocess — so shutdown releases them explicitly rather than
         # leaving it to garbage collection.
@@ -6341,6 +6478,7 @@ class LogViewerApp(App[None]):
         # Left installed it would be a dead registry holding a reference to a
         # registry that has already torn its plugins down.
         install_query_plugins()
+        install_watch_plugins()
         if self._persist_state:
             # Persist as-is: the selected source is deliberately kept so the
             # next launch reopens it.

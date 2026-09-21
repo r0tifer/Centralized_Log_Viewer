@@ -44,6 +44,8 @@ EXPECTED_API = frozenset(
         "QueryOperator",
         "ComputedField",
         "FilterStage",
+        "WatchMatcher",
+        "WatchSink",
         "Exporter",
         # data handed to a plugin
         "LogEntry",
@@ -56,6 +58,10 @@ EXPECTED_API = frozenset(
         "FormatProfile",
         "DEFAULT_PROFILE",
         "FORMAT_NAMES",
+        # extending the watch rules
+        "WatchRule",
+        "KIND_PATTERN",
+        "SINK_SAMPLE_LIMIT",
         # data a plugin hands back
         "ExportResult",
         # the severity vocabulary
@@ -103,6 +109,14 @@ EXPECTED_SIGNATURES: dict[str, str] = {
     "LogFormat.parse": "(self, line: 'str') -> 'Optional[LogEntry]'",
     "QueryOperator.test": "(self, stored: 'str', value: 'str') -> 'bool'",
     "ComputedField.value": "(self, entry: 'LogEntry') -> 'Optional[str]'",
+    "WatchMatcher.matches": (
+        "(self, entry: 'LogEntry', rule: 'WatchRule') -> 'bool'"
+    ),
+    "WatchMatcher.validate": "(self, pattern: 'str') -> 'Optional[str]'",
+    "WatchSink.deliver": (
+        "(self, name: 'str', count: 'int', context: 'FilterContext', "
+        "entries: 'Sequence[LogEntry]' = ()) -> 'None'"
+    ),
     "FormatProfile.keys": "(self) -> 'frozenset[str]'",
     "FilterStage.apply": (
         "(self, entry: 'LogEntry', context: 'FilterContext') -> 'Optional[LogEntry]'"

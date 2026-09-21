@@ -180,6 +180,14 @@ class PluginsDialog(ModalScreen[Optional[tuple[PluginStatus, ...]]]):
         )
         if row.kinds:
             line.append(f"  {', '.join(row.kinds)}", style="#7aa3d1")
+        if row.reads_content:
+            # Between the kinds and the state, and in the warning colour rather
+            # than the kinds' own: "sink" says where this plugin sends things,
+            # and this says *what* it sends. It survives to 80 columns because
+            # it is two characters, which is the point -- the fact an operator
+            # most needs before enabling something should not be the first
+            # thing a narrow terminal drops.
+            line.append("  ⚑", style="#facc15")
         line.append(
             f"  — {state}",
             style="dim" if row.state in QUIET_STATES else "#facc15",
@@ -253,6 +261,13 @@ class PluginsDialog(ModalScreen[Optional[tuple[PluginStatus, ...]]]):
 
     def _detail(self, row: PluginStatus) -> str:
         parts = [f"{row.source}: {row.origin}"]
+        if row.reads_content:
+            # Stated in full here, because the row only has room for a glyph
+            # and this is not a fact to leave an operator guessing at.
+            parts.append(
+                "⚑ Reads your log lines and delivers them wherever it is "
+                "configured to send them."
+            )
         if row.detail:
             parts.append(row.detail)
         consequence = self._consequence(row)

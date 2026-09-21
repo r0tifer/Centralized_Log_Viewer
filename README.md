@@ -76,9 +76,9 @@ desktop terminal and on a headless 80-column SSH session.
   do on a single file. A set may span machines: with SSH configured, local and
   remote logs interleave in one pane, and `node:` says which machine each line
   came from.
-- 🧩 **Plugins.** Seven interfaces — sources, log formats, query operators,
-  computed fields, filter stages and exporters — published as a versioned API
-  in `clv.api`. Install one by copying a file into
+- 🧩 **Plugins.** Nine interfaces — sources, log formats, query operators,
+  computed fields, filter stages, watch rule kinds, watch destinations and
+  exporters — published as a versioned API in `clv.api`. Install one by copying a file into
   `~/.config/clv/plugins/` — no root, no Python toolchain, and it survives a
   package upgrade. A file there is listed but **not run** until you name it in
   the `plugins` setting, so installing a plugin and running one stay two
@@ -998,6 +998,19 @@ something you typed, not something a log contained. Everything runs in-process
 for the life of the session — no daemon, no desktop notification service, no
 subprocess.
 
+**Both halves are extensible.** A plugin can add a *rule kind* — "five of these
+within a minute" rather than "this pattern matched" — and the `Kind` button
+appears in the rules dialog as soon as one is installed. A plugin can also add a
+*destination*, so a hit can go to a file, a webhook or anywhere else instead of
+only to a toast. Two guarantees hold whatever is installed: a destination is fed
+what the rate limiter already coalesced, so it cannot be used for a storm; and
+it runs on its own thread, so one that blocks cannot stall the viewer. A
+destination receives a rule name and a count, and receives your log lines only
+if it declares that it wants them — a plugin that does is flagged in the plugins
+dialog (`P`). A rule records the kind it needs, so one whose plugin is gone is
+kept exactly as written, marked unusable and named, rather than quietly matching
+something else. See `clv/plugins/AGENTS.md`.
+
 ### Exporting
 
 `Ctrl+E` writes the entries the filters kept to a file. Three formats ship:
@@ -1243,6 +1256,14 @@ cd ~/.config/clv/plugins && cp examples/nginx_error.py .
 then add `nginx_error` to `plugins`. Nothing in `examples/` is listed or run:
 it is one directory down and CLV only looks in the directory itself, so the
 plugin count keeps meaning *plugins you installed*.
+
+Two more are there beside it: `field_regex.py`, which adds the `~` operator and
+the `age` field described under *Field queries*, and `watch_alerts.py`, which
+adds a `burst` watch rule kind — "five of these within a minute" — and a
+destination that appends every watch hit to a file you name. That last one ships
+**inert**: it delivers nothing at all until its `[plugin:watch_alerts]` section
+gives it a path, which is the pattern any plugin that sends your logs somewhere
+is expected to follow.
 
 **Teaching CLV a format is a plugin's job like any other.** A `LogFormat` gets
 offered every line the built-ins declined; what it returns is an entry on equal

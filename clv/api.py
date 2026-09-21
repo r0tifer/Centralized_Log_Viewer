@@ -62,6 +62,8 @@ from .plugins import (
     Plugin,
     ProviderSource,
     QueryOperator,
+    WatchMatcher,
+    WatchSink,
     setting_bool,
     setting_list,
 )
@@ -89,6 +91,7 @@ from .services.parsing import (
 )
 from .services.query import BUILTIN_OPERATORS, NORMALISED_FIELD_KEYS
 from .services.refs import SourceRef
+from .services.watch import KIND_PATTERN, SINK_SAMPLE_LIMIT, WatchRule
 
 __all__ = [
     # The promise's own version. Constrain this, not clv.__version__.
@@ -100,6 +103,8 @@ __all__ = [
     "QueryOperator",
     "ComputedField",
     "FilterStage",
+    "WatchMatcher",
+    "WatchSink",
     "Exporter",
     # --- data handed to a plugin --------------------------------------------
     "LogEntry",
@@ -122,6 +127,19 @@ __all__ = [
     # may not claim. Published so an author can check rather than discover it
     # from a load error.
     "FORMAT_NAMES",
+    # --- extending the watch rules -------------------------------------------
+    # A matcher is handed the whole rule, because its `pattern` is the matcher's
+    # own parameter string and its `name` is the key to hold per-rule state
+    # under.
+    "WatchRule",
+    # The rule kind CLV owns, and therefore the one a `WatchMatcher` may not
+    # claim. Published on the same argument as `FORMAT_NAMES` and
+    # `BUILTIN_OPERATORS`: an author should be able to check rather than
+    # discover it from a load error.
+    "KIND_PATTERN",
+    # How many lines a `wants_entries` sink can actually be handed, so a sink
+    # sizes its payload against the real ceiling rather than against the count.
+    "SINK_SAMPLE_LIMIT",
     # --- data a plugin hands back -------------------------------------------
     "ExportResult",
     # --- the severity vocabulary --------------------------------------------

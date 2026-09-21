@@ -47,7 +47,7 @@ CONFIG_VERSION_OPTION = "config_version"
 #: template's option set changes. Deliberately not ``__version__``: most
 #: releases do not touch the settings schema, and stamping the app version
 #: would re-migrate every operator's file for nothing.
-CURRENT_CONFIG_VERSION = 4
+CURRENT_CONFIG_VERSION = 5
 
 #: One remote host per section: ``[ssh:web01]``. The suffix is the host's name
 #: within CLV — what the tree shows, what ``node:`` matches, and the fallback
@@ -125,6 +125,13 @@ _LIMITS: dict[str, tuple[int, int, int]] = {
     # already the slowest thing between opening a log and seeing it. Floor is
     # zero and means no guard, exactly as above.
     "plugin_read_budget_ms": (50, 0, 60_000),
+    # Milliseconds a watch sink may spend inside one delivery before CLV stops
+    # waiting for it. Not a budget in the sense the two above are -- a sink runs
+    # on a thread of its own and being slow costs the pane nothing -- but a
+    # deadline: a sink that never returns would otherwise be fed forever and
+    # silently deliver nothing. Generous, because the thing on the other end is
+    # usually a network. Zero means no deadline.
+    "plugin_sink_timeout_ms": (5_000, 0, 60_000),
 }
 
 DEFAULT_SETTINGS_TEMPLATE = f"""[{CONFIG_SECTION}]
@@ -232,6 +239,17 @@ plugin_time_budget_ms = 250
 #
 # Set to 0 to turn this guard off too.
 plugin_read_budget_ms = 50
+
+# milliseconds. How long a watch sink - a plugin that delivers a watch hit
+# somewhere, typically over the network - may spend in one delivery before CLV
+# gives up on it, takes it out of service and says so in the plugins dialog (P).
+# A sink runs on its own thread and never blocks the viewer, so this is not
+# about speed: it is the only thing standing between a webhook whose endpoint
+# stopped answering and a sink that is fed for the rest of the session and
+# quietly delivers nothing.
+#
+# Set to 0 for no deadline.
+plugin_sink_timeout_ms = 5000
 
 # Read log folders on other machines over SSH. Off by default, and for a
 # stronger version of the reason above: a remote source spawns ssh, and a
@@ -421,6 +439,7 @@ class LogConfig:
     cluster_lookback: int = _LIMITS["cluster_lookback"][0]
     plugin_time_budget_ms: int = _LIMITS["plugin_time_budget_ms"][0]
     plugin_read_budget_ms: int = _LIMITS["plugin_read_budget_ms"][0]
+    plugin_sink_timeout_ms: int = _LIMITS["plugin_sink_timeout_ms"][0]
     #: Ring the terminal bell when a watch rule notifies. Off by default: a
     #: bell is a thing an operator opts into, never a thing a log does to them.
     watch_bell: bool = False
@@ -696,14 +715,19 @@ CLV's `clv/plugins/AGENTS.md`.
 Worked examples
 ---------------
 
-Two complete, commented plugins, each walking through what its kind of plugin
-has to declare and why:
+Three complete, commented plugins, each walking through what its kind of
+plugin has to declare and why:
 
     examples/nginx_error.py   teaches CLV to read nginx's error log, a format
                               the built-in matchers do not recognise
     examples/field_regex.py   adds `svc~^web[0-9]+` - a regex against one
                               field - and `age<60`, seconds since the line
                               was written
+    examples/watch_alerts.py  adds a `burst` watch rule kind - "five of these
+                              within a minute" - and a sink that appends every
+                              watch hit to a file you name. The sink ships
+                              inert: it delivers nothing until its
+                              [plugin:watch_alerts] section gives it a path
 
 Nothing in `examples/` is listed or run: it is one directory down, and CLV
 only looks here. To use one, copy it up and name it:
@@ -733,6 +757,7 @@ PLUGIN_EXAMPLES_DIR = "examples"
 SEEDED_EXAMPLES: dict[str, str] = {
     "nginx_error.py": "clv.examples.nginx_error",
     "field_regex.py": "clv.examples.field_regex",
+    "watch_alerts.py": "clv.examples.watch_alerts",
 }
 
 
@@ -1479,6 +1504,7 @@ def load_config(path: Optional[Path] = None) -> LogConfig:
         cluster_lookback=_read_int(section, "cluster_lookback"),
         plugin_time_budget_ms=_read_int(section, "plugin_time_budget_ms"),
         plugin_read_budget_ms=_read_int(section, "plugin_read_budget_ms"),
+        plugin_sink_timeout_ms=_read_int(section, "plugin_sink_timeout_ms"),
         watch_bell=_read_bool(section, "watch_bell", False),
         enable_journald=_read_bool(section, "enable_journald", False),
         plugins=_read_plugin_list(section, issues),
