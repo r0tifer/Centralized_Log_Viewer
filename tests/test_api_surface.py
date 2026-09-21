@@ -46,6 +46,8 @@ EXPECTED_API = frozenset(
         "FilterStage",
         "ClusterRule",
         "ShapeContributor",
+        "TimelineAnnotation",
+        "TimelineMetric",
         "WatchMatcher",
         "WatchSink",
         "Exporter",
@@ -112,6 +114,11 @@ EXPECTED_SIGNATURES: dict[str, str] = {
     "QueryOperator.test": "(self, stored: 'str', value: 'str') -> 'bool'",
     "ComputedField.value": "(self, entry: 'LogEntry') -> 'Optional[str]'",
     "ShapeContributor.contribute": "(self, entry: 'LogEntry') -> 'str'",
+    "TimelineAnnotation.annotations": (
+        "(self, window: 'TimeWindow') -> "
+        "'Iterable[tuple[datetime, str, Optional[str]]]'"
+    ),
+    "TimelineMetric.value": "(self, entry: 'LogEntry') -> 'Optional[float]'",
     "WatchMatcher.matches": (
         "(self, entry: 'LogEntry', rule: 'WatchRule') -> 'bool'"
     ),
@@ -198,6 +205,19 @@ def test_a_cluster_rule_declares_a_pattern_and_a_placeholder() -> None:
 
     assert api.ClusterRule.pattern == ""
     assert api.ClusterRule.placeholder == ""
+
+
+def test_a_timeline_metric_declares_a_name_and_a_unit() -> None:
+    """Two class attributes, and the caption is what they are for.
+
+    ``metric_name`` is not optional in practice — a metric that does not set it
+    is refused at load — but the *default* is part of the frozen surface: it is
+    what an author's subclass inherits before they set it, and what the load
+    check tests against.
+    """
+
+    assert api.TimelineMetric.metric_name == ""
+    assert api.TimelineMetric.unit == ""
 
 
 def test_an_exporter_declares_whether_it_wants_a_destination() -> None:

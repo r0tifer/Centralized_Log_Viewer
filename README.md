@@ -858,6 +858,22 @@ says so in the caption instead of drawing an empty rectangle.
 Whether the bar is open is remembered between runs, along with a **Timeline**
 switch in the Advanced drawer. Which bucket you had selected is not.
 
+**A plugin can mark the axis and change what a bucket measures.** A
+`TimelineAnnotation` puts deploys, incidents or maintenance windows on the bar —
+the marked column is underlined in the mark's own severity colour, its label
+shows in the caption, and `shift+←` / `shift+→` step between marks. A
+`TimelineMetric` scales the bar by something other than the line count: bytes,
+durations, retries. The caption then leads with the measurement and names the
+plugin supplying it, because a bar of bytes and a bar of lines are the same
+glyphs.
+
+A metric is declared as a value *per entry* and CLV does the summing, which is
+not a simplification — it is what keeps the histogram foldable, so a tailed line
+still finds its bucket by arithmetic instead of forcing a rebuild. A median
+cannot be expressed here, and that is the interface working rather than a
+limitation of it. `examples/timeline_marks.py` in your plugin directory works
+both halves through.
+
 ### Marking lines
 
 `m` marks the line under the cursor and `M` steps between the marks, wrapping
@@ -1098,7 +1114,7 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `v` / `V` | Saved views (then `r` renames, `d` deletes) / save the current filters as a view |
 | `W` | Watch rules (then `a` adds, `d` deletes) |
 | `d` | Show / hide the event detail pane |
-| `b` | Show / hide the severity timeline (then `←` `→` `Enter` to filter to a bucket) |
+| `b` | Show / hide the severity timeline (then `←` `→` `Enter` to filter to a bucket, `shift+←` `shift+→` to step between plugin annotations) |
 | `c` | Collapse / expand repeated lines (then `Enter` on a cluster row) |
 | `w` | Follow new lines (auto-scroll) on/off |
 | `o` | Structured columns (time · level · source · message) on/off |

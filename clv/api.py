@@ -64,6 +64,8 @@ from .plugins import (
     ProviderSource,
     QueryOperator,
     ShapeContributor,
+    TimelineAnnotation,
+    TimelineMetric,
     WatchMatcher,
     WatchSink,
     setting_bool,
@@ -107,6 +109,8 @@ __all__ = [
     "FilterStage",
     "ClusterRule",
     "ShapeContributor",
+    "TimelineAnnotation",
+    "TimelineMetric",
     "WatchMatcher",
     "WatchSink",
     "Exporter",
@@ -137,6 +141,12 @@ __all__ = [
     # namespace a plugin can collide in and would otherwise discover from a load
     # error. Clustering has no such namespace: two rules may write the same
     # placeholder harmlessly, and a contributor claims nothing at all.
+    # --- extending the timeline ----------------------------------------------
+    # `TimeWindow` is already published above, and it is the whole of what a
+    # `TimelineAnnotation` is handed -- no constant joins these two either. A
+    # metric claims no namespace (there is one metric and it is settled by
+    # priority, not by a name nobody else may take), and a mark claims nothing
+    # at all.
     # --- extending the watch rules -------------------------------------------
     # A matcher is handed the whole rule, because its `pattern` is the matcher's
     # own parameter string and its `name` is the key to hold per-rule state

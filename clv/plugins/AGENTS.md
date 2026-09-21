@@ -751,7 +751,129 @@ were, on the next render. CLV clears the shape cache as part of installing a
 rule set, which is what makes "the next render" true rather than "the next line
 nothing has shaped before".
 
-### 10. Exporter
+### 10. TimelineAnnotation
+
+Marks on the timeline's axis: not how much happened, but what else did.
+
+The histogram (`b`) answers *when did this start*. An annotation answers *what
+was happening then*, which is the difference between a spike and a spike with a
+cause.
+
+```python
+from clv.api import TimelineAnnotation
+
+class Deploys(TimelineAnnotation):
+    name = "deploy-marks"
+
+    def annotations(self, window):
+        for moment, version in self._deploys:      # read at setup()
+            yield (moment, f"deploy {version}", "notice")
+```
+
+The bucket a mark lands in is drawn **underlined and in the mark's own severity
+colour**, its label goes in the caption when that bucket is selected, and
+`shift+←` / `shift+→` step between marked buckets. The glyph itself is not
+replaced: the volume has to survive the mark, and the bar has to stay two rows
+tall whatever is installed.
+
+- **You are called on the event loop, and you may not do I/O.** This runs inside
+  the render that draws the bar, so a provider that opens a socket blocks the
+  pane — and it is charged against `plugin_time_budget_ms`, so one that does it
+  anyway strikes out and is switched off. Fetch in `setup()`, or on a thread of
+  your own, and answer this call from memory.
+- **You are asked once per window, not once per render.** The answer is cached
+  against the window on screen, so typing in the query box does not re-ask you.
+  The cache is cleared whenever the plugin registry changes, which is how
+  switching a provider off takes its marks off the bar.
+- **Return what you have; CLV drops what does not fit.** A moment outside the
+  window is not drawn, so filtering by `window` yourself is an optimisation and
+  not a requirement. At most 200 marks are kept for one grid.
+- **A label goes in a caption.** One row, under a bar as wide as the pane. Keep
+  it to a few words; several marks in one bucket caption as the first plus
+  `(+N more)`.
+- **The level is a severity**, normalised exactly as a parsed line's is, and it
+  is what colours the mark. Return `None` for something that is not a severity —
+  a maintenance window is not a warning.
+- **Answer in the right shape or not at all.** Anything that is not a
+  `(datetime, str, level|None)` triple takes the plugin out of service, and the
+  whole call is dropped rather than the offending mark: a provider that cannot
+  say what shape its marks are is one whose good marks cannot be trusted to mean
+  what their labels say.
+
+### 11. TimelineMetric
+
+What a timeline bucket measures, when counting entries is the wrong unit.
+
+A hundred lines is not a hundred kilobytes. On a log where the interesting
+quantity is bytes, duration or retries, a histogram of line counts is a
+histogram of the wrong thing.
+
+```python
+from clv.api import TimelineMetric
+
+class BytesRead(TimelineMetric):
+    name = "bytes-metric"
+    metric_name = "bytes read"
+    unit = "B"
+
+    def value(self, entry):
+        return float(entry.fields.get("bytes", 0) or 0)
+```
+
+The bar is then scaled by the metric and the caption **leads with it and names
+this plugin** — because a bar whose heights mean bytes looks exactly like a bar
+whose heights mean lines, and the caption is the only thing that says which.
+
+#### Your metric must be foldable, and that is why this interface is so thin
+
+`Timeline.extend` folds a newly tailed line into its bucket by arithmetic, which
+is what makes tailing cost what arrived rather than what is buffered. A sum
+survives that. A median does not, and neither does a percentile, a distinct
+count, or an average that has forgotten its denominator.
+
+So you declare a per-entry number and **CLV does the summing**. There is no
+`aggregate()` to implement, which makes a non-foldable metric *unexpressible*
+rather than broken — the alternative would produce a bar that was right on the
+first render and silently wrong on every line tailed after it.
+
+- **`None` means "not measured by me"** and contributes nothing, so a metric can
+  answer for the entries it understands and stay out of the way for the rest.
+- **An entry with no timestamp is never passed to you.** It has no bucket, it is
+  reported in `undated`, and a metric does not get to change that.
+- **`count` never stops meaning entries.** A metric changes what the bar is
+  scaled by and what the caption leads with; nothing downstream that reads a
+  bucket's count has to know one is installed.
+- **Return a finite number or `None`.** A string, an infinity or a NaN takes the
+  plugin out of service, because each one makes the *scale* meaningless rather
+  than one bucket wrong. A bool is refused too, with a message: `1.0 if ... else
+  0.0` is how you count a subset, and it says so where a `True` would not.
+- **`metric_name` is required.** A plugin that cannot name its metric is refused
+  at load — the caption would have nothing to say.
+
+#### One metric at a time
+
+Two enabled metrics is a conflict, and CLV resolves it by `priority` and reports
+that it did: the winner runs, the loser is named in the `P` dialog with the
+plugin that beat it, and switching the winner off promotes the runner-up on the
+next render. Losing a tie-break is **not a fault** — the loser stays `loaded`,
+nothing is marked failed, and no operator action is required unless they wanted
+the other one.
+
+#### Cost: per entry, per rebuild, memoised by nothing
+
+The same shape as a `ShapeContributor`, on the same ceiling: `value` runs for
+every entry every time the bar is rebuilt, which is every keystroke in the query
+box while `b` is open. Read a field. Do not compute one.
+
+#### Switching either off takes effect immediately
+
+Both are installed **enabled-only**, like the clustering seam and for the same
+reason: no saved view, watch rule or session names a metric or a mark, so there
+is nothing to reserve. Switch one off in `P` and the bar goes back to counting
+entries on the next render, with the annotation cache cleared as part of
+installing the new set.
+
+### 12. Exporter
 
 Saves or transmits the entries the filters kept.
 
@@ -1104,6 +1226,14 @@ The order is settled once, when plugins are loaded, and does not change for the
 session. Enabling or disabling a plugin from the `P` dialog changes whether it
 runs, never where.
 
+**One registry uses `priority` to decide rather than to order.** A timeline
+bucket measures one thing, so two enabled `TimelineMetric` plugins are a
+conflict rather than a sequence: the lowest number wins, the other is named in
+`P` with the plugin that beat it, and switching the winner off promotes it.
+Everywhere else a low number means *first*, not *instead* — this is the one
+place the two differ, and it is called out because an author reading the
+paragraph above would have no reason to expect it.
+
 ---
 
 ## Saved views, watch rules and a missing plugin
@@ -1169,6 +1299,8 @@ a stage that is merely slow makes CLV look broken and says nothing at all.
 | `FilterStage.apply` | **every render** | **once per buffered entry** |
 | `ClusterRule` (CLV substitutes) | **every render with `c` on** | **once per distinct line, memoised** |
 | `ShapeContributor.contribute` | **every render with `c` on** | **once per buffered entry, memoised by nothing** |
+| `TimelineAnnotation.annotations` | when the bar's window changes | once per window, **not** per rebuild |
+| `TimelineMetric.value` | **every rebuild with `b` on** | **once per buffered entry, memoised by nothing** |
 | `WatchMatcher.matches` | **every poll** | **once per newly arrived entry, per rule of its kind** |
 | `WatchSink.deliver` | when a rate-limit window closes | once per rule per window, **on its own thread** |
 | `Exporter.export` | on `Ctrl+E` | once |
@@ -1231,7 +1363,7 @@ source opens pays every cold cost a plugin has, and a large paste or a loaded
 machine can put a healthy stage over the line for a pass or two. A plugin that
 is genuinely slow still strikes out within about a second and a half of typing.
 
-**Five budgets, one policy.** `LogFormat.parse` is charged against a separate
+**Six budgets, one policy.** `LogFormat.parse` is charged against a separate
 ceiling, because it is measured against a different thing: a pass on the read
 path is one batch of lines from a reader's `prime` or `poll`, not one render.
 The query plugins get a third instance, sharing the render path's ceiling
@@ -1241,13 +1373,22 @@ strikes interleaved by whichever happened to be measured first. `WatchMatcher`
 gets a fourth, on the **read** ceiling, because a matcher pass is one poll's
 batch of newly arrived lines and not one keystroke. The clustering plugins get a
 fifth, back on the render ceiling — a cluster pass is one shaping of the
-filtered set, which is a keystroke and not a batch of read lines. Everything
-else is identical in all five: three consecutive passes over the line, disabled,
-named in `P`, and reachable by **Re-enable**.
+filtered set, which is a keystroke and not a batch of read lines. The timeline
+plugins get a sixth, also on the render ceiling, because a timeline pass is one
+rebuild of the bar over that same filtered set. Everything else is identical in
+all six: three consecutive passes over the line, disabled, named in `P`, and
+reachable by **Re-enable**.
+
+The timeline budget measures its two halves very differently, and that is
+deliberate. A `TimelineMetric` is charged per entry per rebuild, memoised by
+nothing — the expensive half, and the one the ceiling is really for. A
+`TimelineAnnotation` is asked once per *window*, so most passes charge it
+nothing at all and the passes that do are the ones where it actually went and
+did something.
 
 ```ini
 [log_viewer]
-plugin_time_budget_ms = 250     # FilterStage.apply, the query and cluster plugins
+plugin_time_budget_ms = 250     # FilterStage.apply, the query, cluster and timeline plugins
 plugin_read_budget_ms = 50      # the read path: LogFormat.parse, WatchMatcher.matches
 plugin_sink_timeout_ms = 5000   # not a budget -- see below
 ```

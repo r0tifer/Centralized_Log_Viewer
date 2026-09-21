@@ -715,7 +715,7 @@ CLV's `clv/plugins/AGENTS.md`.
 Worked examples
 ---------------
 
-Four complete, commented plugins, each walking through what its kind of
+Five complete, commented plugins, each walking through what its kind of
 plugin has to declare and why:
 
     examples/nginx_error.py   teaches CLV to read nginx's error log, a format
@@ -732,6 +732,10 @@ plugin has to declare and why:
                               Kubernetes pod suffix and an ANSI colour run are
                               normalised away, and one field of your choosing
                               keeps two streams in separate clusters
+    examples/timeline_marks.py marks deploys on the timeline (`b`) and scales
+                              its bars by bytes rather than by lines. Ships
+                              inert: it marks nothing until its
+                              [plugin:timeline_marks] section lists moments
 
 Nothing in `examples/` is listed or run: it is one directory down, and CLV
 only looks here. To use one, copy it up and name it:
@@ -763,6 +767,7 @@ SEEDED_EXAMPLES: dict[str, str] = {
     "field_regex.py": "clv.examples.field_regex",
     "watch_alerts.py": "clv.examples.watch_alerts",
     "cluster_rules.py": "clv.examples.cluster_rules",
+    "timeline_marks.py": "clv.examples.timeline_marks",
 }
 
 

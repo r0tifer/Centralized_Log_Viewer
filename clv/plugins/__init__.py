@@ -1,13 +1,19 @@
 """CLV plugin interfaces and loader.
 
-Six extension points, each matching a thing operators keep asking CLV to do that
-core should not hard-code:
+Twelve extension points, each matching a thing operators keep asking CLV to do
+that core should not hard-code:
 
 * :class:`LogSourceProvider` — where log lines come from.
 * :class:`LogFormat` — how a line CLV does not recognise is parsed.
 * :class:`QueryOperator` — a comparison token the query box does not have.
 * :class:`ComputedField` — a queryable field derived rather than parsed.
 * :class:`FilterStage` — what happens to a line on its way to the pane.
+* :class:`ClusterRule` — one more volatile token the repeat clusterer folds out.
+* :class:`ShapeContributor` — an extra component of the key two entries share.
+* :class:`TimelineAnnotation` — marks on the timeline's axis.
+* :class:`TimelineMetric` — what a timeline bucket measures, if not entries.
+* :class:`WatchMatcher` — a watch rule kind that is not "this pattern matched".
+* :class:`WatchSink` — where a watch hit is delivered.
 * :class:`Exporter` — where the current view can be sent.
 
 Plugins are loaded from two places: modules dropped into ``clv/plugins/``
@@ -34,6 +40,7 @@ import configparser
 import importlib
 import importlib.metadata
 import inspect
+import math
 import os
 import pkgutil
 import re
@@ -42,13 +49,14 @@ import time
 import types
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
 
 from ..services.clustering import ClusterRuleSpec, ShapeSpec
-from ..services.filtering import FilterSpec
+from ..services.filtering import FilterSpec, TimeWindow
 from ..services.formats import DEFAULT_PROFILE, FormatProfile
-from ..services.parsing import FORMAT_NAMES, LogEntry
+from ..services.parsing import FORMAT_NAMES, LogEntry, normalize_level
 from ..services.query import (
     BUILTIN_OPERATORS,
     KEY_CHARS,
@@ -57,6 +65,7 @@ from ..services.query import (
     is_query_key,
 )
 from ..services.refs import SourceRef
+from ..services.timeline import AnnotationSpec, MetricSpec
 from ..services.watch import (
     KIND_PATTERN,
     MatcherSpec,
@@ -592,6 +601,133 @@ class ShapeContributor(Plugin):
         """
 
 
+class TimelineAnnotation(Plugin):
+    """Marks on the timeline's axis: not how much happened, but what else did.
+
+    The histogram (``b``) answers *when did this start*. An annotation answers
+    *what was happening then* — a deploy, an incident, a maintenance window —
+    which is the difference between a spike and a spike with a cause::
+
+        class Deploys(TimelineAnnotation):
+            name = "deploy-marks"
+
+            def annotations(self, window):
+                for moment, version in self._deploys:      # read at setup()
+                    yield (moment, f"deploy {version}", "notice")
+
+    The bucket a mark lands in is drawn underlined and in the mark's own
+    severity colour, its label goes in the caption when that bucket is selected,
+    and ``shift+←`` / ``shift+→`` step between marked buckets.
+
+    **You are called on the event loop, and you may not do I/O.** This runs
+    inside the render that draws the bar, so a provider that opens a socket
+    blocks the pane — and it is charged against ``plugin_time_budget_ms`` like
+    every other render-path plugin, so one that does it anyway strikes out and
+    is switched off. Fetch in :meth:`~Plugin.setup`, or on a thread of your own,
+    and answer this call from memory.
+
+    **You are asked once per window, not once per render.** The answer is cached
+    against the window the bar is showing and reused until the grid moves, so
+    typing in the query box does not re-ask you. The cache is cleared whenever
+    the plugin registry changes, which is how switching a provider off takes its
+    marks off the bar.
+
+    **Return what you have; CLV drops what does not fit.** A moment outside the
+    window is not drawn — filtering by ``window`` yourself is an optimisation,
+    not a requirement. At most
+    :data:`~clv.services.timeline.MAX_ANNOTATIONS` marks are kept for one grid.
+
+    The third element is a severity, normalised the way a parsed line's is, and
+    ``None`` is the ordinary answer for something that is not a severity at all.
+    """
+
+    @abstractmethod
+    def annotations(
+        self, window: TimeWindow
+    ) -> Iterable[tuple[datetime, str, Optional[str]]]:
+        """``(moment, label, level)`` for the visible *window*.
+
+        Anything that is not a three-element tuple of a :class:`~datetime.datetime`,
+        a string and a severity-or-``None`` takes the plugin out of service with
+        a message naming what it returned — the marks are drawn and captioned,
+        and a provider that half-answers would put a mark of unknown meaning on
+        the axis.
+
+        Raising does the same and is recorded once; the bar then renders exactly
+        as it did before the plugin was installed.
+        """
+
+
+class TimelineMetric(Plugin):
+    """What a timeline bucket measures, when counting entries is the wrong unit.
+
+    A hundred lines is not a hundred kilobytes, and a log where the interesting
+    quantity is bytes, duration or retries gets a histogram that answers a
+    question nobody asked::
+
+        class BytesRead(TimelineMetric):
+            name = "bytes-metric"
+            metric_name = "bytes read"
+            unit = "B"
+
+            def value(self, entry):
+                return float(entry.fields.get("bytes", 0) or 0)
+
+    The bar is then scaled by the metric, and the caption leads with it and
+    names this plugin — because a bar whose heights mean bytes looks exactly
+    like a bar whose heights mean lines.
+
+    **Your metric must be foldable, and that is why this interface is so thin.**
+    :meth:`~clv.services.timeline.Timeline.extend` folds a newly tailed line
+    into its bucket by arithmetic, which is what makes tailing cost what arrived
+    rather than what is buffered. A sum survives that; a median, a percentile or
+    a distinct count does not. So you declare a per-entry number and **CLV does
+    the summing** — there is no ``aggregate()`` to implement, which makes a
+    non-foldable metric unexpressible rather than quietly wrong on every line
+    after the first render.
+
+    ``None`` means "not measured by me" and contributes nothing, so a metric can
+    answer for the entries it understands and stay out of the way for the rest.
+    An entry with **no timestamp** is never passed here at all: it has no bucket,
+    it is reported in ``undated``, and a metric does not get to change that.
+
+    **One metric runs at a time.** Two enabled metrics is a conflict CLV
+    resolves by :attr:`~Plugin.priority` and reports in the ``P`` dialog, naming
+    the winner; the loser stays loaded and contributes nothing, and takes over
+    if the winner is switched off. Losing a tie-break is not a fault and does
+    not mark anything failed.
+
+    **Cost: per entry, per rebuild, memoised by nothing.** The same budget and
+    the same shape as a :class:`ShapeContributor` — read a field, do not compute
+    one.
+    """
+
+    #: What this measures, in the words the caption will use — ``"bytes read"``,
+    #: not ``"bytes_read_total"``. Required: a plugin that cannot name its
+    #: metric is refused at load, because the caption would have no way to say
+    #: what the bar is showing.
+    metric_name: str = ""
+
+    #: Printed after the scaled figure: ``unit = "B"`` reads as ``1.4 MB``.
+    #: Optional, and empty prints a bare number. Prefixes are thousands-based,
+    #: so a metric wanting binary ones does its own division and says so here.
+    unit: str = ""
+
+    @abstractmethod
+    def value(self, entry: LogEntry) -> Optional[float]:
+        """This entry's contribution, or ``None`` to measure nothing.
+
+        Must be a finite real number. A bool is refused with a message rather
+        than summed as 1 — ``1.0 if condition else 0.0`` is how you count a
+        subset, and it says so where a ``True`` would not. A non-number, an
+        infinity or a NaN takes the plugin out of service, because each one
+        makes the bar's scale meaningless rather than merely wrong.
+
+        Raising does the same and is recorded once; the bar then goes back to
+        counting entries.
+        """
+
+
 class WatchMatcher(Plugin):
     """Teaches CLV a kind of watch rule that is not "this pattern matched".
 
@@ -1066,7 +1202,19 @@ MAX_PLUGIN_ERRORS = 50
 #: wants a CLV you are not running" call for different actions from the
 #: operator, and the management UI must not have to *parse the message* to tell
 #: them apart. ``"load"`` is the unremarkable case and stays the default.
-ERROR_CATEGORIES = ("load", "incompatible", "shadowed", "missing", "runtime")
+#: ``conflict`` is the odd one and is deliberately not a fault: it is two
+#: plugins competing for something only one of them can have — today, the one
+#: metric a timeline bucket measures. CLV picks by ``priority`` and says so, the
+#: loser stays loaded and healthy, and :meth:`PluginRegistry.status` leaves the
+#: row's state alone and shows the note as its detail.
+ERROR_CATEGORIES = (
+    "load",
+    "incompatible",
+    "shadowed",
+    "missing",
+    "runtime",
+    "conflict",
+)
 
 
 @dataclass
@@ -1320,6 +1468,8 @@ _KINDS: tuple[tuple[str, type], ...] = (
     ("filter", FilterStage),
     ("cluster rule", ClusterRule),
     ("shape", ShapeContributor),
+    ("timeline", TimelineAnnotation),
+    ("metric", TimelineMetric),
     ("matcher", WatchMatcher),
     ("sink", WatchSink),
     ("exporter", Exporter),
@@ -1506,6 +1656,13 @@ class PluginRegistry:
     #: ``clv.services.clustering``.
     rules: list[ClusterRule] = field(default_factory=list)
     contributors: list[ShapeContributor] = field(default_factory=list)
+    #: Plugin-supplied marks on the time axis and the one metric a bucket
+    #: measures, in :func:`plugin_sort_key` order. A provider is asked once per
+    #: window; a metric is consulted per entry per rebuild. Both are reached
+    #: only through the specs :meth:`timeline_stack` hands to
+    #: ``clv.services.timeline``.
+    annotators: list[TimelineAnnotation] = field(default_factory=list)
+    metrics: list[TimelineMetric] = field(default_factory=list)
     #: Plugin-supplied rule kinds and delivery destinations, in
     #: :func:`plugin_sort_key` order. Reached only through the specs
     #: :meth:`watch_stack` hands to ``clv.services.watch``.
@@ -1569,6 +1726,8 @@ class PluginRegistry:
             + len(self.filters)
             + len(self.rules)
             + len(self.contributors)
+            + len(self.annotators)
+            + len(self.metrics)
             + len(self.matchers)
             + len(self.sinks)
             + len(self.exporters)
@@ -1620,6 +1779,11 @@ class PluginRegistry:
         self.filters.sort(key=plugin_sort_key)
         self.rules.sort(key=plugin_sort_key)
         self.contributors.sort(key=plugin_sort_key)
+        # Priority order is load-bearing here rather than merely tidy: it is how
+        # two metrics competing for one bucket are settled, so `metrics[0]`
+        # being the winner is a property of this sort having run.
+        self.annotators.sort(key=plugin_sort_key)
+        self.metrics.sort(key=plugin_sort_key)
         # Both were missed when the watch seam landed, and each docstring said
         # otherwise. It cost nothing for a matcher, which is looked up by kind —
         # but a sink was delivered to in `pkgutil.iter_modules` order while
@@ -1807,6 +1971,14 @@ class PluginRegistry:
             )
             errors = errors_for(origin, [record.name for record in records])
             categories = {error.category for error in errors}
+            # Not a fault and not a reason to call anything "not enabled": a
+            # plugin that lost a tie-break is loaded, healthy and one switch away
+            # from being the one that runs. It contributes its note to `detail`
+            # below and nothing to the state, which is why it is taken out of
+            # the set the state is decided from -- a module shipping a losing
+            # metric *and* a working annotation must not be reported as broken.
+            conflicts = [error for error in errors if error.category == "conflict"]
+            categories.discard("conflict")
             detail = "; ".join(
                 error.message + (f" (x{error.count})" if error.count > 1 else "")
                 for error in errors
@@ -1828,7 +2000,9 @@ class PluginRegistry:
             elif categories - {"shadowed"}:
                 state = "failed"
                 category = next(
-                    error.category for error in errors if error.category != "shadowed"
+                    error.category
+                    for error in errors
+                    if error.category not in ("shadowed", "conflict")
                 )
             elif categories:
                 # Shadowed, and nothing else. Losing a name to something found
@@ -1844,6 +2018,14 @@ class PluginRegistry:
                     if source != "user"
                     else "off"
                 )
+                # Kept beside it rather than replaced by it: "off" and "it would
+                # not have been the metric anyway" are two different things for
+                # an operator deciding whether switching it on would change
+                # anything.
+                if conflicts:
+                    detail = "; ".join(
+                        [detail] + [error.message for error in conflicts]
+                    )
             elif discovered is not None and not discovered.enabled:
                 state, category = "not enabled", ""
             else:
@@ -1979,6 +2161,8 @@ class PluginRegistry:
                 FilterStage,
                 ClusterRule,
                 ShapeContributor,
+                TimelineAnnotation,
+                TimelineMetric,
                 WatchMatcher,
                 WatchSink,
                 Exporter,
@@ -2032,6 +2216,12 @@ class PluginRegistry:
 
         if isinstance(plugin, ClusterRule):
             problem = self._cluster_fault(plugin)
+            if problem is not None:
+                self.errors.append(PluginError(origin, problem))
+                return False
+
+        if isinstance(plugin, TimelineMetric):
+            problem = self._metric_fault(plugin)
             if problem is not None:
                 self.errors.append(PluginError(origin, problem))
                 return False
@@ -2282,6 +2472,40 @@ class PluginRegistry:
                 )
         return None
 
+    def _metric_fault(self, plugin: "TimelineMetric") -> Optional[str]:
+        """Why *plugin* may not be a metric, or None if it may.
+
+        One check, and it is about the caption rather than about the number. A
+        bar drawn from a metric and a bar drawn from counts are the same glyphs;
+        the caption is the only thing that distinguishes them, and a metric with
+        no name leaves it saying nothing. At load, like the other three faults —
+        an unnamed metric would otherwise be discovered as a caption that reads
+        oddly, which nobody reports as a bug.
+        """
+
+        name = getattr(plugin, "metric_name", "")
+        if not isinstance(name, str) or not name.strip():
+            return (
+                "declares no metric_name; a bar scaled by a metric has to be "
+                "able to say what it is showing"
+            )
+        return None
+
+    def timeline_stack(
+        self, *, budget: Optional[PluginBudget] = None
+    ) -> "TimelineStack":
+        """The enabled timeline plugins as ``clv.services.timeline`` takes them.
+
+        The fifth of the same shape, for the fifth time for the same reason:
+        ``timeline.py`` may not import this module, so the guard travels with
+        the plugin rather than being fetched alongside it. Unlike the four
+        before it this one also *decides* something — which metric runs — because
+        picking by ``priority`` needs the registry, and the service must not be
+        handed a choice it has no way to make.
+        """
+
+        return TimelineStack(self, budget=budget)
+
     def cluster_stack(
         self, *, budget: Optional[PluginBudget] = None
     ) -> "ClusterStack":
@@ -2335,6 +2559,8 @@ class PluginRegistry:
             "filter": self.filters,
             "cluster rule": self.rules,
             "shape": self.contributors,
+            "timeline": self.annotators,
+            "metric": self.metrics,
             "matcher": self.matchers,
             "sink": self.sinks,
             "exporter": self.exporters,
@@ -2855,6 +3081,218 @@ class ClusterStack:
             return ""
 
         return contribute
+
+
+class TimelineStack:
+    """The enabled timeline plugins, wrapped in everything CLV owes them.
+
+    Produces the :class:`~clv.services.timeline.AnnotationSpec` records and the
+    single :class:`~clv.services.timeline.MetricSpec` that
+    ``timeline.install_timeline_plugins`` stores, with every third-party
+    callable already carrying its guard and its budget.
+
+    **Enabled only**, like :class:`ClusterStack` and for the same reason: a mark
+    on an axis and a bucket's unit are named by nothing that is saved, so a
+    plugin switched off is simply not installed and the bar goes back to being
+    what it was. Nothing could be silently reinterpreted in the meantime, which
+    is what makes Phase 8's reservation rule unnecessary here.
+
+    **This one also decides something.** The other four stacks install whatever
+    they are given; a bucket can only measure one thing, so this picks the
+    highest-priority enabled metric, records a note against every loser naming
+    the winner, and hands the service a single spec. The service is not given a
+    choice it would have no basis to make, and the decision is re-run on every
+    rebuild of the stack — so switching the winner off promotes the runner-up
+    rather than leaving the bar counting entries.
+    """
+
+    __slots__ = ("_registry", "annotators", "metric", "_budget")
+
+    def __init__(
+        self, registry: "PluginRegistry", *, budget: Optional[PluginBudget] = None
+    ) -> None:
+        self._registry = registry
+        self._budget = budget
+        self.annotators: tuple[AnnotationSpec, ...] = tuple(
+            AnnotationSpec(
+                plugin=_plugin_name(plugin),
+                fetch=self._guard_fetch(plugin),
+            )
+            for plugin in registry.annotators
+            if not registry.is_disabled(plugin)
+        )
+        self.metric: Optional[MetricSpec] = self._elect_metric()
+
+    def start(self) -> None:
+        """Open a budget pass. One rebuild of the bar is one pass."""
+
+        budget = self._budget
+        if budget is not None and budget.active:
+            budget.start()
+
+    def settle(self) -> None:
+        """Close the pass, disabling anything that has struck out."""
+
+        budget = self._budget
+        if budget is not None and budget.active:
+            budget.settle()
+
+    def _elect_metric(self) -> Optional[MetricSpec]:
+        """The metric that runs, and a note for each one that does not.
+
+        ``registry.metrics`` is in :func:`plugin_sort_key` order, so the first
+        enabled plugin in it is the highest-priority one and the election is a
+        walk rather than a sort.
+
+        Every metric's previous note is discarded first, because this contest is
+        re-run whenever the stack is rebuilt and last time's loser may be this
+        time's winner. Leaving the old note behind would leave the ``P`` dialog
+        saying a plugin is not in use while the bar is drawn from its numbers.
+        """
+
+        registry = self._registry
+        winner: Optional[TimelineMetric] = None
+        for plugin in registry.metrics:
+            registry.errors.discard(_plugin_name(plugin), category="conflict")
+            if registry.is_disabled(plugin):
+                continue
+            if winner is None:
+                winner = plugin
+                continue
+            registry.errors.append(
+                PluginError(
+                    _plugin_name(plugin),
+                    f"metric not in use: {_plugin_name(winner)} has priority. "
+                    "A bucket measures one thing; switch that plugin off to "
+                    "use this one",
+                    category="conflict",
+                )
+            )
+        if winner is None:
+            return None
+        return MetricSpec(
+            plugin=_plugin_name(winner),
+            metric_name=winner.metric_name,
+            # Read once, here, rather than per caption: a plugin that changed
+            # its unit between renders would relabel numbers that had already
+            # been summed under the old one.
+            unit=str(getattr(winner, "unit", "") or ""),
+            value=self._guard_value(winner),
+        )
+
+    def _guard_fetch(self, plugin: TimelineAnnotation):
+        registry = self._registry
+        budget = self._budget
+        clock = time.perf_counter
+
+        def fetch(window: TimeWindow) -> tuple[tuple[datetime, str, Optional[str]], ...]:
+            if registry.is_disabled(plugin):
+                return ()
+            timing = budget is not None and budget.active
+            mark = clock() if timing else 0.0
+            try:
+                # `list` inside the `try`, not outside: the documented shape is
+                # a generator, and a generator that raises does so while it is
+                # being walked rather than when it is created.
+                produced = list(plugin.annotations(window))
+            except Exception as exc:  # noqa: BLE001 - third-party code
+                registry.disable(
+                    plugin, f"raised: {exc}", origin=_plugin_name(plugin)
+                )
+                return ()
+            finally:
+                if timing:
+                    budget.charge(plugin, clock() - mark)
+            return self._marks(plugin, produced)
+
+        return fetch
+
+    def _marks(
+        self, plugin: TimelineAnnotation, produced: Sequence[Any]
+    ) -> tuple[tuple[datetime, str, Optional[str]], ...]:
+        """Check what a provider answered, or take it out of service.
+
+        All or nothing per call, rather than dropping the bad item: a provider
+        that cannot say what shape its marks are is a provider whose *good* marks
+        cannot be trusted to mean what their labels say, and a mark of uncertain
+        meaning on a time axis is worse than no mark at all.
+        """
+
+        marks: list[tuple[datetime, str, Optional[str]]] = []
+        for item in produced:
+            if not isinstance(item, tuple) or len(item) != 3:
+                self._registry.disable(
+                    plugin,
+                    f"annotations() yielded {type(item).__name__}; each mark "
+                    "must be a (moment, label, level) tuple",
+                    origin=_plugin_name(plugin),
+                )
+                return ()
+            moment, label, level = item
+            if not isinstance(moment, datetime) or not isinstance(label, str):
+                self._registry.disable(
+                    plugin,
+                    "annotations() yielded a mark that is not "
+                    "(datetime, str, level); got "
+                    f"({type(moment).__name__}, {type(label).__name__})",
+                    origin=_plugin_name(plugin),
+                )
+                return ()
+            # Normalised exactly as a parsed line's level is, so a mark saying
+            # `"warning"` is coloured the same as a line saying `"WARN"` and an
+            # unrecognised word becomes None rather than an invented severity.
+            marks.append((moment, label, normalize_level(level)))
+        return tuple(marks)
+
+    def _guard_value(self, plugin: TimelineMetric):
+        registry = self._registry
+        budget = self._budget
+        clock = time.perf_counter
+
+        def value(entry: LogEntry) -> Optional[float]:
+            if registry.is_disabled(plugin):
+                return None
+            timing = budget is not None and budget.active
+            mark = clock() if timing else 0.0
+            try:
+                result = plugin.value(entry)
+            except Exception as exc:  # noqa: BLE001 - third-party code
+                registry.disable(
+                    plugin, f"raised: {exc}", origin=_plugin_name(plugin)
+                )
+                return None
+            finally:
+                if timing:
+                    budget.charge(plugin, clock() - mark)
+            if result is None:
+                return None
+            if isinstance(result, bool) or not isinstance(result, (int, float)):
+                # A bool is refused rather than summed as 1: counting a subset
+                # of entries is a legitimate metric and `1.0 if ... else 0.0`
+                # says so, where a `True` reads as an answer to a different
+                # question.
+                registry.disable(
+                    plugin,
+                    f"value() returned {type(result).__name__}; a timeline "
+                    "metric must return a number or None",
+                    origin=_plugin_name(plugin),
+                )
+                return None
+            number = float(result)
+            if not math.isfinite(number):
+                # An infinity or a NaN does not make one bucket wrong, it makes
+                # the whole bar meaningless: `peak_value` is what every height
+                # is scaled against, and neither has a scale.
+                registry.disable(
+                    plugin,
+                    f"value() returned {result!r}; a timeline metric must "
+                    "return a finite number",
+                    origin=_plugin_name(plugin),
+                )
+                return None
+            return number
+
+        return value
 
 
 class WatchStack:
@@ -3795,6 +4233,9 @@ __all__ = [
     "ClusterRule",
     "ShapeContributor",
     "ClusterStack",
+    "TimelineAnnotation",
+    "TimelineMetric",
+    "TimelineStack",
     "WatchMatcher",
     "WatchSink",
     "WatchStack",

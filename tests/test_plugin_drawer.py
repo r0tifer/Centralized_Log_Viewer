@@ -176,6 +176,29 @@ def test_a_clustering_plugin_says_which_half_of_the_seam_it_supplies() -> None:
     _run(scenario)
 
 
+def test_a_timeline_plugin_says_which_half_of_the_seam_it_supplies() -> None:
+    """`timeline` and `metric`, not "timeline" for both.
+
+    They are different promises: one puts marks on an axis, the other changes
+    what every bucket on that axis measures. An operator deciding whether to
+    enable a module needs to know which it is getting, and `metric` is also the
+    kind that can lose a tie-break to another plugin.
+    """
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.push_screen(
+                PluginsDialog([replace(ROWS[0], kinds=("timeline", "metric"))])
+            )
+            await pilot.pause()
+
+            assert "timeline, metric" in _rows(app.screen)[0]
+
+    _run(scenario)
+
+
 def test_the_consequence_of_a_toggle_is_shown_beside_the_toggle() -> None:
     """Two of these are the reason the phase needed a decision at all."""
 

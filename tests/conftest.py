@@ -116,6 +116,25 @@ def cluster_plugins_are_not_shared_between_tests():
 
 
 @pytest.fixture(autouse=True)
+def timeline_plugins_are_not_shared_between_tests():
+    """Reset the installed annotation providers and metric between tests.
+
+    The fourth of the same argument, and it leaks in two directions at once. A
+    leftover metric changes what every later bar is *scaled by* and what its
+    caption claims to be showing; a leftover provider leaves marks — and the
+    triples behind them — in the module's one-entry annotation cache, which is
+    keyed on the window and would happily serve a later test whose grid covers
+    the same seconds. ``install_timeline_plugins`` clears that cache, which is
+    exactly why putting the module back is enough.
+    """
+
+    yield
+    from clv.services.timeline import install_timeline_plugins
+
+    install_timeline_plugins()
+
+
+@pytest.fixture(autouse=True)
 def watch_plugins_are_not_shared_between_tests():
     """Reset the installed watch matchers and sinks between tests.
 

@@ -308,7 +308,11 @@ distros.
   than ranges recomputed from the data, which is what lets a tailed line find
   its bucket by arithmetic; when an arrival falls outside the grid `extend`
   says so and the caller rebuilds, rather than guessing. An entry with no
-  timestamp is counted in `undated` and reported, never placed.
+  timestamp is counted in `undated` and reported, never placed. Two plugin
+  seams: a `TimelineAnnotation` marks the axis, and a `TimelineMetric` says
+  what a bucket measures — declared as a per-entry value CLV sums, because the
+  fixed grid above is what makes a non-foldable metric unexpressible rather
+  than broken.
 - `clustering.py` — what `c` collapses. A line's *shape* is its message with the
   volatile tokens normalised away, plus its level and its source — so a WARN and
   an ERROR that read alike stay apart, and a merged view never folds two logs
@@ -417,7 +421,7 @@ shared globals or reaching into another widget's tree.
 
 ## Plugins
 
-Ten interfaces in `clv/plugins/__init__.py`:
+Twelve interfaces in `clv/plugins/__init__.py`:
 
 | Interface | Method | Purpose |
 | --- | --- | --- |
@@ -428,6 +432,8 @@ Ten interfaces in `clv/plugins/__init__.py`:
 | `FilterStage` | `apply(entry, context) -> LogEntry \| None` | Transform or drop entries |
 | `ClusterRule` | `pattern`, `placeholder` — CLV substitutes | One more volatile token for the repeat clusterer to normalise out |
 | `ShapeContributor` | `contribute(entry) -> str` | An extra component of the key two entries must share to cluster |
+| `TimelineAnnotation` | `annotations(window) -> (moment, label, level)…` | Marks on the timeline's axis — deploys, incidents, maintenance |
+| `TimelineMetric` | `metric_name`, `value(entry) -> float \| None` — CLV sums | What a bucket measures, if not entries. Per-entry only, so it stays foldable |
 | `WatchMatcher` | `matches(entry, rule) -> bool` | A watch rule kind that is not "this pattern matched" |
 | `WatchSink` | `deliver(name, count, context, entries)` | Where a watch hit goes, besides the toast |
 | `Exporter` | `export(entries, context) -> ExportResult` | Send the current view somewhere |

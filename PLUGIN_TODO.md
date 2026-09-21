@@ -41,7 +41,7 @@ that argument; Phase 7b is the exception, and it is here because designing the
 | 8 — Query | `QueryOperator`, `ComputedField`, and the degradation rule | ✅ Done |
 | 9 — Watch | `WatchMatcher`, `WatchSink`, off the event loop | ✅ Done |
 | 10 — Clustering | `ClusterRule`, `ShapeContributor`, and the shape cache | ✅ Done |
-| 11 — Timeline | `TimelineAnnotation`, `TimelineMetric`, foldable only | ⬜ Not started |
+| 11 — Timeline | `TimelineAnnotation`, `TimelineMetric`, foldable only | ✅ Done |
 | **Stage D — Surface** | | |
 | 12 — Commands and controls | Commands, bindings, drawer sections, modal screens | ⬜ Not started |
 | **Stage E — Trust and distribution** | | |
@@ -2246,6 +2246,16 @@ arrived rather than what is buffered.
   Deploys, incidents, maintenance windows — the context that makes a spike mean
   something. Rendered on the bar; `←`/`→` step to annotations as well as
   buckets, extending `TimelineBar.BINDINGS` rather than adding a new key.
+
+  **Corrected on landing: `shift+←`/`shift+→`, which is a new key.** The
+  sentence above asks for two things that turn out to be incompatible. Plain
+  arrows already reach every annotation, because a mark lives in a bucket and
+  the arrows walk buckets — so "step to annotations as well" can only mean
+  *skip* to them, and a key that skips when a plugin is installed and steps when
+  one is not is exactly the kind of binding Requirement 11 exists to refuse. The
+  arrows keep meaning one bucket; `shift` means the next marked one; both are on
+  `TimelineBar.BINDINGS`, which is the half of the instruction that was about
+  where the binding lives rather than how many there are.
 - **`TimelineMetric`** — what a bucket measures, if not count:
 
   ```python
@@ -2257,6 +2267,16 @@ arrived rather than what is buffered.
   `Bucket` ([timeline.py:44](clv/services/timeline.py#L44)) gains `value: float`
   beside `count`; `count` never stops meaning entries, so nothing downstream
   that reads it has to change.
+
+  **Corrected on landing: a metric declares a name and a `unit`, not only a
+  value.** The phase text says a metric "declares nothing but a per-entry
+  value", and that sentence is load-bearing about *aggregation* — there is no
+  `aggregate()` and there never will be. It is wrong about *display*: a total is
+  a float, and a caption that prints `1449984.0` where it meant `1.4 MB` fails
+  the same test the caption rule below sets. `metric_name` is required (a metric
+  that cannot name itself is refused at load, because the caption would have
+  nothing to say) and `unit` is optional. Neither is reachable from the fold, so
+  neither weakens the constraint the interface exists to enforce.
 - **A metric must be foldable, and this is enforced, not requested.** `extend`
   adds an arrival into an existing bucket by arithmetic; a metric that is a sum
   survives that, and a median or a percentile does not. `TimelineMetric`
@@ -2273,8 +2293,22 @@ arrived rather than what is buffered.
 - **Annotations outside the window are not drawn and not fetched twice.** The
   provider is asked for the visible window only, once per rebuild, and the
   result is cached against Phase 6's generation counter and the window.
+
+  Landed as: once per **window**, which is stronger than once per rebuild and is
+  what the sentence was reaching for — a rebuild happens on every keystroke in
+  the query box. The cache is a single `(window, triples)` pair in
+  `timeline.py`, cleared by `install_timeline_plugins`, which is how the
+  generation reaches it without the service learning what a generation is. The
+  provider is called **on the event loop** and is told so in the contract: it
+  answers from memory, does its I/O in `setup()` or on a thread of its own, and
+  is charged against the render ceiling if it does otherwise.
 - **One metric at a time.** Two metric plugins both enabled is a conflict the
-  operator resolves; CLV picks by `priority` and reports that it did.
+  operator resolves; CLV picks by `priority` and reports that it did. The loser
+  is *loaded and not installed* rather than disabled — a new `conflict` error
+  category that supplies a row's detail and leaves its state alone, so a module
+  shipping a losing metric beside a working annotation is not reported as
+  broken, and switching the winner off promotes the runner-up on the next
+  render.
 - **Annotations are coarse-grained and isolable**; metrics are per-entry and are
   not.
 

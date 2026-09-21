@@ -21,7 +21,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from time import monotonic
 from pathlib import Path
-from typing import Iterable, Iterator, Literal, Optional, Sequence
+from typing import Any, Iterable, Iterator, Literal, Optional, Sequence
 
 from rich.console import Group, RenderableType
 from rich.panel import Panel
@@ -148,7 +148,7 @@ from .services.session import (
     SourceSession,
     local_facts,
 )
-from .services.timeline import Timeline, build_timeline
+from .services.timeline import Timeline, build_timeline, install_timeline_plugins
 from .services.timeline import EMPTY as EMPTY_TIMELINE
 from .services.watch import (
     SINK_SAMPLE_LIMIT,
@@ -427,6 +427,8 @@ BINDING_CATEGORIES: dict[str, str] = {
     "bucket_right": "Navigation",
     "bucket_home": "Navigation",
     "bucket_end": "Navigation",
+    "annotation_left": "Navigation",
+    "annotation_right": "Navigation",
     "apply_bucket": "Navigation",
     "toggle_auto_scroll": "View",
     "toggle_structured": "View",
@@ -862,11 +864,20 @@ class LogViewerApp(App[None]):
         #: And a fifth, for the cluster rules and shape contributors over one
         #: clustering of the filtered set.
         self._cluster_budget = self._new_cluster_budget()
+        #: And a sixth, for the annotation providers and the metric over one
+        #: rebuild of the timeline.
+        self._timeline_budget = self._new_timeline_budget()
         #: The guarded, budgeted clustering plugins, as `install_cluster_plugins`
         #: took them. Held so `_write_rows` can open and close a budget pass
         #: around the clustering it drives.
         self._cluster_stack = self._plugins.cluster_stack(
             budget=self._cluster_budget
+        )
+        #: The guarded, budgeted timeline plugins, as `install_timeline_plugins`
+        #: took them. Held for the same reason the cluster stack is: the pass
+        #: has to be opened and closed around the rebuild that drives it.
+        self._timeline_stack = self._plugins.timeline_stack(
+            budget=self._timeline_budget
         )
         #: The instant a relative time window ("15m") counts back from, held
         #: still until the buffer changes. `parse_relative_window` reads
@@ -1024,11 +1035,13 @@ class LogViewerApp(App[None]):
         self._query_budget = self._new_query_budget()
         self._watch_budget = self._new_watch_budget()
         self._cluster_budget = self._new_cluster_budget()
+        self._timeline_budget = self._new_timeline_budget()
         self._plugin_generation = self._plugins.generation
         self._install_formats()
         self._install_query_plugins()
         self._install_watch_plugins()
         self._install_cluster_plugins()
+        self._install_timeline_plugins()
         # After the wiring, so a provider's `setup()` sees a fully assembled
         # plugin rather than one still waiting for its resolver.
         self._plugins.start()
@@ -3317,6 +3330,35 @@ class LogViewerApp(App[None]):
             self._cluster_stack.rules, self._cluster_stack.contributors
         )
 
+    def _install_timeline_plugins(self) -> None:
+        """Put the timeline plugins where `clv.services.timeline` looks for them.
+
+        Injection, like the four installs above it: `timeline.py` takes its
+        annotation providers and its metric from a module registry this method
+        fills, and never imports `clv.plugins`.
+
+        **Enabled only, like the clustering install and unlike the query one.**
+        A mark on an axis and a bucket's unit are named by nothing that is
+        saved, so a plugin switched off is simply absent and the bar goes back
+        to counting entries.
+
+        `install_timeline_plugins` clears the annotation cache itself, which is
+        what makes a provider switched off stop marking the bar on the next
+        rebuild rather than on the next window.
+
+        The *election* happens here too, in the stack: `timeline_stack()` picks
+        the highest-priority enabled metric and records a note against each one
+        it passed over. Re-run on every generation change, so switching the
+        winner off promotes the runner-up.
+        """
+
+        self._timeline_stack = self._plugins.timeline_stack(
+            budget=self._timeline_budget
+        )
+        install_timeline_plugins(
+            self._timeline_stack.annotators, self._timeline_stack.metric
+        )
+
     def _toast_sink(self) -> SinkSpec:
         """CLV's own delivery: a toast, on the event loop, never disabled."""
 
@@ -3436,6 +3478,60 @@ class LogViewerApp(App[None]):
             label="cluster",
         )
 
+    def _forget_budgets(self, plugin: Any) -> None:
+        """Clear *plugin*'s strike count on every budget that could hold one.
+
+        **All six, which is the fix rather than the tidy-up.** The re-enable
+        path was written when there were two, and each seam phase since has
+        added a budget without adding it here — so a `QueryOperator`, a
+        `WatchMatcher`, a `ShapeContributor` or a `TimelineMetric` that had
+        struck once or twice on its own ceiling, and was then taken out of
+        service for some *other* reason, came back from **Re-enable** still
+        carrying those strikes. One slow pass and it was gone again, which is
+        the exact failure the `forget` calls exist to prevent and the exact
+        thing the contract promises does not happen.
+
+        Iterating rather than naming two more is what stops the seventh budget
+        from being missed the same way.
+        """
+
+        for budget in (
+            self._plugin_budget,
+            self._read_budget,
+            self._query_budget,
+            self._watch_budget,
+            self._cluster_budget,
+            self._timeline_budget,
+        ):
+            budget.forget(plugin)
+
+    def _new_timeline_budget(self) -> PluginBudget:
+        """The sixth instance: the annotation providers and the metric.
+
+        The **render** ceiling, on the same argument `_new_cluster_budget`
+        makes: a timeline pass is one rebuild of the bar over the filtered set,
+        which happens on a keystroke in the query box and not on a batch of read
+        lines.
+
+        Its own instance rather than the cluster budget's, for the reason every
+        one of these is its own: a slow `ShapeContributor` and a slow
+        `TimelineMetric` inside one render would otherwise have their strikes
+        interleaved by whichever happened to be measured first.
+
+        The two halves it measures are charged very differently, and that is
+        deliberate. A metric is called per entry, per rebuild, memoised by
+        nothing — the expensive half, and the one the ceiling is really for. An
+        annotation provider is called once per *window*, so a pass usually
+        charges it nothing at all and the passes that do are the ones where it
+        actually went and did something.
+        """
+
+        return PluginBudget(
+            self._plugins,
+            limit_ms=self._config.plugin_time_budget_ms,
+            label="timeline",
+        )
+
     def _sync_plugin_generation(self) -> None:
         """Invalidate what a plugin change makes stale, wherever it lives.
 
@@ -3486,6 +3582,13 @@ class LogViewerApp(App[None]):
         # rule switched off stops folding lines on the next render rather than
         # on the next line nothing has shaped before.
         self._install_cluster_plugins()
+        # And the timeline, for both halves of the same reason: the annotation
+        # cache holds marks a provider that has just been switched off supplied,
+        # and the metric election has to be re-run because the plugin that won
+        # it may be the one that just went out of service. This runs before the
+        # render that the generation change is about to trigger, which is the
+        # render that rebuilds the bar.
+        self._install_timeline_plugins()
 
     def _render_log(self, *, scroll_end: bool = False) -> None:
         if self._is_shutting_down:
@@ -3843,11 +3946,22 @@ class LogViewerApp(App[None]):
         # The session decides how a stamp is read, so the bar and the pane
         # cannot disagree about the order of the same lines. It hands back None
         # for every set that does not span time zones, which is every local one.
-        self._timeline = build_timeline(
-            entries,
-            width=self._timeline_width(),
-            moment_of=self._session.moment_mapper(),
-        )
+        #
+        # The pass the timeline plugins are charged against: one rebuild is one
+        # pass. `_extend_timeline` opens none -- one tailed line is not a pass,
+        # the same rule `_append_clustered` follows -- so what a metric costs
+        # while tailing rolls into the next rebuild. That is the same per-entry
+        # work measured a beat late, not work going unmeasured.
+        stack = self._timeline_stack
+        stack.start()
+        try:
+            self._timeline = build_timeline(
+                entries,
+                width=self._timeline_width(),
+                moment_of=self._session.moment_mapper(),
+            )
+        finally:
+            stack.settle()
         # is_running, not is_mounted: rendering is unit-tested without a screen,
         # and a widget refresh needs one. Same guard _update_status uses.
         if self.is_running:
@@ -4629,8 +4743,7 @@ class LogViewerApp(App[None]):
                     # strike count. Left as it was, one slow pass would take a
                     # re-enabled plugin straight back out, and Re-enable would
                     # be a control that appears not to work.
-                    self._plugin_budget.forget(record.plugin)
-                    self._read_budget.forget(record.plugin)
+                    self._forget_budgets(record.plugin)
                 # The fault goes with the decision to forgive it. Left on the
                 # record it would keep the row reading `failed` after the plugin
                 # was put back -- and, worse, the *next* genuine failure would
@@ -4647,8 +4760,7 @@ class LogViewerApp(App[None]):
             if row.enabled:
                 for record in records:
                     self._plugins.enable(record.plugin)
-                    self._plugin_budget.forget(record.plugin)
-                    self._read_budget.forget(record.plugin)
+                    self._forget_budgets(record.plugin)
                 if not records:
                     # Loading is import-time and single-shot (`PLUGIN_TODO.md`,
                     # "Loading model"), so naming a plugin CLV has never
@@ -6568,6 +6680,7 @@ class LogViewerApp(App[None]):
         install_query_plugins()
         install_watch_plugins()
         install_cluster_plugins()
+        install_timeline_plugins()
         if self._persist_state:
             # Persist as-is: the selected source is deliberately kept so the
             # next launch reopens it.

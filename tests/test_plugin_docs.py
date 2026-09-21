@@ -325,6 +325,96 @@ def test_the_clustering_reversal_is_on_the_record_in_the_contract_too() -> None:
     assert "settings.conf" in reversed_section
 
 
+# --- Phase 11: the timeline seam and the fold rule --------------------------
+
+
+def test_the_timeline_interfaces_are_documented_where_the_others_are() -> None:
+    """Both halves, in the numbered list, like every other kind."""
+
+    text = _read(PLUGIN_AGENTS)
+
+    assert "### 10. TimelineAnnotation" in text
+    assert "### 11. TimelineMetric" in text
+    # Exporter was 10 and is now 12. Asserted because the renumbering is the
+    # easy thing to get half-right, and a list with two number 10s reads as a
+    # document nobody checked.
+    assert "### 12. Exporter" in text
+
+
+def test_the_fold_rule_is_documented_as_the_reason_for_the_interface() -> None:
+    """The one thing about this seam an author cannot infer from the type.
+
+    `value() -> float` looks like an oversight — where is the aggregate hook? —
+    until you know that `extend` folds an arrival by arithmetic. An author who
+    is not told will go looking for the missing method, and an author who is
+    will understand why a median is not a feature request.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    section = text.split("### 11. TimelineMetric", 1)[1].split("\n### ", 1)[0]
+
+    assert "foldable" in section
+    assert "median" in section
+    assert "CLV does the summing" in section
+    # And the honest statement of what that costs, in the same breath.
+    assert "unexpressible" in section
+
+
+def test_the_one_metric_rule_is_written_down_with_what_it_is_not() -> None:
+    """A conflict resolved by priority is not a fault, and the docs must say so.
+
+    An operator reading "conflict" in the `P` dialog will assume something is
+    broken unless the contract says otherwise — and the loser is a healthy
+    plugin one switch away from being the one that runs.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    section = text.split("#### One metric at a time", 1)[1].split("\n#### ", 1)[0]
+
+    assert "priority" in section
+    assert "not a fault" in section
+
+
+def test_an_annotation_provider_is_told_it_runs_on_the_event_loop() -> None:
+    """The constraint that decides how the plugin is written.
+
+    A provider is the obvious place to put an HTTP call — deploys come from an
+    API — and the seam cannot stop one. What it can do is say, where the author
+    is looking, that the call is on the render path and that the budget will
+    take a plugin that blocks out of service.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    section = text.split("### 10. TimelineAnnotation", 1)[1].split("\n### ", 1)[0]
+
+    assert "may not do I/O" in section
+    assert "setup()" in section
+    assert "once per window" in section
+
+
+def test_the_timeline_budget_is_documented_as_the_sixth() -> None:
+    text = _read(PLUGIN_AGENTS)
+    budget = text.split("### The budget", 1)[1].split("\n### ", 1)[0]
+
+    assert "Six budgets, one policy" in budget
+    assert "TimelineMetric" in budget
+
+
+def test_the_readme_says_what_a_metric_bar_is_showing() -> None:
+    """The caption rule is a user-facing promise, not an implementation note."""
+
+    readme = REPO_ROOT / "README.md"
+    if not readme.exists():  # pragma: no cover - installed package
+        pytest.skip("running from an installed package")
+    text = _read(readme)
+    section = text.split("### The severity timeline", 1)[1].split("\n### ", 1)[0]
+
+    assert "TimelineMetric" in section
+    # Wrapped in the source, so matched on the half that cannot move.
+    assert "plugin supplying it" in section
+    assert "foldable" in section
+
+
 def test_the_query_interfaces_are_documented_where_the_others_are() -> None:
     """In the numbered list, because that is where an author looks for a signature."""
 
