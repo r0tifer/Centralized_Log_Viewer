@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
 
+from ..services.clustering import ClusterRuleSpec, ShapeSpec
 from ..services.filtering import FilterSpec
 from ..services.formats import DEFAULT_PROFILE, FormatProfile
 from ..services.parsing import FORMAT_NAMES, LogEntry
@@ -475,6 +476,119 @@ class ComputedField(Plugin):
         Must be a string: values are compared as the parser stores them and
         nothing downstream coerces. Returning anything else takes the plugin out
         of service with a message naming the rule it broke.
+        """
+
+
+class ClusterRule(Plugin):
+    r"""One more volatile token for the repeat clusterer to normalise out.
+
+    Clustering folds lines that read the same once their volatile tokens are
+    replaced by placeholders. The built-in list — quoted strings, timestamps,
+    UUIDs, addresses, hex, paths, numbers — is fixed and ordered, and a log
+    whose noisy token is none of those gets one cluster per line, which is the
+    feature not working on exactly the log that needed it::
+
+        class EmailAddress(ClusterRule):
+            name = "email-address"
+            pattern = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+            placeholder = "<email>"
+
+    **Declarative on purpose: you supply the pattern, CLV runs it.** There is no
+    method to implement and therefore no third-party call on a path that runs
+    per line. Everything that could go wrong is checked when the plugin loads,
+    which is the one time an author is there to read the message.
+
+    What is checked, and why each one is invisible at runtime:
+
+    * :attr:`pattern` must be a compiled pattern or a string this accepts and
+      compiles. An unreadable regex is reported with its own error.
+    * It may not match the **empty string**. ``\d*`` matches at every position,
+      so a rule written that way would splice its placeholder between every
+      character of every line.
+    * :attr:`placeholder` may contain **no digit**. Plugin rules run after the
+      built-ins, so a later plugin rule matching numbers would chew up an
+      earlier one's placeholder — the reason CLV's own nine are digit-free.
+    * It may contain **no backslash**: it is a :func:`re.sub` replacement
+      template, so a group reference in it would splice in whatever the pattern
+      captured, or raise on a group that does not exist.
+
+    An **empty** placeholder is legal and means "delete this token" — stripping
+    an ANSI colour run is a real rule, and it is the reason this is not refused
+    as an oversight.
+
+    **Ordering is append-only, and you are handed the line CLV has already
+    normalised.** Plugin rules run after every built-in, in
+    :func:`plugin_sort_key` order — the only position that cannot break the
+    built-in order, in which each rule runs on what the previous left. It is
+    also the trap: the obvious Kubernetes rule,
+    ``re.compile(r"-[a-z0-9]{8,10}-[a-z0-9]{5}\b")``, never fires, because by
+    the time it runs ``api-7d9f8b6c4-x2n9q`` is already ``api-<hex>-x2n9q``.
+    Press ``c`` and look at what a line collapses to before writing a rule for
+    it; ``clv/examples/cluster_rules.py`` works the case through.
+
+    **Cost: one substitution per *distinct* line.** ``normalise`` is memoised,
+    so a repeated line is shaped once however often it is rendered. The cluster
+    budget (``plugin_time_budget_ms``) measures what that costs, and because
+    the cache absorbs the repeats what it sees is the work that is actually new.
+    """
+
+    #: The regular expression this rule replaces. A compiled pattern, or a
+    #: string CLV compiles at load. Rejected when absent, unreadable, or able to
+    #: match the empty string.
+    pattern: Any = ""
+
+    #: What to write in its place. No digit, no backslash; empty means delete.
+    placeholder: str = ""
+
+
+class ShapeContributor(Plugin):
+    """An extra component of the key two entries must share to cluster.
+
+    A cluster's shape is the source, the level and the normalised message.
+    Field *values* are deliberately not in it — a request ID differing between
+    two lines is exactly what must not split a cluster — but sometimes a value
+    is precisely what should::
+
+        class ByUnit(ShapeContributor):
+            name = "cluster-by-unit"
+
+            def contribute(self, entry):
+                return entry.fields.get("unit", "")
+
+    Two units logging the same sentence then stay two clusters, and nothing
+    about what a shape already means has changed.
+
+    **A contributor that returns the same string for everything is a no-op.**
+    That is what makes adding one safe: it can only ever split clusters further,
+    never merge two that were apart.
+
+    **Your answer must be a pure function of the entry.** CLV clusters the whole
+    filtered set on a render and folds tailed lines into that same stream one at
+    a time; a contribution that changes between those two calls makes the
+    incremental path and a full recompute disagree about what belongs with what.
+    Returning anything but a string takes the plugin out of service, because the
+    value is composed into the key and a repr would give every entry a shape of
+    its own.
+
+    **Cost: per entry, per render, and memoised by nothing.** The shape cache is
+    keyed on the line's text, which is not enough to remember an answer that
+    depends on the whole entry — so this is the expensive half of the clustering
+    seam and the half the budget is really there for. Read a field; do not
+    compute one.
+    """
+
+    @abstractmethod
+    def contribute(self, entry: LogEntry) -> str:
+        """This entry's extra shape component, or ``""`` to add nothing.
+
+        ``""`` adds nothing *at all* rather than an empty component, which is
+        what lets a contributor answer for the entries it knows about and stay
+        out of the way for the rest — and what makes a contributor taken out of
+        service leave the shape byte-identical to a build without it.
+
+        Raising takes the contributor out of service for the session and is
+        recorded once; clustering then continues on the shape it had before the
+        plugin was installed.
         """
 
 
@@ -1204,6 +1318,8 @@ _KINDS: tuple[tuple[str, type], ...] = (
     ("operator", QueryOperator),
     ("computed field", ComputedField),
     ("filter", FilterStage),
+    ("cluster rule", ClusterRule),
+    ("shape", ShapeContributor),
     ("matcher", WatchMatcher),
     ("sink", WatchSink),
     ("exporter", Exporter),
@@ -1259,10 +1375,11 @@ class PluginBudget:
     One instance per *path*, not per plugin. The render path — every
     :class:`FilterStage` over every buffered entry, once per keystroke in the
     query box — gets one, built by the app from ``plugin_time_budget_ms``.
-    ``PLUGIN_TODO.md``'s Stage C adds a second for the read path, where
-    ``LogFormat`` and ``ClusterRule`` are called per *line*; it is this class
-    with a different label and a different key, so neither path restates the
-    policy and they cannot drift apart.
+    There are five: the render path, the read path (``LogFormat.parse`` over one
+    batch of lines), the query plugins, the watch matchers, and the clustering
+    plugins. Two ceilings and one policy between them — the same class with a
+    different label and a different key, so no path restates the rule and they
+    cannot drift apart.
 
     A pass is ``start()``, some number of ``charge()`` calls, ``settle()``.
     Time is attributed to the plugin rather than to the call, because "which
@@ -1382,6 +1499,13 @@ class PluginRegistry:
     operators: list[QueryOperator] = field(default_factory=list)
     computed: list[ComputedField] = field(default_factory=list)
     filters: list[FilterStage] = field(default_factory=list)
+    #: Plugin-supplied normalisation rules and shape components, in
+    #: :func:`plugin_sort_key` order. A rule is consulted per *distinct* line
+    #: behind the shape cache; a contributor per entry, behind nothing. Both are
+    #: reached only through the specs :meth:`cluster_stack` hands to
+    #: ``clv.services.clustering``.
+    rules: list[ClusterRule] = field(default_factory=list)
+    contributors: list[ShapeContributor] = field(default_factory=list)
     #: Plugin-supplied rule kinds and delivery destinations, in
     #: :func:`plugin_sort_key` order. Reached only through the specs
     #: :meth:`watch_stack` hands to ``clv.services.watch``.
@@ -1443,6 +1567,8 @@ class PluginRegistry:
             + len(self.operators)
             + len(self.computed)
             + len(self.filters)
+            + len(self.rules)
+            + len(self.contributors)
             + len(self.matchers)
             + len(self.sinks)
             + len(self.exporters)
@@ -1492,6 +1618,15 @@ class PluginRegistry:
         self.operators.sort(key=plugin_sort_key)
         self.computed.sort(key=plugin_sort_key)
         self.filters.sort(key=plugin_sort_key)
+        self.rules.sort(key=plugin_sort_key)
+        self.contributors.sort(key=plugin_sort_key)
+        # Both were missed when the watch seam landed, and each docstring said
+        # otherwise. It cost nothing for a matcher, which is looked up by kind —
+        # but a sink was delivered to in `pkgutil.iter_modules` order while
+        # claiming to run in priority order, which is the accident `priority`
+        # exists to remove.
+        self.matchers.sort(key=plugin_sort_key)
+        self.sinks.sort(key=plugin_sort_key)
         self.exporters.sort(key=plugin_sort_key)
         # The end of a load: whatever a downstream cache holds was computed
         # before these plugins existed.
@@ -1842,6 +1977,8 @@ class PluginRegistry:
                 QueryOperator,
                 ComputedField,
                 FilterStage,
+                ClusterRule,
+                ShapeContributor,
                 WatchMatcher,
                 WatchSink,
                 Exporter,
@@ -1889,6 +2026,12 @@ class PluginRegistry:
 
         if isinstance(plugin, (QueryOperator, ComputedField)):
             problem = self._query_fault(plugin)
+            if problem is not None:
+                self.errors.append(PluginError(origin, problem))
+                return False
+
+        if isinstance(plugin, ClusterRule):
+            problem = self._cluster_fault(plugin)
             if problem is not None:
                 self.errors.append(PluginError(origin, problem))
                 return False
@@ -2052,6 +2195,60 @@ class PluginRegistry:
         # parsed field, so it cannot shadow one. See `ComputedField`.
         return None
 
+    def _cluster_fault(self, plugin: ClusterRule) -> Optional[str]:
+        """Why *plugin* may not join the normalisation rules, or None if it may.
+
+        **At load, never at the first line**, and here that is not merely the
+        cheaper place — it is the only place. A :class:`ClusterRule` declares a
+        pattern and a placeholder and CLV performs the substitution, so there is
+        no call that could fail later and nothing to disable when it does. Every
+        one of these is silent at runtime: a placeholder with a digit in it gets
+        chewed up by the next plugin rule that matches numbers, a backslash
+        splices in a capture group, and a pattern matching the empty string
+        rewrites every position of every line. All three read, from the outside,
+        as clustering behaving oddly on this log.
+        """
+
+        try:
+            pattern = _compiled_rule(plugin)
+        except re.error as exc:
+            return f"pattern is not a usable regular expression: {exc}"
+        except TypeError:
+            declared = getattr(plugin, "pattern", None)
+            if declared is None or declared == "":
+                return "declares no pattern, so it would normalise nothing"
+            return (
+                f"pattern must be a compiled regular expression or a string, "
+                f"not {type(declared).__name__}"
+            )
+        if pattern.search("") is not None:
+            return (
+                f"pattern {pattern.pattern!r} matches the empty string, so it "
+                "would write its placeholder at every position of every line"
+            )
+
+        placeholder = getattr(plugin, "placeholder", "")
+        if not isinstance(placeholder, str):
+            return (
+                "placeholder must be a string, not "
+                f"{type(placeholder).__name__}"
+            )
+        if "\\" in placeholder:
+            return (
+                f"placeholder {placeholder!r} contains a backslash. It is a "
+                "substitution template, so a group reference in it would be "
+                "replaced by whatever the pattern captured rather than written "
+                "out"
+            )
+        if any(char.isdigit() for char in placeholder):
+            return (
+                f"placeholder {placeholder!r} contains a digit. Plugin rules "
+                "run after CLV's own, so a later rule matching numbers would "
+                "rewrite what this one produced — which is why every built-in "
+                "placeholder is digit-free"
+            )
+        return None
+
     def _watch_fault(self, plugin: "WatchMatcher") -> Optional[str]:
         """Why *plugin* may not claim its rule kind, or None if it may.
 
@@ -2084,6 +2281,18 @@ class PluginRegistry:
                     f"{_plugin_name(other)}"
                 )
         return None
+
+    def cluster_stack(
+        self, *, budget: Optional[PluginBudget] = None
+    ) -> "ClusterStack":
+        """The enabled clustering plugins as ``clv.services.clustering`` takes them.
+
+        The fourth of the same shape, for the fourth time for the same reason:
+        ``clustering.py`` may not import this module, so the guard travels with
+        the plugin rather than being fetched alongside it.
+        """
+
+        return ClusterStack(self, budget=budget)
 
     def watch_stack(self, *, budget: Optional[PluginBudget] = None) -> "WatchStack":
         """The loaded watch plugins as specs ``clv.services.watch`` can install.
@@ -2124,6 +2333,8 @@ class PluginRegistry:
             "operator": self.operators,
             "computed field": self.computed,
             "filter": self.filters,
+            "cluster rule": self.rules,
+            "shape": self.contributors,
             "matcher": self.matchers,
             "sink": self.sinks,
             "exporter": self.exporters,
@@ -2505,6 +2716,147 @@ class QueryStack:
         return value
 
 
+class ClusterStack:
+    """The enabled clustering plugins, wrapped in everything CLV owes them.
+
+    Produces the :class:`~clv.services.clustering.ClusterRuleSpec` and
+    :class:`~clv.services.clustering.ShapeSpec` records
+    ``clustering.install_cluster_plugins`` stores, with the substitution and
+    the contribution already carrying their guard and their budget.
+
+    **Enabled only, and that is the one place this seam departs from the two
+    before it.** A ``QueryOperator``'s token and a ``WatchMatcher``'s kind stay
+    registered while their plugin is switched off, because a saved query or rule
+    means something under them and dropping one would silently reinterpret it. A
+    cluster rule reserves nothing: no saved view, watch rule or session names
+    one, and there is no text whose meaning could change. So an out-of-service
+    rule is simply not installed, and the shapes go back to being what they were
+    — which is also the only behaviour an operator switching a rule off in the
+    ``P`` dialog could reasonably expect.
+
+    The wrappers re-check :meth:`PluginRegistry.is_disabled` per call anyway,
+    because a plugin disabled mid-render is disabled immediately and the specs
+    are only rebuilt on the next generation change.
+    """
+
+    __slots__ = ("_registry", "rules", "contributors", "_budget")
+
+    def __init__(
+        self, registry: "PluginRegistry", *, budget: Optional[PluginBudget] = None
+    ) -> None:
+        self._registry = registry
+        self._budget = budget
+        self.rules: tuple[ClusterRuleSpec, ...] = tuple(
+            ClusterRuleSpec(
+                plugin=_plugin_name(plugin),
+                apply=self._guard_apply(plugin),
+            )
+            for plugin in registry.rules
+            if not registry.is_disabled(plugin)
+        )
+        self.contributors: tuple[ShapeSpec, ...] = tuple(
+            ShapeSpec(
+                plugin=_plugin_name(plugin),
+                contribute=self._guard_contribute(plugin),
+            )
+            for plugin in registry.contributors
+            if not registry.is_disabled(plugin)
+        )
+
+    def start(self) -> None:
+        """Open a budget pass. One clustering of the filtered set is one pass."""
+
+        budget = self._budget
+        if budget is not None and budget.active:
+            budget.start()
+
+    def settle(self) -> None:
+        """Close the pass, disabling anything that has struck out."""
+
+        budget = self._budget
+        if budget is not None and budget.active:
+            budget.settle()
+
+    def _guard_apply(self, plugin: ClusterRule):
+        """One rule's substitution, timed and contained.
+
+        The pattern and the placeholder are read **once**, here, rather than per
+        line: a plugin that recomputed either between calls would otherwise make
+        the memoised shape of a line depend on when it was first seen.
+
+        The ``except`` is belt and braces and is expected never to fire.
+        :meth:`PluginRegistry._cluster_fault` has already proved the pattern
+        compiles, does not match the empty string, and has a placeholder that is
+        a literal — after which ``sub`` has nothing left to raise about short of
+        the interpreter running out of something. It is here because the cost of
+        an ``except`` that does not fire is zero and the cost of one missing is
+        a render that dies on a line.
+        """
+
+        registry = self._registry
+        budget = self._budget
+        clock = time.perf_counter
+        pattern = _compiled_rule(plugin)
+        placeholder = plugin.placeholder
+
+        def apply(text: str) -> str:
+            if registry.is_disabled(plugin):
+                return text
+            timing = budget is not None and budget.active
+            mark = clock() if timing else 0.0
+            try:
+                return pattern.sub(placeholder, text)
+            except Exception as exc:  # noqa: BLE001 - third-party pattern
+                registry.disable(
+                    plugin, f"raised: {exc}", origin=_plugin_name(plugin)
+                )
+                return text
+            finally:
+                if timing:
+                    budget.charge(plugin, clock() - mark)
+
+        return apply
+
+    def _guard_contribute(self, plugin: ShapeContributor):
+        registry = self._registry
+        budget = self._budget
+        clock = time.perf_counter
+
+        def contribute(entry: LogEntry) -> str:
+            if registry.is_disabled(plugin):
+                # The no-op contribution, not a marker: a disabled contributor
+                # has to leave the shape it would have widened exactly as it
+                # was before the plugin was installed.
+                return ""
+            timing = budget is not None and budget.active
+            mark = clock() if timing else 0.0
+            try:
+                result = plugin.contribute(entry)
+            except Exception as exc:  # noqa: BLE001 - third-party code
+                registry.disable(
+                    plugin, f"raised: {exc}", origin=_plugin_name(plugin)
+                )
+                return ""
+            finally:
+                if timing:
+                    budget.charge(plugin, clock() - mark)
+            if isinstance(result, str):
+                return result
+            # The contribution is composed into the shape. A non-string would be
+            # formatted by its repr, and an object whose repr carries its
+            # address gives every entry a shape of its own -- clustering
+            # switched off, with nothing on screen to say so.
+            registry.disable(
+                plugin,
+                f"contribute() returned {type(result).__name__}; a shape "
+                "contributor must return a string",
+                origin=_plugin_name(plugin),
+            )
+            return ""
+
+        return contribute
+
+
 class WatchStack:
     """The loaded watch plugins, wrapped in everything CLV owes them.
 
@@ -2802,6 +3154,25 @@ def _entry_fault(entry: Any, format_name: str) -> Optional[str]:
                 "downstream coerces"
             )
     return None
+
+
+def _compiled_rule(plugin: ClusterRule) -> re.Pattern[str]:
+    """*plugin*'s pattern, compiled. Raises what ``re.compile`` raises.
+
+    A :class:`ClusterRule` may declare either a compiled pattern or the string
+    for one, because writing ``re.compile`` around a literal is the kind of
+    ceremony an author forgets and then cannot diagnose. Called from
+    :meth:`PluginRegistry._cluster_fault`, which is where the failure is
+    reported, and again from :class:`ClusterStack`, where it cannot fail — the
+    ``re`` module memoises compilation, so the second call is a dict lookup.
+    """
+
+    pattern = getattr(plugin, "pattern", "")
+    if isinstance(pattern, re.Pattern):
+        return pattern
+    if isinstance(pattern, str) and pattern:
+        return re.compile(pattern)
+    raise TypeError(f"pattern must be a pattern or a string, not {type(pattern)!r}")
 
 
 def _plugin_name(plugin: Any) -> str:
@@ -3421,6 +3792,9 @@ __all__ = [
     "QueryOperator",
     "ComputedField",
     "QueryStack",
+    "ClusterRule",
+    "ShapeContributor",
+    "ClusterStack",
     "WatchMatcher",
     "WatchSink",
     "WatchStack",

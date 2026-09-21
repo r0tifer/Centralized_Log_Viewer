@@ -44,6 +44,8 @@ EXPECTED_API = frozenset(
         "QueryOperator",
         "ComputedField",
         "FilterStage",
+        "ClusterRule",
+        "ShapeContributor",
         "WatchMatcher",
         "WatchSink",
         "Exporter",
@@ -109,6 +111,7 @@ EXPECTED_SIGNATURES: dict[str, str] = {
     "LogFormat.parse": "(self, line: 'str') -> 'Optional[LogEntry]'",
     "QueryOperator.test": "(self, stored: 'str', value: 'str') -> 'bool'",
     "ComputedField.value": "(self, entry: 'LogEntry') -> 'Optional[str]'",
+    "ShapeContributor.contribute": "(self, entry: 'LogEntry') -> 'str'",
     "WatchMatcher.matches": (
         "(self, entry: 'LogEntry', rule: 'WatchRule') -> 'bool'"
     ),
@@ -182,6 +185,19 @@ def test_a_published_callable_keeps_its_signature(dotted: str, expected: str) ->
 )
 def test_plugin_metadata_keeps_its_defaults(attribute: str, default: object) -> None:
     assert getattr(api.Plugin, attribute) == default
+
+
+def test_a_cluster_rule_declares_a_pattern_and_a_placeholder() -> None:
+    """The one published interface whose contract is data rather than a method.
+
+    ``ClusterRule`` has nothing in ``EXPECTED_SIGNATURES`` because it has no
+    method to implement — CLV performs the substitution — so these two names
+    and their defaults *are* the frozen surface, and this is where a rename
+    would have to be seen in the diff.
+    """
+
+    assert api.ClusterRule.pattern == ""
+    assert api.ClusterRule.placeholder == ""
 
 
 def test_an_exporter_declares_whether_it_wants_a_destination() -> None:

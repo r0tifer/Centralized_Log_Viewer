@@ -98,6 +98,24 @@ def query_plugins_are_not_shared_between_tests():
 
 
 @pytest.fixture(autouse=True)
+def cluster_plugins_are_not_shared_between_tests():
+    """Reset the installed cluster rules and shape contributors between tests.
+
+    The third of the same argument, and the one with the longest reach. A
+    leaked rule does not merely stay registered: ``install_cluster_plugins``
+    clears the memoised shape cache, so every later test that clusters anything
+    would be shaping its lines through a rule from a test that has already
+    finished — and clustering that is subtly wrong reads exactly like
+    clustering that works.
+    """
+
+    yield
+    from clv.services.clustering import install_cluster_plugins
+
+    install_cluster_plugins()
+
+
+@pytest.fixture(autouse=True)
 def watch_plugins_are_not_shared_between_tests():
     """Reset the installed watch matchers and sinks between tests.
 

@@ -59,7 +59,7 @@ from .services.clustering import (
     ClusterStream,
     cluster_entries,
     describe as describe_clusters,
-    normalise,
+    install_cluster_plugins,
     summarise,
 )
 from .services.settings_file import SettingsDocument
@@ -859,6 +859,15 @@ class LogViewerApp(App[None]):
         self._query_budget = self._new_query_budget()
         #: And once more, for the watch matchers over one poll's new lines.
         self._watch_budget = self._new_watch_budget()
+        #: And a fifth, for the cluster rules and shape contributors over one
+        #: clustering of the filtered set.
+        self._cluster_budget = self._new_cluster_budget()
+        #: The guarded, budgeted clustering plugins, as `install_cluster_plugins`
+        #: took them. Held so `_write_rows` can open and close a budget pass
+        #: around the clustering it drives.
+        self._cluster_stack = self._plugins.cluster_stack(
+            budget=self._cluster_budget
+        )
         #: The instant a relative time window ("15m") counts back from, held
         #: still until the buffer changes. `parse_relative_window` reads
         #: `datetime.now()`, so without this every call to `_filter_spec`
@@ -1014,10 +1023,12 @@ class LogViewerApp(App[None]):
         self._read_budget = self._new_read_budget()
         self._query_budget = self._new_query_budget()
         self._watch_budget = self._new_watch_budget()
+        self._cluster_budget = self._new_cluster_budget()
         self._plugin_generation = self._plugins.generation
         self._install_formats()
         self._install_query_plugins()
         self._install_watch_plugins()
+        self._install_cluster_plugins()
         # After the wiring, so a provider's `setup()` sees a fully assembled
         # plugin rather than one still waiting for its resolver.
         self._plugins.start()
@@ -3283,6 +3294,29 @@ class LogViewerApp(App[None]):
             SINK_SAMPLE_LIMIT if wants_entry_samples() else 0
         )
 
+    def _install_cluster_plugins(self) -> None:
+        """Put the clustering plugins where `clv.services.clustering` looks.
+
+        Injection, like the three installs above it: `clustering.py` takes its
+        normalisation rules and shape contributors from a module registry this
+        method fills and never imports `clv.plugins`.
+
+        **Enabled only, unlike the query and watch installs.** A token and a
+        rule kind stay registered while their plugin is switched off, because a
+        saved query or rule means something under them; a cluster rule is named
+        by nothing that is saved, so switching it off simply takes it out of the
+        rules and the shapes go back to what they were. `install_cluster_plugins`
+        clears the shape cache itself, which is what makes that take effect on
+        the next render rather than on the next distinct line.
+        """
+
+        self._cluster_stack = self._plugins.cluster_stack(
+            budget=self._cluster_budget
+        )
+        install_cluster_plugins(
+            self._cluster_stack.rules, self._cluster_stack.contributors
+        )
+
     def _toast_sink(self) -> SinkSpec:
         """CLV's own delivery: a toast, on the event loop, never disabled."""
 
@@ -3375,18 +3409,51 @@ class LogViewerApp(App[None]):
             label="watch",
         )
 
+    def _new_cluster_budget(self) -> PluginBudget:
+        """The fifth instance: cluster rules and shape contributors per clustering.
+
+        It takes the **render** ceiling. `PLUGIN_TODO.md` Phase 10 said the read
+        one, and that sentence was wrong about where clustering happens: a
+        cluster pass is `_write_rows` over the filtered set, on a keystroke in
+        the query box, and the read path never shapes anything at all.
+
+        Its own instance rather than the render budget's, on the argument
+        `_new_query_budget` already makes: a slow `FilterStage` and a slow
+        `ShapeContributor` running inside one render would otherwise have their
+        strikes interleaved by whichever happened to be measured first.
+
+        The cache changes what this measures, and usefully. A rule is charged
+        only for the lines `normalise` has not already shaped, so a pass over a
+        buffer of repeats costs almost nothing and a plugin is judged on work
+        that is actually new. A contributor is memoised by nothing and is
+        charged for every entry, every render, which is why it is the half of
+        this seam the ceiling is really for.
+        """
+
+        return PluginBudget(
+            self._plugins,
+            limit_ms=self._config.plugin_time_budget_ms,
+            label="cluster",
+        )
+
     def _sync_plugin_generation(self) -> None:
         """Invalidate what a plugin change makes stale, wherever it lives.
 
         The staged view is one, and it is keyed on the generation directly. The
-        clustering shape cache is the one that needs this method to exist:
+        clustering shape cache is the one that needed this method to exist:
         :func:`clv.services.clustering.normalise` is an ``lru_cache`` on a
         module-level function, so there is no instance to key and nothing to
-        pass a generation to. ``PLUGIN_TODO.md`` Phase 10 feeds it
-        plugin-supplied normalisation rules, at which point a cache left alone
-        across an enable would serve shapes computed under the old rules --
-        entries folded into the wrong cluster, which is a wrong answer and not
-        merely a stale one.
+        pass a generation to, and a cache left alone across an enable serves
+        shapes computed under the old rules -- entries folded into the wrong
+        cluster, which is a wrong answer and not merely a stale one.
+
+        Phase 10 landed and that clear now lives **inside**
+        ``install_cluster_plugins``, reached through
+        :meth:`_install_cluster_plugins` below: a service that owns a cache owns
+        its invalidation, and a caller obliged to remember eventually does not.
+        The ordering here is the whole of what this method still owes it -- the
+        install happens before anything re-clusters, because it runs before the
+        render that this generation change is about to trigger.
 
         ``clustering`` learns nothing about plugins by this: the dependency runs
         the way it already did, and the app -- which imports both -- is what
@@ -3398,7 +3465,6 @@ class LogViewerApp(App[None]):
             return
         self._plugin_generation = generation
         self._visible_cache = None
-        normalise.cache_clear()
         # A format switched off must stop claiming a row shape and a field
         # vocabulary it no longer parses lines for. What is already in the
         # buffer keeps the `format_name` it was parsed with -- re-opening the
@@ -3416,6 +3482,10 @@ class LogViewerApp(App[None]):
         # plugin the operator has switched off.
         self._install_watch_plugins()
         self._sync_watch_rules()
+        # And the clustering, which is where the shape cache is cleared -- so a
+        # rule switched off stops folding lines on the next render rather than
+        # on the next line nothing has shaped before.
+        self._install_cluster_plugins()
 
     def _render_log(self, *, scroll_end: bool = False) -> None:
         if self._is_shutting_down:
@@ -3533,7 +3603,18 @@ class LogViewerApp(App[None]):
                 self.log_panel.write_entry(self._renderable_for(entry), entry)
             return
 
-        stream = cluster_entries(entries, lookback=self._config.cluster_lookback)
+        # The pass the clustering plugins are charged against: one shaping of
+        # the filtered set. `_append_clustered` opens none -- one tailed entry
+        # is not a pass, and the same is true of `_visible_view`'s incremental
+        # callers for the same reason.
+        stack = self._cluster_stack
+        stack.start()
+        try:
+            stream = cluster_entries(
+                entries, lookback=self._config.cluster_lookback
+            )
+        finally:
+            stack.settle()
         self._clusters = stream
         self._cluster_rows = {}
         # Keys that no longer exist are dropped rather than kept forever: the
@@ -5840,7 +5921,14 @@ class LogViewerApp(App[None]):
         in the file.
         """
 
-        stream = cluster_entries(entries, lookback=self._config.cluster_lookback)
+        stack = self._cluster_stack
+        stack.start()
+        try:
+            stream = cluster_entries(
+                entries, lookback=self._config.cluster_lookback
+            )
+        finally:
+            stack.settle()
         return [
             summarise(row) if isinstance(row, Cluster) else row for row in stream.rows
         ]
@@ -6479,6 +6567,7 @@ class LogViewerApp(App[None]):
         # registry that has already torn its plugins down.
         install_query_plugins()
         install_watch_plugins()
+        install_cluster_plugins()
         if self._persist_state:
             # Persist as-is: the selected source is deliberately kept so the
             # next launch reopens it.

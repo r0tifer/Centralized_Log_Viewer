@@ -715,7 +715,7 @@ CLV's `clv/plugins/AGENTS.md`.
 Worked examples
 ---------------
 
-Three complete, commented plugins, each walking through what its kind of
+Four complete, commented plugins, each walking through what its kind of
 plugin has to declare and why:
 
     examples/nginx_error.py   teaches CLV to read nginx's error log, a format
@@ -728,6 +728,10 @@ plugin has to declare and why:
                               watch hit to a file you name. The sink ships
                               inert: it delivers nothing until its
                               [plugin:watch_alerts] section gives it a path
+    examples/cluster_rules.py teaches `c` to fold repeats it could not: a
+                              Kubernetes pod suffix and an ANSI colour run are
+                              normalised away, and one field of your choosing
+                              keeps two streams in separate clusters
 
 Nothing in `examples/` is listed or run: it is one directory down, and CLV
 only looks here. To use one, copy it up and name it:
@@ -758,6 +762,7 @@ SEEDED_EXAMPLES: dict[str, str] = {
     "nginx_error.py": "clv.examples.nginx_error",
     "field_regex.py": "clv.examples.field_regex",
     "watch_alerts.py": "clv.examples.watch_alerts",
+    "cluster_rules.py": "clv.examples.cluster_rules",
 }
 
 

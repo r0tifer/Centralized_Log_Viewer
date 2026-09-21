@@ -152,6 +152,30 @@ def test_a_multi_kind_plugin_lists_every_interface_it_supplies() -> None:
     _run(scenario)
 
 
+def test_a_clustering_plugin_says_which_half_of_the_seam_it_supplies() -> None:
+    """Two kinds, two labels, and both short enough to survive a narrow pane.
+
+    A module supplying both halves is the ordinary case — a rule and the
+    contributor that keeps its clusters apart usually ship together — so the
+    row has to say which it has rather than "clustering".
+    """
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.push_screen(
+                PluginsDialog(
+                    [replace(ROWS[0], kinds=("cluster rule", "shape"))]
+                )
+            )
+            await pilot.pause()
+
+            assert "cluster rule, shape" in _rows(app.screen)[0]
+
+    _run(scenario)
+
+
 def test_the_consequence_of_a_toggle_is_shown_beside_the_toggle() -> None:
     """Two of these are the reason the phase needed a decision at all."""
 

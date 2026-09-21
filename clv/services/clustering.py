@@ -46,6 +46,40 @@ writing Python against a reviewed interface is a different party making a
 different promise. The rules stay unconfigurable from ``settings.conf``, and
 nothing here becomes a text format.
 
+Plugins
+-------
+
+Two seams, installed by the app through :func:`install_cluster_plugins` and
+neither reachable from here by import: this module never learns that
+``clv.plugins`` exists, and what it is handed are :class:`ClusterRuleSpec` and
+:class:`ShapeSpec` records whose callables already carry their guard.
+
+* A :class:`~clv.plugins.ClusterRule` supplies one more volatile token to
+  normalise out. Plugin rules run **after every built-in**, in
+  ``plugin_sort_key`` order, and before the whitespace collapse. Appending is
+  the only position that cannot break the order above, in which each rule runs
+  on what the previous left behind.
+
+  The digit-free placeholder rule is **validated at load**, not assumed: a
+  placeholder carrying a digit would be chewed up by a later plugin rule
+  matching numbers, and the mistake is invisible at runtime — a shape that is
+  subtly wrong reads exactly like clustering working. A backslash is refused on
+  the same argument, because the placeholder is a :func:`re.sub` *replacement
+  template*, so a group reference written in it would splice in whatever the
+  pattern captured.
+
+* A :class:`~clv.plugins.ShapeContributor` widens the key itself. Contributions
+  are appended to the shape in the same order, so a plugin can keep two clusters
+  apart — by ``unit``, by ``node`` — without changing what any existing
+  component of a shape means. One returning the same string for everything is a
+  no-op, which is what makes adding one safe.
+
+**Only *enabled* plugins are installed.** Unlike a ``QueryOperator``'s token or
+a ``WatchMatcher``'s rule kind, a cluster rule reserves nothing: no saved view,
+watch rule or session names one, so there is nothing that could be silently
+reinterpreted while the plugin is switched off. A rule out of service is simply
+absent and the shapes go back to being what they were.
+
 The lookback
 ------------
 
@@ -63,6 +97,14 @@ keystroke in the query box. Shaping five thousand lines costs about 115 ms,
 which is far too much to pay per character — so :func:`normalise` is memoised
 and every render after the first is dictionary lookups, at about 6 ms. A tailed
 line costs one :meth:`ClusterStream.add`, not a recompute.
+
+That cache is why :func:`install_cluster_plugins` clears it, always: a shape
+computed under the old rule set is not stale, it is *wrong*, and an entry folded
+into the wrong cluster looks exactly like the feature working. It also decides
+the two seams' cost models, which are not the same. A plugin rule is one
+substitution per **distinct** line, paid once and then memoised; a contributor
+runs per **entry** per render and is memoised by nothing, because its answer
+depends on the whole entry rather than on the text alone.
 """
 
 from __future__ import annotations
@@ -71,7 +113,7 @@ import re
 from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import lru_cache
-from typing import Iterable, Optional, Sequence, Union
+from typing import Callable, Iterable, Optional, Sequence, Union
 
 from .parsing import LogEntry, level_rank
 from .session import ORIGIN_FIELD
@@ -149,6 +191,94 @@ RULE_NAMES: tuple[str, ...] = tuple(name for name, _pattern, _placeholder in _RU
 
 _WHITESPACE = re.compile(r"\s+")
 
+
+# --- the plugin registry ----------------------------------------------------
+#
+# Module-level and installed by the app, the shape `query.install_query_plugins`
+# and `watch.install_watch_plugins` already have, and for the same reason: this
+# module may not import `clv.plugins`, so what it receives are records whose
+# callables already carry their guard and their budget.
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterRuleSpec:
+    """One installed normalisation rule.
+
+    :attr:`apply` is the whole of it: a callable that takes the line as it
+    stands and returns it with this rule's token replaced. The substitution
+    itself is CLV's — a :class:`~clv.plugins.ClusterRule` declares a compiled
+    pattern and a placeholder and nothing else — so what the guard around it
+    catches is not the plugin raising, which it cannot, but a pathological input
+    making :meth:`re.Pattern.sub` fail on a line nobody will ever see again.
+
+    Unlike :class:`~clv.services.query.OperatorSpec` there is no null state: an
+    out-of-service rule is not installed at all. See the module docstring.
+    """
+
+    plugin: str
+    apply: Callable[[str], str]
+
+
+@dataclass(frozen=True, slots=True)
+class ShapeSpec:
+    """One extra component of the key two entries must share.
+
+    :attr:`contribute` returns the string appended to the shape for an entry.
+    An empty string is a legitimate answer and the no-op one — it says "this
+    entry is not one I distinguish" — which is why a contributor that is
+    disabled mid-render falls back to it rather than to anything louder.
+    """
+
+    plugin: str
+    contribute: Callable[[LogEntry], str]
+
+
+#: Installed rules, in ``plugin_sort_key`` order, applied after every built-in.
+#: Empty on every build with no clustering plugins, which is what keeps this
+#: seam free: :func:`normalise` iterates a tuple with nothing in it.
+_PLUGIN_RULES: tuple[ClusterRuleSpec, ...] = ()
+#: Installed shape contributors, in the same order. Empty is the common case and
+#: :func:`shape_of` returns the exact string it returned before they existed.
+_CONTRIBUTORS: tuple[ShapeSpec, ...] = ()
+
+
+def install_cluster_plugins(
+    rules: Sequence[ClusterRuleSpec] = (),
+    contributors: Sequence[ShapeSpec] = (),
+) -> None:
+    """Register what the enabled clustering plugins declared. Replaces, not merges.
+
+    Called once at mount and again whenever the plugin registry's generation
+    moves, so a rule switched off in the ``P`` dialog stops folding lines and a
+    re-enabled one starts again. Both arguments default to empty, which is how a
+    test — and ``on_unmount`` — puts the module back.
+
+    **This clears the shape cache, and that is not the caller's job.** Every
+    shape :func:`normalise` has memoised was computed under the rule set being
+    replaced; left alone it would go on answering with shapes the installed
+    rules no longer produce, which is a wrong answer rather than a stale one and
+    is indistinguishable from clustering working. Owning the invalidation here
+    means there is no way to install a rule set and forget.
+    """
+
+    global _PLUGIN_RULES, _CONTRIBUTORS
+
+    _PLUGIN_RULES = tuple(rules)
+    _CONTRIBUTORS = tuple(contributors)
+    normalise.cache_clear()
+
+
+def installed_rules() -> tuple[ClusterRuleSpec, ...]:
+    """Every installed normalisation rule, in the order they run."""
+
+    return _PLUGIN_RULES
+
+
+def installed_contributors() -> tuple[ShapeSpec, ...]:
+    """Every installed shape contributor, in the order they are appended."""
+
+    return _CONTRIBUTORS
+
 #: Distinct messages whose shape is remembered.
 #:
 #: Clustering re-runs on every render, and a render happens on every keystroke
@@ -166,19 +296,43 @@ _SHAPE_CACHE_SIZE = 8_192
 
 @lru_cache(maxsize=_SHAPE_CACHE_SIZE)
 def normalise(text: str) -> str:
-    """Replace every volatile token in *text*, in the documented order."""
+    """Replace every volatile token in *text*, in the documented order.
+
+    Plugin rules run after the built-ins and before the whitespace collapse, so
+    a placeholder one of them writes is still tidied the same way and a rule
+    cannot land in the middle of the fixed order it was documented to follow.
+    """
 
     for _name, pattern, placeholder in _RULES:
         text = pattern.sub(placeholder, text)
+    for spec in _PLUGIN_RULES:
+        text = spec.apply(text)
     return _WHITESPACE.sub(" ", text).strip()
 
 
 def shape_of(entry: LogEntry) -> str:
-    """The key two entries must share to cluster together."""
+    """The key two entries must share to cluster together.
+
+    With no contributors installed this is the string it has always been, byte
+    for byte — the property ``tests/test_clustering.py`` pins by never having
+    been changed for this seam.
+    """
 
     body = entry.message or entry.raw
     origin = entry.fields.get(ORIGIN_FIELD, "")
-    return f"{origin}\0{entry.level or ''}\0{normalise(body)}"
+    shape = f"{origin}\0{entry.level or ''}\0{normalise(body)}"
+    if not _CONTRIBUTORS:
+        return shape
+    # An empty contribution adds *nothing*, not an empty component. That is
+    # what makes "a contributor that is disabled, or that raised, leaves the
+    # shape exactly as it was" true byte for byte rather than approximately --
+    # the guard returns "" in both cases, and a trailing separator would be a
+    # shape no build without the plugin could ever produce.
+    return shape + "".join(
+        f"\0{contribution}"
+        for contribution in (spec.contribute(entry) for spec in _CONTRIBUTORS)
+        if contribution
+    )
 
 
 class Cluster:
@@ -415,12 +569,17 @@ __all__ = [
     "DEFAULT_LOOKBACK",
     "RULE_NAMES",
     "Cluster",
+    "ClusterRuleSpec",
     "ClusterStream",
     "Growth",
     "Row",
+    "ShapeSpec",
     "cluster_entries",
     "describe",
     "expand",
+    "install_cluster_plugins",
+    "installed_contributors",
+    "installed_rules",
     "normalise",
     "shape_of",
     "summarise",

@@ -270,6 +270,61 @@ def test_the_log_format_seam_is_documented_like_the_others() -> None:
 # --- Phase 8: the query seam and its degradation rule -----------------------
 
 
+def test_the_clustering_interfaces_are_documented_where_the_others_are() -> None:
+    """Both halves of the seam, in the numbered list, like every other kind."""
+
+    text = _read(PLUGIN_AGENTS)
+
+    assert "### 8. ClusterRule" in text
+    assert "### 9. ShapeContributor" in text
+
+
+def test_the_placeholder_invariant_is_documented_as_a_rule_not_a_habit() -> None:
+    """The constraint that is obvious in CLV's source and invisible to an author.
+
+    A digit in a placeholder is eaten by a later rule, a backslash is a group
+    reference, and a pattern matching the empty string rewrites every position
+    of every line. All three are refused at load, and an author who cannot find
+    that here meets it as a plugin that silently did not load.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+
+    assert "digit-free" in text
+    assert "backslash" in text
+    assert "empty string" in text
+
+
+def test_the_normalised_line_trap_is_written_down() -> None:
+    """A plugin rule sees what CLV's own rules left, and the docs must say so.
+
+    It is the one thing about this seam an author cannot discover by reading
+    the interface: their pattern is handed a line that has already been through
+    nine substitutions, so the obvious rule for a pod name matches nothing and
+    reports nothing.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+
+    assert "already normalised" in text
+    assert "api-<hex>-x2n9q" in text
+
+
+def test_the_clustering_reversal_is_on_the_record_in_the_contract_too() -> None:
+    """The module docstring carries it; so does the Non-Goals list.
+
+    The query DSL reversal is recorded in both places, and clustering's was in
+    only one — which left a reader of the contract's own Non-Goals with a rule
+    the code no longer follows.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    reversed_section = text.split("### Reversed", 1)[1]
+
+    assert "No rules DSL for clustering" in reversed_section
+    assert "settings.conf" in reversed_section
+
+
 def test_the_query_interfaces_are_documented_where_the_others_are() -> None:
     """In the numbered list, because that is where an author looks for a signature."""
 

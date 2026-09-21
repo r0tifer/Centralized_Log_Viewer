@@ -919,6 +919,15 @@ Clusters only form within `cluster_lookback` entries (200 by default, see
 session and swallow an event from an hour ago. Whether clustering is on is
 remembered between runs; which clusters you had open is not.
 
+**The rules are extensible by plugin, and deliberately not from
+`settings.conf`.** A plugin can add a token to normalise away — an address, a
+pod name, a colour escape your logs are full of — and can widen the key so two
+streams stay in separate clusters. What it cannot be is a list of regexes in a
+config file: a typo there is a silently mis-clustered pane, with no review, no
+test and no way to tell a bad rule from a bad log. A plugin is Python someone
+can read and test, and CLV checks what it declares before running any of it.
+`clv/examples/cluster_rules.py`, in your plugin directory, is a worked one.
+
 ### Saved views
 
 A filter set you had to think about is worth keeping. `V` names the one that is
@@ -1403,6 +1412,6 @@ worth starring and comparing across a fleet.
 ```bash
 python -m pip install -e .
 python -m pip install pytest
-python -m pytest            # 2042 passed, 1 skipped, 11 deselected
+python -m pytest            # 2137 passed, 1 skipped, 11 deselected
 python -m textual run clv/app.py --dev
 ```

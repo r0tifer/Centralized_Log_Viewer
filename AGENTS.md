@@ -417,7 +417,7 @@ shared globals or reaching into another widget's tree.
 
 ## Plugins
 
-Eight interfaces in `clv/plugins/__init__.py`:
+Ten interfaces in `clv/plugins/__init__.py`:
 
 | Interface | Method | Purpose |
 | --- | --- | --- |
@@ -426,6 +426,8 @@ Eight interfaces in `clv/plugins/__init__.py`:
 | `QueryOperator` | `test(stored, value) -> bool` | A comparison token the query grammar does not have |
 | `ComputedField` | `value(entry) -> str \| None` | A queryable field derived rather than parsed |
 | `FilterStage` | `apply(entry, context) -> LogEntry \| None` | Transform or drop entries |
+| `ClusterRule` | `pattern`, `placeholder` — CLV substitutes | One more volatile token for the repeat clusterer to normalise out |
+| `ShapeContributor` | `contribute(entry) -> str` | An extra component of the key two entries must share to cluster |
 | `WatchMatcher` | `matches(entry, rule) -> bool` | A watch rule kind that is not "this pattern matched" |
 | `WatchSink` | `deliver(name, count, context, entries)` | Where a watch hit goes, besides the toast |
 | `Exporter` | `export(entries, context) -> ExportResult` | Send the current view somewhere |
@@ -501,7 +503,7 @@ installed" — the trade Item 12 asked for.
   and `workspace` fixtures, and every assertion runs against another backend —
   which is how `RemoteBackend` is held to the same behaviour as `LocalBackend`.
 
-Run: `python -m pytest` (2042 passed, 1 skipped, 11 deselected) on **both** 3.11
+Run: `python -m pytest` (2137 passed, 1 skipped, 11 deselected) on **both** 3.11
 and 3.14 — the local default is 3.14 and a green suite there is not evidence
 that the supported floor still works.
 

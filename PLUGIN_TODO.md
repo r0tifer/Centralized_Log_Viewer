@@ -40,7 +40,7 @@ that argument; Phase 7b is the exception, and it is here because designing the
 | 7b — logfmt | `key=value` parsing, built in because a plugin cannot | ✅ Done |
 | 8 — Query | `QueryOperator`, `ComputedField`, and the degradation rule | ✅ Done |
 | 9 — Watch | `WatchMatcher`, `WatchSink`, off the event loop | ✅ Done |
-| 10 — Clustering | `ClusterRule`, `ShapeContributor`, and the shape cache | ⬜ Not started |
+| 10 — Clustering | `ClusterRule`, `ShapeContributor`, and the shape cache | ✅ Done |
 | 11 — Timeline | `TimelineAnnotation`, `TimelineMetric`, foldable only | ⬜ Not started |
 | **Stage D — Surface** | | |
 | 12 — Commands and controls | Commands, bindings, drawer sections, modal screens | ⬜ Not started |
@@ -2140,7 +2140,86 @@ that the rules are extensible by plugin and not by config file, and why.
 
 **Gate.** A plugin rule folds a repeat the built-ins could not, expansion still
 returns every line, and toggling the rule mid-session takes effect. Suite green
-on 3.11 and 3.14.
+on 3.11 and 3.14: 2137 passed on both.
+
+**As shipped.** Six decisions worth recording, two of them corrections to this
+phase's own text.
+
+*The budget is the **render** ceiling, not the read one.* This file said "rules
+are per-line and inside the read-path budget", and the second half is wrong
+about where clustering happens. Nothing shapes a line on the read path: a
+cluster pass is `_write_rows` over the *filtered* set, driven by a keystroke in
+the query box, which is the render path's unit exactly. So `plugin_time_budget_ms`,
+a fifth `PluginBudget` instance labelled `cluster`, settling on its own so a
+slow `FilterStage` and a slow `ShapeContributor` inside one render do not have
+their strikes interleaved — the argument `_new_query_budget` already made.
+
+*A `ClusterRule` cannot raise, and the load checks are what replaced that test.*
+The testing list above asks for "a rule that raises is disabled". Nothing can:
+the interface is **data**, CLV performs the substitution, and there is no
+third-party call on the path at all. That is not a gap in the seam but the best
+property it has — the one kind called per line contains no plugin code. What
+replaced the test is a rejection matrix, because everything that can go wrong is
+knowable at load: a pattern that does not compile, one that **matches the empty
+string** (it would write its placeholder at every position of every line), a
+placeholder carrying a digit, and a placeholder carrying a backslash. That last
+one was not in the plan and is the one an author is least equipped to diagnose:
+the placeholder is a `re.sub` *replacement template*, so `<\1>` splices in
+whatever the pattern captured rather than writing the two characters that were
+typed. A `ShapeContributor` keeps the ordinary runtime guard, because it is an
+ordinary method.
+
+*Plugin rules are handed the line CLV has already normalised, and the phase's
+own example proved it.* The Kubernetes pod suffix this phase was drafted around
+cannot be matched by the obvious rule: by the time a plugin rule runs,
+`api-7d9f8b6c4-x2n9q` is `api-<hex>-x2n9q`, because the built-in hex rule got
+the middle hash first. The worked example's ANSI rule fell into the same hole
+one level down — the integer rule had already made `\x1b[31m` into
+`\x1b[<int>m`. Both are consequences of "plugin rules run last", which is not
+negotiable: appending is the only position that cannot break the built-in
+order. So the trap is documented where an author meets it — in the interface,
+in `clv/plugins/AGENTS.md`, and in `clv/examples/cluster_rules.py`, whose two
+rules are now written against what actually reaches them — and pinned by
+`test_a_rule_is_handed_the_line_the_builtins_already_normalised`.
+
+*Only **enabled** plugins are installed, which inverts Phase 8's rule on
+purpose.* A `QueryOperator`'s token and a `WatchMatcher`'s kind stay claimed
+while their plugin is switched off, because a saved query or rule *means*
+something under them and dropping one would silently reinterpret it. Nothing
+saved names a cluster rule — `state.clustering` is a bool and a cluster key is
+content-derived and session-only — so there is nothing to reserve and nothing
+that could change meaning. An out-of-service rule is simply absent and the
+shapes go back to what they were, which is also the only reading of the `P`
+dialog's switch that is not a lie. Requirement 12 is vacuous for this seam, and
+that is a property of it rather than an omission.
+
+*An empty contribution adds nothing, not an empty component.* Found by the test
+written for the disabled case: a contributor that is switched off or has raised
+returns `""`, and appending `"\0" + ""` produced a shape with a trailing
+separator — one no build without the plugin could ever produce, so "clustering
+continues on the shape it had before" was false by one byte. Empty
+contributions are skipped. The cost is a theoretical ambiguity between two
+contributors answering in complementary halves; the benefit is that taking a
+contributor out of service is byte-identical to never having installed it,
+which is the property the guard exists to provide.
+
+*The shape cache is cleared by `install_cluster_plugins`, not by its caller.*
+`app.py` had been clearing it in `_sync_plugin_generation` since Phase 6, in
+advance of this phase. A service that owns a cache owns its invalidation: the
+clear moved inside the install, where it cannot be forgotten by a test, a
+future caller, or the next seam. What the app still owes it is ordering, and
+that is all it owes it.
+
+**Also swept here.** `PluginRegistry.order()` never sorted `matchers` or
+`sinks`, though both docstrings claimed `plugin_sort_key` order: a matcher is
+looked up by kind so it cost nothing, but sinks were delivered to in
+`pkgutil.iter_modules` order — the filesystem accident `priority` exists to
+remove — for a release. Both join the sort, and the test that pins it is driven
+off `_KINDS` rather than off a list someone remembered to name, because a seam
+phase adds a list every time. `clv/plugins/AGENTS.md`'s `Reversed` list gains
+the clustering non-goal, which had been recorded only in `clustering.py`'s
+docstring while the query DSL reversal beside it was recorded in both — leaving
+a reader of the contract's own Non-Goals with a rule the code no longer follows.
 
 **Commit.** `feat(plugins): cluster rules and shape contributors`
 

@@ -632,7 +632,126 @@ used for a storm), and make it **stoppable enough** (the deadline). The decision
 to install a plugin that posts anywhere is the operator's, made with those three
 facts in hand.
 
-### 8. Exporter
+### 8. ClusterRule
+
+One more volatile token for the repeat clusterer (`c`) to normalise out.
+
+Clustering folds lines that read the same once their volatile tokens are
+replaced by placeholders. CLV's nine rules — quoted strings, timestamps, UUIDs,
+IPv6, IPv4, hex, paths, floats, integers — are fixed and ordered. A log whose
+noisy token is none of those gets one cluster per line.
+
+```python
+from clv.api import ClusterRule
+
+class EmailAddress(ClusterRule):
+    name = "email-address"
+    pattern = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")   # or the string
+    placeholder = "<email>"
+```
+
+**There is no method to implement.** You declare the pattern and the
+placeholder; CLV performs the substitution. That is what keeps a seam which
+runs per line free of any third-party call — and it is why every mistake you
+can make here is caught **when the plugin loads**, with a message, rather than
+on a line in a running pane.
+
+What is refused at load, and why each one is invisible at runtime:
+
+| Refused | Because |
+| --- | --- |
+| no `pattern`, or one that does not compile | it would normalise nothing; the `re.error` is reported as written |
+| a `pattern` that matches the **empty string** | `\d*` matches at every position, so the placeholder would be written between every character of every line |
+| a `placeholder` containing a **digit** | plugin rules run after CLV's own, so a later one matching numbers would rewrite what this one produced — the reason every built-in placeholder is digit-free |
+| a `placeholder` containing a **backslash** | it is a `re.sub` replacement template: a group reference would splice in what the pattern captured, or raise |
+
+An **empty** placeholder is legal and deletes the token. Stripping decoration —
+an ANSI colour run — is a real rule, and the reason this is not treated as an
+oversight.
+
+#### You are handed the line CLV has already normalised
+
+Plugin rules run **after every built-in**, in `priority` order among
+themselves. Appending is the only position that cannot break the built-in
+order, in which each rule runs on what the previous left behind — and `priority`
+cannot move a plugin rule ahead of CLV's own nine.
+
+It is also the trap. The obvious Kubernetes rule never fires:
+
+```python
+pattern = re.compile(r"-[a-z0-9]{8,10}-[a-z0-9]{5}\b")   # matches nothing
+```
+
+By the time it runs, `api-7d9f8b6c4-x2n9q` is already `api-<hex>-x2n9q`: the
+hex rule matched the middle hash first. The same happens to `\x1b\[[0-9;]*m`,
+because the integer rule has turned `\x1b[31m` into `\x1b[<int>m`. Press `c`
+and look at what a line already collapses to before writing a rule for it, and
+write the pattern against *that*. `clv/examples/cluster_rules.py` works through
+both cases.
+
+#### Cost: once per distinct line
+
+`normalise` is memoised, so your pattern runs once per **distinct** line
+however often the pane re-renders. A buffer of repeats — which is the buffer
+clustering is for — costs one substitution per shape. The cluster budget
+measures what is left, which is the work that is actually new.
+
+### 9. ShapeContributor
+
+An extra component of the key two entries must share to cluster together.
+
+A shape is the source, the level and the normalised message. Field *values* are
+deliberately not in it — a request ID differing between two lines is exactly
+what must not split a cluster — but sometimes a value is precisely what should.
+
+```python
+from clv.api import ShapeContributor
+
+class ByUnit(ShapeContributor):
+    name = "cluster-by-unit"
+
+    def contribute(self, entry) -> str:
+        return entry.fields.get("unit", "")
+```
+
+`Started` from `nginx.service` and `Started` from `postgres.service` then stay
+two clusters, and nothing about what a shape already means has changed.
+
+- **A contributor that returns a constant is a no-op.** It can only ever split
+  clusters further, never merge two that were apart — which is what makes
+  adding one safe.
+- **`""` adds nothing at all**, not an empty component. It is how you answer
+  for the entries you know about and stay out of the way for the rest, and it
+  is what a contributor taken out of service falls back to, so switching one
+  off leaves shapes byte-identical to a build without it.
+- **Your answer must be a pure function of the entry.** CLV clusters the
+  filtered set in one pass and folds tailed lines into that same stream one at
+  a time; a contribution that changed between those two calls would make the
+  incremental path and a full recompute disagree, and nothing would report it.
+- **Return a string.** Anything else takes the plugin out of service: the value
+  is composed into the key, and a repr carrying an address would give every
+  entry a shape of its own — clustering switched off, with nothing on screen to
+  say so.
+
+#### Cost: per entry, per render, memoised by nothing
+
+This is the expensive half of the clustering seam. The shape cache is keyed on
+the line's text, which cannot remember an answer that depends on the whole
+entry, so `contribute` runs for every entry on every render — every keystroke
+in the query box, over the whole buffer. Read a field. Do not compute one.
+
+#### Switching either off takes effect immediately
+
+Both are installed **enabled-only**, which is where clustering differs from the
+query and watch seams. A `QueryOperator`'s token and a `WatchMatcher`'s kind
+stay claimed while their plugin is switched off, because a saved query or rule
+means something under them. Nothing saved names a cluster rule, so there is
+nothing to reserve: switch one off in `P` and the shapes go back to what they
+were, on the next render. CLV clears the shape cache as part of installing a
+rule set, which is what makes "the next render" true rather than "the next line
+nothing has shaped before".
+
+### 10. Exporter
 
 Saves or transmits the entries the filters kept.
 
@@ -1048,6 +1167,8 @@ a stage that is merely slow makes CLV look broken and says nothing at all.
 | `QueryOperator.test` | **every render** | **once per buffered entry, per term** |
 | `ComputedField.value` | **every render** | **once per buffered entry whose own fields lack the key** |
 | `FilterStage.apply` | **every render** | **once per buffered entry** |
+| `ClusterRule` (CLV substitutes) | **every render with `c` on** | **once per distinct line, memoised** |
+| `ShapeContributor.contribute` | **every render with `c` on** | **once per buffered entry, memoised by nothing** |
 | `WatchMatcher.matches` | **every poll** | **once per newly arrived entry, per rule of its kind** |
 | `WatchSink.deliver` | when a rate-limit window closes | once per rule per window, **on its own thread** |
 | `Exporter.export` | on `Ctrl+E` | once |
@@ -1110,7 +1231,7 @@ source opens pays every cold cost a plugin has, and a large paste or a loaded
 machine can put a healthy stage over the line for a pass or two. A plugin that
 is genuinely slow still strikes out within about a second and a half of typing.
 
-**Four budgets, one policy.** `LogFormat.parse` is charged against a separate
+**Five budgets, one policy.** `LogFormat.parse` is charged against a separate
 ceiling, because it is measured against a different thing: a pass on the read
 path is one batch of lines from a reader's `prime` or `poll`, not one render.
 The query plugins get a third instance, sharing the render path's ceiling
@@ -1118,13 +1239,15 @@ because they are the same kind of work on the same trigger — but settling
 separately, so a slow `FilterStage` and a slow `QueryOperator` do not have their
 strikes interleaved by whichever happened to be measured first. `WatchMatcher`
 gets a fourth, on the **read** ceiling, because a matcher pass is one poll's
-batch of newly arrived lines and not one keystroke. Everything else is identical
-in all four: three consecutive passes over the line, disabled, named in `P`, and
-reachable by **Re-enable**.
+batch of newly arrived lines and not one keystroke. The clustering plugins get a
+fifth, back on the render ceiling — a cluster pass is one shaping of the
+filtered set, which is a keystroke and not a batch of read lines. Everything
+else is identical in all five: three consecutive passes over the line, disabled,
+named in `P`, and reachable by **Re-enable**.
 
 ```ini
 [log_viewer]
-plugin_time_budget_ms = 250     # FilterStage.apply, and the query plugins
+plugin_time_budget_ms = 250     # FilterStage.apply, the query and cluster plugins
 plugin_read_budget_ms = 50      # the read path: LogFormat.parse, WatchMatcher.matches
 plugin_sink_timeout_ms = 5000   # not a budget -- see below
 ```
@@ -1440,6 +1563,17 @@ the rule stated at the head of [TODO.md](../../TODO.md).
   stands and **no index is planned**. What is planned is a user plugin
   directory, an explicit enable-list, and manifests a `clv plugin install` can
   verify from a path, a tarball or a URL that anyone may host.
+- **"No rules DSL for clustering."** *Reversed 2026-08-14* by
+  [PLUGIN_TODO.md](../../PLUGIN_TODO.md) Phase 10, and recorded in
+  `clv/services/clustering.py`'s own docstring where a reader of that module
+  meets it. The objection was to **the operator** hand-writing regex rules into
+  `settings.conf`, where a typo is a silently mis-clustered pane and there is no
+  review, no test and no way to tell a bad rule from a bad log. That stands: the
+  rules are still unconfigurable from `settings.conf` and nothing here became a
+  text format. What a plugin author may now add is a `ClusterRule` — a compiled
+  pattern and a placeholder, validated at load — and a `ShapeContributor`. A
+  different party, writing Python against a reviewed interface, making a
+  different promise.
 - **"No query DSL."** *Reversed 2026-08-14* by
   [PLUGIN_TODO.md](../../PLUGIN_TODO.md) Phase 8, and the reversal is narrow
   enough to state exactly. The objection was to a query *language* — `OR`,

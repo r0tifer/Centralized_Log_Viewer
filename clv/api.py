@@ -52,6 +52,7 @@ from __future__ import annotations
 
 from .plugins import (
     PLUGIN_API_VERSION,
+    ClusterRule,
     ComputedField,
     Exporter,
     ExportResult,
@@ -62,6 +63,7 @@ from .plugins import (
     Plugin,
     ProviderSource,
     QueryOperator,
+    ShapeContributor,
     WatchMatcher,
     WatchSink,
     setting_bool,
@@ -103,6 +105,8 @@ __all__ = [
     "QueryOperator",
     "ComputedField",
     "FilterStage",
+    "ClusterRule",
+    "ShapeContributor",
     "WatchMatcher",
     "WatchSink",
     "Exporter",
@@ -127,6 +131,12 @@ __all__ = [
     # may not claim. Published so an author can check rather than discover it
     # from a load error.
     "FORMAT_NAMES",
+    # --- extending the clustering --------------------------------------------
+    # No constant joins these two, and the absence is the point. `FORMAT_NAMES`,
+    # `BUILTIN_OPERATORS` and `KIND_PATTERN` are published because each names a
+    # namespace a plugin can collide in and would otherwise discover from a load
+    # error. Clustering has no such namespace: two rules may write the same
+    # placeholder harmlessly, and a contributor claims nothing at all.
     # --- extending the watch rules -------------------------------------------
     # A matcher is handed the whole rule, because its `pattern` is the matcher's
     # own parameter string and its `name` is the key to hold per-rule state

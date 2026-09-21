@@ -52,6 +52,7 @@ from clv.services.watch import (
     WatchNotifier,
     WatchRule,
     install_watch_plugins,
+    installed_sinks,
     matcher_kinds,
     validate_pattern,
     wants_entry_samples,
@@ -176,6 +177,29 @@ def _install(*plugins, budget: PluginBudget | None = None):
     stack = registry.watch_stack(budget=budget)
     install_watch_plugins(stack.matchers, stack.sinks)
     return registry, stack
+
+
+def test_sinks_are_delivered_to_in_priority_order() -> None:
+    """Swept in with Phase 10, because it was never true and always claimed.
+
+    ``PluginRegistry.order()`` did not sort ``sinks``, so the list the
+    dispatcher walks was in whichever order ``pkgutil.iter_modules`` returned —
+    the filesystem accident ``priority`` exists to remove — while the attribute
+    and the interface both documented priority order. It went unseen because
+    nothing before this asked two sinks which of them went first.
+    """
+
+    class First(Recorder):
+        name = "first"
+        priority = 10
+
+    class Second(Recorder):
+        name = "second"
+        priority = 900
+
+    _install(Second(), First())
+
+    assert [spec.plugin for spec in installed_sinks()] == ["first", "second"]
 
 
 def _log(tmp_path: Path, *lines: str, name: str = "app.log") -> Path:
