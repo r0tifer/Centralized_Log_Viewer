@@ -29,7 +29,7 @@ from clv.plugins import (
 )
 from clv.services.config import load_config
 from clv.widgets.advanced_drawer import AdvancedFiltersDrawer
-from clv.widgets.plugins_dialog import PluginsDialog
+from clv.widgets.plugins_dialog import STATE_MARKS, PluginsDialog
 
 
 def _run(scenario) -> None:
@@ -890,5 +890,51 @@ def test_a_plugin_reads_its_section_through_the_app(tmp_path: Path) -> None:
             )
 
             assert seen == {"replacement": "***"}
+
+    _run(scenario)
+
+
+# --- the isolated row -------------------------------------------------------
+
+
+def test_an_isolated_row_says_what_containment_does_and_does_not_buy() -> None:
+    """The fifth state, and the one sentence an operator meets it with.
+
+    `isolated` was reserved by Phase 4 and produced by nothing until the host
+    landed. It is a *quiet* state — a plugin in a child process is healthy, and
+    painting it the colour a broken one gets would make containment look like
+    something to fix — so the row is dim and the honest sentence is in the
+    detail pane rather than in a toast nobody would see again.
+    """
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.push_screen(
+                PluginsDialog(
+                    (
+                        PluginStatus(
+                            name="shipper",
+                            origin="/home/x/.config/clv/plugins/shipper",
+                            source="user",
+                            kinds=("exporter",),
+                            state="isolated",
+                            detail="runs in a subprocess CLV can stop",
+                        ),
+                    )
+                )
+            )
+            await pilot.pause()
+
+            row = _rows(app.screen)[0]
+            assert "shipper" in row and "isolated" in row
+            assert row.startswith(STATE_MARKS["isolated"])
+
+            detail = _detail(await _highlight(app, pilot, 0))
+            assert "separate process" in detail
+            assert "stop" in detail
+            # The half that cannot be dropped: containment is not safety.
+            assert "still runs as you" in detail
 
     _run(scenario)

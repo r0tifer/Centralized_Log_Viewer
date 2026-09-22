@@ -1099,6 +1099,10 @@ class LogViewerApp(App[None]):
         self._plugins = load_plugins(
             enabled=self._config.plugins,
             settings=plugin_settings_for(self._config),
+            # Passed at load rather than set afterwards: a plugin the operator
+            # isolated in `settings.conf` starts its host during this call, and
+            # the ceiling has to be the operator's on the pass that starts it.
+            host_timeout_ms=self._config.plugin_host_timeout_ms,
         )
         self._wire_remote_providers()
         # Rebound: `load_plugins` returned a new registry, and a budget still
@@ -6357,8 +6361,12 @@ class LogViewerApp(App[None]):
         self._config = load_config()
         # Every plugin holds a live view of its own section, so re-reading the
         # file is all it takes for one to see an edited setting -- no restart,
-        # and no plugin reaching for the settings parser itself.
+        # and no plugin reaching for the settings parser itself. An isolated one
+        # holds a snapshot instead, and is handed the new section before its
+        # next call; the deadline it is held to is re-read here for the same
+        # reason, since an operator who raised it after a kill means it now.
         self._plugins.refresh_settings(plugin_settings_for(self._config))
+        self._plugins.host_timeout_ms = float(self._config.plugin_host_timeout_ms)
         self._settings_path = get_config_file() or user_config_path()
         refreshed = self._reconcile_backends()
         # The cap can have changed under us, so the session adopts the new one

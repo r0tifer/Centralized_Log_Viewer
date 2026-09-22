@@ -132,6 +132,13 @@ _LIMITS: dict[str, tuple[int, int, int]] = {
     # silently deliver nothing. Generous, because the thing on the other end is
     # usually a network. Zero means no deadline.
     "plugin_sink_timeout_ms": (5_000, 0, 60_000),
+    # Milliseconds an *isolated* plugin may take to answer one call -- including
+    # the handshake that starts its host -- before CLV kills the child and takes
+    # the plugin out of service. A deadline rather than a budget, like the sink
+    # timeout above, and the first one in CLV that can actually be enforced: a
+    # thread cannot be stopped from outside and a process can. Zero waits
+    # forever, which is what a plugin running in-process does anyway.
+    "plugin_host_timeout_ms": (5_000, 0, 60_000),
 }
 
 DEFAULT_SETTINGS_TEMPLATE = f"""[{CONFIG_SECTION}]
@@ -250,6 +257,20 @@ plugin_read_budget_ms = 50
 #
 # Set to 0 for no deadline.
 plugin_sink_timeout_ms = 5000
+
+# milliseconds. How long a plugin that runs in its own process - one that
+# declared `isolated = True`, or one you isolated with `isolated = true` in its
+# own [plugin:<name>] section below - may take to answer one call before CLV
+# kills it and says so in the plugins dialog (P).
+#
+# This is the only ceiling in CLV that can actually be enforced. The render
+# budgets work by measuring a pass and declining to start the next one, so a
+# plugin that hangs inside a call hangs the viewer; a child process can simply
+# be killed. Isolation contains crashes, hangs and leaks - it does not make an
+# untrusted plugin safe, because the child runs as you, with your files.
+#
+# Set to 0 to wait forever, which is what an in-process plugin does anyway.
+plugin_host_timeout_ms = 5000
 
 # Read log folders on other machines over SSH. Off by default, and for a
 # stronger version of the reason above: a remote source spawns ssh, and a
@@ -440,6 +461,7 @@ class LogConfig:
     plugin_time_budget_ms: int = _LIMITS["plugin_time_budget_ms"][0]
     plugin_read_budget_ms: int = _LIMITS["plugin_read_budget_ms"][0]
     plugin_sink_timeout_ms: int = _LIMITS["plugin_sink_timeout_ms"][0]
+    plugin_host_timeout_ms: int = _LIMITS["plugin_host_timeout_ms"][0]
     #: Ring the terminal bell when a watch rule notifies. Off by default: a
     #: bell is a thing an operator opts into, never a thing a log does to them.
     watch_bell: bool = False
@@ -1520,6 +1542,7 @@ def load_config(path: Optional[Path] = None) -> LogConfig:
         plugin_time_budget_ms=_read_int(section, "plugin_time_budget_ms"),
         plugin_read_budget_ms=_read_int(section, "plugin_read_budget_ms"),
         plugin_sink_timeout_ms=_read_int(section, "plugin_sink_timeout_ms"),
+        plugin_host_timeout_ms=_read_int(section, "plugin_host_timeout_ms"),
         watch_bell=_read_bool(section, "watch_bell", False),
         enable_journald=_read_bool(section, "enable_journald", False),
         plugins=_read_plugin_list(section, issues),

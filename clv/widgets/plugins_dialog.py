@@ -49,7 +49,19 @@ STATE_MARKS = {
 
 #: States that are the operator's own doing rather than a fault. Rendered dim
 #: rather than amber, and not counted as problems anywhere.
-QUIET_STATES = ("loaded", "not enabled")
+#:
+#: ``isolated`` is one of them: a plugin running in a child process is healthy,
+#: and rendering it in the colour a broken one gets would make containment look
+#: like a problem an operator has to fix.
+QUIET_STATES = ("loaded", "not enabled", "isolated")
+
+#: What an isolated row says, under the origin. Short enough for the detail pane
+#: at 80 columns and honest in both halves: a killable plugin is not a safe one,
+#: and this is the only place an operator meets that fact while deciding.
+ISOLATED_NOTE = (
+    "Runs in a separate process CLV can stop if it hangs or crashes. "
+    "It still runs as you, with your files."
+)
 
 
 class PluginsDialog(ModalScreen[Optional[tuple[PluginStatus, ...]]]):
@@ -268,6 +280,11 @@ class PluginsDialog(ModalScreen[Optional[tuple[PluginStatus, ...]]]):
                 "⚑ Reads your log lines and delivers them wherever it is "
                 "configured to send them."
             )
+        if row.state == "isolated":
+            # Ahead of `detail`, which for an isolated row is CLV's own summary
+            # of the same fact. This is the sentence that has to survive being
+            # read quickly, so it goes where the eye lands first.
+            parts.append(ISOLATED_NOTE)
         if row.detail:
             parts.append(row.detail)
         consequence = self._consequence(row)

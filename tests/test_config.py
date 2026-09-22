@@ -1301,6 +1301,46 @@ def test_the_template_documents_the_read_budget() -> None:
     assert "once per line *read*" in DEFAULT_SETTINGS_TEMPLATE
 
 
+# --- the isolation deadline -------------------------------------------------
+
+
+def test_the_host_timeout_defaults_and_clamps_like_the_budgets(tmp_path) -> None:
+    """A deadline rather than a budget, held to the same shape and the same 0."""
+
+    assert LogConfig().plugin_host_timeout_ms == 5_000
+
+    path = tmp_path / "settings.conf"
+    path.write_text("[log_viewer]\nplugin_host_timeout_ms = 0\n", encoding="utf-8")
+    assert load_config(path).plugin_host_timeout_ms == 0
+
+    path.write_text(
+        "[log_viewer]\nplugin_host_timeout_ms = 9999999\n", encoding="utf-8"
+    )
+    assert load_config(path).plugin_host_timeout_ms == 60_000
+
+    path.write_text("[log_viewer]\nplugin_host_timeout_ms = soon\n", encoding="utf-8")
+    assert load_config(path).plugin_host_timeout_ms == 5_000
+
+
+def test_the_template_says_what_isolation_does_and_does_not_do(tmp_path) -> None:
+    """The honest sentence reaches the operator's own settings file.
+
+    `clv/plugins/AGENTS.md` is where an author reads it. This is where an
+    operator does — beside the key they would raise after CLV killed something,
+    which is the moment they are most likely to want it to mean more than it
+    does.
+    """
+
+    assert "plugin_host_timeout_ms = 5000" in DEFAULT_SETTINGS_TEMPLATE
+    # Unwrapped and un-commented before matching: this is prose in a settings
+    # file, and where a comment line breaks is not the test's business.
+    prose = " ".join(
+        line.lstrip("# ") for line in DEFAULT_SETTINGS_TEMPLATE.splitlines()
+    )
+    assert "does not make an untrusted plugin safe" in prose
+    assert "the child runs as you" in prose
+
+
 # --- the worked example -----------------------------------------------------
 
 

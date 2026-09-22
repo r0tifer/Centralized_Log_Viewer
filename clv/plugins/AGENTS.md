@@ -45,18 +45,30 @@ Judge it the same way: by who wrote it and whether you read it.
 
 ### What isolation does and does not do
 
-**Today there is none.** Every plugin runs in CLV's process. A plugin that
-hangs or leaks memory cannot be stopped. CLV can catch an exception, and it can
-disable a stage that is repeatedly *slow* on the render path (see
-[Performance](#performance)) — but a budget only works on code that returns, and
-neither of those is isolation.
+Isolation is **failure containment, not safety**. A subprocess host can be
+killed on crash, hang or timeout, which is the first time in CLV's history a
+plugin can be *stopped*. It does not make an untrusted plugin safe. The child
+runs as the operator, with the operator's filesystem and the operator's
+network. Everything in *What a plugin can do* stays true of an isolated plugin
+except the ability to take the viewer down with it.
 
-When isolation arrives it will be **failure containment, not safety**: a
-subprocess host can be killed on crash, hang or timeout, which is the first
-time in CLV's history a plugin can be *stopped*. It will not make an untrusted
-plugin safe. The child runs as the operator, with the operator's filesystem and
-the operator's network. Everything in *What a plugin can do* stays true of an
-isolated plugin except the ability to take the viewer down with it.
+**It is opt-in, and only four kinds may ask.** A plugin declares
+`isolated = True`, or an operator writes `isolated = true` in its
+`[plugin:<name>]` section; the coarse-grained kinds get a host and the per-entry
+kinds are refused at load with the reason named. [Isolation](#isolation) below
+has the mechanism.
+
+**By default there is none**, and for a plugin that has not asked, nothing in
+this section applies: it runs in CLV's process, and a plugin that hangs or leaks
+there cannot be stopped. CLV can catch an exception, and it can disable a stage
+that is repeatedly *slow* on the render path (see [Performance](#performance)) —
+but a budget only works on code that returns, and neither of those is isolation.
+
+**The import is contained only through the settings door.** A class attribute
+has to be read to be honoured, and reading it means importing the module that
+declares it, in this process, before anything is contained. An operator who
+writes `isolated = true` in the plugin's own section is asking for something
+CLV can answer before the import: that module is never imported here at all.
 
 Any wording that would let this section be summarised as "plugins are contained,
 therefore plugins are safe" is wrong. `tests/test_plugin_docs.py` enforces the
@@ -553,8 +565,9 @@ named in the `P` dialog and fed nothing further.
 goes on running for as long as it likes; all the deadline buys is that CLV stops
 waiting for it and stops queueing behind it. A sink that talks to the network
 should therefore set **its own** timeouts rather than relying on this one. The
-subprocess host in `PLUGIN_TODO.md` Phase 13 is what would make a hang genuinely
-stoppable; a thread never will be.
+[isolation host](#isolation) is what makes a hang genuinely stoppable — a sink
+that declared `isolated = True` runs where CLV can kill it — and a thread never
+will be.
 
 #### What a sink is given, and what it is not
 
@@ -988,9 +1001,10 @@ the *next* one, and CLV cannot interrupt a call it is inside. Do the slow part
 on a thread of your own and answer from what that thread last stored, exactly as
 an annotation provider does.
 
-This is the one kind of failure isolation CLV does not have today, and it is
-why `PLUGIN_TODO.md` Phase 13 lists `Command` as isolable: a plugin that
-declares `isolated = True` will get a subprocess that *can* be killed.
+This is the one kind of failure CLV cannot contain in its own process, and it
+is why `Command` is one of the four [isolable](#isolation) kinds: a command that
+declares `isolated = True` runs in a child that *can* be killed, and the
+ceiling it is held to is `plugin_host_timeout_ms`.
 
 Raising is survivable and visible. The exception disables the command for the
 session through the same mechanism a raising `FilterStage` goes through — its
@@ -1031,8 +1045,9 @@ Two consequences worth knowing:
 
 - **A long-running command cannot report progress part-way through.** Its
   messages arrive together, the moment it returns.
-- **Every member of the context is encodable**, which is what makes the
-  isolation host in Phase 13 possible for this kind at all.
+- **Every member of the context is encodable**, which is what makes
+  [isolation](#isolation) possible for this kind at all — including the outbox,
+  which is filled in the child and drained here.
 
 #### Asking is asking
 
@@ -1258,6 +1273,14 @@ could not be a module name is dropped and reported, and the sections around it
 still load. `[plugin:]` with no name, and a duplicated section, are each
 reported and skipped.
 
+**One key CLV reads for itself: `isolated`.** Everything else in the section is
+the plugin's business, and this is the exception — `isolated = true` asks CLV to
+run that plugin in a child process it can kill, and it is answered **before the
+module is imported**, which is the whole reason it is a settings key and not
+only a class attribute. See [Isolation](#isolation). It is still handed to the
+plugin with the rest of the section; a plugin that wants its own `isolated` key
+for something else will be confusing an operator, not colliding with CLV.
+
 **One legacy key, folded in rather than renamed.** `enable_journald` lives in
 `[log_viewer]`, is in every operator's settings file, and is what the Advanced
 drawer's switch writes. It is read into `[plugin:journald]` as `enabled`, so
@@ -1275,6 +1298,11 @@ implements none of them behaves exactly as it did before they existed.
 | `setup()` | Once, after every plugin has loaded and been configured | Before first use |
 | `teardown()` | Once, at shutdown | After CLV has closed its readers, before the session is persisted |
 
+All three run **in the child** for an [isolated](#isolation) plugin, and its
+`setup()` runs when its host starts — which for a plugin nobody has called yet
+is never. Nothing else about the order changes.
+
+
 `teardown()` runs after the readers so a plugin cannot resurrect a source on
 its way out, and before the session is persisted so a plugin that fails on exit
 still leaves the operator's session intact.
@@ -1291,9 +1319,12 @@ exception and carries on, but a `teardown()` that blocks forever blocks exit,
 and nothing here stops it. The [budget](#the-budget) bounds a stage's time on
 the render path and deliberately does not reach the lifecycle hooks: a hook that
 never returns cannot be timed out from inside the process it is hanging, which
-needs a process CLV can kill (`PLUGIN_TODO.md` Phase 13). Until that lands a
-plugin author is being trusted not to block on the way out, and that is a
-convention rather than a protection, like every other one on this page.
+needs a process CLV can kill. For an [isolated](#isolation) plugin that is
+exactly what happens: `teardown()` runs in the child, is bounded by
+`plugin_host_timeout_ms`, and a child that will not leave is terminated and then
+killed. In-process, a plugin author is being trusted not to block on the way
+out, and that is a convention rather than a protection, like every other one on
+this page.
 
 **`setup()` and `teardown()` are session lifecycle, not the enable switch.**
 Turning a plugin off in the `P` dialog and back on does not re-run `setup()`.
@@ -1319,7 +1350,7 @@ Five states:
 | `not enabled` | Present, and not named in `plugins` — or switched off from the dialog. Not a fault, and not reported as one. |
 | `failed` | It raised at import or at runtime, or CLV could not read it. The row carries the recorded message in full. |
 | `incompatible` | An unsatisfied `requires_clv` or `requires_api`. The row names the constraint *and* the running version. |
-| `isolated` | Reserved for the isolation host. Nothing produces it yet. |
+| `isolated` | Every plugin this module loaded runs in a child process CLV can stop. A module with one isolated plugin and one in-process reads `loaded`, and says how many are contained in its detail — see [Isolation](#isolation). |
 
 Two asymmetries the dialog states as it is used, because neither is guessable:
 
@@ -1601,9 +1632,9 @@ plugin_sink_timeout_ms = 5000   # not a budget -- see below
 **`Command.run` is on none of them, and that one *is* a limitation.** A command
 runs synchronously on the event loop, so the thing to bound is a call CLV is
 currently inside — and a budget cannot interrupt one, it can only decline to
-make the next. A command that hangs hangs CLV. `PLUGIN_TODO.md` Phase 13's
-subprocess host is the answer, and it is the first time in CLV's history a
-plugin will be stoppable.
+make the next. A command that hangs hangs CLV — unless it is
+[isolated](#isolation), which is the one and only answer to this and the first
+time in CLV's history a plugin can be stopped.
 
 **A `WatchSink` is on none of them, and that is not an omission.** A sink runs
 on a thread of its own, so being slow costs the pane nothing and there is no
@@ -1627,7 +1658,7 @@ Time inside `apply()` is measured; nothing else is. In particular:
 - **`setup()`, `configure()` and `teardown()` are outside every budget.** A
   plugin that *hangs* in one of them hangs CLV, and on `teardown()` that means
   hanging exit. Exceptions there are contained; time is not. Bounding it needs a
-  process CLV can kill, which is `PLUGIN_TODO.md` Phase 13 and not a timer.
+  process CLV can kill, which is [isolation](#isolation) and not a timer.
 - **`Command.run` is outside every budget, for the same reason.** It is called
   on the event loop and CLV is inside it for as long as it takes; a stopwatch
   around a call that has already returned cannot bound one that has not. Its
@@ -1644,7 +1675,139 @@ Time inside `apply()` is measured; nothing else is. In particular:
   budget measures time, and a deque that only ever grows costs none.
 
 Both are consequences of a plugin running in CLV's own process — see
-[Trust model](#trust-model).
+[Trust model](#trust-model). All four have one answer, and it is the next
+section: not a better timer, a process CLV can kill.
+
+---
+
+## Isolation
+
+**Isolation contains crashes, hangs and leaks; it does not make an untrusted
+plugin safe.** The child runs as the operator, with the operator's filesystem,
+the operator's environment and the operator's credentials. Read
+[Trust model](#trust-model) first and do not let this section be summarised into
+its opposite.
+
+What it buys is precisely one thing: your plugin can be *stopped*. Nothing else
+in CLV can do that. A budget measures a pass that finished and declines to start
+the next one; a sink's deadline stops CLV waiting for a thread it cannot end.
+A child process is killable, and that is the whole of the feature.
+
+### Asking for it
+
+Two doors, and they are not equivalent.
+
+```python
+class Shipper(Exporter):
+    name = "shipper"
+    isolated = True          # the author asks
+```
+
+```ini
+[plugin:shipper]
+isolated = true              # the operator asks
+```
+
+The class attribute is the author saying "my work belongs somewhere it can be
+killed". The settings key is the operator saying the same thing about a plugin
+whose author did not — and it buys strictly more, because CLV can read it
+*before* the import.
+
+The difference is worth being exact about. For the class attribute, CLV imports
+the module and constructs the plugin **in its own process** — it has to, in
+order to read the attribute at all — and only the calls go to the child. So
+module-level code and `__init__`, which are the first things a plugin gets to
+do and both run before any interface check, are not contained. A module
+isolated from `settings.conf` is never imported here at all, and both of those
+run in the child with everything else.
+
+The enable-list still applies. Isolation is not a way around consent, and a
+plugin that is not named in `plugins =` is not loaded however it is isolated.
+
+### Which kinds may ask
+
+| Isolable | Refused |
+| --- | --- |
+| `Exporter`, `WatchSink`, `Command`, `TimelineAnnotation` | `LogSourceProvider`, `LogFormat`, `QueryOperator`, `ComputedField`, `FilterStage`, `ClusterRule`, `ShapeContributor`, `TimelineMetric`, `WatchMatcher` |
+
+The four on the left are coarse-grained: called on demand, or once per rebuild.
+Eight of the nine on the right are called **per entry or per line**, where a
+round trip is not a slower version of the same program but a different one —
+see [How often each kind is called](#how-often-each-kind-is-called) for the
+numbers that make that a fact rather than an opinion.
+
+`LogSourceProvider` is refused for its own reason, kept separate because it is
+about *when* rather than *how often*: `open_reader()` hands back a live reader
+that CLV polls from the event loop on every tick, which needs a streaming host
+rather than this one.
+
+A refusal is reported at load, names the kind and says why, and the plugin is
+**not loaded**. It is never run in-process instead: a stated preference that
+silently degrades is worse than no isolation, because the operator believes
+otherwise.
+
+### What it costs you
+
+- **One child per origin.** A module's plugins share it, because they share the
+  module's imported state.
+- **Started on first use**, so a command nobody presses costs nothing. A plugin
+  isolated from `settings.conf` is the exception and starts at load, because
+  asking the child is the only way to learn what is in a module CLV did not
+  import.
+- **Everything you are handed is a copy**, encoded and rebuilt: entries through
+  the [wire form](#the-wire-form), the spec, the window, the source ref, your
+  panel. Mutating what you were handed changes nothing anywhere.
+- **`configure()` gets a snapshot, not a live view.** In-process, the mapping
+  you keep changes underneath you when the operator edits `settings.conf`. A
+  snapshot cannot, so CLV sends you a new one before your next call after a
+  reload. Read through the mapping as usual; just do not assume an edit reaches
+  you without a call.
+- **`print()` goes nowhere.** The child's stdout and stderr are `/dev/null`,
+  because they would otherwise be the terminal CLV is drawing on and your
+  output would look like the viewer corrupting itself. Use `context.notify()`,
+  or write to a file of your own.
+- **A slow call is now a killed call.** `plugin_host_timeout_ms` (default 5000)
+  bounds every call including the handshake that starts your host. Over it, the
+  child is killed, your plugin is disabled, and the `P` dialog says so with
+  **Re-enable** as the way back.
+- **It bounds the freeze; it does not remove it.** A `Command` and an
+  `Exporter` are still called from the event loop, and CLV still waits for the
+  answer — so a command of yours that hangs pauses the pane for up to
+  `plugin_host_timeout_ms` and then comes back, where in-process it paused the
+  pane for good. A `WatchSink` is the one that is genuinely unaffected: it was
+  already on a thread of its own. Isolation is what makes a hang **end**, not
+  what makes it invisible; if you need CLV to stay live while you work, do the
+  work on a thread of your own and answer from what it last stored.
+
+### What a failure looks like
+
+| What happened | What CLV does |
+| --- | --- |
+| Your code raised | The ordinary third-party failure. Reported by the call site that made the call; your host stays up |
+| You did not answer in time | Child killed, plugin disabled, reason recorded. **Re-enable** starts a fresh one |
+| The child crashed or exited | Same, with "exited" in the reason |
+| The host would not start | Plugin disabled and reported. **Never** run in-process instead |
+
+### Frozen builds
+
+CLV's release binaries are PyInstaller bundles, and both halves of this matter
+if you are working on the host itself:
+
+- `clv/__main__.py` completes the spawn handshake **before** it imports
+  anything of CLV's. Spawn starts a child by re-running `sys.executable`, which
+  in a frozen build is the CLV binary; without it the first isolated call
+  re-launches the viewer. It calls `multiprocessing.spawn.freeze_support()`
+  rather than the documented `multiprocessing.freeze_support()` on purpose: on
+  **3.11**, the version the release binaries are built with, the documented one
+  is gated on `sys.platform == 'win32'` and does nothing at all on the Linux
+  bundle it exists for. 3.14 widened that check, which is why a green local
+  suite says nothing about it, and why the release workflow has a smoke test
+  that runs an isolated plugin in the built binary.
+- The child scrubs its own environment with
+  `clv.plugins.sources.journald.child_environment()` — the same function the
+  journal provider passes to `Popen` — because PyInstaller puts `_internal` on
+  `LD_LIBRARY_PATH` and a child that then execs a system binary loads the
+  bundle's libcrypto instead of the system's.
 
 ---
 
@@ -1795,9 +1958,10 @@ version it does not know **before reading any other key** — a payload from a
 future CLV is rejected whole rather than half-decoded into an entry that looks
 plausible and is not.
 
-You will not need this in-process. It is published now, ahead of the isolation
-host that consumes it, so that the encoding is part of the frozen contract
-rather than an artefact of whichever phase first needed it.
+You will not need this in-process. It is what an [isolated](#isolation)
+plugin's entries travel as, and it was published ahead of the host that consumes
+it so that the encoding is part of the frozen contract rather than an artefact
+of whichever phase first needed it.
 
 ---
 
@@ -1908,10 +2072,10 @@ Still non-goals:
 - Credentials of any kind — no password field, no key generation, no agent
   management, and never a disabled host key check.  
 - Background daemons or telemetry. A plugin may not run unattended, and CLV
-  reports nothing anywhere. The opt-in subprocess host planned in
-  [PLUGIN_TODO.md](../../PLUGIN_TODO.md) Phase 13 is not a daemon: it lives and
-  dies with the viewer, it is started only for a plugin whose author asked for
-  it, and it exists to make a plugin *killable*, not to make it long-lived.
+  reports nothing anywhere. The opt-in [subprocess host](#isolation) is not a
+  daemon: it lives and dies with the viewer, it is started only for a plugin
+  whose author or operator asked for it, and it exists to make a plugin
+  *killable*, not to make it long-lived.
 
 ### Reversed
 

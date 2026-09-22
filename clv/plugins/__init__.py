@@ -95,6 +95,15 @@ ENTRY_POINT_GROUP = "clv.plugins"
 #: Subdirectories of clv/plugins scanned for drop-in modules.
 _LOCAL_SUBPACKAGES = ("sources", "filters", "exporters")
 
+#: Modules of CLV's own that sit in ``clv/plugins/`` and are not drop-ins.
+#:
+#: The flat walk imports every module beside the subpackages, which is how a
+#: single-file plugin can be dropped straight into ``clv/plugins/``. CLV's
+#: machinery lives there too, and without this it is walked like a plugin:
+#: imported, found to export nothing, and reported to the operator as "defines
+#: no plugin" against an origin they have no way to act on.
+_LOADER_MODULES = ("host",)
+
 #: Extra plugin directories, ``os.pathsep``-separated, searched *before* the
 #: user plugin directory.
 #:
@@ -153,6 +162,24 @@ class Plugin(ABC):
     #: plugins that do not care both take the default and compose by name, which
     #: is at least a rule their authors can predict.
     priority: int = 100
+
+    #: Ask to be run in a subprocess CLV can stop. Default False.
+    #:
+    #: **Failure containment, not safety.** A host can be killed when it
+    #: crashes, hangs or leaks, which is the first time in CLV's history a
+    #: plugin can be *stopped* -- and it does not make an untrusted plugin safe:
+    #: the child runs as the operator, with the operator's filesystem. Setting
+    #: this is a robustness decision, never a security boundary.
+    #:
+    #: Only the coarse-grained kinds may ask. :data:`ISOLABLE_KINDS` lists them
+    #: and every other kind is refused at load with the reason named, because a
+    #: round trip per entry or per line is not a slower version of the same
+    #: program.
+    #:
+    #: An operator can ask on a plugin's behalf, with ``isolated = true`` in its
+    #: ``[plugin:<name>]`` section -- and that door contains strictly more,
+    #: because CLV then never imports the module in its own process at all.
+    isolated: bool = False
 
     def describe(self) -> str:
         return self.name
@@ -1740,6 +1767,354 @@ _KINDS: tuple[tuple[str, type], ...] = (
 )
 
 
+#: The kinds an isolation host may hold. Coarse-grained, every one of them:
+#: called on demand, or once per rebuild, never per entry and never per line.
+#:
+#: In :data:`_KINDS` order, so a message listing them reads the way a row does.
+ISOLABLE_KINDS = ("timeline", "sink", "exporter", "command")
+
+#: Why each of the others may not be isolated, in that plugin's own terms.
+#:
+#: A refusal is a sentence an author reads, not an omission they discover. The
+#: shape of the answer is the same for eight of the nine -- a round trip per
+#: entry or per line is not a slower version of the same program, it is a
+#: different one -- and ``source`` is refused for its own reason, which is
+#: worth keeping distinct because it is about *when* CLV calls it rather than
+#: how often.
+_ISOLATION_REFUSALS: dict[str, str] = {
+    "source": (
+        "a source provider hands back a live reader that CLV polls from the "
+        "event loop on every tick, which needs a streaming host rather than "
+        "this one"
+    ),
+    "format": "parse() is called once per line read",
+    "operator": "test() is called once per entry, per render",
+    "computed field": "value() is called once per entry, per render",
+    "filter": "apply() is called once per entry, per render",
+    "cluster rule": "a cluster rule is applied once per line shaped",
+    "shape": "contribute() is called once per entry shaped",
+    "metric": "value() is called once per entry, per rebuild",
+    "matcher": "matches() is called once per entry, per poll",
+}
+
+#: The declarative half of a plugin: what CLV *reads* rather than calls.
+#:
+#: These are the attributes a proxy has to be able to answer for, because the
+#: loader, the export dialog, the binding installer and the ``P`` dialog all
+#: read them off the object without invoking anything. They travel once, at the
+#: handshake, and a proxy answers from them locally -- an export dialog that had
+#: to ask another process what extension to suggest would be a round trip per
+#: keystroke.
+_MANIFEST_ATTRIBUTES = (
+    "wants_path",
+    "suggested_extension",
+    "wants_entries",
+    "command_name",
+    "title",
+    "key",
+    "show",
+)
+
+
+def isolation_fault(kinds: Sequence[str]) -> Optional[str]:
+    """Why a plugin of these *kinds* may not be isolated, or None if it may.
+
+    Enforced at load, never at the first call, on the argument every other
+    fault check in this module makes: it is knowable from the declaration, and
+    discovering it at the first call means discovering it in front of an
+    operator who has already installed the thing.
+
+    **A plugin that is refused is not loaded**, rather than loaded in-process.
+    Running a plugin somewhere other than where it asked to run would turn a
+    stated preference into a suggestion, and the one thing worse than no
+    isolation is isolation an operator believes they have.
+    """
+
+    refused = [kind for kind in kinds if kind not in ISOLABLE_KINDS]
+    if not refused:
+        return None
+    reasons = "; ".join(
+        f"{kind} — {_ISOLATION_REFUSALS.get(kind, 'it is called per entry')}"
+        for kind in refused
+    )
+    return (
+        f"asks for isolation, which is refused for {reasons}. Isolation is "
+        f"available to: {', '.join(ISOLABLE_KINDS)}"
+    )
+
+
+def manifest_for(plugin: Any) -> dict[str, Any]:
+    """Describe *plugin* the way the other process would describe it.
+
+    One function, two callers, and that is the point: the class-declared door
+    builds this here from a live class, and the settings-forced door builds it
+    in the child from a class this process never imported. Two implementations
+    would be two answers to "what is this plugin", differing exactly when it
+    mattered.
+
+    Everything here is a JSON scalar by construction -- an attribute of any
+    other type is carried as its ``str``, because a plugin can put anything on
+    its class and a manifest that cannot cross a pipe is no manifest at all.
+    """
+
+    attributes: dict[str, Any] = {}
+    for key in _MANIFEST_ATTRIBUTES:
+        try:
+            value = getattr(plugin, key)
+        except Exception:  # noqa: BLE001 - a property on third-party code
+            continue
+        if value is None or isinstance(value, (str, bool, int, float)):
+            attributes[key] = value
+        else:
+            attributes[key] = str(value)
+    priority = getattr(plugin, "priority", 100)
+    if not isinstance(priority, int) or isinstance(priority, bool):
+        priority = 100
+    return {
+        "index": 0,
+        "qualname": f"{type(plugin).__module__}.{type(plugin).__qualname__}",
+        "name": _plugin_name(plugin),
+        "kinds": [label for label, interface in _KINDS if isinstance(plugin, interface)],
+        "attributes": attributes,
+        "priority": priority,
+        "requires_clv": getattr(plugin, "requires_clv", None),
+        "requires_api": getattr(plugin, "requires_api", None),
+    }
+
+
+# --- standing in for a plugin in another process ----------------------------
+
+
+class _IsolatedPlugin:
+    """A plugin that lives in a child process, in the shape CLV expects here.
+
+    Every call site in CLV resolves a plugin by ``isinstance`` and calls it by
+    name -- the registry files by interface, the stacks guard by interface, the
+    dialogs read attributes. So the thing standing in for an isolated plugin has
+    to *be* one of those interfaces rather than merely quack like one, which is
+    what the per-kind subclasses below are for, and why not one call site in
+    ``app.py`` knows this class exists.
+
+    It answers the declarative half from the manifest and forwards the rest.
+    """
+
+    def __init__(
+        self,
+        *,
+        registry: "PluginRegistry",
+        host: Any,
+        entry: Any,
+        resolve_by_qualname: bool,
+    ) -> None:
+        self._registry = registry
+        self._host = host
+        self._entry = entry
+        self._resolve_by_qualname = resolve_by_qualname
+        self._index: Optional[int] = None if resolve_by_qualname else entry.index
+        self.name = entry.name
+        self.priority = entry.priority
+        self.requires_clv = entry.requires_clv
+        self.requires_api = entry.requires_api
+        self.isolated = True
+        for key, value in entry.attributes.items():
+            setattr(self, key, value)
+
+    @property
+    def origin(self) -> str:
+        return self._host.origin
+
+    def configure(self, settings: Mapping[str, str]) -> None:
+        """Take a snapshot for the child.
+
+        An in-process plugin is handed a **live view** of its section and sees a
+        reload without being called again. That cannot cross a process boundary,
+        so an isolated plugin holds a snapshot which CLV replaces before its
+        next call. Said out loud in ``clv/plugins/AGENTS.md``, because a plugin
+        author who relied on the live view would otherwise find out by having
+        stale settings.
+        """
+
+        self._host.settings_changed(dict(settings))
+
+    def setup(self) -> None:
+        """Nothing here. ``setup()`` runs in the child, once its host is up.
+
+        Deliberately a no-op rather than a forwarding call: ``start()`` skips
+        isolated plugins and drives their hosts instead, so that a plugin whose
+        command is never pressed never costs a subprocess.
+        """
+
+    def teardown(self) -> None:
+        """Nothing here either -- ``shutdown()`` drives the hosts. See above."""
+
+    # --- the forwarding half ------------------------------------------------
+
+    def _call(self, method: str, payload: Optional[Mapping[str, Any]] = None) -> Any:
+        """Run *method* in the child, or take this plugin out of service.
+
+        A plugin that raises comes back as an ordinary exception and reaches the
+        guard that call site already has. A host that timed out or died is
+        different in kind -- there is nothing left to call -- so the plugin is
+        disabled here, by the same :meth:`PluginRegistry.disable` a raising
+        filter stage goes through, and the exception is re-raised so the call
+        site reports it the way it reports every other plugin failure.
+        """
+
+        from .host import HostDead, HostError
+
+        # Read off the registry rather than held by the host, so that a reload
+        # that raised the ceiling applies to the next call rather than to the
+        # next host -- an operator who raises it after a kill means it now.
+        self._host.timeout_ms = self._registry.host_timeout_ms
+        try:
+            self._host.ensure_started(setup=self._registry.started)
+            index = self._resolve_index()
+            if index is None:
+                raise HostDead(
+                    f"the isolation host did not produce {self.name!r}"
+                )
+            return self._host.call(index, method, payload)
+        except HostError as exc:
+            self._registry.disable(self, str(exc), origin=_plugin_name(self))
+            raise
+
+    def _resolve_index(self) -> Optional[int]:
+        """Which plugin in the child this one is.
+
+        Known already for a plugin the child enumerated. For one declared on its
+        class here, the parent built the manifest from its own import and the
+        child built its own from a second one, so the two are matched by
+        qualified name -- the one thing that is the same object in both.
+        """
+
+        if self._index is not None:
+            return self._index
+        self._index = self._host.index_of(self._entry.qualname)
+        return self._index
+
+
+class _IsolatedExporter(_IsolatedPlugin, Exporter):
+    def export(
+        self,
+        entries: Sequence[LogEntry],
+        context: FilterContext,
+        *,
+        destination: Optional[Path] = None,
+    ) -> ExportResult:
+        from .host import entries_to_wire, export_result_from_wire, filter_context_to_wire
+
+        return export_result_from_wire(
+            self._call(
+                "export",
+                {
+                    "entries": entries_to_wire(entries),
+                    "context": filter_context_to_wire(context),
+                    "destination": None if destination is None else str(destination),
+                    "wants_path": bool(getattr(self, "wants_path", False)),
+                },
+            )
+        )
+
+
+class _IsolatedSink(_IsolatedPlugin, WatchSink):
+    def deliver(
+        self,
+        name: str,
+        count: int,
+        context: FilterContext,
+        entries: Sequence[LogEntry] = (),
+    ) -> None:
+        from .host import entries_to_wire, filter_context_to_wire
+
+        self._call(
+            "deliver",
+            {
+                "name": str(name),
+                "count": int(count),
+                "context": filter_context_to_wire(context),
+                "entries": entries_to_wire(entries),
+            },
+        )
+
+
+class _IsolatedAnnotation(_IsolatedPlugin, TimelineAnnotation):
+    def annotations(
+        self, window: TimeWindow
+    ) -> Iterable[tuple[datetime, str, Optional[str]]]:
+        from .host import annotations_from_wire, window_to_wire
+
+        return annotations_from_wire(
+            self._call("annotations", {"window": window_to_wire(window)}) or ()
+        )
+
+
+class _IsolatedCommand(_IsolatedPlugin, Command):
+    def run(self, context: "CommandContext") -> Optional["Panel"]:
+        from .host import command_context_to_wire
+
+        return self._answer(
+            self._call("run", {"context": command_context_to_wire(context)}), context
+        )
+
+    def on_control(
+        self, control_id: str, value: Any, context: "CommandContext"
+    ) -> Optional["Panel"]:
+        from .host import _scalar, command_context_to_wire
+
+        return self._answer(
+            self._call(
+                "on_control",
+                {
+                    "control_id": str(control_id),
+                    # CLV's own widgets produce a bool or a string here and
+                    # nothing else, so this is a guard rather than a conversion
+                    # -- and the failure it guards against is an unencodable
+                    # value taking down a call instead of a control looking odd.
+                    "value": _scalar(value),
+                    "context": command_context_to_wire(context),
+                },
+            ),
+            context,
+        )
+
+    def _answer(self, produced: Any, context: "CommandContext") -> Optional["Panel"]:
+        """Unpack what the child returned, including what it asked for.
+
+        The child filled *its* copy of the context's outbox; this fills the
+        parent's, so ``_apply_command_requests`` drains exactly what it drains
+        for an in-process command and every refusal is decided by the path that
+        already owns it.
+        """
+
+        from .host import panel_from_wire, requests_from_wire
+
+        if not isinstance(produced, Mapping):  # pragma: no cover - defensive
+            return None
+        context.requests.extend(requests_from_wire(produced.get("requests") or ()))
+        return panel_from_wire(produced.get("panel"))
+
+
+#: One proxy class per set of kinds, composed once and reused. The set is the
+#: cache key rather than the plugin, because two exporters need the same class.
+_PROXY_MIXINS: dict[str, type] = {
+    "timeline": _IsolatedAnnotation,
+    "sink": _IsolatedSink,
+    "exporter": _IsolatedExporter,
+    "command": _IsolatedCommand,
+}
+_PROXY_CLASSES: dict[tuple[str, ...], type] = {}
+
+
+def _proxy_class(kinds: Sequence[str]) -> type:
+    key = tuple(kind for kind in ISOLABLE_KINDS if kind in set(kinds))
+    cached = _PROXY_CLASSES.get(key)
+    if cached is None:
+        bases = tuple(_PROXY_MIXINS[kind] for kind in key)
+        cached = type(f"Isolated({', '.join(key)})", bases, {})
+        _PROXY_CLASSES[key] = cached
+    return cached
+
+
 def _origin_source(origin: str) -> str:
     """Which of the three search roots *origin* came from.
 
@@ -1984,6 +2359,16 @@ class PluginRegistry:
     #: Bumped whenever what this registry would *do* to an entry changes.
     #: See :attr:`generation`.
     _generation: int = field(default=0, repr=False)
+    #: One :class:`~clv.plugins.host.PluginHost` per origin that asked to be
+    #: isolated, created on the first plugin that needs it and started later --
+    #: or, for a plugin the operator isolated from ``settings.conf``, started at
+    #: load, because asking the child is the only way to learn what is in a
+    #: module this process deliberately never imported.
+    _hosts: dict[str, Any] = field(default_factory=dict, repr=False)
+    #: How long an isolated plugin has to answer before its host is killed.
+    #: ``plugin_host_timeout_ms``; 0 waits forever, which is what a build with
+    #: no host does anyway.
+    host_timeout_ms: float = field(default=5_000.0, repr=False)
 
     @property
     def total(self) -> int:
@@ -2102,6 +2487,16 @@ class PluginRegistry:
                 current.clear()
         # A plugin reads through the view it was handed, so a changed section
         # changes what it returns without any call reaching this module.
+        #
+        # Except one in another process, which cannot read through anything.
+        # Each host is *told* its section changed and carries the new one to the
+        # child before its next call -- rather than being sent it now, which
+        # would put a round trip per isolated plugin on the reload path for
+        # plugins that may never be called again.
+        for origin, host in self._hosts.items():
+            host.settings_changed(
+                dict(self.settings_for(_origin_label(origin, _origin_source(origin))))
+            )
         self._generation += 1
 
     # --- lifecycle -----------------------------------------------------------
@@ -2140,9 +2535,17 @@ class PluginRegistry:
             return
         self._started = True
         for record in self.loaded:
-            if self.is_disabled(record.plugin):
+            if self.is_disabled(record.plugin) or isinstance(
+                record.plugin, _IsolatedPlugin
+            ):
+                # An isolated plugin is set up in the child, by its host, and
+                # only once that host exists -- which for a plugin whose command
+                # is never pressed is never. Forwarding `setup()` from here would
+                # start every host at mount and hand back the subprocess cost
+                # this design spends laziness to avoid.
                 continue
             self._run_hook(record.plugin, "setup")
+        self._start_hosts()
 
     def shutdown(self) -> None:
         """Run ``teardown()`` on every plugin that was set up. Once per session.
@@ -2162,9 +2565,170 @@ class PluginRegistry:
             return
         self._stopped = True
         for record in self.loaded:
-            if self.is_disabled(record.plugin):
+            if self.is_disabled(record.plugin) or isinstance(
+                record.plugin, _IsolatedPlugin
+            ):
                 continue
             self._run_hook(record.plugin, "teardown")
+        self._stop_hosts()
+
+    # --- isolation ----------------------------------------------------------
+
+    @property
+    def started(self) -> bool:
+        """Whether :meth:`start` has run.
+
+        Read by a proxy starting its host late: a host that comes up after the
+        session started has missed ``start()`` and has to run ``setup()`` on its
+        way in, or an isolated plugin would be called before it was set up.
+        """
+
+        return self._started
+
+    def _isolation_requested(self, origin: str) -> bool:
+        """Whether the operator asked for *origin* to be isolated.
+
+        ``isolated = true`` in the plugin's own ``[plugin:<name>]`` section. Read
+        from the section rather than from the class on purpose: this is the
+        answer the loader needs **before** it imports anything, which is what
+        makes this door contain an import that crashes or hangs.
+        """
+
+        return setting_bool(
+            self.settings_for(_origin_label(origin, _origin_source(origin))), "isolated"
+        )
+
+    def _host_for(self, origin: str) -> Any:
+        """The host for *origin*, created but not started.
+
+        One per origin rather than per plugin: a module's plugins share the
+        module's imported state, and giving them a child each would import it
+        once per plugin and hand two halves of one plugin two sets of globals.
+        """
+
+        host = self._hosts.get(origin)
+        if host is None:
+            # Local, so that a build with no isolated plugins never imports the
+            # host module and never touches multiprocessing. Requirement 10.
+            from .host import PluginHost
+
+            host = PluginHost(
+                origin,
+                timeout_ms=self.host_timeout_ms,
+                settings=dict(
+                    self.settings_for(_origin_label(origin, _origin_source(origin)))
+                ),
+            )
+            self._hosts[origin] = host
+        return host
+
+    def _isolate(self, plugin: Any, origin: str) -> Optional[Any]:
+        """Swap *plugin* for something that runs it in a child, or refuse it.
+
+        Returns the stand-in, or None having recorded why not. A refusal is a
+        refusal to **load**: the alternative is running a plugin in-process
+        after it asked not to be, which is worse than not isolating at all
+        because the operator would believe otherwise.
+        """
+
+        entry = manifest_for(plugin)
+        problem = isolation_fault(entry["kinds"])
+        if problem is not None:
+            self.errors.append(PluginError(origin, problem))
+            return None
+        try:
+            from .host import HostPlugin
+
+            return _proxy_class(entry["kinds"])(
+                registry=self,
+                host=self._host_for(origin),
+                entry=HostPlugin.from_wire(entry),
+                resolve_by_qualname=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - a build without the host module
+            # `load_plugins` never raises, and this is the one place in the
+            # isolation path that could have: the host module is imported
+            # lazily, so a build that failed to bundle it would surface here,
+            # at load, as an exception escaping the loader rather than as a
+            # plugin CLV could not contain.
+            self.errors.append(
+                PluginError(origin, f"could not be isolated: {exc}")
+            )
+            return None
+
+    def _proxies_for(self, host: Any) -> list[Any]:
+        return [
+            record.plugin
+            for record in self.loaded
+            if isinstance(record.plugin, _IsolatedPlugin) and record.plugin._host is host
+        ]
+
+    def _start_hosts(self) -> None:
+        """Run ``setup()`` in every host that is already up.
+
+        Only the ones already running: a lazily started host runs its setup on
+        the way in, which is the same call in a different order rather than a
+        second implementation of it.
+        """
+
+        from .host import HostError
+
+        for host in list(self._hosts.values()):
+            if not host.alive:
+                continue
+            host.timeout_ms = self.host_timeout_ms
+            try:
+                failed = host.setup([plugin.index for plugin in host.plugins])
+            except HostError as exc:
+                for proxy in self._proxies_for(host):
+                    self.disable(proxy, str(exc), origin=_plugin_name(proxy))
+                continue
+            self._report_hook_failures(host, failed)
+
+    def _stop_hosts(self) -> None:
+        """Tear down and stop every host, exactly once, whatever they do.
+
+        A host mid-call is the case the escalation in ``PluginHost.stop`` exists
+        for: it will not answer the polite request, and waiting for it is the
+        hang this whole mechanism was built to end.
+        """
+
+        from .host import HostError
+
+        for host in list(self._hosts.values()):
+            if host.alive:
+                # The ceiling as it stands now, not as it stood when this host
+                # was built: a reload can have changed it, and `teardown()` is
+                # the call most likely to be the one that hangs.
+                host.timeout_ms = self.host_timeout_ms
+                try:
+                    self._report_hook_failures(
+                        host, host.teardown([plugin.index for plugin in host.plugins])
+                    )
+                except HostError as exc:
+                    self.errors.append(
+                        PluginError(host.origin, str(exc), category="runtime")
+                    )
+            try:
+                host.stop()
+            except Exception:  # noqa: BLE001 - shutdown must not raise
+                pass
+        self._hosts.clear()
+
+    def _report_hook_failures(
+        self, host: Any, failed: Sequence[tuple[int, str]]
+    ) -> None:
+        by_index = {
+            proxy._resolve_index(): proxy for proxy in self._proxies_for(host)
+        }
+        for index, message in failed:
+            proxy = by_index.get(index)
+            if proxy is None:  # pragma: no cover - a plugin the parent refused
+                self.errors.append(
+                    PluginError(host.origin, message, category="runtime")
+                )
+                continue
+            self.disable(proxy, message, origin=_plugin_name(proxy))
 
     def available(self) -> list[DiscoveredPlugin]:
         """Plugins installed in a user root but not enabled.
@@ -2303,7 +2867,33 @@ class PluginRegistry:
             elif discovered is not None and not discovered.enabled:
                 state, category = "not enabled", ""
             else:
-                state, category = "loaded", ""
+                # The one state Phase 4 reserved and never produced. A row says
+                # "isolated" only when *everything* it loaded is: a module
+                # running a filter here and an exporter in a child is not
+                # contained, and a row claiming otherwise would be the one lie
+                # this surface cannot afford. Mixed says how many, in the
+                # detail, rather than rounding either way.
+                contained = [
+                    record
+                    for record in records
+                    if isinstance(record.plugin, _IsolatedPlugin)
+                ]
+                if contained and len(contained) == len(records):
+                    state, category = "isolated", ""
+                    detail = detail or (
+                        "runs in a subprocess CLV can stop; it still runs as you"
+                    )
+                else:
+                    state, category = "loaded", ""
+                    if contained:
+                        detail = "; ".join(
+                            part
+                            for part in (
+                                detail,
+                                f"{len(contained)} of {len(records)} isolated",
+                            )
+                            if part
+                        )
 
             named = True if discovered is None else discovered.enabled
             rows.append(
@@ -2381,6 +2971,19 @@ class PluginRegistry:
             return
         self._disabled[key] = reason
         self._generation += 1
+        if isinstance(plugin, _IsolatedPlugin):
+            # Nothing will call into that child again, so it should not still be
+            # running. This is what makes the `P` dialog's "stops now" true for
+            # an isolated plugin: an operator who switches one off means the
+            # process too, and a host holding a socket open for a plugin nobody
+            # can reach is the state this whole phase is about being able to end.
+            # A host killed for hanging is already gone and stopping it again is
+            # a no-op; `enable()` revives it either way.
+            host = plugin._host
+            if all(
+                self.is_disabled(other) for other in self._proxies_for(host)
+            ):
+                host.stop()
         if record:
             self.errors.append(
                 PluginError(
@@ -2393,6 +2996,12 @@ class PluginRegistry:
 
         if self._disabled.pop(id(plugin), None) is None:
             return False
+        if isinstance(plugin, _IsolatedPlugin):
+            # A host that was killed for hanging is not evidence that the next
+            # call will hang, and an operator who has deliberately put a plugin
+            # back into service must not be answered with the corpse of its last
+            # attempt. The next call starts a fresh child.
+            plugin._host.revive()
         self._generation += 1
         return True
 
@@ -2447,6 +3056,25 @@ class PluginRegistry:
                 PluginError(origin, "does not implement a CLV plugin interface")
             )
             return False
+
+        # Isolation, before anything is filed and after it is known to be a
+        # plugin at all. What is filed from here on is the stand-in, so every
+        # check below -- the version constraints, the per-kind faults, the
+        # ordering, the fault-disabling -- applies to the thing CLV will
+        # actually call, rather than to an object it has decided not to use.
+        #
+        # The settings door is checked here as well as before the import,
+        # because `add()` is the one place every loader and every test funnels
+        # through: a plugin handed straight to it must honour the operator's
+        # `isolated = true` the same way one walked in from a root does.
+        if not isinstance(plugin, _IsolatedPlugin) and (
+            bool(getattr(plugin, "isolated", False))
+            or self._isolation_requested(origin)
+        ):
+            isolated = self._isolate(plugin, origin)
+            if isolated is None:
+                return False
+            plugin = isolated
 
         # Both constraints, in the same grammar, with the same two failure
         # shapes: an unreadable constraint is an error naming it, and an
@@ -4168,6 +4796,15 @@ def _load_module(
     installed in a different directory.
     """
 
+    # Before the import, which is the whole of what this door buys. A plugin the
+    # operator isolated in `settings.conf` is never imported into this process,
+    # so an import that raises, hangs or spawns something is contained the same
+    # way a call is -- which a class attribute cannot do for itself, since
+    # reading it means importing the module that declares it.
+    if registry._isolation_requested(origin):
+        _load_isolated(registry, origin, clv_version)
+        return
+
     try:
         module = importlib.import_module(module_name)
     except Exception as exc:  # noqa: BLE001 - third-party code
@@ -4182,6 +4819,69 @@ def _load_module(
         registry.errors.append(PluginError(origin, diagnosis))
     for candidate in candidates:
         registry.add(candidate, origin=origin, clv_version=clv_version)
+
+
+def _load_isolated(
+    registry: PluginRegistry, origin: str, clv_version: str
+) -> None:
+    """Load *origin* in a child process, having imported nothing here.
+
+    The mirror image of :func:`_load_module`: there, CLV imports a module and
+    asks the objects what they are; here it asks a child what it found, and
+    builds a stand-in per answer. Everything after that is the same path -- the
+    version constraints, the per-kind faults, the ordering and the dialog row
+    are all decided by ``add()`` on the stand-in, so an isolated plugin is
+    refused for a missing ``command_name`` in exactly the words an in-process
+    one is.
+    """
+
+    try:
+        from .host import HostError
+
+        host = registry._host_for(origin)
+    except Exception as exc:  # noqa: BLE001 - a build without the host module
+        registry.errors.append(PluginError(origin, f"could not be isolated: {exc}"))
+        return
+
+    try:
+        host.ensure_started(setup=registry.started)
+    except HostError as exc:
+        registry.errors.append(PluginError(origin, str(exc)))
+        registry._hosts.pop(origin, None)
+        return
+
+    for message in host.errors:
+        # Raised in the child, filed here: a module CLV never imported still has
+        # to be able to report a plugin of its that could not be built, and to
+        # do it against the origin the operator installed.
+        registry.errors.append(PluginError(origin, message))
+
+    if not host.plugins:
+        registry.errors.append(
+            PluginError(origin, "defines no plugin — add register() or __all__")
+        )
+
+    added = 0
+    for entry in host.plugins:
+        problem = isolation_fault(entry.kinds)
+        if problem is not None:
+            registry.errors.append(PluginError(origin, problem))
+            continue
+        proxy = _proxy_class(entry.kinds)(
+            registry=registry,
+            host=host,
+            entry=entry,
+            resolve_by_qualname=False,
+        )
+        if registry.add(proxy, origin=origin, clv_version=clv_version):
+            added += 1
+
+    if not added:
+        # Nothing survived, so nothing will ever call into this child. Leaving
+        # it running would be a subprocess per refused plugin, for the life of
+        # the session, doing nothing.
+        host.stop()
+        registry._hosts.pop(origin, None)
 
 
 def plugin_search_roots() -> list[Path]:
@@ -4393,6 +5093,13 @@ def _load_local(
         for info in pkgutil.iter_modules([directory]):
             if info.name.startswith("_") or info.name in _LOCAL_SUBPACKAGES:
                 continue
+            if package_name == __name__ and info.name in _LOADER_MODULES:
+                # CLV's own machinery, which lives beside the drop-in folders
+                # and is not one. Scanned as a drop-in it loads cleanly, exports
+                # nothing and is reported as "defines no plugin" -- an error
+                # about CLV, in the operator's plugin list, that no operator can
+                # act on.
+                continue
             module_name = f"{package_name}.{info.name}"
             key = info.name.casefold()
             # Only a *user* root can shadow a bundled drop-in, and only one the
@@ -4494,6 +5201,11 @@ def _load_entry_points(
             )
             continue
         claimed.setdefault(key, origin)
+        if registry._isolation_requested(origin):
+            # Before `load()`, for the reason `_load_module` checks before
+            # `import_module`: loading an entry point imports its module.
+            _load_isolated(registry, origin, clv_version)
+            continue
         try:
             loaded = entry_point.load()
         except Exception as exc:  # noqa: BLE001 - third-party code
@@ -4522,6 +5234,7 @@ def load_plugins(
     roots: Optional[Sequence[Path]] = None,
     enabled: Iterable[str] = (),
     settings: Optional[Mapping[str, Mapping[str, str]]] = None,
+    host_timeout_ms: Optional[float] = None,
 ) -> PluginRegistry:
     """Discover and load all available plugins.
 
@@ -4541,7 +5254,12 @@ def load_plugins(
     *settings* is the parsed ``[plugin:<name>]`` sections. Seeded **before**
     anything is imported, so a plugin is configured on the same pass it is
     constructed rather than being handed its settings some time after it has
-    started deciding things without them.
+    started deciding things without them -- and so that a section saying
+    ``isolated = true`` is known before the module it names would have been
+    imported, which is what lets that plugin be loaded in a child instead.
+
+    *host_timeout_ms* bounds every call into an isolation host, including the
+    handshake that starts one. ``None`` leaves the registry's default.
 
     Never raises: any failure is captured in :attr:`PluginRegistry.errors`.
     """
@@ -4550,6 +5268,11 @@ def load_plugins(
         from .. import __version__ as clv_version  # local import avoids a cycle
 
     registry = PluginRegistry()
+    if host_timeout_ms is not None:
+        # Before anything is loaded, because a plugin the operator isolated in
+        # `settings.conf` starts its host during the load and has to be bounded
+        # by the operator's ceiling on the pass that starts it.
+        registry.host_timeout_ms = float(host_timeout_ms)
     if settings:
         registry.refresh_settings(settings)
     #: Names taken by an enabled *user* module. Only these may displace a
@@ -4648,7 +5371,10 @@ __all__ = [
     "PluginErrors",
     "PluginRegistry",
     "PluginStatus",
+    "ISOLABLE_KINDS",
+    "isolation_fault",
     "load_plugins",
+    "manifest_for",
     "plugin_search_roots",
     "plugin_sort_key",
     "satisfies",

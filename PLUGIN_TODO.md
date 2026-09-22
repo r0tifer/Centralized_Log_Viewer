@@ -45,7 +45,7 @@ that argument; Phase 7b is the exception, and it is here because designing the
 | **Stage D — Surface** | | |
 | 12 — Commands and controls | Commands, bindings, modal panels | ✅ Done |
 | **Stage E — Trust and distribution** | | |
-| 13 — Isolation | An opt-in subprocess host, and honesty about what it buys | ⬜ Not started |
+| 13 — Isolation | An opt-in subprocess host, and honesty about what it buys | ✅ Done |
 | 14 — The CLI layer | `clv` grows an argv, without changing what bare `clv` does | ⬜ Not started |
 | 15 — Registry | Manifests, `clv plugin install`, signatures, no hosted index | ⬜ Not started |
 | **Stage F — Release** | | |
@@ -160,7 +160,7 @@ Recorded so they are not relitigated per phase.
 | Scope | **Every seam, including the ones the first draft declined** | Query terms, watch rules, clustering, timeline, screen, isolation and distribution are all in. The argument that they are speculative was wrong in one specific way: they are not speculative to *CLV*, which uses every one of them itself, and a plugin that cannot reach them is a second-class author writing against a first-class core. |
 | Install path | **`~/.config/clv/plugins/`, plus `CLV_PLUGIN_PATH`** | Beside `settings.conf`, which CLV already creates on first run and already tells the operator about ([README.md:133](README.md#L133)). One place, already in their muscle memory. The env var is for development and for the tests, not for users. |
 | Security posture | **Honest documentation, an explicit enable-list, and opt-in isolation** | The sandbox claim goes. A plugin is trusted code, stated plainly; a file in the plugin directory is inert until named; and a plugin that declares `isolated = True` gets a subprocess it can be killed in. Three separate things, and the documentation never lets them blur into "sandboxed". |
-| Isolation model | **Author opts in, CLV gates by kind** | A plugin declares `isolated = True`. Coarse-grained kinds — `Exporter`, `LogSourceProvider`, `WatchSink`, `Command` — get a host. Per-entry kinds — `FilterStage`, `LogFormat`, `QueryOperator`, `ComputedField`, `ClusterRule`, `ShapeContributor`, `TimelineMetric` — are refused with a stated reason. Opt-in rather than mandatory because a five-line exporter should not pay subprocess startup it did not ask for. |
+| Isolation model | **Author opts in, operator may insist, CLV gates by kind** | A plugin declares `isolated = True`, **or** the operator writes `isolated = true` in its `[plugin:<name>]` section. Call-and-return kinds — `Exporter`, `WatchSink`, `Command`, `TimelineAnnotation` — get a host. Everything else is refused with a stated reason, `LogSourceProvider` for its own. Opt-in rather than mandatory because a five-line exporter should not pay subprocess startup it did not ask for. *Amended on landing: this row and the phase text disagreed about which kinds — see Phase 13's* **Corrected on landing**. |
 | What isolation buys | **Failure containment, not safety** | A host can be killed on crash, hang or timeout; that is the first time in CLV's history a plugin can be *stopped*. It does not make an untrusted plugin safe: the child runs as the operator with the operator's filesystem. Said in exactly those words in the docs, per Requirement 3. |
 | API surface | **`clv/api.py` with `PLUGIN_API_VERSION`** | A thin published module re-exporting the frozen contracts. CLV's version tracks the app; the API version tracks the promise. A plugin declares `requires_api = ">=1.0,<2.0"` and stops caring what `clv.__version__` says. |
 | API mechanism | **Re-export in-process, explicit codec across a process** | `clv.api` re-exports the real `LogEntry` and `FilterSpec` rather than converting to DTOs — a conversion per entry per render is the one cost the performance finding says CLV cannot pay. Crossing a process boundary is the exception, and gets a versioned wire form because `mappingproxy` makes pickle impossible anyway. |
@@ -195,6 +195,9 @@ rather than one at a time.
 | `TimelineAnnotation` | 11 | Marks on the time axis | ✅ |
 | `TimelineMetric` | 11 | What a bucket measures, if not count | ❌ per-entry |
 | `Command` | 12 | A named action, optionally bound to a key | ✅ |
+
+Isolable, as landed: `Exporter`, `WatchSink`, `Command`, `TimelineAnnotation`.
+`LogSourceProvider` is refused — see Phase 13.
 
 ---
 
@@ -2550,6 +2553,18 @@ second half of that sentence survives contact with the first.
 **Expected outcomes**
 
 - **`isolated = True`** on a plugin class asks for a subprocess host.
+
+  **Added on landing: `isolated = true` in `[plugin:<name>]` asks for one too**,
+  and it buys strictly more. A class attribute has to be *read* to be honoured,
+  and reading it means importing the module in CLV's process — where module-level
+  code has already run before any interface check, which is the first sentence of
+  the trust model. The settings key is answerable before the import, from a
+  section the loader already has in hand before it touches a root
+  (`refresh_settings` is seeded first, and `pkgutil.iter_modules` yields names
+  without importing them). A plugin isolated that way is never imported here at
+  all, so an import that raises, hangs or spawns something is contained like any
+  other call. The two doors meet at one `manifest_for()` and one `load` message;
+  what differs is only who is asking and when CLV can hear it.
 - **Kind gating, enforced at load with a stated reason.** Allowed:
   `Exporter`, `LogSourceProvider`, `WatchSink`, `Command`, `TimelineAnnotation`
   — all coarse-grained, all called on demand or once per rebuild. Refused:
@@ -2557,17 +2572,47 @@ second half of that sentence survives contact with the first.
   `ClusterRule`, `ShapeContributor`, `TimelineMetric` — all per entry or per
   line. The refusal names the kind and says why, so an author reads a reason
   rather than discovering an omission.
+
+  **Corrected on landing: four kinds, not five, and the two lists above this
+  one did not agree.** The decisions table said `Exporter`,
+  `LogSourceProvider`, `WatchSink`, `Command`; this said those plus
+  `TimelineAnnotation`, and neither refusal list mentioned `WatchMatcher`. Both
+  are now one list: **`Exporter`, `WatchSink`, `Command`,
+  `TimelineAnnotation`** — every kind CLV calls and waits for an answer from.
+
+  `LogSourceProvider` is refused, and it is the correction with an argument
+  behind it rather than a bookkeeping error. A provider does not answer a
+  question; it hands back a **live reader** whose `poll()` runs on the tail
+  timer at `refresh_hz`, on the event loop. Isolating that is not this host with
+  a different payload — it is a second protocol in which the child *pushes*
+  framed lines and the parent drains them non-blocking, the way
+  `JournalReader._drain` already does, plus rotation and `RELOAD_NOTICE`
+  semantics across the boundary. That is a phase, not a bullet, and shipping the
+  bullet would have meant either a round trip per tick on the event loop — the
+  freeze this whole phase exists to prevent — or a provider quietly running
+  in-process after asking not to. It is refused by name, with that reason.
 - **The host.** One subprocess per isolated plugin, started lazily on first use
   and stopped at `teardown()`. `multiprocessing` with the **spawn** start
   method — not fork, which in a running Textual app with open readers and a
   terminal in raw mode is a footgun. Spawn requires picklable arguments, which
   is precisely why Phase 2 published a wire form: `LogEntry` cannot be pickled
   at all (verified), so nothing crosses without `entry_to_wire`.
+
+  **One per origin, not per plugin.** A module's plugins share the module's
+  imported state, so a host each would import it once per plugin and hand two
+  halves of one plugin two sets of globals. It also means one connection with
+  two possible callers — a `WatchSink` on `SinkDispatcher`'s thread and a
+  `Command` on the event loop, from one module — which is a lock rather than a
+  design change, and interleaved requests on one pipe would have been a
+  corrupted stream rather than a slow one.
 - **Frozen builds work, and this is the requirement most likely to be missed.**
   `multiprocessing` under PyInstaller needs `freeze_support()` as the first
   thing in `clv/__main__.py`, or a spawned child re-runs the app and the binary
   forks itself repeatedly. Tested against a real frozen build, not only against
-  a source checkout.
+  a source checkout — `release.yml` grows a second smoke step that enables an
+  isolated plugin in the built binary and fails if it was imported anything
+  other than exactly once, in a process that is not the viewer's. See *As
+  shipped* for which `freeze_support` it has to be.
 - **The child does not inherit the bundle's library path.** PyInstaller puts
   `_internal` on `LD_LIBRARY_PATH` and a child that then execs a system binary
   loads the bundle's libcrypto instead of the system's —
@@ -2577,6 +2622,14 @@ second half of that sentence survives contact with the first.
 - **A host that crashes, hangs or exits is reported and its plugin disabled**
   through Phase 1's `disable()` and Phase 4's row. A call exceeding the budget
   kills the host. This is the capability that does not exist today at any price.
+
+  **It is a deadline, not an eighth budget.** The seven `PluginBudget`s measure
+  a pass that finished and refuse to start the next; there is no pass to measure
+  here and nothing to give three strikes to. `plugin_host_timeout_ms` (5 s,
+  clamped like its neighbours, 0 waits forever) bounds one call, including the
+  handshake that starts the host, and a breach kills rather than counts. So
+  `_forget_budgets` and `test_plugin_perf.py`'s `== 7` are untouched, which is
+  the right answer rather than a convenient one.
 - **Privilege reduction where the platform offers it, described exactly.** The
   child starts in a scrubbed environment and a restricted working directory.
   That is the extent of it. No claim of namespaces, seccomp or capability
@@ -2587,9 +2640,21 @@ second half of that sentence survives contact with the first.
   crashes, hangs and leaks; it does not make an untrusted plugin safe.* Phase
   0's stub is where the first of those goes, and Phase 0's test that the word
   "sandbox" does not appear still passes after this phase.
-- **Isolation is visible.** The drawer's `isolated` state from Phase 4 is
-  filled in, so an operator can see which plugins are contained and which are
+
+  **Corrected on landing: four places, and the second one is not the drawer.**
+  Phase 4 moved the per-plugin rows out of the drawer and into the `P` dialog —
+  the drawer keeps one summary line and a button — so the isolated-state help
+  text lives in `clv/widgets/plugins_dialog.py`. The fourth is the shipped
+  `settings.conf`, beside `plugin_host_timeout_ms`: an operator raising the
+  ceiling after CLV killed something is the reader most likely to want
+  containment to mean more than it does, and that is the moment to say it does
   not.
+- **Isolation is visible.** The `isolated` state Phase 4 reserved is filled in,
+  so an operator can see which plugins are contained and which are not. A row
+  says `isolated` only when **every** plugin that origin loaded is; a module
+  running one plugin here and one in a child reads `loaded` and says how many
+  are contained, because a row claiming containment for a module that is half
+  in-process is the one lie this surface cannot afford.
 - **A plugin that fails to start isolated is not silently run in-process.** It
   is disabled and reported — the opposite choice would turn a security
   preference into a suggestion.
@@ -2609,6 +2674,16 @@ stub is filled in with exactly that sentence and no more.
 - A host that crashes: plugin disabled, error reported, CLV unaffected.
 - A host that hangs: killed at the budget, plugin disabled, UI responsive
   throughout.
+
+  **Corrected on landing: the UI is not responsive throughout, and could not
+  be.** A `Command` and an `Exporter` are called *from* the event loop and CLV
+  waits for the answer, so a hanging isolated command parks the pane for the
+  length of the deadline — 5 s by default — and then returns. What the host
+  changes is that it returns at all; in-process it never did. The one kind
+  genuinely unaffected is `WatchSink`, which was already on a thread. The test
+  asserts what is true: the app comes back, is usable afterwards, and the child
+  is gone. Claiming responsiveness would have been the phase's own wording
+  surviving contact with nothing.
 - A host that fails to start: plugin disabled, **not** run in-process — asserted
   by a plugin whose in-process execution would write a sentinel.
 - Wire round trip across a real process boundary for every built-in format.
@@ -2623,6 +2698,103 @@ stub is filled in with exactly that sentence and no more.
 without the pane stuttering; a frozen build spawns a child without forking
 itself. `clv/plugins/AGENTS.md` still contains no occurrence of "sandbox". Suite
 green on 3.11 and 3.14.
+
+Checked by hand against a real `CLV_PLUGIN_PATH` root carrying two modules — one
+declaring `isolated = True` on an exporter and a keyed command, one an ordinary
+command the operator isolated from `settings.conf`. Both rows in `P` read
+**isolated** and carried the sentence about still running as you; `j` opened the
+plugin's panel inside 80x24 and a switch round-tripped through the child and
+dismissed it; the exporter wrote its file through the app's own export path and
+reported a pid that was not the viewer's; and the forced command ran by name.
+The import marks are the phase in one file: `forced` was imported **only** by
+the child, and `shipper` by both the viewer and its child — which is exactly the
+documented difference between the two doors, observed rather than asserted. No
+child outlived the run.
+
+Suite green on 3.11 and 3.14: 2338 passed, 1 skipped on both. Each full run also
+turned up one failure in `tests/test_plugin_perf.py` — a *different* test each
+time, both of them wall-clock ratio checks over the read path this phase does
+not touch, both reporting a 10x blowup between two timings of the same work on a
+box under a load average of 12, and both passing alone on both interpreters.
+That is the family of flake `tests/test_clustering.py` warns about in its own
+preamble; it is recorded here rather than quietly re-run, because "it passed the
+second time" is the sentence that hides a real regression.
+
+**As shipped.** Six decisions worth recording beyond the corrections above, and
+four of them are things this phase *found* rather than chose. Three of those four
+turned up only because the tests drive real children — a fake host would have
+asserted that CLV sends the right message and proved nothing about any of them —
+and the fourth turned up by reading 3.11's standard library rather than by
+running anything at all.
+
+*The registry holds a stand-in, and no call site knows.* Every seam in CLV
+resolves a plugin by `isinstance` and reads its declarative attributes directly
+— `_KINDS` files by interface, the stacks guard by interface, the export dialog
+reads `wants_path`, the binding installer reads `key`. So an isolated plugin is
+represented by a proxy composed from the interfaces it actually implements
+(`_proxy_class`, cached per kind set), carrying the manifest's attributes on
+itself and forwarding only the calls. The result is that `_export_via_plugin`,
+`_run_command`, `_panel_control`, `WatchStack._guard_deliver` and
+`TimelineStack._guard_fetch` are **unchanged** — `app.py`'s whole diff for this
+phase is two lines, both of them the operator's ceiling reaching the registry.
+
+*A raise and a kill are different facts, and the proxy keeps them apart.* A
+plugin that raises in the child comes back as an ordinary exception and reaches
+the guard that call site already has, which disables it or reports it exactly as
+it does in-process; the host stays up, because nothing about it failed. A
+timeout or a dead child is different in kind — there is nothing left to call —
+so the proxy disables itself through the same `disable()` a raising stage goes
+through and re-raises, and `enable()` revives the host so **Re-enable** starts a
+fresh one rather than handing back the corpse of the last attempt.
+
+*`freeze_support()` is a no-op on the floor it was added for.* The phase text
+says to call it first in `clv/__main__.py`, and doing exactly that would have
+shipped a frozen build where isolation did not work: on **3.11**, which is what
+`release.yml` builds the binaries with, `multiprocessing.freeze_support` is
+gated on `sys.platform == 'win32'` and does nothing on Linux. 3.14 widened the
+gate to any frozen build, so the local suite, the CI matrix and every test in
+this file agree it is fine — the divergence is only visible in a bundle, which
+is the one thing none of them has. CLV calls
+`multiprocessing.spawn.freeze_support()`, the implementation underneath both,
+which detects a spawned child from argv on every platform and every version; the
+call is guarded by `sys.frozen`, so a source run does not pay 33 ms to import
+`multiprocessing` for a handshake that cannot apply to it. Requirement 8 caught
+this, and it caught it by reading 3.11's source rather than by running anything.
+
+*Spawn re-runs the parent's `__main__`, and that is wrong in all three places
+CLV runs.* The default bootstrap re-imports whatever started the process so a
+target defined there can be found; CLV's target is `clv.plugins.host._child_main`
+and needs none of it. Under `python -m clv` it re-imported the whole
+application into a process that exists to run one exporter; under the test suite
+it re-imported pytest per host; and in anything embedding CLV without an
+`if __name__` guard it raised the classic bootstrapping `RuntimeError` — from
+CLV's subprocess, about the operator's file. `Process.start()` is now bracketed
+by a `__main__` with no spec and no file, which is how `multiprocessing` already
+handles an interactive interpreter. A host starts in ~0.2 s.
+
+*Textual replaces `sys.stderr`, and `multiprocessing` wants a real descriptor.*
+`resource_tracker` passes `sys.stderr.fileno()` to the tracker process it starts
+on the first spawn, and inside a running app that call does not answer with a
+descriptor: the very first isolated call in a live viewer died with
+`bad value(s) in fds_to_keep`, a message about neither plugins nor isolation,
+while the identical call from a script worked. The start is bracketed with
+`os.devnull` — **not** `sys.__stderr__`, which is the terminal the viewer is
+drawing on and which the tracker writes to uninvited on exit.
+
+*The child inherits the terminal, so it is silenced at the descriptor.* A
+plugin's `print()`, a library's warning, or an unraisable exception on the way
+out would otherwise land on the pane, and what an operator sees is not stray
+output but CLV appearing to corrupt its own screen. `dup2` onto fds 1 and 2
+rather than rebinding `sys.stdout`, because a C library writing to the
+descriptor directly is precisely the case worth covering. Documented as a cost:
+an isolated plugin talks through `notify()`.
+
+**Also swept here.** `clv/plugins/host.py` sits beside the drop-in folders, and
+the flat walk in `_load_local` imports every module there — so CLV's own
+machinery was loaded as a plugin, found to export nothing, and reported to the
+operator as "defines no plugin" against an origin they could do nothing about.
+`_LOADER_MODULES` names what is CLV's rather than a drop-in; Phase 15's
+`manifest.py` would have hit it next.
 
 **Commit.** `feat(plugins): an opt-in subprocess host for coarse-grained plugins`
 
@@ -2875,7 +3047,7 @@ reason that survives the decision to include everything else.
 | `clv/plugins/host.py` | 13 | **New** — the subprocess host and the wire protocol |
 | `clv/cli.py` | 14,15 | **New** — argv, `doctor`, `plugin` subcommands |
 | `clv/plugins/manifest.py` | 15 | **New** — manifest parsing, checksums, signatures |
-| `clv/services/config.py` | 3,5,6 | `plugins`, `[plugin:<name>]`, `plugin_time_budget_ms` |
+| `clv/services/config.py` | 3,5,6,13 | `plugins`, `[plugin:<name>]`, `plugin_time_budget_ms`, `plugin_host_timeout_ms` |
 | `clv/services/parsing.py` | 7a,7b | `LogParser(formats=...)`, injected dispatch, `FORMAT_NAMES`, the logfmt matcher and the ISO deferral |
 | `clv/services/query.py` | 8 | Operator registry, computed fields, generated `_TERM_RE` |
 | `clv/services/filtering.py` | 8 | `FilterSpec.parse` routes through the operator registry |
@@ -2886,11 +3058,12 @@ reason that survives the decision to include everything else.
 | `clv/storage.py` | 8 | `SavedView.requires` |
 | `clv/app.py` | 1,2,4,5,6,7a,8,9,11,12,13 | Wiring, cache, dispatch, drawer, host lifecycle |
 | `clv/widgets/advanced_drawer.py` | 4,12 | Plugin section; plugin-contributed sections |
+| `clv/widgets/plugins_dialog.py` | 4,13 | The per-plugin rows, and the isolated state's own sentence |
 | `clv/widgets/columns.py` | 7a,7b | `FormatProfile.consumed`, `install_profiles`, the logfmt profile |
 | `clv/widgets/detail_pane.py` | 7a,7b | Plugin format labels; `FORMAT_LABELS` gains logfmt |
 | `clv/widgets/help_overlay.py` | 12 | Plugin command section |
 | `clv/widgets/timeline.py` | 11 | Annotation rendering and stepping |
-| `clv/__main__.py` | 13,14 | `freeze_support()`, argv entry |
+| `clv/__main__.py` | 13,14 | `freeze_support()`, before anything of CLV's is imported; argv entry |
 | `clv/plugins/formats/` | 7a | **New** — drop-in directory and the nginx reference |
 | `examples/plugins/` | 16 | **New** — one copyable example per interface |
 | `clv/plugins/README.md` | 16 | **New** — author-facing quick start. Covers the **shipped** sources too: journald, and the SSH transport `SSH_TODO.md` Phase 4 added (a backend rather than a provider — see `clv/plugins/AGENTS.md`, which holds that contract until this file exists). |

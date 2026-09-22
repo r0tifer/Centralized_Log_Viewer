@@ -185,6 +185,7 @@ use.
 | `plugins` | Plugins to load from `~/.config/clv/plugins/`, comma separated, named without the `.py`. A file in that directory is listed but **not imported** until it is named here — installing a plugin and running one are two decisions. Plugins bundled with CLV are not listed here. | *(empty)* |
 | `plugin_time_budget_ms` | Wall time one plugin may spend on a single pass of the render path. A plugin over it on three consecutive passes is disabled and named in the `P` dialog. `0` turns the guard off. | `250` |
 | `plugin_read_budget_ms` | The same, for a plugin-supplied log format, measured over one batch of lines read from a file rather than over a render. `0` turns the guard off. | `50` |
+| `plugin_host_timeout_ms` | How long a plugin running in its own process may take to answer one call before CLV kills it. The only ceiling here that can actually be enforced — see [Running a plugin where it can be stopped](#running-a-plugin-where-it-can-be-stopped). `0` waits forever. | `5000` |
 | `enable_ssh` | Read log folders on machines named in `[ssh:<name>]` sections. Off by default, and for a stronger version of the same reason: a remote source spawns a *network* subprocess. With it false nothing connects, however many hosts are configured. | `false` |
 
 Invalid values fall back to safe defaults; the app never fails to start because
@@ -1322,7 +1323,7 @@ supplies, where it came from, and one of five states:
 | `not enabled` | Installed and waiting to be named in `plugins`, or switched off. |
 | `failed` | It raised, or CLV could not read it. The row shows the message. |
 | `incompatible` | It asked for a CLV or plugin API this build is not. Both versions are named. |
-| `isolated` | Reserved; nothing produces it yet. |
+| `isolated` | Running in a separate process CLV can stop — see [Running a plugin where it can be stopped](#running-a-plugin-where-it-can-be-stopped). |
 
 **Space** enables or disables the highlighted row, and **r** puts back a plugin
 a failure took out of service. Nothing is written until the dialog is closed, so
@@ -1360,6 +1361,45 @@ plugin *can do*, and CLV does not sandbox one — install one the way you would
 install any other program. The trust model and a checklist for reviewing
 someone else's plugin are in
 [`clv/plugins/AGENTS.md`](clv/plugins/AGENTS.md).
+
+### Running a plugin where it can be stopped
+
+Everything above is about a plugin that *fails*. A plugin that **hangs** is a
+different problem, and until now CLV had no answer to it: a budget works by
+measuring a pass that finished and declining to start the next one, so a plugin
+that never returns takes the viewer with it.
+
+A plugin can run in a process of its own instead:
+
+```ini
+[plugin:shipper]
+isolated = true
+```
+
+or its author can ask for the same thing with `isolated = True` on the class.
+Either way CLV starts a child the first time that plugin is needed, and a call
+that takes longer than `plugin_host_timeout_ms` (5 s by default) ends with the
+child killed, the plugin disabled, and the reason in `P` — where **r** puts it
+back and starts a fresh one.
+
+Writing it in `settings.conf` buys one thing the class attribute cannot: CLV
+never imports that module into its own process at all, so code the plugin runs
+*at import* is contained too.
+
+**This contains crashes, hangs and leaks. It does not make an untrusted plugin
+safe** — the child runs as you, with your files and your credentials, and
+everything in the paragraph above stays true of it.
+
+Four kinds can ask: exporters, watch sinks, commands and timeline annotations.
+The rest are called once per line or once per entry, where a round trip between
+processes is not a slower version of the same program but a different one; they
+are refused at load, by name, with the reason. Source providers are refused too,
+for their own reason: CLV polls a source's reader from the event loop on every
+tick.
+
+An isolated plugin's `print()` goes nowhere — its output would otherwise land on
+the terminal CLV is drawing on — so it talks to you through the same toasts
+every other plugin uses.
 
 For development, `CLV_PLUGIN_PATH` names extra directories (`:`-separated)
 searched ahead of the user directory, so a plugin can be run from where it is

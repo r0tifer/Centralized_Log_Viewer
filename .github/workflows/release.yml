@@ -169,11 +169,18 @@ jobs:
               dnf -y -q install python3.11 python3.11-pip
               python3.11 -m pip install --quiet --upgrade pip
               python3.11 -m pip install --quiet pyinstaller .
+              # --hidden-import: the isolation host is imported lazily, from
+              # inside a function, so that a build with no isolated plugins
+              # never touches multiprocessing. A spawned child then imports it
+              # by name rather than through any import PyInstaller can see, and
+              # a bundle that left it out would fail only for the one operator
+              # who enabled an isolated plugin.
               python3.11 -m PyInstaller -y \
                 --name "${BIN_NAME}" \
                 --onedir \
                 --console \
                 --add-data "settings.conf:." \
+                --hidden-import clv.plugins.host \
                 clv/__main__.py
             '
           # The container writes as root; the rest of the job is the runner user.
@@ -243,6 +250,66 @@ jobs:
             echo "::error::the no-op upgrade took a backup" >&2; exit 1
           fi
           echo "Smoke test passed for ${{ matrix.arch }}"
+
+      - name: Smoke test plugin isolation in the frozen build
+        run: |
+          set -euo pipefail
+          # The one thing the test suite cannot catch. `multiprocessing`'s spawn
+          # starts a child by re-running sys.executable, which in a frozen build
+          # is this binary -- so without freeze_support() as the first statement
+          # in clv/__main__.py, the first isolated plugin re-launches the whole
+          # viewer, repeatedly. Against an interpreter, which is all the suite
+          # ever has, spawn needs no help and the bug is invisible.
+          #
+          # The probe records the pid of whatever imported it. Isolated from
+          # settings.conf, CLV never imports it in its own process, so a correct
+          # build writes exactly one line and it is not the viewer's pid.
+          export HOME="${RUNNER_TEMP}/iso-home"
+          export XDG_CONFIG_HOME="${RUNNER_TEMP}/iso-config"
+          export CLV_ISO_PROBE="${RUNNER_TEMP}/iso-probe.txt"
+          CONF="${XDG_CONFIG_HOME}/clv/settings.conf"
+          PLUGINS="${XDG_CONFIG_HOME}/clv/plugins"
+          mkdir -p "$HOME" "${PLUGINS}"
+          cat > "${PLUGINS}/isoprobe.py" <<'PROBE'
+          import os
+
+          with open(os.environ["CLV_ISO_PROBE"], "a", encoding="utf-8") as handle:
+              handle.write("imported by %d\n" % os.getpid())
+
+          from clv.api import Command
+
+
+          class Probe(Command):
+              name = "iso-probe"
+              command_name = "iso-probe"
+              title = "Isolation probe"
+
+              def run(self, context):
+                  context.notify("here")
+          PROBE
+          "dist/${BIN_NAME}/${BIN_NAME}" --print-default-config > "${CONF}"
+          sed -i 's/^plugins =$/plugins = isoprobe/' "${CONF}"
+          printf '\n[plugin:isoprobe]\nisolated = true\n' >> "${CONF}"
+          grep -q '^plugins = isoprobe$' "${CONF}" \
+            || { echo "::error::could not enable the probe plugin in ${CONF}" >&2; exit 1; }
+          TERM=xterm-256color timeout 20 "dist/${BIN_NAME}/${BIN_NAME}" < /dev/null > /dev/null 2>&1 &
+          PID=$!
+          sleep 10
+          kill -TERM "$PID" 2>/dev/null || true
+          wait "$PID" 2>/dev/null || true
+          test -f "${CLV_ISO_PROBE}" \
+            || { echo "::error::the isolated plugin was never imported — no host started" >&2; exit 1; }
+          LINES="$(wc -l < "${CLV_ISO_PROBE}")"
+          if [[ "${LINES}" -ne 1 ]]; then
+            echo "::error::the isolated plugin was imported ${LINES} times — the binary is re-launching itself; is freeze_support() still first in clv/__main__.py?" >&2
+            cat "${CLV_ISO_PROBE}" >&2
+            exit 1
+          fi
+          if grep -q "imported by ${PID}$" "${CLV_ISO_PROBE}"; then
+            echo "::error::the viewer imported the plugin itself; settings-forced isolation did not take" >&2
+            exit 1
+          fi
+          echo "Isolation smoke test passed for ${{ matrix.arch }}"
 
       - name: Stage install tree
         run: |

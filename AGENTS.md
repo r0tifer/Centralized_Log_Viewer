@@ -126,7 +126,7 @@ distros.
 | **App shell** | `clv/app.py` | Layout, routing, lifecycle, breakpoints | Parse, filter, read files, or define widget visuals |
 | **Services** | `clv/services/` | Source identity (`refs.py`), source IO (`backend.py`), parsing, filtering, discovery, reading, buffering, config, settings-file editing (`settings_file.py`), source management | Touch the UI or import Textual, or reach past `backend.py` to `os` |
 | **Widgets** | `clv/widgets/` | Self-contained UI + own `DEFAULT_CSS`; also the shared, Textual-free renderable vocabulary the pane is built from — `severity.py` (the palette), `columns.py` (the structured row), `payloads.py` (the JSON/XML/HTML/CSS/CSV preview) | Depend on other widgets' internals or import `clv.app` |
-| **Plugins** | `clv/plugins/` | Extension interfaces + loader; also the two things that spawn a subprocess and so need consent — `sources/journald.py` and `sources/ssh.py` (the SSH transport and `RemoteBackend`) | Break interface contracts, or spawn anything before the operator opts in |
+| **Plugins** | `clv/plugins/` | Extension interfaces + loader; the three things that spawn a subprocess and so need consent — `sources/journald.py`, `sources/ssh.py` (the SSH transport and `RemoteBackend`) and `host.py` (the isolation host, spawned only for a plugin that asked to be contained) | Break interface contracts, or spawn anything before the operator opts in |
 | **State** | `clv/storage.py` | JSON session persistence (atomic), including `SavedView` records | Depend on the UI |
 
 ### Services
@@ -512,7 +512,7 @@ installed" — the trade Item 12 asked for.
   and `workspace` fixtures, and every assertion runs against another backend —
   which is how `RemoteBackend` is held to the same behaviour as `LocalBackend`.
 
-Run: `python -m pytest` (2293 passed, 1 skipped, 11 deselected) on **both** 3.11
+Run: `python -m pytest` (2338 passed, 1 skipped, 11 deselected) on **both** 3.11
 and 3.14 — the local default is 3.14 and a green suite there is not evidence
 that the supported floor still works.
 
@@ -550,10 +550,12 @@ that the supported floor still works.
   management. CLV uses the SSH setup the operator already has.
 - Heavy parsing DSLs or schema-aware pipelines.
 - Background daemons or privileged operations. The opt-in plugin isolation host
-  planned in [PLUGIN_TODO.md](PLUGIN_TODO.md) Phase 13 is neither: it lives and
-  dies with the viewer, runs at the operator's own privilege and never above it,
-  and exists so a plugin that hangs can be *killed*. It is not a sandbox, and
-  `clv/plugins/AGENTS.md`'s trust model says so in those words.
+  ([clv/plugins/host.py](clv/plugins/host.py), `PLUGIN_TODO.md` Phase 13) is
+  neither: it lives and dies with the viewer, runs at the operator's own
+  privilege and never above it, is started only for a plugin whose author or
+  operator asked for it, and exists so a plugin that hangs can be *killed*. It
+  is not a sandbox, and `clv/plugins/AGENTS.md`'s trust model says so in those
+  words — containment, not safety.
 
 ### Reversed
 

@@ -525,6 +525,10 @@ def test_a_command_author_is_told_it_runs_on_the_event_loop() -> None:
     A `FilterStage` that is slow is disabled by a budget. A `Command` that hangs
     hangs CLV, because a stopwatch cannot interrupt a call the process is inside
     — so the only honest answer is to say so, and to name what will fix it.
+
+    What fixes it is now a section rather than a phase number: the pointer moved
+    from "Phase 13 will" to the isolation this file documents, and the test
+    moved with it rather than being deleted for having gone stale.
     """
 
     text = _read(PLUGIN_AGENTS)
@@ -532,7 +536,8 @@ def test_a_command_author_is_told_it_runs_on_the_event_loop() -> None:
     assert "#### You run on the event loop, synchronously" in section
     assert "freezes the pane" in section
     assert "no budget that can save you" in section
-    assert "Phase 13" in section
+    assert "isolated = True" in section
+    assert "(#isolation)" in section, "and the reader is sent somewhere it is explained"
 
 
 def test_the_refusal_of_show_true_is_documented_with_its_reason() -> None:
@@ -589,3 +594,75 @@ def test_the_control_vocabulary_is_listed_for_an_author_to_check() -> None:
     for kind in ("label", "static", "switch", "input", "select", "button"):
         assert f"`{kind}`" in section, f"the vocabulary never documents {kind}"
     assert "MAX_PANEL_CONTROLS" in section
+
+
+# --- isolation ----------------------------------------------------------------
+
+
+def test_the_isolation_section_says_what_it_does_and_does_not_do() -> None:
+    """The sentence, in the file that documents the mechanism.
+
+    ``test_the_sandbox_claim_cannot_come_back`` enforces the mechanical half:
+    the word may not appear. This is the other half — the honest statement has
+    to be *present*, in the section an author reads while deciding whether to
+    set the attribute, not only in the trust model three thousand lines earlier.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    assert "## Isolation" in text
+    # Unwrapped before matching: these are sentences, and which word a line
+    # happens to break on is not something a test should have an opinion about.
+    section = " ".join(
+        text.split("\n## Isolation", 1)[1].split("\n## ", 1)[0].split()
+    )
+
+    assert "does not make an untrusted plugin safe" in section
+    assert "runs as the operator" in section
+    # What it does buy, said as plainly as what it does not.
+    assert "stopped" in section
+
+
+def test_the_isolation_section_names_the_kinds_on_both_sides() -> None:
+    """An author reads a reason, never discovers an omission."""
+
+    from clv.plugins import ISOLABLE_KINDS, _ISOLATION_REFUSALS
+
+    text = _read(PLUGIN_AGENTS)
+    section = text.split("\n## Isolation", 1)[1].split("\n## ", 1)[0]
+
+    for interface in ("Exporter", "WatchSink", "Command", "TimelineAnnotation"):
+        assert f"`{interface}`" in section, f"{interface} is isolable and unlisted"
+    for interface in ("LogFormat", "FilterStage", "QueryOperator", "TimelineMetric"):
+        assert f"`{interface}`" in section, f"{interface} is refused and unlisted"
+
+    # The two lists in the document are the two lists in the loader.
+    assert len(ISOLABLE_KINDS) == 4
+    assert set(ISOLABLE_KINDS).isdisjoint(_ISOLATION_REFUSALS)
+    assert "per entry or per line" in section
+    # A provider is refused for a different reason, and the difference is the
+    # thing worth documenting: it is about *when* CLV calls it.
+    assert "live reader" in section
+
+
+def test_both_doors_into_isolation_are_documented() -> None:
+    """Including the half the class attribute cannot buy."""
+
+    text = _read(PLUGIN_AGENTS)
+    section = text.split("\n## Isolation", 1)[1].split("\n## ", 1)[0]
+
+    assert "isolated = True" in section, "the author's door"
+    assert "isolated = true" in section, "the operator's door"
+    assert "never imported" in section
+    assert "enable-list still applies" in section, "isolation is not a way around consent"
+
+
+def test_an_isolated_author_is_told_what_changes_for_them() -> None:
+    """The four costs that are not guessable from "it runs elsewhere"."""
+
+    text = _read(PLUGIN_AGENTS)
+    section = text.split("\n## Isolation", 1)[1].split("\n## ", 1)[0]
+
+    assert "snapshot" in section, "configure() no longer hands out a live view"
+    assert "print()" in section, "the child's output goes nowhere"
+    assert "plugin_host_timeout_ms" in section
+    assert "freeze_support()" in section, "the frozen build requirement"
