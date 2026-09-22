@@ -1,6 +1,6 @@
 """CLV plugin interfaces and loader.
 
-Twelve extension points, each matching a thing operators keep asking CLV to do
+Thirteen extension points, each matching a thing operators keep asking CLV to do
 that core should not hard-code:
 
 * :class:`LogSourceProvider` — where log lines come from.
@@ -15,6 +15,7 @@ that core should not hard-code:
 * :class:`WatchMatcher` — a watch rule kind that is not "this pattern matched".
 * :class:`WatchSink` — where a watch hit is delivered.
 * :class:`Exporter` — where the current view can be sent.
+* :class:`Command` — a named action an operator invokes, and the modal it draws.
 
 Plugins are loaded from two places: modules dropped into ``clv/plugins/``
 (``sources/``, ``filters/``, ``exporters/`` or flat), and installed
@@ -886,6 +887,268 @@ class Exporter(Plugin):
         """
 
 
+#: The empty panel form, shared. A `CommandContext` built outside a panel hands
+#: out this one rather than a fresh dict per invocation -- the same argument
+#: `LogEntry.fields` makes for its own shared empty mapping, and the same
+#: guarantee: it is read-only, so nothing can write into what everyone sees.
+_EMPTY_VALUES: Mapping[str, Any] = types.MappingProxyType({})
+
+
+#: The controls a plugin may ask CLV to draw. Six, and the list is short on
+#: purpose: every one of them is something CLV already styles, lays out and
+#: tests at 80 columns, so a panel built from them inherits the breakpoint
+#: behaviour rather than having to be measured on its own.
+CONTROL_KINDS = ("label", "static", "switch", "input", "select", "button")
+
+
+@dataclass(frozen=True, slots=True)
+class Control:
+    """One control in a :class:`Panel`, as a description rather than a widget.
+
+    A plugin says *what* it wants and CLV decides what that looks like. That
+    division is Requirement 11 of ``PLUGIN_TODO.md`` in one dataclass: the
+    responsive breakpoints and the 80-column floor are CLV's, and a plugin that
+    could hand over a widget would make every breakpoint test conditional on
+    what happens to be installed.
+
+    ``kind`` is one of :data:`CONTROL_KINDS`:
+
+    ``label``
+        A caption for the control below it.
+    ``static``
+        A line of text. The only way a panel says something without asking for
+        anything.
+    ``switch``
+        On or off. ``value`` is a ``bool``.
+    ``input``
+        A line of text. ``value`` is the initial contents, ``placeholder`` the
+        prompt shown while it is empty.
+    ``select``
+        One of ``options``, each a ``(value, label)`` pair. ``value`` is the
+        initially selected *value*, not its label.
+    ``button``
+        Pressing it calls :meth:`Command.on_control` with ``value=True``.
+
+    ``id`` is how the control is named back to you and is the key it appears
+    under in :attr:`CommandContext.values`. It must be non-empty and unique
+    within a panel; CLV refuses a panel that breaks either rule rather than
+    drawing one whose controls cannot be told apart.
+    """
+
+    kind: str
+    id: str
+    label: str = ""
+    value: Any = ""
+    #: ``select`` only: ``(value, label)`` pairs, in the order to show them.
+    options: tuple[tuple[str, str], ...] = ()
+    #: ``input`` only: what to show while the field is empty.
+    placeholder: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class Panel:
+    """A modal screen's worth of controls, described rather than built.
+
+    Returned from :meth:`Command.run` to open a modal, and from
+    :meth:`Command.on_control` to redraw one. A modal is the one place a plugin
+    gets real room, precisely because full-screen means it cannot interact with
+    the main layout at all -- so nothing it does can move a breakpoint.
+
+    ``Panel(dismiss=True)`` closes the modal. Return ``None`` from
+    ``on_control`` to leave what is on screen exactly as it is, which is the
+    ordinary answer for a callback that only recorded something.
+    """
+
+    title: str = ""
+    controls: tuple[Control, ...] = ()
+    #: Close the modal instead of drawing this panel. The rest of the panel is
+    #: ignored when this is set.
+    dismiss: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CommandContext:
+    """What a command is handed, and the only way it can answer back.
+
+    **Pure data, in both directions, and the second half is the load-bearing
+    one.** The obvious way to let a command raise a toast is to hand it a
+    callable -- but a bound method carries ``__self__`` and a closure carries
+    ``__closure__``, so a context built that way has a live route to the ``App``
+    object for anyone who looks, and the rule that a command cannot reach the
+    app would be a convention rather than a fact.
+
+    So every outward call here *appends to* :attr:`requests` and CLV drains the
+    queue after :meth:`Command.run` returns, performing each one itself. A
+    command cannot touch the screen, the registry, the session or the store. It
+    describes what it would like to have happen, and CLV decides.
+
+    That has a cost worth knowing: a long-running command cannot report progress
+    part-way through. Its messages arrive together, the moment it returns. A
+    command is on demand and synchronous, and if it is slow enough for that to
+    matter it is slow enough to be the operator's problem -- see
+    ``clv/plugins/AGENTS.md`` on why a command runs on the event loop.
+
+    It has a benefit too, and it was not free anywhere else: every member of
+    this class is already encodable, so the isolation host ``PLUGIN_TODO.md``
+    Phase 13 plans has nothing here it cannot send across a pipe.
+    """
+
+    #: The selected line, or ``None`` when the cursor is not on one.
+    entry: Optional[LogEntry] = None
+    #: Everything the current filters match, in display order. The *filtered*
+    #: set, not the buffer and not the window the pane happens to be showing.
+    entries: Sequence[LogEntry] = ()
+    #: The filters that produced :attr:`entries`.
+    spec: Optional[FilterSpec] = None
+    #: The open source, or ``None`` when nothing is selected.
+    source: Optional[SourceRef] = None
+    #: Every control's current value, keyed by :attr:`Control.id`. Empty outside
+    #: a panel. Live: a panel's callback reads the whole form from here rather
+    #: than tracking what it has been told about so far.
+    #:
+    #: A ``default_factory`` rather than a plain default, and the shared mapping
+    #: is what it returns -- exactly as ``LogEntry.fields`` does it, and for
+    #: exactly the same reason. Python 3.11, the floor the release binaries are
+    #: built against, rejects any dataclass default whose class is unhashable
+    #: and ``mappingproxy`` is one; 3.12 narrowed that check to list/dict/set,
+    #: which is why a plain default imports cleanly on a newer interpreter and
+    #: fails on the oldest supported one. Requirement 8 exists because this has
+    #: already happened here once.
+    values: Mapping[str, Any] = field(default_factory=lambda: _EMPTY_VALUES)
+    #: What this command has asked CLV to do, in the order it asked. Appended to
+    #: by the four methods below and drained by CLV afterwards; a command has no
+    #: reason to read it and every reason not to write it directly.
+    requests: list[tuple[str, Any]] = field(
+        default_factory=list, repr=False, compare=False
+    )
+
+    def notify(self, text: str, severity: str = "info") -> None:
+        """Raise a toast. *severity* is ``info``, ``warning`` or ``error``."""
+
+        self.requests.append(("notify", (str(text), str(severity))))
+
+    def request_query(self, text: str) -> None:
+        """Ask CLV to put *text* in the query box and re-filter.
+
+        Refused, named and reported if it does not parse -- with the query
+        parser's own message, so a plugin's bad query reads exactly as an
+        operator's would.
+        """
+
+        self.requests.append(("query", str(text)))
+
+    def request_source(self, ref: SourceRef) -> None:
+        """Ask CLV to select *ref*, which must be a source it already offers.
+
+        A command can move to a source; it cannot conjure one. A ref that the
+        last discovery did not list, and that no enabled provider offers, is
+        refused and reported rather than quietly doing nothing.
+        """
+
+        self.requests.append(("source", ref))
+
+    def request_view(self, name: str) -> None:
+        """Ask CLV to apply the saved view called *name*.
+
+        A view whose plugin is missing still degrades by preserve-disable-explain
+        (Requirement 12): it is refused with what it needs named, not applied
+        with some of its filters silently meaning something else.
+        """
+
+        self.requests.append(("view", str(name)))
+
+
+class Command(Plugin):
+    """A named action an operator can invoke, optionally bound to a key.
+
+    The seam that lets a plugin be *run* rather than merely consulted. Every
+    other interface in this module is called by CLV when CLV needs an answer;
+    this one is called because somebody asked for it::
+
+        class CopyAsNdjson(Command):
+            name = "ndjson-copy"
+            command_name = "copy-ndjson"
+            title = "Copy this view as NDJSON"
+            key = "j"
+
+            def run(self, context):
+                path = Path.home() / "clv-view.ndjson"
+                path.write_text(
+                    "\\n".join(json.dumps(e.fields) for e in context.entries)
+                )
+                context.notify(f"Wrote {len(context.entries)} lines to {path}")
+
+    **You run on the event loop, synchronously.** The same terms a plugin
+    :class:`Exporter` has always run on. Nothing else in CLV happens while
+    :meth:`run` is executing, so a command that blocks on a socket freezes the
+    pane -- there is no budget here that can save you, because CLV cannot
+    interrupt a call it is inside. Do the slow part on a thread of your own, or
+    declare ``isolated = True`` once ``PLUGIN_TODO.md`` Phase 13 lands and let
+    CLV run you somewhere it can kill you.
+
+    **Your key is hidden, and it may be refused.** A binding is installed with
+    ``show=False`` whatever you ask for: the footer's ordering is hand-tuned
+    against an 80-column floor and you cannot know what yours would push off.
+    ``?`` is how hidden bindings are found, which is already how CLV handles its
+    own overflow. A key that collides with a built-in, or with a command that
+    sorted ahead of you, is refused and reported -- and you stay invocable by
+    name from the ``C`` dialog, which is the whole reason that dialog exists.
+    """
+
+    #: Stable identifier. What the binding dispatches on and what the ``C``
+    #: dialog matches -- not operator-facing prose, so keep it short and do not
+    #: rename it once it has shipped. A command declaring nothing here is
+    #: refused at load, because nothing could ever address it.
+    command_name: str = ""
+
+    #: What the help overlay and the ``C`` dialog print. Operator-facing, and
+    #: required for the same reason a :class:`TimelineMetric` must name itself:
+    #: a row with nothing to say is a row nobody can act on.
+    title: str = ""
+
+    #: An optional key, in Textual's naming (``"j"``, ``"ctrl+j"``). Empty --
+    #: the default -- means the command is invocable by name only, which is a
+    #: perfectly ordinary thing for a command to be.
+    key: str = ""
+
+    #: Asking to appear in the footer. **Refused**, always, and reported when
+    #: set -- it is here so that an author who wants it reads a reason rather
+    #: than wondering why nothing happened. Requirement 11: a plugin cannot
+    #: know what its entry would push off the footer at 80 columns, and every
+    #: breakpoint test in CLV stays unconditional on what is installed.
+    show: bool = False
+
+    @abstractmethod
+    def run(self, context: CommandContext) -> Optional[Panel]:
+        """Do the thing. Return a :class:`Panel` to open a modal, or ``None``.
+
+        Raising takes the command out of service for the session and is recorded
+        once, exactly as a raising :class:`FilterStage` is; the key stops
+        working and the row in ``P`` says why, with **Re-enable** as the way
+        back.
+        """
+
+    def on_control(
+        self, control_id: str, value: Any, context: CommandContext
+    ) -> Optional[Panel]:
+        """A control in your panel changed, or a button was pressed.
+
+        *control_id* is the :attr:`Control.id`; *value* is its new value, and
+        ``True`` for a button. ``context.values`` holds the whole form, so there
+        is no need to track what you have been told so far.
+
+        Return a :class:`Panel` to redraw, ``Panel(dismiss=True)`` to close, and
+        ``None`` -- the default -- to leave the screen alone.
+
+        **You are on a modal's keystroke path.** This runs inside the event that
+        typed a character, so it is charged against ``plugin_time_budget_ms``
+        like every other plugin CLV calls from a render, and three consecutive
+        passes over the line take you out of service and close the panel.
+        """
+
+        return None
+
+
 # --- adapting the simple contract -------------------------------------------
 
 
@@ -1473,6 +1736,7 @@ _KINDS: tuple[tuple[str, type], ...] = (
     ("matcher", WatchMatcher),
     ("sink", WatchSink),
     ("exporter", Exporter),
+    ("command", Command),
 )
 
 
@@ -1669,6 +1933,11 @@ class PluginRegistry:
     matchers: list[WatchMatcher] = field(default_factory=list)
     sinks: list[WatchSink] = field(default_factory=list)
     exporters: list[Exporter] = field(default_factory=list)
+    #: Plugin-supplied named actions, in :func:`plugin_sort_key` order. Ordered
+    #: because the order settles who gets a contested key: the first claim wins
+    #: and "first" has to mean something an author can predict, not whichever
+    #: module `pkgutil` happened to list first.
+    commands: list[Command] = field(default_factory=list)
     errors: PluginErrors = field(default_factory=PluginErrors)
     #: Every plugin found in a user root, loaded or not, in search order.
     #: Empty on a build with no user plugin directory, which is the common case
@@ -1731,6 +2000,7 @@ class PluginRegistry:
             + len(self.matchers)
             + len(self.sinks)
             + len(self.exporters)
+            + len(self.commands)
         )
 
     @property
@@ -1792,6 +2062,10 @@ class PluginRegistry:
         self.matchers.sort(key=plugin_sort_key)
         self.sinks.sort(key=plugin_sort_key)
         self.exporters.sort(key=plugin_sort_key)
+        # Load-bearing rather than tidy, the way the metrics' sort is: the key
+        # a command gets is decided by walking this list and taking the first
+        # claim, so "first" is priority-then-name only because this ran.
+        self.commands.sort(key=plugin_sort_key)
         # The end of a load: whatever a downstream cache holds was computed
         # before these plugins existed.
         self._generation += 1
@@ -2166,6 +2440,7 @@ class PluginRegistry:
                 WatchMatcher,
                 WatchSink,
                 Exporter,
+                Command,
             ),
         ):
             self.errors.append(
@@ -2228,6 +2503,12 @@ class PluginRegistry:
 
         if isinstance(plugin, WatchMatcher):
             problem = self._watch_fault(plugin)
+            if problem is not None:
+                self.errors.append(PluginError(origin, problem))
+                return False
+
+        if isinstance(plugin, Command):
+            problem = self._command_fault(plugin)
             if problem is not None:
                 self.errors.append(PluginError(origin, problem))
                 return False
@@ -2472,6 +2753,49 @@ class PluginRegistry:
                 )
         return None
 
+    def _command_fault(self, plugin: "Command") -> Optional[str]:
+        """Why *plugin* may not be a command, or None if it may.
+
+        **At load, never at the first invocation**, on the argument the other
+        four faults make. Every one of these is knowable without running
+        anything, and every one of them is silent at runtime: a command with no
+        `command_name` has no binding to dispatch and no row to select, a
+        command with no `title` is a blank line in the help overlay, and a
+        duplicate name means the second one loads cleanly and is then never
+        reached because the first answers to the name.
+        """
+
+        name = getattr(plugin, "command_name", "")
+        if not isinstance(name, str) or not name.strip():
+            return "declares no command_name, so nothing could ever invoke it"
+        if name != name.strip() or any(char.isspace() for char in name):
+            return f"command_name {name!r} contains whitespace"
+        # Casefolded for the reason `_watch_fault` folds a rule kind: the name
+        # is matched case-insensitively when a binding dispatches, so `Redact`
+        # against `redact` would load and then never be reached -- which from
+        # the outside is a command that simply does not work.
+        folded = name.casefold()
+        for other in self.commands:
+            if getattr(other, "command_name", "").casefold() == folded:
+                return (
+                    f"command_name {name!r} is already registered by "
+                    f"{_plugin_name(other)}"
+                )
+
+        title = getattr(plugin, "title", "")
+        if not isinstance(title, str) or not title.strip():
+            return (
+                "declares no title; the help overlay and the C dialog have "
+                "nothing to print for a command that cannot name itself"
+            )
+
+        key = getattr(plugin, "key", "")
+        if not isinstance(key, str):
+            return "key must be a string, in Textual's naming (\"j\", \"ctrl+j\")"
+        if key != key.strip() or any(char.isspace() for char in key):
+            return f"key {key!r} contains whitespace"
+        return None
+
     def _metric_fault(self, plugin: "TimelineMetric") -> Optional[str]:
         """Why *plugin* may not be a metric, or None if it may.
 
@@ -2564,6 +2888,7 @@ class PluginRegistry:
             "matcher": self.matchers,
             "sink": self.sinks,
             "exporter": self.exporters,
+            "command": self.commands,
         }[kind]
 
     def discover_sources(self) -> list[ProviderSource]:
@@ -3591,6 +3916,83 @@ def _entry_fault(entry: Any, format_name: str) -> Optional[str]:
                 "Values are compared as the parser stored them and nothing "
                 "downstream coerces"
             )
+    return None
+
+
+#: How many controls one panel may hold. A modal is full-screen and scrolls, so
+#: this is not a layout limit -- it is a bound on how much third-party code runs
+#: per keystroke, since every control is a widget CLV mounts and `on_control`
+#: is called against the whole live form.
+MAX_PANEL_CONTROLS = 32
+
+
+def panel_fault(panel: Any) -> Optional[str]:
+    """Why *panel* cannot be drawn, or None if it can.
+
+    Checked every time a command hands one over rather than once at load,
+    because a panel is *returned* rather than declared: `run()` builds it from
+    whatever the plugin knows at the moment it is invoked, so there is no
+    earlier point at which it exists to be checked.
+
+    The duplicate-id rule is the one that earns its place. `values` is keyed on
+    the id, so two controls sharing one means a panel whose form silently loses
+    a field -- and the plugin reading it back gets an answer that looks right.
+    """
+
+    if not isinstance(panel, Panel):
+        return f"returned {type(panel).__name__}, not a Panel"
+    if panel.dismiss:
+        # Nothing else about a dismissing panel is read, so nothing else about
+        # it is worth refusing over.
+        return None
+    if not isinstance(panel.title, str) or not panel.title.strip():
+        return "returned a Panel with no title"
+    controls = panel.controls
+    if isinstance(controls, (str, bytes)) or not isinstance(controls, Iterable):
+        return "returned a Panel whose controls are not a sequence"
+    controls = tuple(controls)
+    if not controls:
+        return "returned a Panel with no controls"
+    if len(controls) > MAX_PANEL_CONTROLS:
+        return (
+            f"returned a Panel with {len(controls)} controls; "
+            f"the limit is {MAX_PANEL_CONTROLS}"
+        )
+    seen: set[str] = set()
+    for control in controls:
+        if not isinstance(control, Control):
+            return f"returned a {type(control).__name__} where a Control was expected"
+        if control.kind not in CONTROL_KINDS:
+            return (
+                f"returned a control of kind {control.kind!r}; "
+                f"the kinds are {', '.join(CONTROL_KINDS)}"
+            )
+        if not isinstance(control.id, str) or not control.id.strip():
+            return f"returned a {control.kind} control with no id"
+        if control.id in seen:
+            return (
+                f"returned two controls with id {control.id!r}; "
+                "values are keyed on the id and one would be lost"
+            )
+        seen.add(control.id)
+        if control.kind == "select":
+            options = control.options
+            if isinstance(options, (str, bytes)) or not isinstance(options, Iterable):
+                return f"select {control.id!r} has no options"
+            pairs = tuple(options)
+            if not pairs:
+                return f"select {control.id!r} has no options"
+            for pair in pairs:
+                if (
+                    isinstance(pair, (str, bytes))
+                    or not isinstance(pair, Sequence)
+                    or len(pair) != 2
+                    or not all(isinstance(part, str) for part in pair)
+                ):
+                    return (
+                        f"select {control.id!r} has an option that is not a "
+                        "(value, label) pair of strings"
+                    )
     return None
 
 

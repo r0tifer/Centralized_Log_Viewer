@@ -1126,11 +1126,20 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `Ctrl+L` | Copy mode (hides all chrome) |
 | `R` | Add, edit, test and remove remote hosts (SSH); also reachable from `a` |
 | `P` | Manage plugins (then `space` toggles, `r` re-enables) |
+| `C` | Run a plugin command (then `Enter` runs the highlighted one) |
 | `Ctrl+S` | Save added sources to `settings.conf` |
 | `Ctrl+R` | Reload configuration and rescan |
 | `q` | Quit |
 
 Every action has a keyboard path; mouse is fully supported but never required.
+
+**A plugin may add keys to this list, and they are always hidden.** A plugin
+command can ask for a key, and it never appears in the footer: the footer's
+ordering is tuned against an 80-column floor and a plugin cannot know what its
+entry would push off. Press `?` to see every binding an installed plugin added,
+listed under **Plugins** beside CLV's own. A key a plugin asks for that CLV
+already uses is refused rather than taken — the built-in keeps working, and the
+command stays runnable by name from `C`.
 
 ---
 

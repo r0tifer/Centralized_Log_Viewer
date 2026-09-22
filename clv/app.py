@@ -18,10 +18,12 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from dataclasses import dataclass, replace
+from functools import partial
+from types import MappingProxyType
 from datetime import datetime, timedelta
-from time import monotonic
+from time import monotonic, perf_counter
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Literal, Optional, Sequence
+from typing import Any, Iterable, Iterator, Literal, Mapping, Optional, Sequence
 
 from rich.console import Group, RenderableType
 from rich.panel import Panel
@@ -29,7 +31,7 @@ from rich.style import Style
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
-from textual.binding import Binding
+from textual.binding import Binding, BindingsMap
 from textual.containers import Container, Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.message import Message
@@ -40,14 +42,19 @@ from textual.widgets._tree import TreeNode
 
 from .plugins import (
     OPERATOR_DISABLE_REASON,
+    Command,
+    CommandContext,
     Exporter,
     FilterContext,
+    Panel as CommandPanel,
     PluginBudget,
     PluginError,
     PluginRegistry,
     PluginStatus,
     ProviderSource,
+    _plugin_name,
     load_plugins,
+    panel_fault,
 )
 from .services import SourceManager, persist_log_sources, persist_setting
 from .services.sources import check_access
@@ -115,6 +122,7 @@ from .services.query import (
     computed_field_names,
     entry_matches,
     install_query_plugins,
+    parse_query,
     requirements,
     unsatisfied,
 )
@@ -174,8 +182,10 @@ from .widgets.detail_pane import DetailPane
 from .widgets.export_dialog import ExportChoice, ExportDialog, ExportRequest
 from .widgets.filter_chip import FilterChip, FilterChips
 from .widgets.goto_dialog import GotoDialog
-from .widgets.help_overlay import HelpOverlay, HelpSection
+from .widgets.help_overlay import HelpOverlay, HelpSection, format_key
 from .widgets.log_view import LogView
+from .widgets.commands_dialog import CommandRow, CommandsDialog
+from .widgets.plugin_panel import PluginPanelScreen
 from .widgets.plugins_dialog import PluginsDialog
 from .widgets.query_bar import QueryBar
 from .widgets.remote_hosts_dialog import (
@@ -374,6 +384,11 @@ SKEW_REPORTING_THRESHOLD = timedelta(seconds=2)
 #: it — but it still has to shrink before the log text does.
 MERGED_COLUMN_WIDTHS: dict[str, int] = {"-compact": 8, "-narrow": 14, "-wide": 20}
 
+#: What `CommandContext.values` holds outside a panel. Shared and read-only for
+#: the reason `clv.plugins._EMPTY_VALUES` is: a fresh dict per invocation is a
+#: per-command allocation for a mapping nobody may write to.
+_EMPTY_PANEL_VALUES: Mapping[str, Any] = MappingProxyType({})
+
 #: Help categories, in the order the overlay lists them. A category with no
 #: bindings is skipped, so a group can be declared before the item that fills
 #: it: Navigation is empty until a line cursor exists to navigate with.
@@ -456,9 +471,35 @@ BINDING_CATEGORIES: dict[str, str] = {
     # code running inside CLV, which is a category an operator reasons about
     # separately. Stage C of `PLUGIN_TODO.md` adds rows here.
     "manage_plugins": "Plugins",
+    # The by-name surface, and the bridge action every plugin key dispatches
+    # through. `plugin_command` is listed under its bare name because
+    # `build_help_sections` strips a binding's parameters before it looks a
+    # category up -- a plugin binding's action is `plugin_command('redact')`,
+    # and keying this map on the spelling with the argument in it would need one
+    # entry per installed plugin, which is not a thing a constant can have.
+    "commands": "Plugins",
+    "plugin_command": "Plugins",
     "save_session": "Session",
     "quit_app": "Session",
 }
+
+
+def _copy_bindings(source: BindingsMap) -> BindingsMap:
+    """A binding map that shares no list with *source*.
+
+    `BindingsMap.copy()` copies the dict and not the lists inside it, and
+    `bind()` appends into the list it finds — so a copy taken that way lets a
+    later `bind()` on an existing key write into the original. Nothing reaches
+    that today, because a key already in the map is a key `_reserved_keys`
+    refuses; this is here so that staying true is not a condition of the copy
+    being safe.
+    """
+
+    copied = BindingsMap()
+    copied.key_to_bindings = {
+        key: list(bindings) for key, bindings in source.key_to_bindings.items()
+    }
+    return copied
 
 
 def build_help_sections(
@@ -474,7 +515,12 @@ def build_help_sections(
     lookup = BINDING_CATEGORIES if categories is None else categories
     grouped: dict[str, list[tuple[str, str]]] = {}
     for binding in bindings:
-        category = lookup.get(binding.action, "Other")
+        # On the action's *name*, not on the whole action string. Textual
+        # actions carry parameters -- a plugin command binds
+        # `plugin_command('redact')` -- and an exact lookup would drop every one
+        # of them into "Other", which is the bucket that exists to catch a
+        # mistake rather than to hold a whole category of binding.
+        category = lookup.get(binding.action.split("(", 1)[0], "Other")
         grouped.setdefault(category, []).append(
             (binding.key, binding.description or binding.action)
         )
@@ -761,6 +807,12 @@ class LogViewerApp(App[None]):
             "Manage plugins (then space toggles, r re-enables)",
             show=False,
         ),
+        # Hidden for the reason every binding added after the footer filled up
+        # at 80 columns is, and capitalised the way every other dialog key is
+        # (`P`, `R`, `V`, `W`). This is what makes "a command whose key was
+        # refused is still invocable by name" true rather than aspirational:
+        # without a by-name surface, a refused key is a command nobody can run.
+        Binding("C", "commands", "Plugin commands (then enter runs one)", show=False),
         Binding("ctrl+r", "reload_sources", "Reload", show=True),
         Binding("q", "quit_app", "Quit", show=True),
     ]
@@ -867,6 +919,28 @@ class LogViewerApp(App[None]):
         #: And a sixth, for the annotation providers and the metric over one
         #: rebuild of the timeline.
         self._timeline_budget = self._new_timeline_budget()
+        #: And a seventh, for a `Command`'s panel callbacks. The only one that
+        #: is not a sweep over entries: a pass here is one keystroke in a modal.
+        self._panel_budget = self._new_panel_budget()
+        #: The binding map as Textual built it, before any plugin touched it.
+        #: `_install_command_bindings` restores from this rather than rebuilding
+        #: from `LogViewerApp.BINDINGS`, and the difference is not academic:
+        #: `DOMNode` merges bindings down the whole MRO, so `App`'s own
+        #: `ctrl+c`, `ctrl+q` and `ctrl+p` are in the live map and in no class
+        #: attribute this file can see. Rebuilding from the class attribute
+        #: dropped all three -- which, since this install runs at mount whether
+        #: or not anything is installed, took `ctrl+c` away from every session.
+        self._base_bindings = _copy_bindings(self._bindings)
+        #: The `Binding` objects installed for plugin commands this session.
+        #: Instance state rather than class state -- `App.bind` writes to
+        #: `self._bindings`, and `LogViewerApp.BINDINGS` is shared by every app
+        #: this process constructs, which in a test suite is all of them. Kept
+        #: because the help overlay is built from `Binding` objects and these
+        #: are the only ones not reachable from a class attribute.
+        self._command_bindings: list[Binding] = []
+        #: Which command holds which key, so a second claim on one can be
+        #: refused by name rather than by silently losing.
+        self._command_keys: dict[str, str] = {}
         #: The guarded, budgeted clustering plugins, as `install_cluster_plugins`
         #: took them. Held so `_write_rows` can open and close a budget pass
         #: around the clustering it drives.
@@ -1036,12 +1110,14 @@ class LogViewerApp(App[None]):
         self._watch_budget = self._new_watch_budget()
         self._cluster_budget = self._new_cluster_budget()
         self._timeline_budget = self._new_timeline_budget()
+        self._panel_budget = self._new_panel_budget()
         self._plugin_generation = self._plugins.generation
         self._install_formats()
         self._install_query_plugins()
         self._install_watch_plugins()
         self._install_cluster_plugins()
         self._install_timeline_plugins()
+        self._install_command_bindings()
         # After the wiring, so a provider's `setup()` sees a fully assembled
         # plugin rather than one still waiting for its resolver.
         self._plugins.start()
@@ -3478,10 +3554,459 @@ class LogViewerApp(App[None]):
             label="cluster",
         )
 
+    # --- plugin commands ----------------------------------------------------
+
+    def _reserved_keys(self) -> set[str]:
+        """Keys a plugin may not claim, because something already answers to them.
+
+        Read off **the app's own binding map** rather than off
+        `LogViewerApp.BINDINGS`, and that is the load-bearing detail. `DOMNode`
+        merges bindings down the entire MRO, so `App`'s `ctrl+c`, `ctrl+q` and
+        `ctrl+p` are live on this app and appear in no class attribute this file
+        declares. Gathered from the class attribute, a plugin asking for
+        `ctrl+c` would have been handed the key that quits CLV.
+
+        The two widget classes are added because their keys are live on the main
+        screen too -- the log pane's cursor keys and the timeline bar's bucket
+        keys are bound on the widget so they cannot fight a text input, which
+        puts them outside the app's map and squarely in a plugin's way.
+
+        Modal screens' own keys are deliberately absent. A modal is a separate
+        screen with its own binding map, so its `escape` and CLV's are never
+        offered the same keypress, and refusing `d` to a plugin because the
+        saved-views dialog uses it for Delete would be refusing a key nothing
+        contends for.
+        """
+
+        keys = set(self._base_bindings.key_to_bindings)
+        for source in (LogView.BINDINGS, TimelineBar.BINDINGS):
+            for binding in source:
+                keys.update(part.strip() for part in str(binding.key).split(","))
+        keys.discard("")
+        return keys
+
+    def _install_command_bindings(self) -> None:
+        """Give every enabled command its key, and refuse the ones that collide.
+
+        Runs where the other five installs run and again on every generation
+        change, so switching a command off in `P` takes its key away and
+        switching it back on returns it.
+
+        **Restored rather than patched.** A plugin going out of service has to
+        lose its key, and Textual's binding map has no removal that leaves the
+        rest untouched — so the map is put back to the copy taken before any
+        plugin touched it, and the surviving commands are bound onto that. It is
+        cheap (single digits of bindings) and it is the only version of this
+        that cannot leak a key belonging to a plugin since disabled.
+        """
+
+        # From the pristine copy, never from `LogViewerApp.BINDINGS`: that
+        # attribute is CLV's own bindings and not the merged map Textual
+        # actually runs, so rebuilding from it silently dropped `App`'s
+        # `ctrl+c`, `ctrl+q` and `ctrl+p`.
+        self._bindings = _copy_bindings(self._base_bindings)
+        self._command_bindings = []
+        self._command_keys = {}
+
+        reserved = self._reserved_keys()
+        for command in self._plugins.commands:
+            # Last time's note goes before this time's decision, exactly as
+            # `TimelineStack._elect_metric` discards before re-running its
+            # election -- and for the same reason. This contest is re-run on
+            # every generation change, and a refusal is a statement about the
+            # *current* set: the command that lost `j` to a higher-priority one
+            # wins it the moment that one is switched off. Left behind, the
+            # note would say a command has no key while its key works, and
+            # `PluginErrors` would collapse the re-reports into a count that
+            # read as a fault recurring rather than an install re-running.
+            self._plugins.errors.discard(
+                _plugin_name(command), category="conflict"
+            )
+            if self._plugins.is_disabled(command):
+                continue
+            name = getattr(command, "command_name", "")
+            key = getattr(command, "key", "") or ""
+            if getattr(command, "show", False):
+                # Not a fault: the plugin asked for something it may not have.
+                # `conflict` is the category Phase 11 added for exactly this --
+                # a note that supplies a row's detail and leaves its state
+                # alone, so a module shipping one greedy command beside three
+                # good ones is not reported as broken.
+                self._plugins.errors.append(
+                    PluginError(
+                        _plugin_name(command),
+                        f"command {name!r} asked to appear in the footer; plugin "
+                        "bindings are always hidden, because a plugin cannot "
+                        "know what its entry would push off at 80 columns. "
+                        "Press ? to find it.",
+                        category="conflict",
+                    )
+                )
+            if not key:
+                continue
+            if key in reserved:
+                self._plugins.errors.append(
+                    PluginError(
+                        _plugin_name(command),
+                        f"command {name!r} asked for {key!r}, which is CLV's. "
+                        f"Run it by name from {format_key('C')} instead.",
+                        category="conflict",
+                    )
+                )
+                continue
+            if key in self._command_keys:
+                self._plugins.errors.append(
+                    PluginError(
+                        _plugin_name(command),
+                        f"command {name!r} asked for {key!r}, which "
+                        f"{self._command_keys[key]!r} claimed first. Lower its "
+                        f"priority to win the key, or run it by name from "
+                        f"{format_key('C')}.",
+                        category="conflict",
+                    )
+                )
+                continue
+            binding = Binding(
+                key,
+                f"plugin_command({name!r})",
+                getattr(command, "title", "") or name,
+                show=False,
+            )
+            # Never `show=True`, whatever the plugin asked: the footer's
+            # ordering is hand-tuned against an 80-column floor and Requirement
+            # 11 says every breakpoint test stays unconditional on what is
+            # installed. `?` is how hidden bindings are found.
+            self.bind(key, binding.action, description=binding.description, show=False)
+            self._command_bindings.append(binding)
+            self._command_keys[key] = name
+
+    def _command_named(self, name: str) -> Optional[Command]:
+        """The enabled command answering to *name*, or None.
+
+        Case-insensitive, matching `_command_fault`'s duplicate check: the name
+        rides in a binding's action string and in a settings file, both of which
+        are places a capital letter arrives by accident.
+        """
+
+        folded = name.casefold()
+        for command in self._plugins.commands:
+            if getattr(command, "command_name", "").casefold() != folded:
+                continue
+            return None if self._plugins.is_disabled(command) else command
+        return None
+
+    def _command_context(self, values: Mapping[str, Any] | None = None) -> CommandContext:
+        """What a command is handed. Read-only data, and an empty outbox.
+
+        The filtered set rather than the buffer and rather than the `_show_lines`
+        window: a command acting on "this view" means the lines the filters
+        matched, which is the same set `Ctrl+E` exports and the same set the
+        histogram is built from.
+        """
+
+        try:
+            entries = tuple(self._visible_view().entries)
+        except QueryError:
+            # The query box is mid-edit and does not parse. A command invoked
+            # now gets the empty set rather than a raise -- it is being asked
+            # about a view that does not currently exist.
+            entries = ()
+        return CommandContext(
+            entry=self.log_panel.cursor_entry,
+            entries=entries,
+            spec=self._filter_spec(),
+            source=self._selected_source,
+            values=values if values is not None else _EMPTY_PANEL_VALUES,
+        )
+
+    def action_commands(self) -> None:
+        """List every plugin command, and run one. The by-name surface."""
+
+        if not [
+            command
+            for command in self._plugins.commands
+            if not self._plugins.is_disabled(command)
+        ]:
+            # Requirement 10 at the keyboard, the way `action_manage_plugins`
+            # answers it: with nothing installed there is nothing to list, and
+            # an empty modal is a worse answer than a sentence.
+            self._notify("No plugin commands installed.")
+            return
+        self.run_worker(self._prompt_commands(), group="dialogs", exit_on_error=False)
+
+    async def _prompt_commands(self) -> None:
+        rows = [
+            CommandRow(
+                command_name=getattr(command, "command_name", ""),
+                title=getattr(command, "title", ""),
+                key=self._key_for(command),
+                plugin=_plugin_name(command),
+            )
+            for command in self._plugins.commands
+            if not self._plugins.is_disabled(command)
+        ]
+        chosen = await self.push_screen(CommandsDialog(rows), wait_for_dismiss=True)
+        if chosen is None:
+            return
+        command = self._command_named(chosen)
+        if command is None:  # disabled while the dialog was open
+            self._notify("That command is no longer available.", "warning")
+            return
+        self._run_command(command)
+
+    def _key_for(self, command: Command) -> str:
+        """The key this command actually got, which is not always the one it asked for."""
+
+        name = getattr(command, "command_name", "")
+        for key, claimed in self._command_keys.items():
+            if claimed == name:
+                return key
+        return ""
+
+    def action_plugin_command(self, name: str) -> None:
+        """The bridge every plugin key dispatches through.
+
+        One action for every command there will ever be, resolved by name.
+        Nothing a plugin wrote is ever installed onto this class: Textual
+        resolves `action_*` by attribute, and a plugin that could add one would
+        be adding a method to `LogViewerApp`.
+        """
+
+        command = self._command_named(name)
+        if command is None:
+            # The key outlived the command -- disabled from `P`, or its module
+            # switched off -- and the rebuild that removes the binding has not
+            # run yet. Silent rather than a toast: the operator pressed a key
+            # that no longer does anything, which is what an unbound key does.
+            return
+        self._run_command(command)
+
+    def _run_command(self, command: Command) -> None:
+        """Invoke *command*, then do what it asked for.
+
+        The guard is `_export_via_plugin`'s, one seam later and for the same
+        reason: a command is coarse-grained, invoked on demand, and runs
+        synchronously on the event loop. What is different is the outbox --
+        an exporter reports by returning a value, and a command reports by
+        queueing requests CLV performs afterwards.
+        """
+
+        name = _plugin_name(command)
+        context = self._command_context()
+        try:
+            panel = command.run(context)
+        except Exception as exc:  # noqa: BLE001 - third-party code
+            # Disabled for the session, exactly as a raising `FilterStage` is,
+            # and reachable again through Re-enable in `P`. A command that
+            # raises has taken its key out of service, which is why this is a
+            # `disable()` and not a bare error: the alternative is a key that
+            # throws every time it is pressed.
+            self._plugins.disable(command, f"run() raised: {exc}")
+            self._notify(f"Command {name} failed: {exc}", "error")
+            self._refresh_plugin_status()
+            self._sync_plugin_generation()
+            return
+
+        self._apply_command_requests(command, context)
+        if panel is None:
+            return
+        problem = panel_fault(panel)
+        if problem is not None:
+            self._plugins.disable(command, problem)
+            self._notify(f"Command {name}: {problem}", "error")
+            self._refresh_plugin_status()
+            self._sync_plugin_generation()
+            return
+        if panel.dismiss:
+            # A panel that only asks to close, from a command that was not in a
+            # panel to begin with. Nothing to draw and nothing to complain
+            # about -- the command has already done whatever it did.
+            return
+        self._open_panel(command, panel)
+
+    def _apply_command_requests(self, command: Command, context: CommandContext) -> None:
+        """Perform what *command* queued, in order, and report what is refused.
+
+        **The last of each kind wins, and there is one render at the end.** A
+        command that asks for two queries meant the second one, and applying
+        both would filter twice and fight the cursor restore on each -- which is
+        the argument `_apply_view` already makes about setting five fields one
+        at a time.
+        """
+
+        name = _plugin_name(command)
+        pending: dict[str, Any] = {}
+        for kind, payload in context.requests:
+            if kind == "notify":
+                text, severity = payload
+                self._notify(
+                    text, severity if severity in ("info", "warning", "error") else "info"
+                )
+            else:
+                pending[kind] = payload
+
+        # Each of the three renders on success and reports on refusal, so
+        # there is nothing to do here afterwards: a request that was refused
+        # has already said so through a toast and left the pane alone.
+        if "query" in pending:
+            self._apply_command_query(name, pending["query"])
+        if "source" in pending:
+            self._apply_command_source(name, pending["source"])
+        if "view" in pending:
+            self._apply_command_view(name, pending["view"])
+
+    def _refuse(self, name: str, detail: str) -> bool:
+        """Report a refused request against the plugin and tell the operator.
+
+        Not a `disable()`. A request CLV will not perform is the plugin being
+        wrong about the state of the world -- a view that has been deleted, a
+        source that has rotated away -- and taking a command out of service for
+        the session over it would be punishing it for something that is true
+        again after the next rescan.
+        """
+
+        self._plugins.errors.append(PluginError(name, detail, category="conflict"))
+        self._notify(f"Command {name}: {detail}", "warning")
+        self._refresh_plugin_status()
+        return False
+
+    def _apply_command_query(self, name: str, text: str) -> bool:
+        settings = self.advanced_drawer.settings
+        try:
+            # Both halves, in the order the render path does them: the field
+            # terms first, then whatever regex is left over. Checking only one
+            # would let the other through to `_render_log`, which reports an
+            # invalid query as a line in the pane -- correct for something the
+            # operator typed, and wrong for something a plugin asked for.
+            parsed = parse_query(text, self._known_fields)
+            compile_query(
+                parsed.text,
+                case_sensitive=True if settings.case_sensitive else None,
+                regex=settings.use_regex,
+            )
+        except QueryError as exc:
+            # The parser's own message, so a plugin's bad query reads exactly as
+            # an operator's would rather than being translated into something
+            # about plugins.
+            return self._refuse(name, f"asked for a query that does not parse: {exc}")
+        self.query_bar.set_query_value(text)
+        self._update_state(query=text)
+        self._sync_regex_validation()
+        self._render_log()
+        return True
+
+    def _apply_command_source(self, name: str, ref: Any) -> bool:
+        if not is_source_ref(ref):
+            return self._refuse(
+                name, f"asked to open {ref!r}, which is not a source reference"
+            )
+        if ref not in self._file_refs and not self._plugins.offers(ref):
+            # A command can move to a source; it cannot conjure one. Refused by
+            # name rather than silently doing nothing, because a jump-to that
+            # quietly does not jump is the failure an operator cannot diagnose.
+            return self._refuse(
+                name, f"asked to open {format_ref(ref)}, which CLV is not offering"
+            )
+        self._select_source(ref)
+        return True
+
+    def _apply_command_view(self, name: str, view_name: str) -> bool:
+        view = self._view_named(view_name)
+        if view is None:
+            return self._refuse(name, f"asked for a saved view called {view_name!r}")
+        # `_apply_view` owns the preserve-disable-explain refusal for a view
+        # whose plugin is missing (Requirement 12) and says so in the operator's
+        # own words. Reached rather than reimplemented, so a plugin asking for a
+        # view gets exactly what pressing `v` would.
+        self._apply_view(view)
+        return True
+
+    # --- plugin panels ------------------------------------------------------
+
+    def _open_panel(self, command: Command, panel: CommandPanel) -> None:
+        """Push *panel* as a modal, unless one is already open.
+
+        Guarded the way `action_show_help` guards the overlay: a command
+        reachable by a key is reachable while its own panel is on screen, and
+        two panels for one plugin is a stack nobody can get out of in one press.
+        """
+
+        if isinstance(self.screen, PluginPanelScreen):
+            return
+        self.run_worker(
+            self._show_panel(command, panel), group="dialogs", exit_on_error=False
+        )
+
+    async def _show_panel(self, command: Command, panel: CommandPanel) -> None:
+        screen = PluginPanelScreen(panel, on_control=partial(self._panel_control, command))
+        await self.push_screen(screen, wait_for_dismiss=True)
+
+    def _panel_control(
+        self, command: Command, control_id: str, value: Any, values: Mapping[str, Any]
+    ) -> Optional[CommandPanel]:
+        """One control changed. Ask the plugin what the panel should look like now.
+
+        Charged against `_panel_budget`, because this runs inside the event that
+        typed the character: a plugin that spends a second here has stopped the
+        modal echoing what is being typed into it. Three consecutive passes over
+        the ceiling take it out of service through the same `disable()` every
+        other seam uses, and the screen closes because there is no longer
+        anybody to ask.
+
+        Returning `None` means "leave the screen alone", which is both the
+        default and what every failure here degrades to.
+        """
+
+        if self._plugins.is_disabled(command):
+            return CommandPanel(dismiss=True)
+        name = _plugin_name(command)
+        context = self._command_context(values)
+        budget = self._panel_budget
+        active = budget.active
+        if active:
+            budget.start()
+        started = perf_counter()
+        try:
+            panel = command.on_control(control_id, value, context)
+        except Exception as exc:  # noqa: BLE001 - third-party code
+            self._plugins.disable(command, f"on_control() raised: {exc}")
+            self._notify(f"Command {name} failed: {exc}", "error")
+            self._refresh_plugin_status()
+            self._sync_plugin_generation()
+            return CommandPanel(dismiss=True)
+        finally:
+            if active:
+                budget.charge(command, perf_counter() - started)
+                budget.settle()
+
+        if self._plugins.is_disabled(command):
+            # Struck out on `settle()` above. The panel goes with it: a form
+            # whose callbacks no longer run is a form that lies about what
+            # pressing its buttons will do.
+            self._notify(
+                f"Command {name} was switched off: {self._plugins.disabled_reason(command)}",
+                "warning",
+            )
+            self._refresh_plugin_status()
+            self._sync_plugin_generation()
+            return CommandPanel(dismiss=True)
+
+        self._apply_command_requests(command, context)
+        if panel is None:
+            return None
+        problem = panel_fault(panel)
+        if problem is not None:
+            self._plugins.disable(command, problem)
+            self._notify(f"Command {name}: {problem}", "error")
+            self._refresh_plugin_status()
+            self._sync_plugin_generation()
+            return CommandPanel(dismiss=True)
+        return panel
+
     def _forget_budgets(self, plugin: Any) -> None:
         """Clear *plugin*'s strike count on every budget that could hold one.
 
-        **All six, which is the fix rather than the tidy-up.** The re-enable
+        **All seven, which is the fix rather than the tidy-up.** The re-enable
         path was written when there were two, and each seam phase since has
         added a budget without adding it here — so a `QueryOperator`, a
         `WatchMatcher`, a `ShapeContributor` or a `TimelineMetric` that had
@@ -3491,8 +4016,9 @@ class LogViewerApp(App[None]):
         the exact failure the `forget` calls exist to prevent and the exact
         thing the contract promises does not happen.
 
-        Iterating rather than naming two more is what stops the seventh budget
-        from being missed the same way.
+        Iterating rather than naming two more is what stops the eighth budget
+        from being missed the same way -- the seventh, the panel budget Phase 12
+        added, arrived after this was written and cost one line because of it.
         """
 
         for budget in (
@@ -3502,6 +4028,7 @@ class LogViewerApp(App[None]):
             self._watch_budget,
             self._cluster_budget,
             self._timeline_budget,
+            self._panel_budget,
         ):
             budget.forget(plugin)
 
@@ -3530,6 +4057,32 @@ class LogViewerApp(App[None]):
             self._plugins,
             limit_ms=self._config.plugin_time_budget_ms,
             label="timeline",
+        )
+
+    def _new_panel_budget(self) -> PluginBudget:
+        """The seventh instance: a `Command`'s panel callbacks.
+
+        The odd one out, and worth saying why it exists at all. The other six
+        measure a plugin sweeping a set — every entry, every line, every bucket
+        — and the ceiling is really about the size of the sweep. A panel
+        callback sweeps nothing: it is called once, for one control, because
+        somebody typed a character.
+
+        It still needs a ceiling, and for the same reason the render path does.
+        `on_control` runs inside the event that typed the character, so a plugin
+        that spends two seconds deciding what to redraw has stopped the modal
+        from echoing what is being typed into it — which is exactly the
+        experience `plugin_time_budget_ms` exists to bound, arriving through a
+        different door.
+
+        The **render** ceiling rather than the read one, because that is what a
+        keystroke is: `_new_cluster_budget`'s argument, one seam further on.
+        """
+
+        return PluginBudget(
+            self._plugins,
+            limit_ms=self._config.plugin_time_budget_ms,
+            label="panel",
         )
 
     def _sync_plugin_generation(self) -> None:
@@ -3589,6 +4142,12 @@ class LogViewerApp(App[None]):
         # render that the generation change is about to trigger, which is the
         # render that rebuilds the bar.
         self._install_timeline_plugins()
+        # And the command bindings, which is the one install that takes
+        # something *away*: a command switched off in `P` has to stop answering
+        # to its key, and Textual's binding map has no removal that leaves the
+        # rest alone -- so the map is rebuilt from `BINDINGS` and the surviving
+        # commands are bound back onto it.
+        self._install_command_bindings()
 
     def _render_log(self, *, scroll_end: bool = False) -> None:
         if self._is_shutting_down:
@@ -5616,6 +6175,13 @@ class LogViewerApp(App[None]):
         # objects, so a key added there can no more go missing from the overlay
         # than one added here.
         bindings = list(self.BINDINGS) + list(LogView.BINDINGS) + list(TimelineBar.BINDINGS)
+        # And the plugin commands, which are the only bindings in CLV not
+        # reachable from a class attribute: they are installed per instance by
+        # `_install_command_bindings`, because `LogViewerApp.BINDINGS` is shared
+        # by every app this process constructs. Gathered here rather than
+        # appended as a separate section, so a plugin key can no more go missing
+        # from the overlay than one added to `BINDINGS` can.
+        bindings += self._command_bindings
         self.push_screen(HelpOverlay(build_help_sections(bindings)))
 
     def action_toggle_advanced(self) -> None:

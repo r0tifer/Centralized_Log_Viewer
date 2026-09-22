@@ -51,15 +51,21 @@ use it without a running screen. That is asserted, not intended.
 from __future__ import annotations
 
 from .plugins import (
+    CONTROL_KINDS,
+    MAX_PANEL_CONTROLS,
     PLUGIN_API_VERSION,
     ClusterRule,
+    Command,
+    CommandContext,
     ComputedField,
+    Control,
     Exporter,
     ExportResult,
     FilterContext,
     FilterStage,
     LogFormat,
     LogSourceProvider,
+    Panel,
     Plugin,
     ProviderSource,
     QueryOperator,
@@ -114,6 +120,7 @@ __all__ = [
     "WatchMatcher",
     "WatchSink",
     "Exporter",
+    "Command",
     # --- data handed to a plugin --------------------------------------------
     "LogEntry",
     "FilterContext",
@@ -160,6 +167,25 @@ __all__ = [
     # How many lines a `wants_entries` sink can actually be handed, so a sink
     # sizes its payload against the real ceiling rather than against the count.
     "SINK_SAMPLE_LIMIT",
+    # --- being invoked, and drawing --------------------------------------------
+    # What a command is handed, and -- through the four methods on it -- the
+    # only way it can answer back. Published together because neither is usable
+    # without the other: a `Command` that cannot name its context's type cannot
+    # be written against, and a context with nothing to hand it is not a seam.
+    "CommandContext",
+    # The vocabulary a plugin describes a modal with. CLV builds and styles the
+    # widgets; a plugin never ships one, and never ships CSS. Requirement 11 in
+    # two dataclasses: the breakpoints and the 80-column floor are CLV's, and a
+    # plugin widget in the tree would make every breakpoint test conditional on
+    # what happens to be installed.
+    "Panel",
+    "Control",
+    # The kinds a `Control` may declare and the ceiling on how many one panel
+    # may hold. Published on the same argument as `FORMAT_NAMES` and
+    # `BUILTIN_OPERATORS`: an author should be able to check rather than
+    # discover it from a refused panel.
+    "CONTROL_KINDS",
+    "MAX_PANEL_CONTROLS",
     # --- data a plugin hands back -------------------------------------------
     "ExportResult",
     # --- the severity vocabulary --------------------------------------------

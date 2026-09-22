@@ -393,10 +393,18 @@ def test_an_annotation_provider_is_told_it_runs_on_the_event_loop() -> None:
 
 
 def test_the_timeline_budget_is_documented_as_the_sixth() -> None:
+    """That the timeline budget is counted, not what the running total is.
+
+    This asserted "Six budgets, one policy" until Phase 12 added a seventh, and
+    the total moved out to `test_the_panel_budget_is_documented_as_the_seventh`
+    — one test owns the count and changes when a budget arrives, rather than
+    every budget's test changing for every other budget.
+    """
+
     text = _read(PLUGIN_AGENTS)
     budget = text.split("### The budget", 1)[1].split("\n### ", 1)[0]
 
-    assert "Six budgets, one policy" in budget
+    assert "get a sixth" in budget
     assert "TimelineMetric" in budget
 
 
@@ -466,3 +474,118 @@ def test_the_query_dsl_reversal_is_on_the_record() -> None:
     for word in ("OR", "parentheses", "precedence"):
         assert word in reversal, f"the reversal must still decline {word}"
     assert "vocabulary" in reversal and "structure" in reversal
+
+
+# --- commands and controls (Phase 12) ----------------------------------------
+
+
+def test_the_command_seam_is_documented_where_the_others_are() -> None:
+    """The thirteenth interface, in the numbered list with the twelve before it.
+
+    Not an appendix. An author reading down the interfaces reaches `Command`
+    where they reach everything else, which is the only arrangement in which
+    "a plugin extends a core feature on equal terms" is true of the document as
+    well as of the code.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    assert "### 13. Command" in text
+    section = text.split("### 13. Command", 1)[1].split("\n## ", 1)[0]
+    for word in ("command_name", "title", "CommandContext", "Panel", "Control"):
+        assert word in section, f"the Command section never mentions {word}"
+
+
+def test_the_published_table_lists_exactly_what_is_published() -> None:
+    """Checked against `clv.api`, not against a second list written by hand.
+
+    Four interfaces — `ClusterRule`, `ShapeContributor`, `TimelineAnnotation`
+    and `TimelineMetric` — were published by Phases 10 and 11 and never added to
+    this table, and nothing noticed for two phases. A table that restates
+    `__all__` in prose will go stale; one that is *compared* to it cannot.
+    """
+
+    from clv import api
+
+    text = _read(PLUGIN_AGENTS)
+    table = text.split("### What is published", 1)[1].split("###", 1)[0]
+    missing = [name for name in api.__all__ if f"`{name}`" not in table]
+    # The severity constants are listed as a range (`LEVEL_TRACE` … `LEVEL_CRITICAL`)
+    # rather than one by one, which is the right call for a table a human reads.
+    missing = [
+        name
+        for name in missing
+        if not (name.startswith("LEVEL_") and name not in ("LEVEL_ORDER",))
+    ]
+    assert missing == [], f"published but undocumented: {missing}"
+
+
+def test_a_command_author_is_told_it_runs_on_the_event_loop() -> None:
+    """The one failure mode this seam has and the others do not.
+
+    A `FilterStage` that is slow is disabled by a budget. A `Command` that hangs
+    hangs CLV, because a stopwatch cannot interrupt a call the process is inside
+    — so the only honest answer is to say so, and to name what will fix it.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    section = text.split("### 13. Command", 1)[1].split("\n## ", 1)[0]
+    assert "#### You run on the event loop, synchronously" in section
+    assert "freezes the pane" in section
+    assert "no budget that can save you" in section
+    assert "Phase 13" in section
+
+
+def test_the_refusal_of_show_true_is_documented_with_its_reason() -> None:
+    """Requirement 11, in the document as well as in the loader.
+
+    A refusal an author cannot find the reason for reads as a bug in CLV.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    section = text.split("### 13. Command", 1)[1].split("\n## ", 1)[0]
+    assert "refused with a reason" in section
+    assert "80-column floor" in section
+    assert "invocable by name from `C`" in section
+
+
+def test_the_no_css_rule_is_stated_as_a_rule_with_its_reason() -> None:
+    """The concession that keeps every breakpoint test unconditional."""
+
+    text = _read(PLUGIN_AGENTS)
+    section = text.split("### 13. Command", 1)[1].split("\n## ", 1)[0]
+    assert "**Plugins ship no CSS.**" in section
+    assert "breakpoint test" in section
+
+
+def test_the_queued_context_is_explained_rather_than_just_described() -> None:
+    """Why `notify` queues is the whole argument for the shape of the type.
+
+    Handing over a bound method is the obvious implementation and it defeats the
+    rule it appears to honour. A document that only listed the four methods
+    would leave the next author to re-derive that, or not.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    section = text.split("### 13. Command", 1)[1].split("\n## ", 1)[0]
+    assert "__self__" in section and "__closure__" in section
+    assert "queues" in section or "queue" in section
+
+
+def test_the_panel_budget_is_documented_as_the_seventh() -> None:
+    """Six became seven, and the sentence that counted them has to keep up."""
+
+    text = _read(PLUGIN_AGENTS)
+    assert "**Seven budgets, one policy.**" in text
+    budget = text.split("### The budget", 1)[1].split("###", 1)[0]
+    assert "seventh" in budget
+    assert "identical in all seven" in budget
+
+
+def test_the_control_vocabulary_is_listed_for_an_author_to_check() -> None:
+    """`CONTROL_KINDS` published, and the kinds written out where they are used."""
+
+    text = _read(PLUGIN_AGENTS)
+    section = text.split("### 13. Command", 1)[1].split("\n## ", 1)[0]
+    for kind in ("label", "static", "switch", "input", "select", "button"):
+        assert f"`{kind}`" in section, f"the vocabulary never documents {kind}"
+    assert "MAX_PANEL_CONTROLS" in section

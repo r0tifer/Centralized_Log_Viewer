@@ -43,7 +43,7 @@ that argument; Phase 7b is the exception, and it is here because designing the
 | 10 — Clustering | `ClusterRule`, `ShapeContributor`, and the shape cache | ✅ Done |
 | 11 — Timeline | `TimelineAnnotation`, `TimelineMetric`, foldable only | ✅ Done |
 | **Stage D — Surface** | | |
-| 12 — Commands and controls | Commands, bindings, drawer sections, modal screens | ⬜ Not started |
+| 12 — Commands and controls | Commands, bindings, modal panels | ✅ Done |
 | **Stage E — Trust and distribution** | | |
 | 13 — Isolation | An opt-in subprocess host, and honesty about what it buys | ⬜ Not started |
 | 14 — The CLI layer | `clv` grows an argv, without changing what bare `clv` does | ⬜ Not started |
@@ -230,6 +230,11 @@ couplings, both one-directional, and one of them already discharged:
   rather than what the line says about itself.
 - **Phase 12's drawer sections should follow SSH_TODO Phase 7**, which adds the
   host-management dialog and is the larger claim on the drawer's layout budget.
+
+  **Spent, and then moot.** That phase has landed, and Phase 12 then found the
+  drawer had no room for a plugin section at all — see its own *Corrected on
+  landing*. The coupling was real while both were competing for rows; it ended
+  when one of them stopped asking for any.
 
 ---
 
@@ -2395,6 +2400,21 @@ lays out**, and never a widget.
   select, button, and static text. CLV owns the CSS and the breakpoint
   behaviour. A plugin's section collapses to its label at the narrowest
   breakpoint like every other block in the drawer.
+
+  **Corrected on landing: there is no drawer section.** That section cannot
+  exist, and the reason is the one Phase 4 already found and
+  [clv/widgets/AGENTS.md](clv/widgets/AGENTS.md) now records in the imperative:
+  `AdvancedFiltersDrawer` is capped at `max-height: 16`, and a new **row**
+  pushes what follows below the fold, where it lays out and paints nothing. A
+  plugin-supplied section *is* a row, by definition, and the phase asked for one
+  per plugin that wants controls. The drawer has now refused a plugin section
+  twice, for the same measurement, and both times the answer was the same one
+  the SSH fleet reached ([SSH_TODO.md](SSH_TODO.md) Phase 7): a summary line and
+  a button in the drawer, the detail in a modal. So the vocabulary below is the
+  whole vocabulary, and the modal is the whole of where it draws. Requirement 11
+  is better served by the correction than by the text — the thing a drawer
+  section would have bought is room, and the modal is the one place a plugin can
+  be given room that no breakpoint test has to know about.
 - **A modal screen**, from the same vocabulary, pushed by a command. Full-screen
   means no interaction with the main layout, which is why it is the one place a
   plugin gets real room.
@@ -2433,7 +2453,89 @@ unchanged, all five are in the help overlay, one draws a drawer section and one
 opens a modal, and every existing breakpoint test passes without modification.
 Suite green on 3.11 and 3.14.
 
-**Commit.** `feat(plugins): commands, bindings, drawer sections and modals`
+Checked by hand against a real `CLV_PLUGIN_PATH` root carrying six commands —
+one keyed, one asking for `t`, one asking for the footer, one opening a panel,
+and the two from `clv/examples/commands.py`. The footer at 80 columns came back
+byte-identical to a build with no plugins, before and after; `t` still cycled
+the time window; the three that were granted keys were in the `?` overlay under
+**Plugins** and all six were in `C`; the panel opened inside 80x24, round-tripped
+a switch, an input and a select, refused to write with an empty path, and wrote
+twelve raw lines when given one; and switching every command off took the keys
+and the overlay rows away and left the footer where it started. There is **no
+drawer section** — see the correction above. Suite green on 3.11 and 3.14:
+2293 passed, 1 skipped on both.
+
+**As shipped.** Five decisions worth recording, one of them a departure from the
+text above and one of them a bug this phase found rather than a choice it made.
+
+*`CommandContext` queues everything, including `notify()`.* The phase asked for a
+context carrying "a `notify()`", and for a command that "cannot reach the app
+object, which is what stops the vocabulary being a formality". Those two
+sentences are in tension and the obvious implementation loses: a `notify`
+injected as `self._notify` carries the whole application on `__self__`, and a
+lambda carries it on `__closure__`. Either would pass a test asserting the
+context has no `app` attribute while leaving a live route to the screen, the
+registry and the store for anyone who looked. So all four outward calls append
+to `context.requests` and the app drains the queue after `run()` returns and
+performs each one itself. The cost is that a long-running command cannot report
+progress part-way through; the benefit, unplanned, is that every member of the
+context is now encodable, which is exactly what Phase 13 needs from this kind.
+`test_the_context_has_no_route_to_the_app` walks bound methods and closure cells
+rather than attributes, because the shallower test is the one the rejected
+design passes.
+
+*The mediated requests are three, and asking is asking.* `request_query`,
+`request_source` and `request_view` — chosen over a read-only context because a
+command whose only effects are a toast and a modal cannot express "show me the
+errors", which is the first thing anybody would write. Each is validated by the
+path that already owns it: a query by the real parser, reported with the
+parser's own words; a source against what discovery actually offered, because a
+command may move to a source and not conjure one; a view through `_apply_view`,
+so Requirement 12's preserve-disable-explain is inherited rather than
+reimplemented. A refused request is reported and does **not** disable the
+plugin: being wrong about the state of the world is not being broken, and the
+view may exist again after the next rescan.
+
+*A command runs on the event loop, and no budget can save it.* The same terms a
+plugin `Exporter` has run on since the beginning, and the guard in `_run_command`
+is `_export_via_plugin`'s one seam later. It is worth saying out loud rather
+than leaving implied: the six render-path budgets work by measuring a pass and
+declining to start the next, and CLV cannot interrupt a call it is inside. A
+command that hangs hangs CLV. That is the first limitation in this file that the
+isolation host is the *only* answer to, which is why Phase 13 lists `Command` as
+isolable and why the docs say so in the same paragraph that says a command is
+invoked synchronously.
+
+*`on_control` is charged, and it is the seventh budget.* The odd one out: the
+other six measure a plugin sweeping a set, and a panel callback sweeps nothing
+— it is called once, for one control, because somebody typed a character. It
+still needs a ceiling for the same reason the render path does, because a plugin
+that spends a second deciding what to redraw has stopped the modal echoing what
+is being typed into it. `_forget_budgets` already iterated rather than naming
+its members, which is the docstring in that method predicting this phase and
+being right: the seventh cost one line.
+
+*A `Select` posts `Changed` as it mounts, and that was firing callbacks nobody
+triggered.* Found by a test, not in review. Every panel called the plugin's
+`on_control` once per seeded control the moment it opened — before the operator
+had seen the screen, and with a plugin that answers a callback with a redraw it
+would have looped. `prevent()` is the house pattern for this and does not reach
+it: the message arrives from a widget's own mount, after any block in the
+drawing method has ended. Comparing the reported value against the stored form
+does reach it, and is truer anyway — `on_control` means a control changed, and
+being told a switch is still off is not that.
+
+**Also swept here.** `clv/plugins/AGENTS.md`'s *What is published* table was
+missing `ClusterRule`, `ShapeContributor`, `TimelineAnnotation` and
+`TimelineMetric` — published by Phases 10 and 11, listed everywhere else, and
+absent here for two phases with nothing to notice. The table is now compared
+against `clv.api.__all__` by `tests/test_plugin_docs.py` rather than restating
+it, so the next one cannot go missing the same way. `tests/test_plugin_docs.py`
+also stopped pinning the budget count in two places: one test owns the running
+total and changes when a budget arrives, rather than every budget's test
+changing for every other budget's arrival.
+
+**Commit.** `feat(plugins): commands, bindings and modal panels`
 
 ---
 

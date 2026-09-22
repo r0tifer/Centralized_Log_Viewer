@@ -51,6 +51,13 @@ EXPECTED_API = frozenset(
         "WatchMatcher",
         "WatchSink",
         "Exporter",
+        "Command",
+        # being invoked, and drawing
+        "CommandContext",
+        "Panel",
+        "Control",
+        "CONTROL_KINDS",
+        "MAX_PANEL_CONTROLS",
         # data handed to a plugin
         "LogEntry",
         "FilterContext",
@@ -135,6 +142,19 @@ EXPECTED_SIGNATURES: dict[str, str] = {
         "(self, entries: 'Sequence[LogEntry]', context: 'FilterContext', *, "
         "destination: 'Optional[Path]' = None) -> 'ExportResult'"
     ),
+    "Command.run": (
+        "(self, context: 'CommandContext') -> 'Optional[Panel]'"
+    ),
+    "Command.on_control": (
+        "(self, control_id: 'str', value: 'Any', context: 'CommandContext') "
+        "-> 'Optional[Panel]'"
+    ),
+    "CommandContext.notify": (
+        "(self, text: 'str', severity: 'str' = 'info') -> 'None'"
+    ),
+    "CommandContext.request_query": "(self, text: 'str') -> 'None'",
+    "CommandContext.request_source": "(self, ref: 'SourceRef') -> 'None'",
+    "CommandContext.request_view": "(self, name: 'str') -> 'None'",
     "TimeWindow.contains": "(self, moment: 'datetime') -> 'bool'",
     "normalize_level": "(raw: 'object') -> 'Optional[str]'",
     "level_rank": "(level: 'Optional[str]') -> 'int'",

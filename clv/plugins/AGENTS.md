@@ -945,6 +945,207 @@ written as `export(self, entries, context)` against the original interface is
 called exactly as it always was. That is the compatibility rule for this
 attribute and it is pinned by a test.
 
+### 13. Command
+
+A named action an operator can invoke, optionally bound to a key. The only seam
+in CLV that a plugin does not wait to be *consulted* through: a format is asked
+when a line arrives, a metric when a bucket is drawn, a matcher when a rule is
+tested. A command runs because somebody asked for it.
+
+**Reachable from the UI:** `C` opens the command list, which names every loaded
+command and the key it got. A command that declared a key is also reachable from
+that key directly. Both are listed in the `?` overlay under **Plugins**.
+
+```python
+from clv.api import Command, CommandContext
+
+class ShowErrors(Command):
+    name = "show-errors"
+    command_name = "show-errors"     # what CLV dispatches on
+    title = "Show errors only"       # what ? and C print
+    key = "e"                        # optional
+
+    def run(self, context: CommandContext):
+        context.request_query("level>=error")
+```
+
+Four declarations, and two of them are refused at load if they are missing:
+`command_name`, because nothing could address the command without it, and
+`title`, because the overlay and the `C` dialog would have a blank row. A
+duplicate `command_name` is refused too, folded — the second would load cleanly
+and then never be reached, which from the outside is a plugin that does nothing.
+
+#### You run on the event loop, synchronously
+
+The same terms a plugin `Exporter` has always run on, and the reason is the same:
+a command is coarse-grained and invoked on demand, so it is called where it was
+asked for rather than shipped off somewhere.
+
+Nothing else in CLV happens while `run` is executing. A command that blocks on a
+socket freezes the pane, and **there is no budget that can save you** — the six
+render-path ceilings work by measuring a pass and disabling the plugin before
+the *next* one, and CLV cannot interrupt a call it is inside. Do the slow part
+on a thread of your own and answer from what that thread last stored, exactly as
+an annotation provider does.
+
+This is the one kind of failure isolation CLV does not have today, and it is
+why `PLUGIN_TODO.md` Phase 13 lists `Command` as isolable: a plugin that
+declares `isolated = True` will get a subprocess that *can* be killed.
+
+Raising is survivable and visible. The exception disables the command for the
+session through the same mechanism a raising `FilterStage` goes through — its
+key stops working, the row in `P` says why, and **Re-enable** is the way back.
+
+#### What a command is handed, and how it answers
+
+`CommandContext` is data in both directions, and the second half is the part
+worth understanding.
+
+| Member | What it is |
+| --- | --- |
+| `entry` | The selected line, or `None` |
+| `entries` | The **whole filtered set**, not the window the pane is showing |
+| `spec` | The `FilterSpec` that produced `entries` |
+| `source` | The open source, or `None` |
+| `values` | The live panel form; empty outside a panel |
+
+There is no callable into CLV here, and that is deliberate rather than
+minimalist. The obvious way to let a command raise a toast is to hand it a
+bound method — but a bound method carries `__self__`, a closure carries
+`__closure__`, and a context built either way has a live route to the running
+application for anyone who looks. So every outward call **queues**:
+
+```python
+context.notify("Showing errors and worse")
+context.request_query("level>=error")
+context.request_source(ref)
+context.request_view("errors-last-hour")
+```
+
+Each appends to `context.requests`, and CLV drains the queue after `run`
+returns and performs each one itself. A command cannot touch the screen, the
+registry, the session or the store. It says what it would like to happen, and
+CLV decides.
+
+Two consequences worth knowing:
+
+- **A long-running command cannot report progress part-way through.** Its
+  messages arrive together, the moment it returns.
+- **Every member of the context is encodable**, which is what makes the
+  isolation host in Phase 13 possible for this kind at all.
+
+#### Asking is asking
+
+`request_query` is refused if the query does not parse — with the query
+parser's own message, so a plugin's bad query reads exactly as an operator's
+would. `request_source` is refused for a ref CLV is not currently offering: a
+command can *move* to a source, it cannot conjure one. `request_view` is refused
+for a name that is not a saved view, and a view whose plugin is missing still
+degrades by preserve-disable-explain — it is refused with what it needs named,
+never applied with some of its filters silently meaning something else.
+
+A refused request is reported against your plugin and shown to the operator. It
+does **not** disable you: being wrong about the state of the world is not being
+broken, and the view you asked for may exist again after the next rescan.
+
+The last request of each kind wins, and there is one re-render at the end. Two
+`request_query` calls mean the second one.
+
+#### Your key is hidden, and it may be refused
+
+Whatever you set, your binding is installed with `show=False`. The footer fills
+from the left and drops from the right, its ordering is hand-tuned against an
+80-column floor, and a plugin cannot know what its entry would push off. Setting
+`show = True` is **refused with a reason** rather than honoured — it exists so
+that an author who wants the footer reads why they may not have it instead of
+wondering why nothing happened. `?` is how hidden bindings are found, which is
+already how CLV handles its own overflow.
+
+A key is refused when it is one of CLV's — including the ones bound on the log
+pane and the timeline bar, and Textual's command palette — or when another
+command claimed it first. First is by `priority`, then by name, so which command
+wins is a fact about what is installed rather than about what the filesystem
+listed first. Either way you are told, the built-in keeps working, and **you
+stay invocable by name from `C`**, which is the whole reason that dialog exists.
+
+Prefer letting the operator choose. A key is a scarce shared resource and there
+are only so many single characters; reading yours from your own
+`[plugin:<name>]` section is the neighbourly version of asking for one.
+
+#### Drawing: a panel is described, not built
+
+Return a `Panel` from `run` to open a modal. A panel is a title and a tuple of
+`Control` descriptions; CLV builds the widgets, owns the CSS and owns the
+breakpoint behaviour.
+
+**Plugins ship no CSS.** That is a rule with a reason: CLV's responsive
+breakpoints and its 80-column floor are CLV's, and every breakpoint test in the
+suite stays unconditional on what happens to be installed. A plugin that could
+hand over a widget — or style one — would make that untrue for everyone.
+
+A modal is where this costs you least. Full-screen means no interaction with the
+main layout at all, which is exactly why it is the one place a plugin gets real
+room.
+
+```python
+from clv.api import Control, Panel
+
+def run(self, context):
+    return Panel(
+        title="Save this view",
+        controls=(
+            Control("static", "summary", label=f"{len(context.entries)} lines match."),
+            Control("input", "path", label="Write to", placeholder="/tmp/view.txt"),
+            Control("switch", "raw", label="Raw lines", value=False),
+            Control("button", "save", label="Save"),
+        ),
+    )
+```
+
+Six kinds, and the list is short on purpose — every one of them is something
+CLV already styles and already tests at 80 columns:
+
+| `kind` | What it is | `value` |
+| --- | --- | --- |
+| `label` | A heading for what follows | — |
+| `static` | A line of text | — |
+| `switch` | On or off | `bool` |
+| `input` | A line of text, with an optional `placeholder` | `str` |
+| `select` | One of `options`, each a `(value, label)` pair | the selected *value* |
+| `button` | Pressing it calls `on_control` with `True` | — |
+
+`id` must be non-empty and unique within the panel: `values` is keyed on it, and
+two controls sharing one is a form that silently loses a field. A panel CLV
+cannot draw — a bad kind, a duplicate id, a select with no options, more than
+`MAX_PANEL_CONTROLS` controls — takes the plugin out of service with a message
+saying which, because a half-drawn form is worse than none.
+
+#### `on_control` is on a keystroke path
+
+```python
+def on_control(self, control_id, value, context):
+    if control_id != "save":
+        return None
+    write(context.values["path"], context.entries)
+    return Panel(dismiss=True)
+```
+
+Return a `Panel` to redraw, `Panel(dismiss=True)` to close, and `None` — the
+default — to leave the screen alone. `context.values` holds the whole live form
+keyed by `id`, so there is no need to track what you have been told so far;
+`label`, `static` and `button` controls are not in it, because none of them
+holds a value.
+
+You are called for **every character typed into an input**, so this is charged
+against `plugin_time_budget_ms` like anything else CLV calls from a render.
+Three consecutive passes over the ceiling take you out of service and close the
+panel — a form whose callbacks no longer run is a form that lies about what
+pressing its buttons will do. Do the work when a button is pressed, not on the
+way past.
+
+You are **not** called for a value that did not change, including as the panel
+first mounts.
+
 ---
 
 ## Plugin Discovery
@@ -1304,6 +1505,8 @@ a stage that is merely slow makes CLV look broken and says nothing at all.
 | `WatchMatcher.matches` | **every poll** | **once per newly arrived entry, per rule of its kind** |
 | `WatchSink.deliver` | when a rate-limit window closes | once per rule per window, **on its own thread** |
 | `Exporter.export` | on `Ctrl+E` | once |
+| `Command.run` | on its key, or from `C` | once, **on the event loop** |
+| `Command.on_control` | while its panel is open | **once per control change, per keystroke in an input** |
 
 The bold rows are the ones to design against, and they are bold for
 different reasons. `apply` is called *often*: a render happens on every keystroke
@@ -1363,7 +1566,7 @@ source opens pays every cold cost a plugin has, and a large paste or a loaded
 machine can put a healthy stage over the line for a pass or two. A plugin that
 is genuinely slow still strikes out within about a second and a half of typing.
 
-**Six budgets, one policy.** `LogFormat.parse` is charged against a separate
+**Seven budgets, one policy.** `LogFormat.parse` is charged against a separate
 ceiling, because it is measured against a different thing: a pass on the read
 path is one batch of lines from a reader's `prime` or `poll`, not one render.
 The query plugins get a third instance, sharing the render path's ceiling
@@ -1375,9 +1578,11 @@ batch of newly arrived lines and not one keystroke. The clustering plugins get a
 fifth, back on the render ceiling — a cluster pass is one shaping of the
 filtered set, which is a keystroke and not a batch of read lines. The timeline
 plugins get a sixth, also on the render ceiling, because a timeline pass is one
-rebuild of the bar over that same filtered set. Everything else is identical in
-all six: three consecutive passes over the line, disabled, named in `P`, and
-reachable by **Re-enable**.
+rebuild of the bar over that same filtered set. `Command.on_control` gets a
+seventh — the odd one out, because it sweeps nothing: a pass there is one
+keystroke in a modal, and it takes the render ceiling because that is what a
+keystroke is. Everything else is identical in all seven: three consecutive
+passes over the line, disabled, named in `P`, and reachable by **Re-enable**.
 
 The timeline budget measures its two halves very differently, and that is
 deliberate. A `TimelineMetric` is charged per entry per rebuild, memoised by
@@ -1388,10 +1593,17 @@ did something.
 
 ```ini
 [log_viewer]
-plugin_time_budget_ms = 250     # FilterStage.apply, the query, cluster and timeline plugins
+plugin_time_budget_ms = 250     # FilterStage.apply, the query, cluster, timeline and panel plugins
 plugin_read_budget_ms = 50      # the read path: LogFormat.parse, WatchMatcher.matches
 plugin_sink_timeout_ms = 5000   # not a budget -- see below
 ```
+
+**`Command.run` is on none of them, and that one *is* a limitation.** A command
+runs synchronously on the event loop, so the thing to bound is a call CLV is
+currently inside — and a budget cannot interrupt one, it can only decline to
+make the next. A command that hangs hangs CLV. `PLUGIN_TODO.md` Phase 13's
+subprocess host is the answer, and it is the first time in CLV's history a
+plugin will be stoppable.
 
 **A `WatchSink` is on none of them, and that is not an omission.** A sink runs
 on a thread of its own, so being slow costs the pane nothing and there is no
@@ -1416,6 +1628,11 @@ Time inside `apply()` is measured; nothing else is. In particular:
   plugin that *hangs* in one of them hangs CLV, and on `teardown()` that means
   hanging exit. Exceptions there are contained; time is not. Bounding it needs a
   process CLV can kill, which is `PLUGIN_TODO.md` Phase 13 and not a timer.
+- **`Command.run` is outside every budget, for the same reason.** It is called
+  on the event loop and CLV is inside it for as long as it takes; a stopwatch
+  around a call that has already returned cannot bound one that has not. Its
+  `on_control` *is* charged, because that one is a keystroke and CLV gets the
+  loop back between them.
 - **A sink that hangs is abandoned, not killed.** The deadline stops CLV
   waiting for it and stops CLV queueing behind it. The thread goes on running
   for as long as the call takes, holding whatever it holds. This is the same
@@ -1484,9 +1701,10 @@ lesser version of the core than the core writes against itself.
 | Group | Names |
 | --- | --- |
 | Version | `PLUGIN_API_VERSION` |
-| Interfaces | `Plugin`, `LogSourceProvider`, `LogFormat`, `QueryOperator`, `ComputedField`, `FilterStage`, `WatchMatcher`, `WatchSink`, `Exporter` |
+| Interfaces | `Plugin`, `LogSourceProvider`, `LogFormat`, `QueryOperator`, `ComputedField`, `FilterStage`, `ClusterRule`, `ShapeContributor`, `TimelineAnnotation`, `TimelineMetric`, `WatchMatcher`, `WatchSink`, `Exporter`, `Command` |
 | Handed to you | `LogEntry`, `FilterContext`, `FilterSpec`, `TimeWindow`, `ProviderSource`, `SourceRef` |
 | Declaring a format | `FormatProfile`, `DEFAULT_PROFILE`, `FORMAT_NAMES` |
+| Being invoked, and drawing | `CommandContext`, `Panel`, `Control`, `CONTROL_KINDS`, `MAX_PANEL_CONTROLS` |
 | Handed back | `ExportResult` |
 | Severity | `normalize_level`, `level_rank`, `level_matches`, `highest_level`, `LEVEL_TRACE` … `LEVEL_CRITICAL`, `LEVEL_ORDER`, `SEVERITY_BUCKETS` |
 | Fields | `NORMALISED_FIELD_KEYS` |
@@ -1510,6 +1728,17 @@ seam along: the comparison tokens a `QueryOperator` may not claim, and
 `WatchRule` is published because a matcher is handed one, and
 `SINK_SAMPLE_LIMIT` because a sink that asked for content should size its
 payload against the real ceiling rather than against the count it is given.
+`CONTROL_KINDS` and `MAX_PANEL_CONTROLS` are the same argument a fourth time,
+for the panel vocabulary: an author should be able to read what a `Control` may
+be and how many one panel may hold, rather than discover either from a refused
+panel.
+
+Four of these interfaces were missing from this table when Phase 12 came to add
+`Command` to it — `ClusterRule`, `ShapeContributor`, `TimelineAnnotation` and
+`TimelineMetric` were published by Phases 10 and 11 and listed everywhere except
+here. `tests/test_plugin_docs.py` now checks the table against `clv.api.__all__`
+rather than against a list written out a second time, so the next one cannot go
+missing the same way.
 
 ### Two versions, and they are not the same version
 

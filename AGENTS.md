@@ -390,6 +390,8 @@ config.load_config ─→ SourceManager ─→ discovery.discover (thread)
 | `SaveViewDialog` | dismiss value | The name to save the current filters under, or `None` |
 | `ViewPickerDialog` | dismiss value | `ViewRequest(action, name, new_name)`, or `None` when closed. The dialog never edits state; the app acts and reopens it |
 | `WatchRulesDialog` | dismiss value | The edited rule set, or `None` when nothing changed — so a dialog that was only looked at costs no re-indexing |
+| `CommandsDialog` | dismiss value | The chosen `command_name`, or `None`. Runs nothing itself — the app invokes, so third-party code never runs in a widget's event handler |
+| `PluginPanelScreen` | injected callback | Each control change is handed to the callback the app supplied, which returns a replacement `Panel`, a dismissing one, or `None`. The widget imports nothing from `clv.plugins`; the guard, the budget and the disable all live in the app |
 | `RemoteHostsDialog` | dismiss value | The full host list, or `None` when nothing was edited. The dialog holds a working copy and hands back the whole thing, so Escape genuinely discards; the app diffs *records* against the file, which is what leaves a section the parser skipped in place |
 | `SSHConfigImportDialog` | dismiss value | The `~/.ssh/config` aliases the operator ticked, or `None` when none were — never an empty tuple, so "cancelled" and "picked nothing" stay one fact |
 | `AdvancedFiltersDrawer` | `ScanSSHConfigRequested` | Look in `~/.ssh/config` for machines to import. Carries nothing: the drawer does not read that file, know what a host is, or write `settings.conf` |
@@ -421,7 +423,7 @@ shared globals or reaching into another widget's tree.
 
 ## Plugins
 
-Twelve interfaces in `clv/plugins/__init__.py`:
+Thirteen interfaces in `clv/plugins/__init__.py`:
 
 | Interface | Method | Purpose |
 | --- | --- | --- |
@@ -437,6 +439,7 @@ Twelve interfaces in `clv/plugins/__init__.py`:
 | `WatchMatcher` | `matches(entry, rule) -> bool` | A watch rule kind that is not "this pattern matched" |
 | `WatchSink` | `deliver(name, count, context, entries)` | Where a watch hit goes, besides the toast |
 | `Exporter` | `export(entries, context) -> ExportResult` | Send the current view somewhere |
+| `Command` | `run(context) -> Panel \| None`, optional `on_control(id, value, context)` | A named action, invoked by key or from `C`. The one seam a plugin is *asked* through; it draws only by describing a `Panel` CLV builds |
 
 Published as a versioned surface in `clv/api.py` — that, not this module, is
 what a plugin imports. See `clv/plugins/AGENTS.md`.
@@ -509,7 +512,7 @@ installed" — the trade Item 12 asked for.
   and `workspace` fixtures, and every assertion runs against another backend —
   which is how `RemoteBackend` is held to the same behaviour as `LocalBackend`.
 
-Run: `python -m pytest` (2137 passed, 1 skipped, 11 deselected) on **both** 3.11
+Run: `python -m pytest` (2293 passed, 1 skipped, 11 deselected) on **both** 3.11
 and 3.14 — the local default is 3.14 and a green suite there is not evidence
 that the supported floor still works.
 

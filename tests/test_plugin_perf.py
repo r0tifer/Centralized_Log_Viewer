@@ -249,12 +249,15 @@ def test_re_enabling_a_plugin_clears_its_strikes_on_every_budget() -> None:
     slow pass took it straight out again.
 
     Driven off the app's own budgets rather than a list written here, so the
-    seventh cannot be missed the same way.
+    eighth cannot be missed the same way. The seventh — the panel budget Phase
+    12 added for a `Command`'s `on_control` — is what this sentence used to
+    predict, and it arrived costing one line in `_forget_budgets` and one number
+    here, which is the count doing its job rather than being in the way.
     """
 
     app = LogViewerApp()
     budgets = [value for value in vars(app).values() if isinstance(value, PluginBudget)]
-    assert len(budgets) == 6, "a budget was added; `_forget_budgets` needs it too"
+    assert len(budgets) == 7, "a budget was added; `_forget_budgets` needs it too"
     plugin = Counting()
 
     # Two strikes each: one short of the three that disable.

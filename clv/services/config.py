@@ -715,7 +715,7 @@ CLV's `clv/plugins/AGENTS.md`.
 Worked examples
 ---------------
 
-Five complete, commented plugins, each walking through what its kind of
+Six complete, commented plugins, each walking through what its kind of
 plugin has to declare and why:
 
     examples/nginx_error.py   teaches CLV to read nginx's error log, a format
@@ -736,6 +736,10 @@ plugin has to declare and why:
                               its bars by bytes rather than by lines. Ships
                               inert: it marks nothing until its
                               [plugin:timeline_marks] section lists moments
+    examples/commands.py      adds two commands to `C`: one sets the query to
+                              errors-only, one opens a panel that writes the
+                              filtered lines to a file you name. Its key is
+                              yours to pick, in [plugin:commands]
 
 Nothing in `examples/` is listed or run: it is one directory down, and CLV
 only looks here. To use one, copy it up and name it:
@@ -768,6 +772,7 @@ SEEDED_EXAMPLES: dict[str, str] = {
     "watch_alerts.py": "clv.examples.watch_alerts",
     "cluster_rules.py": "clv.examples.cluster_rules",
     "timeline_marks.py": "clv.examples.timeline_marks",
+    "commands.py": "clv.examples.commands",
 }
 
 
