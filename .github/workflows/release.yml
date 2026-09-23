@@ -596,8 +596,19 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     needs: [test, check-version]
     runs-on: ubuntu-latest
-    env:
-      HAS_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN != '' }}
+    # Trusted Publishing: PyPI authenticates this job by an OIDC token GitHub
+    # mints for it, rather than by a long-lived API token kept in the repo's
+    # secrets. `id-token: write` is what allows that token to be requested, and
+    # it is the whole reason this block exists.
+    #
+    # **Job-level `permissions` replaces the workflow-level block rather than
+    # adding to it**, so `contents: read` has to be restated or `checkout`
+    # cannot read the repository. The workflow-level grant is `contents: write`,
+    # for the job that creates the GitHub Release; this job only reads, and
+    # narrowing it here is the point of declaring permissions per job at all.
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -617,9 +628,13 @@ jobs:
       - name: Check package metadata
         run: python -m twine check dist/*
 
+      # No username, no password, no secret. The action exchanges the OIDC
+      # token above for a short-lived PyPI credential scoped to this project.
+      # The binding is owner + repository + **workflow filename**, so renaming
+      # this file breaks publishing until the publisher on PyPI is updated to
+      # match -- and it breaks it at tag time, after the GitHub Release has
+      # already been cut. `environment:` is deliberately absent: the publisher
+      # for this project sets no environment, and naming one here would be a
+      # mismatch rather than extra safety.
       - name: Publish to PyPI
-        if: ${{ env.HAS_PYPI_TOKEN == 'true' }}
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
-        run: python -m twine upload --non-interactive dist/*
+        uses: pypa/gh-action-pypi-publish@release/v1
