@@ -1,11 +1,21 @@
 [tool.poetry]
 name = "clv"
-version = "2.12.0"
+version = "3.0.0"
 description = "Centralized Log Viewer Textual TUI"
 readme = "README.md"
 authors = ["Centralized Log Viewer Maintainers <maintainers@example.com>"]
 packages = [
     { include = "clv" },
+]
+# The settings template ships with the wheel and the sdist, not only with the
+# PyInstaller bundle. `bundled_config_path()` looks beside the package for it
+# and `default_config_text()` falls back to DEFAULT_SETTINGS_TEMPLATE when it is
+# missing -- so a pip install used to run off the fallback and depend on two
+# files staying identical by hand. They are checked against each other by
+# tests/test_config.py; shipping the real one means the check is not the only
+# thing keeping them in step.
+include = [
+    { path = "settings.conf", format = ["sdist", "wheel"] },
 ]
 
 [tool.poetry.dependencies]

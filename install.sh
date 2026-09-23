@@ -46,7 +46,7 @@ Usage: curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | ba
 
 Options:
   --repo <owner/repo>   GitHub repo (default: ${REPO})
-  --version <tag>       Install a specific tag (e.g. v2.1.0). Defaults to latest
+  --version <tag>       Install a specific tag (e.g. v3.0.0). Defaults to latest
   --prefix <dir>        Directory for the launcher (default: /usr/local/bin or ~/.local/bin)
   --libdir <dir>        Directory for the program tree
                         (default: /opt/${APP_NAME} or ~/.local/share/${APP_NAME})

@@ -76,9 +76,11 @@ desktop terminal and on a headless 80-column SSH session.
   do on a single file. A set may span machines: with SSH configured, local and
   remote logs interleave in one pane, and `node:` says which machine each line
   came from.
-- 🧩 **Plugins.** Nine interfaces — sources, log formats, query operators,
-  computed fields, filter stages, watch rule kinds, watch destinations and
-  exporters — published as a versioned API in `clv.api`. Install one by copying a file into
+- 🧩 **Plugins.** Thirteen interfaces — sources, log formats, query operators,
+  computed fields, filter stages, cluster rules, shape contributors, timeline
+  annotations, timeline metrics, watch rule kinds, watch destinations, exporters
+  and commands — published as a versioned API in `clv.api`, with a worked,
+  copyable example for every one of them. Install one by copying a file into
   `~/.config/clv/plugins/` — no root, no Python toolchain, and it survives a
   package upgrade. A file there is listed but **not run** until you name it in
   the `plugins` setting, so installing a plugin and running one stay two
@@ -113,7 +115,7 @@ Without root it installs under `~/.local`.
 
 ```bash
 # Pin a version, choose locations, or require a specific signing key
-install.sh --version v2.1.0
+install.sh --version v3.0.0
 install.sh --prefix ~/bin --libdir ~/opt/clv
 install.sh --gpg-fpr <fingerprint>     # fail unless SHA256SUMS is signed by this key
 ```
@@ -1292,7 +1294,14 @@ user-adjustable tree width. Responsive behavior comes from breakpoint classes
 
 ---
 
-## Installing a plugin
+## Plugins
+
+CLV is extended by plugins: thirteen interfaces, published as a versioned API in
+`clv.api`, covering everything from where lines come from to what a bucket on
+the timeline measures. This chapter is installing and managing them. Writing one
+starts at [`clv/plugins/README.md`](clv/plugins/README.md).
+
+### Installing a plugin
 
 Copy the file in, name it, restart:
 
@@ -1415,9 +1424,9 @@ that too.
 
 ### A worked example, already on your machine
 
-`~/.config/clv/plugins/examples/nginx_error.py` is a complete, commented plugin
-that teaches CLV to read nginx's error log — a format the built-in matchers do
-not recognise, so every line of one is a raw line today. Copy it up a level to
+`~/.config/clv/plugins/examples/` holds **nine** complete, commented plugins —
+one for every interface CLV publishes. Each is copyable as it stands and each
+argues for what it declares rather than describing it. Copy one up a level to
 use it, or as the starting point for your own:
 
 ```bash
@@ -1428,13 +1437,23 @@ then add `nginx_error` to `plugins`. Nothing in `examples/` is listed or run:
 it is one directory down and CLV only looks in the directory itself, so the
 plugin count keeps meaning *plugins you installed*.
 
-Two more are there beside it: `field_regex.py`, which adds the `~` operator and
-the `age` field described under *Field queries*, and `watch_alerts.py`, which
-adds a `burst` watch rule kind — "five of these within a minute" — and a
-destination that appends every watch hit to a file you name. That last one ships
-**inert**: it delivers nothing at all until its `[plugin:watch_alerts]` section
-gives it a path, which is the pattern any plugin that sends your logs somewhere
-is expected to follow.
+| Example | Interface | What it does |
+| --- | --- | --- |
+| `nginx_error.py` | `LogFormat` | Reads nginx's error log — a format the built-in matchers do not recognise, so every line of one is a raw line without it |
+| `field_regex.py` | `QueryOperator`, `ComputedField` | Adds the `~` operator and the `age` field described under *Field queries* |
+| `redact_secrets.py` | `FilterStage` | Hides the value beside `password=`, `token=` and friends wherever the line is shown — the pane, the detail pane, an export, the clipboard |
+| `cluster_rules.py` | `ClusterRule`, `ShapeContributor` | Folds repeats `c` could not: a Kubernetes pod suffix and an ANSI colour run, and one field that keeps two streams apart |
+| `timeline_marks.py` | `TimelineAnnotation`, `TimelineMetric` | Marks deploys on the timeline and scales its bars by bytes rather than by lines |
+| `watch_alerts.py` | `WatchMatcher`, `WatchSink` | Adds a `burst` rule kind — "five of these within a minute" — and a destination that appends every hit to a file you name |
+| `html_report.py` | `Exporter` | Adds an HTML report to `Ctrl+E`: one self-contained file carrying the query that produced it |
+| `container_logs.py` | `LogSourceProvider` | Offers every running container as a source, tailing live through podman or docker |
+| `commands.py` | `Command` | Adds two commands to `C`, one of which opens a panel |
+
+Three of those ship **inert** — `watch_alerts`, `timeline_marks` and
+`container_logs` do nothing at all until their `[plugin:…]` section says so.
+That is the pattern any plugin that sends your logs somewhere, or runs
+something, is expected to follow: `redact_secrets` and `html_report` ship
+working because neither acts on the world.
 
 **Teaching CLV a format is a plugin's job like any other.** A `LogFormat` gets
 offered every line the built-ins declined; what it returns is an entry on equal
@@ -1542,9 +1561,7 @@ searched ahead of the user directory, so a plugin can be run from where it is
 being edited. It is a development mechanism, not an install path, and the
 `plugins` enable-list still applies.
 
----
-
-## Writing a plugin
+### Writing a plugin
 
 Drop a module into `~/.config/clv/plugins/` and name it in `plugins` (above),
 or — for a plugin shipped as part of CLV itself — into `clv/plugins/filters/`
@@ -1552,21 +1569,29 @@ or — for a plugin shipped as part of CLV itself — into `clv/plugins/filters/
 the `clv.plugins` entry point group.
 
 ```python
-from dataclasses import replace
-from clv.api import FilterStage
+from clv.api import FilterContext, FilterStage, LogEntry, setting_list
+
 
 class Redact(FilterStage):
-    name = "redact-secrets"
-    requires_api = ">=1.0,<2.0"     # optional
+    name = "redact_secrets"
+    requires_api = ">=1.0,<2.0"
 
-    def apply(self, entry, context):
-        if "password" not in entry.raw:
-            return entry                # keep unchanged
-        return replace(entry, raw=entry.raw.replace("password", "******"))
+    def apply(self, entry: LogEntry, context: FilterContext) -> Optional[LogEntry]:
+        matcher = self._matcher
+        if matcher is None or not self._suspect(entry.raw):
+            return entry
+        ...
 
-def register():
-    return Redact()
+
+def register() -> list[FilterStage]:
+    return [Redact()]
 ```
+
+That is the shape of every plugin: import from `clv.api`, subclass one
+interface, say which API you were written against, and hand the instances back.
+It is also a genuine excerpt — the whole file is
+`~/.config/clv/plugins/examples/redact_secrets.py` on your machine, and its
+docstring argues for each of those lines rather than describing them.
 
 Return `None` from `apply` to drop a line. A plugin that fails to import, fails
 its version check, or raises at runtime is disabled and reported in the
@@ -1613,6 +1638,6 @@ worth starring and comparing across a fleet.
 ```bash
 python -m pip install -e .
 python -m pip install pytest
-python -m pytest            # 2454 passed, 1 skipped, 11 deselected
+python -m pytest            # 2528 passed, 1 skipped, 11 deselected
 python -m textual run clv/app.py --dev
 ```

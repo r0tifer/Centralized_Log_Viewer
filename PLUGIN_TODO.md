@@ -49,7 +49,7 @@ that argument; Phase 7b is the exception, and it is here because designing the
 | 14 — The CLI layer | `clv` grows an argv, without changing what bare `clv` does | ✅ Done |
 | 15 — Registry | Manifests, `clv plugin install`, signatures, no hosted index | ✅ Done |
 | **Stage F — Release** | | |
-| 16 — Documentation & release | The plugin chapter, worked examples, 3.0.0 | ⬜ Not started |
+| 16 — Documentation & release | The plugin chapter, worked examples, 3.0.0 | ✅ Done |
 
 ---
 
@@ -168,7 +168,7 @@ Recorded so they are not relitigated per phase.
 | Degradation | **Preserve, disable, explain** | A saved view or watch rule referencing an absent plugin is kept intact, marked unusable and named. Falling back to free text was rejected: [query.py:18-38](clv/services/query.py#L18-L38) exists precisely to stop a query silently meaning something else, and a disabled plugin must not do what an unknown field key was designed not to do. |
 | UI seam depth | **Commands, bindings, drawer sections, modal screens — no `compose()` injection** | Plugins get a constrained widget vocabulary that CLV styles and CLV lays out. Styling is CSS-only by doctrine, `BINDINGS` has hand-tuned 80-column footer ordering ([app.py:531-583](clv/app.py#L531-L583)), and a plugin widget in the main tree makes every breakpoint test conditional on what is installed. Requirement 11. |
 | Registry | **Manifests and a CLI, no hosted index** | `clv plugin install/remove/list/verify` against a signed manifest, installing from a path, tarball or URL. Anyone can host. A hosted index is a server, a namespace and a moderation queue — an operational commitment, not a feature, and one that turns every listing into a trust signal CLV is issuing. |
-| Provider sources | **Stay second-class here** | Making a `ProviderSource` starrable, mergeable and session-persistable means replacing bare `Path(entry)` reconstruction in eight call sites — which is [SSH_TODO.md](SSH_TODO.md) Phase 1 precisely, already planned, already scoped. See *Relationship to SSH_TODO*. |
+| Provider sources | ~~**Stay second-class here**~~ — **reversed, by SSH_TODO rather than by this file** | The original argument: making a `ProviderSource` starrable, mergeable and session-persistable means replacing bare `Path(entry)` reconstruction in eight call sites, which is [SSH_TODO.md](SSH_TODO.md) Phase 1 precisely, already planned, already scoped. That phase landed. `JournalRef` is a `SourceRef`, so a journal unit stars, merges and restores; what still cannot is a provider source whose `path` is not a concrete ref type, because `refs.SOURCE_REF_TYPES` is a closed union rather than a duck test. Kept with its reversal rather than rewritten, per the rule at the head of [TODO.md](TODO.md). |
 | Loading model | **Import-time, single-shot, at startup** | No hot reload. `load_plugins()` runs once at mount ([app.py:724](clv/app.py#L724)) and that stays true. Enable and disable from the drawer changes which loaded plugins are *active*, never which modules are imported. |
 | Version comparison | **A real PEP 440 subset, hand-rolled** | `packaging` is not a dependency and will not become one (Requirement 7). The current comparator is ~40 lines and gets prereleases wrong; a correct subset is ~80 and is fully testable. |
 | Release target | **CLV 3.0.0, plugin API 1.0** | The doctrine reversals and the new argv behaviour are major-version news. The plugin API is additive throughout and stays 1.0 — which is the separation in Phase 2 doing its job, visibly, on its first outing. |
@@ -177,8 +177,12 @@ Recorded so they are not relitigated per phase.
 
 ## The interfaces, at the end of this file
 
-Twelve, from three. Listed here so the phases can be read against the whole
-rather than one at a time.
+Thirteen, from three. Listed here so the phases can be read against the whole
+rather than one at a time. (This header said *twelve* against a thirteen-row
+table from Phase 12 until Phase 16's sweep; `README.md` said nine and
+`plugins_dialog.py` said twelve. Three live counts, none of them right, and
+nothing checked any of them against `clv.api` — which is now what
+`tests/test_plugin_docs.py` and `tests/test_examples.py` both count from.)
 
 | Interface | Phase | Kind | Isolable |
 | --- | --- | --- | --- |
@@ -3273,6 +3277,86 @@ manifest, install it on a binary-installed CLV without root, enable it, and see
 their format parsed — without asking a question. That is the goal restated as a
 gate, and it is the one that decides whether this file achieved anything. Suite
 green on 3.11 and 3.14.
+
+**As shipped.** Seven decisions worth recording, and the first two are the
+phase text being wrong rather than the work departing from it.
+
+*The examples were already written, and they are not where this phase said.*
+Six of them existed at `clv/examples/`, seeded into
+`~/.config/clv/plugins/examples/` on first run, covering ten of the thirteen
+interfaces. This phase asked for `examples/plugins/` at the repo root, which
+would have meant relocating a seeding mechanism, its generated `README.txt`
+table, four tests and the packaging story — and landing in a directory that
+ships in neither the wheel nor the bundle. `examples/plugins/` is superseded the
+way Phase 7a's `clv/plugins/formats/` already was. What was actually owed was the
+three missing interfaces: `redact_secrets.py` (`FilterStage`, and the name
+`settings.conf` has shipped a commented section for since Phase 5),
+`html_report.py` (`Exporter`, and the only interface with a destination) and
+`container_logs.py` (`LogSourceProvider`). Nine now, one per interface, and
+`tests/test_examples.py` counts that against `clv.api` rather than a list, so a
+fourteenth seam with no example fails there.
+
+*The examples never reached a binary install, and nothing could have noticed.*
+The single most important thing found in this phase, and it falsified the gate
+rather than missing it. `SEEDED_EXAMPLES` names its modules as **strings**, so
+nothing in CLV statically imports `clv.examples`; PyInstaller's analysis never
+saw them, they were not in the bundle, `importlib.import_module` raised, and
+`_seed_plugin_examples` swallowed it — correctly, because seeding an example is
+the least important thing that happens at startup. Every `.deb`, `.rpm` and
+tarball therefore shipped a `README.txt` naming the examples beside an empty
+directory, while `README.md` said they were "already on your machine". Even
+bundled it would not have worked: PyInstaller ships bytecode and
+`inspect.getsource` has nothing to read. So they ship as **data**
+(`--add-data clv/examples:clv/examples`), `bundled_examples_dir()` finds them the
+way `bundled_config_path()` finds the settings template, and the import stays as
+the source-checkout path. A source checkout cannot see any of this, which is why
+the real check is a smoke step in `release.yml` and the suite gets only a
+`sys._MEIPASS` proxy — the same honesty Phase 3 recorded about its own frozen
+gate.
+
+*`TailRead` is published, because the seam could not be written without it.*
+`open_reader()` exists so a provider can tail, and writing
+`container_logs.py` found that its return value had no published type: the only
+way to build one was `from clv.services.reader import TailRead`, out of the
+package `clv/plugins/AGENTS.md` tells authors is internal and may move. Core
+reads the result's attributes rather than checking its type, so a plugin
+returning something else with the right names worked by accident and would have
+broken silently on the next field added. Additive, so the API is still 1.0 —
+which is the Phase 2 separation earning its keep twice in one phase, once by
+letting CLV go to 3.0.0 and once by absorbing this without moving.
+
+*One `## Plugins` chapter, and the interface reference stays out of it.* The
+material was already 316 contiguous lines in the right place, so this is a
+consolidation rather than the promotion the phase text describes. Every
+sub-heading keeps its exact text, because a slug is built from text rather than
+level and `#running-a-plugin-where-it-can-be-stopped` is linked twice. The
+thirteen interfaces are **not** inlined into `README.md`: they stay in
+`clv/plugins/AGENTS.md`, with a one-line-per-interface map in the new
+`clv/plugins/README.md`. Two copies of a contract is two places for it to
+disagree.
+
+*Three README tests were passing for a reason that had stopped being true.*
+They sliced on the literal `"## Installing a plugin"` — which is still a
+substring of `"### Installing a plugin"`, so the promotion left them green while
+selecting a region that began mid-chapter. Found by rewriting them rather than
+by a failure, which is the argument for `_plugin_chapter()` existing at all.
+
+*The author's checklist replaced a list that promised a check CLV does not run.*
+`## Plugin Review Criteria` ended on "Passes linting and security checks", nine
+lines below a section stating that what CLV enforces is, in all three cases,
+nothing. `## Developer Workflow` went with it: it named three ABCs of thirteen,
+pointed authors at `clv/plugins/` — the bundled drop-in directory, which loads
+*without* the enable-list — and cited a `README.md` that did not exist for five
+phases. `### Reviewing a third-party plugin` is untouched and is a different
+document for a different reader: that one is the operator's.
+
+*Three counts were live and none of them was right.* `README.md` said nine
+interfaces over a list of eight, `plugins_dialog.py` said twelve, this file's own
+table header said twelve over thirteen rows. The fix is not the three edits but
+that `tests/test_plugin_docs.py` and `tests/test_examples.py` now count from
+`clv.api.__all__`. The suite-count check this file deferred at line 442 is
+written too, and it reads a collection tally from a subprocess rather than
+trusting anybody to refresh a number by hand.
 
 **Commit.** `docs(plugins): the plugin chapter, worked examples, and 3.0.0`
 

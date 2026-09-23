@@ -166,23 +166,46 @@ without a round trip.
 
 ## Plugin Integration Points
 
-`clv/` is designed for future extensibility through plugins.  
-Do **not** hardcode external integrations; use hooks instead.
+`clv/` is extended through plugins, and **the dependency runs one way**: no
+service imports `clv.plugins`. `parsing`, `query`, `clustering`, `timeline` and
+`watch` each take their extensions as a parameter, or from a registry the app
+installs at startup. Do not hardcode an integration; take an injection.
+
+**Thirteen interfaces**, defined in `clv/plugins/__init__.py` and published as a
+versioned surface in [`clv/api.py`](api.py) — which is what a plugin imports, and
+the only part of CLV under a stability promise:
+
+| | |
+| --- | --- |
+| Ingestion | `LogSourceProvider` |
+| Per line | `LogFormat`, `ClusterRule` |
+| Per entry | `FilterStage`, `QueryOperator`, `ComputedField`, `ShapeContributor`, `WatchMatcher`, `TimelineMetric` |
+| Called and awaited | `Exporter`, `WatchSink`, `Command`, `TimelineAnnotation` |
+
+The last row is the set that may run in the isolation host; the two above it are
+refused by name, because a round trip per line is a different program rather
+than a slower one.
+
+`plugins.load_plugins()` loads them once at mount into a `PluginRegistry`.
+Three load paths: `CLV_PLUGIN_PATH`, then `~/.config/clv/plugins/` (governed by
+the `plugins` enable-list, so a file there is listed and **not** imported until
+it is named), then the bundled drop-ins below, then `clv.plugins` entry points.
 
 ### Reserved namespaces
-- `clv/plugins/sources/` — new log source providers.
-- `clv/plugins/filters/` — new filter stages.
-- `clv/plugins/exporters/` — output/export pipelines.
+- `clv/plugins/sources/` — log source providers, plus the SSH *backend*, which
+  is not a provider (`register()` returns `[]` — see `clv/plugins/AGENTS.md`).
+- `clv/plugins/filters/` — filter stages.
+- `clv/plugins/exporters/` — export pipelines. The three built-in formats are
+  **not** here: they live in `services/export.py`, so a built-in cannot fail to
+  load and the drawer's count keeps meaning "installed plugins".
+- `clv/examples/` — the nine worked examples. Deliberately **outside**
+  `clv/plugins/`, because everything under that package loads without being
+  named; an example is seeded into the operator's own directory instead and runs
+  only once they copy it up a level.
 
-Each plugin should subclass an abstract interface defined in `clv/plugins/__init__.py`:
-- `LogSourceProvider`
-- `FilterStage`
-- `Exporter`
-
-`plugins.load_plugins()` loads them at startup into a `PluginRegistry`.
-`FilterStage`s run on every render and `Exporter`s are invoked from the `Ctrl+E`
-dialog; `LogSourceProvider` is loaded and reported but not yet consulted by
-discovery.
+Anything added to `clv/plugins/` that is not a drop-in directory must be listed
+in `_LOADER_MODULES`, or the flat walk imports it and reports it to the operator
+as a broken bundled plugin. A test asserts that tuple covers every such module.
 
 ---
 

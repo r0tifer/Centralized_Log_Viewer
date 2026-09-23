@@ -9,7 +9,7 @@ asks for "a plugin section in the Advanced drawer". The drawer is capped at
 ``max-height: 16`` and ``clv/widgets/AGENTS.md`` records what that costs: a new
 *row* pushes what follows below the fold, where it lays out and paints nothing.
 Four installed plugins is four rows before any of them has said anything, and
-Stage C makes twelve interfaces available. The fleet of SSH hosts hit this exact
+Stage C makes thirteen interfaces available. The fleet of SSH hosts hit this exact
 wall and settled it the same way — one summary line in the drawer, the detail in
 a modal — so plugins follow the precedent rather than inventing a second answer.
 

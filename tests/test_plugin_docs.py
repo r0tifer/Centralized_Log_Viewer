@@ -242,7 +242,20 @@ def test_the_readme_points_authors_at_the_published_module() -> None:
     if not readme.exists():  # pragma: no cover - installed package
         pytest.skip("running from an installed package")
     text = _read(readme)
-    assert "from clv.api import FilterStage" in text
+    # Matched on the import *statement* rather than on one exact spelling of it.
+    # Phase 16 replaced the chapter's hand-written snippet with a genuine
+    # excerpt of `clv/examples/redact_secrets.py`, which imports four names on
+    # one line -- so the old literal stopped matching while the claim it was
+    # protecting was more true than before.
+    imports = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip().startswith("from clv.api import")
+    ]
+    assert any("FilterStage" in line for line in imports), (
+        "README.md no longer shows an author importing an interface from "
+        f"clv.api; found: {imports}"
+    )
     assert "from clv.plugins import FilterStage" not in text
 
 
@@ -666,3 +679,205 @@ def test_an_isolated_author_is_told_what_changes_for_them() -> None:
     assert "print()" in section, "the child's output goes nowhere"
     assert "plugin_host_timeout_ms" in section
     assert "freeze_support()" in section, "the frozen build requirement"
+
+
+# --- the author-facing quick start (Phase 16) --------------------------------
+
+PLUGIN_README = REPO_ROOT / "clv" / "plugins" / "README.md"
+
+
+def test_the_author_quick_start_exists() -> None:
+    """`clv/plugins/AGENTS.md` sent authors to a file that did not exist.
+
+    Its *Developer Workflow* step 4 said to document a plugin in "this folder's
+    README.md" for five phases, and `SSH_TODO.md` deferred two of its own
+    references to it on the grounds that creating a stub would give a planned
+    document two owners. Phase 16 is where it is owed.
+    """
+
+    assert PLUGIN_README.is_file(), "clv/plugins/README.md was not written"
+
+
+def test_the_quick_start_covers_every_published_interface() -> None:
+    """One row per interface, checked against `clv.api` rather than a list.
+
+    The same argument as the published-API table above: a fourteenth interface
+    added later and left out of the author's map would be invisible to everyone
+    except the author who went looking for it.
+    """
+
+    import clv.api as api
+    from clv.plugins import Plugin
+
+    text = _read(PLUGIN_README)
+    published = [
+        name
+        for name in api.__all__
+        if isinstance(getattr(api, name), type)
+        and issubclass(getattr(api, name), Plugin)
+        and name != "Plugin"
+    ]
+    missing = [name for name in published if f"`{name}`" not in text]
+    assert missing == [], f"the quick start documents no seam for: {missing}"
+
+
+def test_the_quick_start_names_every_worked_example() -> None:
+    """An interface row that points at no file is a map with no destination."""
+
+    from clv.services.config import SEEDED_EXAMPLES
+
+    text = _read(PLUGIN_README)
+    missing = [name for name in SEEDED_EXAMPLES if f"`{name}`" not in text]
+    assert missing == [], f"the quick start never mentions: {missing}"
+
+
+def test_the_quick_start_states_the_remote_journal_dual_opt_in() -> None:
+    """`SSH_TODO.md` deferred this sentence to whichever file arrived second.
+
+    A unit on another machine is `journalctl` reached over `ssh`, so it needs
+    both switches. An author told about one of them writes a plugin that works
+    on their laptop and reports nothing on a fleet.
+    """
+
+    text = _read(PLUGIN_README)
+    assert "enable_journald" in text
+    assert "enable_ssh" in text
+
+
+def test_the_quick_start_does_not_promise_safety() -> None:
+    """The same rule the rest of this file enforces, in the newest document.
+
+    A quick start is where the temptation is strongest: it is read by someone
+    deciding whether to trust the mechanism, and "sandboxed" is the word that
+    would close the sale.
+    """
+
+    offenders = [
+        f"{number}: {line.strip()}"
+        for number, line in enumerate(_read(PLUGIN_README).splitlines(), start=1)
+        if "sandbox" in line.lower()
+    ]
+    assert not offenders, "clv/plugins/README.md must not use the word 'sandbox':\n  " + "\n  ".join(offenders)
+
+    # Whitespace-normalised, because the sentence is long enough to wrap and a
+    # line break is not a change of meaning. The isolation tests above do the
+    # same for the same reason.
+    flowed = " ".join(_read(PLUGIN_README).split())
+    assert "does not make an untrusted plugin safe" in flowed
+
+
+def test_every_link_out_of_the_quick_start_resolves() -> None:
+    """It is a new file full of cross-references, and nothing else checks them.
+
+    `tests/test_readme_docs.py` does this for `README.md` and stops at that
+    file. A dead anchor here points an author at a contract they then cannot
+    find, which is the one failure this document exists to prevent.
+    """
+
+    import re
+
+    def _slugs(path: Path) -> set[str]:
+        found: set[str] = set()
+        fenced = False
+        for line in _read(path).splitlines():
+            if line.startswith("```"):
+                fenced = not fenced
+                continue
+            if fenced or not line.startswith("#"):
+                continue
+            heading = line.lstrip("#").strip()
+            found.add(re.sub(r"[^\w\- ]", "", heading.lower()).replace(" ", "-"))
+        return found
+
+    broken: list[str] = []
+    for link in re.findall(r"\]\(([^)]+)\)", _read(PLUGIN_README)):
+        if link.startswith(("http://", "https://")):
+            continue
+        target, _, anchor = link.partition("#")
+        path = (PLUGIN_README.parent / (target or PLUGIN_README.name)).resolve()
+        if not path.is_file():
+            broken.append(f"missing file: {link}")
+        elif anchor and anchor not in _slugs(path):
+            broken.append(f"dead anchor: {link}")
+    assert broken == [], "clv/plugins/README.md: " + "; ".join(broken)
+
+
+def test_the_author_checklist_replaced_the_review_criteria() -> None:
+    """The old list promised a check CLV does not perform.
+
+    "Passes linting and security checks" sat nine lines below a section stating
+    that what CLV enforces is, in all three cases, nothing. A checklist in a
+    document about trust may not contain a tick box nobody ticks.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    assert "## A plugin author's checklist" in text
+    assert "## Plugin Review Criteria" not in text
+    assert "Passes linting and security checks" not in text
+
+
+def test_the_checklist_covers_the_eight_things_the_phase_asked_for() -> None:
+    """Each item is a failure someone has actually had.
+
+    Pinned by the load-bearing phrase of each rather than by counting list
+    items, so reordering or rewording is free and dropping one is not.
+    """
+
+    checklist = _read(PLUGIN_AGENTS).split("## A plugin author's checklist", 1)[1]
+    checklist = checklist.split("\n## ", 1)[0]
+    for phrase in (
+        "requires_api",
+        "clv.api",
+        "cheap rejection",
+        "budget",
+        "consent",
+        "isolated",
+        "manifest",
+        "trust requirements",
+    ):
+        assert phrase in checklist, f"the author checklist lost {phrase!r}"
+
+
+def test_the_developer_workflow_no_longer_names_three_interfaces_of_thirteen() -> None:
+    """It told authors to implement "one of the ABCs" and listed the 2023 three.
+
+    It also sent them to `clv/plugins/`, the bundled drop-in directory that
+    loads *without* the enable-list, which is the one place a third-party plugin
+    must not be written.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    assert "## Developer Workflow" not in text
+    assert (
+        "Implement one of the ABCs (`LogSourceProvider`, `FilterStage`, or `Exporter`)"
+        not in text
+    )
+
+
+def test_every_internal_anchor_in_the_plugin_contract_resolves() -> None:
+    """It is 2300 lines of cross-references and nothing checked them.
+
+    The author checklist added six more, each pointing at a section whose
+    heading a later edit is free to reword.
+    """
+
+    import re
+
+    text = _read(PLUGIN_AGENTS)
+    headings: set[str] = set()
+    fenced = False
+    for line in text.splitlines():
+        if line.startswith("```"):
+            fenced = not fenced
+            continue
+        if fenced or not line.startswith("#"):
+            continue
+        heading = line.lstrip("#").strip()
+        headings.add(re.sub(r"[^\w\- ]", "", heading.lower()).replace(" ", "-"))
+
+    dead = [
+        link
+        for link in re.findall(r"\]\((#[^)]+)\)", text)
+        if link[1:] not in headings
+    ]
+    assert dead == [], f"clv/plugins/AGENTS.md has dead anchors: {dead}"
