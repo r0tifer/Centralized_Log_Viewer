@@ -301,6 +301,101 @@ jobs:
           fi
           echo "CLI smoke test passed for ${{ matrix.arch }}"
 
+      - name: Smoke test plugin install in the frozen build
+        run: |
+          set -euo pipefail
+          # PLUGIN_TODO.md Phase 15's gate is a claim about *this* build: "a
+          # plugin packaged, published as a tarball, installed by URL on a
+          # machine with only the binary, verified, enabled and used". The suite
+          # can only check it against an interpreter, and the interesting
+          # failure modes here are frozen-only -- tomllib present in the bundle,
+          # urllib's file handler reachable, and the plugin directory resolving
+          # from $XDG_CONFIG_HOME rather than from __file__ inside a read-only
+          # tree. This is the only place that can be checked.
+          export HOME="${RUNNER_TEMP}/install-home"
+          export XDG_CONFIG_HOME="${RUNNER_TEMP}/install-config"
+          CLV="dist/${BIN_NAME}/${BIN_NAME}"
+          BUILD="${RUNNER_TEMP}/plugin-build"
+          mkdir -p "$HOME" "${BUILD}/demo_format-1.0.0"
+          cd "${BUILD}/demo_format-1.0.0"
+
+          cat > demo_format.py <<'PLUGIN'
+          from clv.api import FilterStage
+
+
+          class Demo(FilterStage):
+              name = "demo_format"
+              requires_api = ">=1.0,<2.0"
+
+              def apply(self, entry, context):
+                  return entry
+          PLUGIN
+
+          SUM="$(sha256sum demo_format.py | cut -d' ' -f1)"
+          cat > clv-plugin.toml <<MANIFEST
+          name = "demo_format"
+          version = "1.0.0"
+          requires_api = ">=1.0,<2.0"
+          kinds = ["FilterStage"]
+          files = [{ path = "demo_format.py", sha256 = "${SUM}" }]
+          MANIFEST
+
+          cd "${BUILD}"
+          tar czf demo.tar.gz demo_format-1.0.0
+          cd "${GITHUB_WORKSPACE}"
+
+          # By URL, which is the half of the gate a local path would not cover.
+          "${CLV}" plugin install "file://${BUILD}/demo.tar.gz" < /dev/null \
+            > "${RUNNER_TEMP}/install.txt"
+          grep -q "checksums: 1 file verified" "${RUNNER_TEMP}/install.txt" \
+            || { echo "::error::install did not verify the checksum" >&2;
+                 cat "${RUNNER_TEMP}/install.txt" >&2; exit 1; }
+          # Requirement 2: installing is not consent to run it.
+          grep -q "NOT enabled" "${RUNNER_TEMP}/install.txt" \
+            || { echo "::error::install did not say the plugin is not enabled" >&2;
+                 cat "${RUNNER_TEMP}/install.txt" >&2; exit 1; }
+
+          "${CLV}" plugin verify < /dev/null > "${RUNNER_TEMP}/verify.txt"
+          grep -q "demo_format: ok" "${RUNNER_TEMP}/verify.txt" \
+            || { echo "::error::verify failed on a clean install" >&2;
+                 cat "${RUNNER_TEMP}/verify.txt" >&2; exit 1; }
+
+          # Tamper, and assert both commands notice. `verify` must also exit 1.
+          echo "# altered" >> "${XDG_CONFIG_HOME}/clv/plugins/demo_format.py"
+          if "${CLV}" plugin verify < /dev/null > "${RUNNER_TEMP}/tampered.txt"; then
+            echo "::error::verify exited 0 after the file was changed" >&2
+            cat "${RUNNER_TEMP}/tampered.txt" >&2; exit 1
+          fi
+          grep -q "demo_format.py" "${RUNNER_TEMP}/tampered.txt" \
+            || { echo "::error::verify did not name the changed file" >&2;
+                 cat "${RUNNER_TEMP}/tampered.txt" >&2; exit 1; }
+
+          # A crafted archive must not write outside the plugin directory. The
+          # member name is what a traversal looks like; the assertion is that
+          # the canary is still absent afterwards.
+          python3 - "${BUILD}/evil.tar" "${RUNNER_TEMP}/pwned" <<'EVIL'
+          import io, sys, tarfile
+          archive, canary = sys.argv[1], sys.argv[2]
+          with tarfile.open(archive, "w") as bundle:
+              payload = b"owned"
+              info = tarfile.TarInfo("../../../../../../" + canary.lstrip("/"))
+              info.size = len(payload)
+              bundle.addfile(info, io.BytesIO(payload))
+          EVIL
+          if "${CLV}" plugin install "${BUILD}/evil.tar" < /dev/null > /dev/null 2>&1; then
+            echo "::error::a traversing archive was accepted" >&2; exit 1
+          fi
+          if [ -e "${RUNNER_TEMP}/pwned" ]; then
+            echo "::error::a refused archive still wrote outside the staging dir" >&2
+            exit 1
+          fi
+
+          "${CLV}" plugin remove demo_format < /dev/null > /dev/null
+          if [ -e "${XDG_CONFIG_HOME}/clv/plugins/demo_format.py" ]; then
+            echo "::error::remove left the plugin behind" >&2; exit 1
+          fi
+          echo "Plugin install smoke test passed for ${{ matrix.arch }}"
+
       - name: Smoke test plugin isolation in the frozen build
         run: |
           set -euo pipefail

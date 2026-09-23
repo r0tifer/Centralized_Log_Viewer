@@ -299,6 +299,11 @@ a subcommand that prints something and exits without starting a screen:
 ```bash
 clv doctor                  # what this build is, what it read, what every plugin did
 clv plugin list             # what is installed, without importing any of it
+clv plugin info <name>      # one plugin's manifest, origin and signature
+clv plugin install <src>    # from a path, a .tar.gz or an https URL
+clv plugin verify [name]    # re-check installed plugins against their manifests
+clv plugin remove <name>    # delete it and stop it being enabled
+clv plugin trust <signer>   # trust a key that signs plugins
 clv --version               # which build you are actually running
 clv --print-default-config  # the newer settings template, to read
 clv --upgrade-config        # fold your settings into it (see Upgrading)
@@ -312,11 +317,13 @@ the reason if it did not. It needs no terminal, so it works over a pipe and in a
 CI step, and it exits 0 even when a plugin is broken — a broken plugin is what it
 is for reporting.
 
-`clv plugin list` imports nothing. That is the point of it rather than an
-implementation detail: looking at what is installed is exactly what you do
-*before* deciding to trust it, and a listing that ran the code would be a poor
-way to inspect something you are unsure about. Use `clv doctor` to see what a
-plugin actually did once enabled.
+**No `clv plugin` command imports a plugin.** That is the point of them rather
+than an implementation detail: looking at what is installed is exactly what you
+do *before* deciding to trust it, and a listing that ran the code would be a poor
+way to inspect something you are unsure about. `clv plugin info` will tell you
+what a plugin declares, who signed it and what settings it is waiting for,
+without ever executing a line of it. Use `clv doctor` to see what a plugin
+actually did once enabled.
 
 Exit codes are `0` success, `1` failure, and `2` a usage error.
 
@@ -1313,6 +1320,99 @@ Advanced drawer says how many are installed but not enabled; a name you list
 that isn't there is reported by name, so a typo says so rather than doing
 nothing.
 
+### Installing a packaged plugin
+
+A plugin published as a tarball carries a `clv-plugin.toml` declaring its name,
+its version and the SHA-256 of every file it ships. `clv plugin install` checks
+all of that before anything is copied:
+
+```bash
+clv plugin install ./nginx_format-1.2.0.tar.gz
+clv plugin install https://example.org/plugins/nginx_format-1.2.0.tar.gz
+clv plugin install --sha256 e3b0c442... https://example.org/nginx_format.tar.gz
+```
+
+**Installing still does not enable.** The command prints the exact line to add
+to `plugins` and leaves the adding to you — the same rule as copying a file in,
+at the command line, where it would be most convenient to break it.
+
+The manual `cp` above stays supported and stays documented. It is the path that
+works with no network, no manifest and no packaging, and `clv plugin install
+./my_plugin.py` is the same act with a record kept of it.
+
+What CLV checks, in this order, before a byte reaches your plugin directory:
+
+| Check | What happens if it fails |
+| --- | --- |
+| `--sha256`, if you gave one | The archive is hashed as a file and the install stops before anything is unpacked |
+| Its size | A download over 16 MB, or an archive expanding past 64 MB, is stopped mid-read |
+| The archive's shape | A member with `..`, an absolute path, a symlink, a hard link or a device node is refused and nothing is extracted |
+| The manifest's checksums | A file that does not match aborts the install, naming the file, before anything is copied |
+| The signature | A *broken* signature refuses; an absent or untrusted one installs and is reported |
+
+**`--sha256` is the only one of those that does not come from inside the
+archive.** Everything else reads something the archive says about itself, and an
+archive swapped in transit says whatever its replacer wanted — it can rewrite
+the files and the manifest's checksums together. A digest you got from the
+download page cannot be rewritten that way, so publish one if you distribute a
+plugin, and use one if you are given one.
+
+Downloads are `https` only and never follow a redirect to another host or to
+`http`. Nothing is ever imported to inspect it, at any point.
+
+#### Signatures, and who decides
+
+A plugin may ship a detached signature beside its manifest. CLV checks it
+against the keys **you** have trusted, and ships none of its own:
+
+```bash
+clv plugin trust "alice@example.com $(cat alice.pub)"
+clv plugin trust --list
+clv plugin verify                 # re-check everything installed
+```
+
+A signature is reported in one of five states — `verified`, `unsigned`,
+`untrusted` (signed by a key you have not trusted), `unverifiable` (no
+`ssh-keygen` installed) and `bad`. Only `bad` refuses an install: an absent
+signature is a choice the author made, a broken one is evidence. The format is
+OpenSSH's own, so a key you already keep in `~/.ssh/allowed_signers` works
+unchanged, and CLV never needs a key of yours.
+
+**CLV ships no trusted keys and will not.** A bundled key would make CLV the
+arbiter of which plugins are legitimate, which is a hosted plugin index arriving
+through a side door — see *Non-Goals* in
+[`clv/plugins/AGENTS.md`](clv/plugins/AGENTS.md). There is no index, no search
+and no auto-update, deliberately.
+
+#### Checking it is still what you installed
+
+```bash
+clv plugin verify              # re-hash everything, re-check every signature
+clv plugin info nginx_format   # manifest, origin, signature, its settings section
+```
+
+`clv doctor` reports a mismatch too, beside the plugin's own row, because that
+is the command you are asked for when something is wrong. A plugin you edited
+yourself reports as changed as well — that is the check working, not a warning
+about you.
+
+Signatures are re-checked against the keys you trust *now*, not the keys you
+trusted at install. Trusting a signer later turns an `untrusted` plugin into a
+verified one with no reinstall, which is the whole reason to trust keys rather
+than files.
+
+#### Removing one
+
+```bash
+clv plugin remove nginx_format            # files gone, name out of `plugins`
+clv plugin remove --purge nginx_format    # also delete its [plugin:…] section
+```
+
+Removing takes the name out of `plugins` — leaving it would report the plugin as
+missing on every launch from then on — but **keeps** its `[plugin:<name>]`
+section, so reinstalling does not mean setting it up again. `--purge` removes
+that too.
+
 ### A worked example, already on your machine
 
 `~/.config/clv/plugins/examples/nginx_error.py` is a complete, commented plugin
@@ -1513,6 +1613,6 @@ worth starring and comparing across a fleet.
 ```bash
 python -m pip install -e .
 python -m pip install pytest
-python -m pytest            # 2372 passed, 1 skipped, 11 deselected
+python -m pytest            # 2454 passed, 1 skipped, 11 deselected
 python -m textual run clv/app.py --dev
 ```

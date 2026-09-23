@@ -102,7 +102,15 @@ _LOCAL_SUBPACKAGES = ("sources", "filters", "exporters")
 #: machinery lives there too, and without this it is walked like a plugin:
 #: imported, found to export nothing, and reported to the operator as "defines
 #: no plugin" against an origin they have no way to act on.
-_LOADER_MODULES = ("host",)
+#:
+#: Every addition here is a module CLV put in this package, and the list has to
+#: grow with them: ``manifest`` and ``install`` arrived in Phase 15 and were
+#: promptly reported to the operator as two broken bundled plugins, because
+#: their dataclasses are classes defined in a module beside the drop-ins and
+#: the walk cannot tell the difference. That is what this tuple is for, and a
+#: test asserts it covers every non-drop-in module here so the next one cannot
+#: repeat it.
+_LOADER_MODULES = ("host", "install", "manifest")
 
 #: Extra plugin directories, ``os.pathsep``-separated, searched *before* the
 #: user plugin directory.
@@ -1504,6 +1512,7 @@ ERROR_CATEGORIES = (
     "missing",
     "runtime",
     "conflict",
+    "tampered",
 )
 
 
@@ -1740,6 +1749,20 @@ class PluginStatus:
     #: most needs before enabling something, and it is knowable from the
     #: declaration without running anything.
     reads_content: bool = False
+    #: Where this plugin came from and who vouched for it, as one sentence —
+    #: ``"installed 1.2.0 from https://… — signed by alice@example.com"``.
+    #:
+    #: Empty for a bundled plugin, an entry point, and a user plugin copied in
+    #: by hand: CLV has no record of those arriving and will not invent a
+    #: verdict on a file it never saw installed. Filled by
+    #: :func:`clv.plugins.manifest.annotate` rather than by :meth:`status`,
+    #: which does no filesystem IO and is not going to start.
+    provenance: str = ""
+    #: What re-hashing this plugin's recorded files found, if anything was
+    #: asked to. Empty means clean **or** never checked — ``clv doctor`` and
+    #: ``clv plugin verify`` are the two callers that ask, and each says which
+    #: of the two it got.
+    integrity: str = ""
     #: Working copy. True when this plugin should be running.
     enabled: bool = True
     #: Working copy. Set when the operator asks for a fault-disabled plugin to

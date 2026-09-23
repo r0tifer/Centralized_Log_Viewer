@@ -14,7 +14,6 @@ supported Textual range.
 
 from __future__ import annotations
 
-import sys
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from dataclasses import dataclass, replace
@@ -56,6 +55,7 @@ from .plugins import (
     load_plugins,
     panel_fault,
 )
+from .plugins import manifest as plugin_manifest
 from .services import SourceManager, persist_log_sources, persist_setting
 from .services.sources import check_access
 from .services.backend import LOCAL, RECONNECT_ATTEMPTS, backoff_for
@@ -5240,7 +5240,11 @@ class LogViewerApp(App[None]):
         )
 
     async def _prompt_plugins(self) -> None:
-        before = tuple(self._plugins.status())
+        # Annotated here rather than inside `status()`, which does no filesystem
+        # IO and is not going to start: `annotate` reads one small record per
+        # user plugin and is the same call `clv doctor` makes, so the dialog and
+        # the report cannot disagree about where a plugin came from.
+        before = plugin_manifest.annotate(self._plugins.status())
         after = await self.push_screen(
             PluginsDialog(before), wait_for_dismiss=True
         )

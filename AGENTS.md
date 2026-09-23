@@ -127,7 +127,7 @@ distros.
 | **CLI** | `clv/cli.py` | argv: the config flags, `clv doctor`, the `clv plugin` group | Import Textual outside the branch that launches the viewer, change what bare `clv` does, or let anything a plugin supplies reach `SUBCOMMANDS` |
 | **Services** | `clv/services/` | Source identity (`refs.py`), source IO (`backend.py`), parsing, filtering, discovery, reading, buffering, config, settings-file editing (`settings_file.py`), source management | Touch the UI or import Textual, or reach past `backend.py` to `os` |
 | **Widgets** | `clv/widgets/` | Self-contained UI + own `DEFAULT_CSS`; also the shared, Textual-free renderable vocabulary the pane is built from — `severity.py` (the palette), `columns.py` (the structured row), `payloads.py` (the JSON/XML/HTML/CSS/CSV preview) | Depend on other widgets' internals or import `clv.app` |
-| **Plugins** | `clv/plugins/` | Extension interfaces + loader; the three things that spawn a subprocess and so need consent — `sources/journald.py`, `sources/ssh.py` (the SSH transport and `RemoteBackend`) and `host.py` (the isolation host, spawned only for a plugin that asked to be contained) | Break interface contracts, or spawn anything before the operator opts in |
+| **Plugins** | `clv/plugins/` | Extension interfaces + loader; distribution (`manifest.py`, `install.py`); the four things that spawn a subprocess and so need consent — `sources/journald.py`, `sources/ssh.py` (the SSH transport and `RemoteBackend`), `host.py` (the isolation host, spawned only for a plugin that asked to be contained) and `manifest.py` (`ssh-keygen -Y`, and only ever from an explicit `clv plugin` command — never from a render, a load or `clv doctor`) | Break interface contracts, or spawn anything before the operator opts in |
 | **State** | `clv/storage.py` | JSON session persistence (atomic), including `SavedView` records | Depend on the UI |
 
 ### Services
@@ -331,6 +331,39 @@ distros.
   payload is truncated at a line boundary and reported, never chunked and never
   silently dropped.
 
+### Distribution
+
+Two modules under `clv/plugins/`, kept apart because one of them is the
+security surface and the other is not.
+
+- `manifest.py` — what a packaged plugin *claims*: `clv-plugin.toml` parsed
+  with `tomllib`, the SHA-256 of every file it declares, the detached signature,
+  and the record CLV keeps of an install under `plugins/.installed/`. Not to be
+  confused with `manifest_for()` in `plugins/__init__.py`, which describes a
+  live plugin object across the isolation host's pipe — same word, unrelated
+  jobs, and both docstrings say so. Three things are deliberately not CLV's to
+  decide: **who is legitimate** (no bundled trust root, ever — a shipped key
+  would make CLV the arbiter of which plugins are real, which is a hosted index
+  through a side door), **who signed it** (`ssh-keygen -Y find-principals`
+  answers from the operator's own allowed-signers file, so a manifest cannot
+  assert its own signer), and **what a signature is for** (`-n clv-plugin` is
+  mandatory, or a signature made over some other file for some other purpose
+  replays as a plugin signature). The manifest is kept byte-for-byte because a
+  signature covers exact bytes: that is what lets an install that read
+  `untrusted` read `verified` once a key is trusted, with no reinstall.
+- `install.py` — what *acts* on the claim, and the one module here that handles
+  hostile input. Extraction is manual (`extractfile()` and a chunked copy) so
+  the rules are identical on the 3.11 floor and on 3.14, where `tarfile`'s
+  filtering default differs and `data_filter` does not exist before 3.11.4. The
+  archive is read as a **stream** (`r|*`), because `getmembers()` decompresses
+  the whole thing to build an index and a bomb would already have cost what the
+  cap exists to prevent. Members are judged by name and by kind before a byte is
+  read; the decompressed-byte cap is checked per chunk rather than against the
+  header's own claim about itself. Nothing reaches the plugin directory until
+  everything has passed, so a refusal leaves it byte-for-byte as it was — which
+  is what the malicious-archive tests assert, and the half of "refused" that is
+  easy to lose.
+
 ### Data flow
 ```
 config.load_config ─→ SourceManager ─→ discovery.discover (thread)
@@ -513,9 +546,15 @@ installed" — the trade Item 12 asked for.
   and `workspace` fixtures, and every assertion runs against another backend —
   which is how `RemoteBackend` is held to the same behaviour as `LocalBackend`.
 
-Run: `python -m pytest` (2372 passed, 1 skipped, 11 deselected) on **both** 3.11
+Run: `python -m pytest` (2454 passed, 1 skipped, 11 deselected) on **both** 3.11
 and 3.14 — the local default is 3.14 and a green suite there is not evidence
 that the supported floor still works.
+
+Six of those need `ssh-keygen` and skip without it: the plugin-signature
+round-trips in `tests/test_plugin_registry.py` generate a throwaway key, sign
+and verify locally, and touch no network. A machine with no OpenSSH reports
+seven skipped rather than one, which is the suite being honest about what it
+could not check rather than a failure.
 
 ---
 
@@ -523,15 +562,27 @@ that the supported floor still works.
 
 - Read only what the operator configured or explicitly selected.
 - **No telemetry and no exfiltration**, absolutely. Network access is limited to
-  hosts the operator names, over SSH, using their own credentials, initiated
-  only by an explicit action, and never with elevated privilege. CLV reports
-  nothing anywhere, to anyone, ever — that part is not narrowed and will not be.
+  hosts the operator names, initiated only by an explicit action, and never with
+  elevated privilege. CLV reports nothing anywhere, to anyone, ever — that part
+  is not narrowed and will not be.
+
+  Two shapes of it, and both are outbound-only and operator-initiated. Reading a
+  remote source is SSH with the operator's own credentials. `clv plugin install
+  <url>` is an https `GET` of exactly the URL they typed — no redirect to another
+  host, no `http`, nothing sent but the request, and the payload written to disk
+  and checksum-verified before anything is unpacked. Neither carries anything
+  about the operator, their logs or their machine.
 - **No privilege escalation, anywhere.** No `sudo`, `doas` or `pkexec`, local or
   remote, not behind a setting. An unreadable file is reported, with the group
   or ACL that would fix it; it is never read by becoming someone else.
 - **No credentials.** No password field in the config schema, in any dialog, in
   `SessionState`, or in memory. A connection that needs interactive input fails
   as unreachable. Host key verification is never disabled, not even for testing.
+- **No trust root.** CLV ships no signing key and will not. A plugin signature
+  is checked against `~/.config/clv/plugin-signers`, which is empty until the
+  operator puts something in it — a bundled key would make CLV the arbiter of
+  which plugins are legitimate, which is the hosted-index commitment under
+  Non-Goals arriving through a side door.
 - Treat log contents as sensitive; never copy them into caches or temp files.
   Session state stores paths and filter settings, never log content — which
   is why marks (`services/marks.py`) live for the session only.

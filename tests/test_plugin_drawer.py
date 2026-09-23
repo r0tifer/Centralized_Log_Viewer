@@ -135,6 +135,47 @@ async def _highlight(app, pilot, index: int):
     return app.screen
 
 
+def test_the_detail_says_where_a_plugin_came_from_and_who_signed_it() -> None:
+    """``PLUGIN_TODO.md`` Phase 15: unsigned is reported "in the output **and in
+    the drawer**".
+
+    One more line under the origin, not a column — the origin says where the
+    file *is*, this says where it came from. A bundled plugin and one copied in
+    by hand have no such line at all, because CLV never saw them arrive and will
+    not invent a verdict on a file it did not install.
+    """
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.push_screen(
+                PluginsDialog(
+                    [
+                        replace(
+                            ROWS[0],
+                            provenance=(
+                                "installed 1.2.0 from https://example.org/x.tar.gz "
+                                "— unsigned"
+                            ),
+                        ),
+                        replace(ROWS[1], provenance=""),
+                    ]
+                )
+            )
+            await pilot.pause()
+
+            first = _detail(await _highlight(app, pilot, 0))
+            assert "https://example.org/x.tar.gz" in first
+            assert "unsigned" in first
+
+            second = _detail(await _highlight(app, pilot, 1))
+            assert "installed" not in second
+            assert "unsigned" not in second
+
+    _run(scenario)
+
+
 def test_a_multi_kind_plugin_lists_every_interface_it_supplies() -> None:
     async def scenario() -> None:
         app = LogViewerApp()

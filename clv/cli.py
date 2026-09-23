@@ -67,9 +67,14 @@ if TYPE_CHECKING:  # pragma: no cover - annotations only
 #: module docstring. ``clv`` with none of these launches the viewer.
 SUBCOMMANDS = ("doctor", "plugin")
 
-#: What ``clv plugin`` accepts. ``PLUGIN_TODO.md`` Phase 15 adds ``info``,
-#: ``install``, ``remove``, ``verify`` and ``trust`` to this tuple.
-PLUGIN_SUBCOMMANDS = ("list",)
+#: What ``clv plugin`` accepts, and the complete list. Closed for the same
+#: reason :data:`SUBCOMMANDS` is, and asserted against the parser's own choices
+#: by ``tests/test_cli.py`` so a later change that fed it a registry fails there
+#: however reasonable it looked.
+#:
+#: Alphabetical rather than grouped: this is a lookup table, and the ``--help``
+#: output an operator scans is ordered by the parser, not by this.
+PLUGIN_SUBCOMMANDS = ("info", "install", "list", "remove", "trust", "verify")
 
 #: Exit codes, as ``PLUGIN_TODO.md`` Phase 14 defines them. 2 is argparse's own
 #: convention for a usage error and is what it already exits with, so this
@@ -144,13 +149,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     plugin = commands.add_parser(
         "plugin",
-        help="inspect installed plugins",
-        description="Inspect what is installed in your plugin directories.",
+        help="install, inspect, verify and remove plugins",
+        description=(
+            "Manage what is in your plugin directories. No command here imports "
+            "a plugin, so none of them can run the code they are describing."
+        ),
     )
     # Required, so `clv plugin` alone is a usage error rather than a silence.
     plugin_commands = plugin.add_subparsers(
         dest="plugin_command", metavar="<command>", required=True
     )
+
     plugin_list = plugin_commands.add_parser(
         "list",
         help="list installed plugins without importing any of them",
@@ -160,6 +169,112 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     plugin_list.set_defaults(handler=_plugin_list)
+
+    plugin_info = plugin_commands.add_parser(
+        "info",
+        help="what one plugin declares, and where it came from",
+        description=(
+            "Everything CLV knows about one plugin without running it: its "
+            "manifest, where it was installed from, who signed it, and its own "
+            "settings section if it has one."
+        ),
+    )
+    plugin_info.add_argument("name", help="the plugin's name, as `plugin list` prints it")
+    plugin_info.set_defaults(handler=_plugin_info)
+
+    plugin_install = plugin_commands.add_parser(
+        "install",
+        help="install a plugin from a path, a tar archive or an https URL",
+        description=(
+            "Verify a plugin and copy it into your plugin directory. It does "
+            "NOT enable it: installing a plugin is not consent to run it, and "
+            "this prints the line to add when you decide it is."
+        ),
+        epilog=(
+            "An archive or a URL has to carry a clv-plugin.toml declaring the "
+            "sha256 of every file. A .py or a directory on this machine does "
+            "not — that is the same act as copying it in by hand."
+        ),
+    )
+    plugin_install.add_argument(
+        "source", help="a .py file, a directory, a .tar.gz, or an https:// URL"
+    )
+    plugin_install.add_argument(
+        "--force",
+        action="store_true",
+        help="replace a plugin of the same name that is already installed",
+    )
+    plugin_install.add_argument(
+        "--sha256",
+        metavar="DIGEST",
+        help=(
+            "the archive's expected sha256, as published beside the download. "
+            "Checked before anything is unpacked — it is the one number that "
+            "did not come from inside the archive."
+        ),
+    )
+    plugin_install.set_defaults(handler=_plugin_install)
+
+    plugin_remove = plugin_commands.add_parser(
+        "remove",
+        help="delete an installed plugin's files",
+        description=(
+            "Delete the plugin and stop it being enabled. Its [plugin:<name>] "
+            "settings section is kept, so reinstalling does not mean setting it "
+            "up again."
+        ),
+    )
+    plugin_remove.add_argument("name", help="the plugin to remove")
+    plugin_remove.add_argument(
+        "--purge",
+        action="store_true",
+        help="also delete its [plugin:<name>] section from your settings file",
+    )
+    plugin_remove.set_defaults(handler=_plugin_remove)
+
+    plugin_verify = plugin_commands.add_parser(
+        "verify",
+        help="re-check installed plugins against their manifests",
+        description=(
+            "Re-hash every file a plugin declared and re-check its signature "
+            "against the keys you trust now. With no name, everything that was "
+            "installed with a manifest."
+        ),
+    )
+    plugin_verify.add_argument(
+        "name", nargs="*", help="the plugins to check; omit for all of them"
+    )
+    plugin_verify.set_defaults(handler=_plugin_verify)
+
+    plugin_trust = plugin_commands.add_parser(
+        "trust",
+        help="trust a key that signs plugins, or list the ones you trust",
+        description=(
+            "CLV ships no keys and trusts nobody by default. A signature counts "
+            "for something only once you have put its signer here."
+        ),
+        epilog=(
+            'Typically: clv plugin trust "alice@example.com '
+            '$(cat alice.pub)". The format is OpenSSH\'s own allowed_signers.'
+        ),
+    )
+    plugin_trust.add_argument(
+        "signer",
+        nargs="?",
+        help='a line of the form "<who> <key-type> <key>"',
+    )
+    plugin_trust.add_argument(
+        "--list",
+        action="store_true",
+        dest="list_signers",
+        help="print the signers you trust and exit",
+    )
+    plugin_trust.add_argument(
+        "--remove",
+        metavar="WHO",
+        help="stop trusting every key belonging to WHO",
+    )
+    plugin_trust.set_defaults(handler=_plugin_trust)
 
     return parser
 
@@ -203,7 +318,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     handler = getattr(args, "handler", None)
     if handler is not None:
-        return handler(sys.stdout)
+        return handler(args, sys.stdout)
 
     # Imported here, not at module scope: everything above has to work over a
     # pipe, and a command that prints a report should not pay for a UI toolkit
@@ -253,7 +368,7 @@ def _reserved_source(arguments: Sequence[str]) -> Optional[str]:
     return None
 
 
-def _doctor(stream: TextIO) -> int:
+def _doctor(args: argparse.Namespace, stream: TextIO) -> int:
     """Load the plugins, report everything, and start no screen.
 
     Loads exactly the way ``LogViewerApp.on_mount`` does, because a report of
@@ -361,7 +476,11 @@ def _report_plugins(stream: TextIO, registry: "PluginRegistry") -> None:
     screen, and this is the caller that takes it up on that.
     """
 
-    rows = registry.status()
+    from .plugins.manifest import annotate, integrity_problems
+
+    # The same call the `P` dialog makes, so the report and the dialog cannot
+    # reach two conclusions about where one plugin came from.
+    rows = annotate(registry.status())
     print("", file=stream)
     if not rows:
         # Requirement 10: a build with no plugins has nothing to say, and says
@@ -399,6 +518,17 @@ def _report_plugins(stream: TextIO, registry: "PluginRegistry") -> None:
                 "configured to send them",
                 file=stream,
             )
+        if row.provenance:
+            print(f"      {row.provenance}", file=stream)
+        if row.source == "user":
+            # Re-hashed here and not in `annotate`, which the dialog also calls:
+            # this is the command an operator is told to run when something is
+            # wrong, so a tamper only `clv plugin verify` could find would be a
+            # check that effectively does not exist. The dialog stays free of it
+            # because opening a dialog should not cost work proportional to what
+            # is installed.
+            for problem in integrity_problems(row.name):
+                print(f"      ⚠ does not match its manifest: {problem}", file=stream)
         if row.detail:
             for line in row.detail.splitlines():
                 print(f"      {line}", file=stream)
@@ -425,7 +555,7 @@ def _hint_for(row: "PluginStatus") -> str:
     return f"add `{row.name}` to `plugins` in your settings file to run it"
 
 
-def _plugin_list(stream: TextIO) -> int:
+def _plugin_list(args: argparse.Namespace, stream: TextIO) -> int:
     """List what is installed, and import none of it.
 
     The promise is the output's last line, and it is the reason this command
@@ -439,6 +569,7 @@ def _plugin_list(stream: TextIO) -> int:
     """
 
     from .plugins import discover_user_plugins, plugin_search_roots
+    from .plugins.manifest import read_record
 
     config = load_config()
     roots = plugin_search_roots()
@@ -458,7 +589,12 @@ def _plugin_list(stream: TextIO) -> int:
             else:
                 state = "not enabled"
             kind = "package" if entry.is_package else "module"
-            print(f"  {entry.name} — {state} ({kind})", file=stream)
+            record = read_record(entry.name)
+            # Appended rather than restructured: this line's shape is what
+            # `tests/test_cli.py` reads, and a version is extra information
+            # about a row rather than a different row.
+            version = f" {record.version}" if record and record.version else ""
+            print(f"  {entry.name}{version} — {state} ({kind})", file=stream)
 
     missing = [error for error in scan.errors if error.category == "missing"]
     if missing:
@@ -471,6 +607,355 @@ def _plugin_list(stream: TextIO) -> int:
     print("", file=stream)
     print(
         f"{installed} installed, {enabled} enabled. Nothing was imported.",
+        file=stream,
+    )
+    return EXIT_OK
+
+
+# --- plugin info -------------------------------------------------------------
+
+
+def _plugin_info(args: argparse.Namespace, stream: TextIO) -> int:
+    """Everything CLV knows about one plugin, having run none of it.
+
+    Assembled from three import-free sources -- the filesystem scan, the
+    installation record, and the settings file -- because the whole value of
+    this command is that an operator can read it about a plugin they have not
+    decided to trust yet.
+    """
+
+    from .plugins import discover_user_plugins, plugin_search_roots
+    from .plugins.manifest import describe_record, read_record, stored_signature
+
+    config = load_config()
+    scan = discover_user_plugins(plugin_search_roots(), config.plugins)
+    name = args.name
+    found = next(
+        (
+            entry
+            for entry in scan.plugins
+            if entry.name.casefold() == name.casefold()
+        ),
+        None,
+    )
+    record = read_record(name)
+
+    if found is None and record is None:
+        print(
+            f"clv: {name} is not installed. `clv plugin list` shows what is.",
+            file=sys.stderr,
+        )
+        return EXIT_FAILURE
+
+    print(f"{name}", file=stream)
+    if found is not None:
+        kind = "package" if found.is_package else "module"
+        # The file, not the module name: a path printed in a report is one
+        # somebody will paste into `ls`.
+        located = found.root / (
+            found.name if found.is_package else f"{found.name}.py"
+        )
+        print(f"  installed: {located} ({kind})", file=stream)
+        if found.shadowed_by is not None:
+            print(f"  shadowed by: {found.shadowed_by}", file=stream)
+        print(f"  enabled: {'yes' if found.enabled else 'no'}", file=stream)
+    else:
+        # A record with no files beside it. Worth its own sentence: it is what
+        # a half-finished `rm` looks like, and the fix is `clv plugin remove`.
+        print("  installed: no — a record remains but the files are gone", file=stream)
+
+    if record is None:
+        print(
+            "  origin: copied in by hand — CLV has no record of it arriving, "
+            "so there is nothing to verify it against",
+            file=stream,
+        )
+    else:
+        if record.version:
+            print(f"  version: {record.version}", file=stream)
+        print(f"  origin: {describe_record(record)}", file=stream)
+        print(f"  installed at: {record.installed_at}", file=stream)
+        if record.author:
+            print(f"  author: {record.author}", file=stream)
+        if record.homepage:
+            print(f"  homepage: {record.homepage}", file=stream)
+        if record.description:
+            print(f"  description: {record.description}", file=stream)
+        if record.kinds:
+            # The manifest's claim, and said as one: CLV has not imported
+            # anything and cannot confirm it. `clv doctor` is what reports what
+            # a plugin actually supplied.
+            print(f"  declares: {', '.join(record.kinds)}", file=stream)
+        for label, constraint in (
+            ("requires plugin API", record.requires_api),
+            ("requires clv", record.requires_clv),
+        ):
+            if constraint:
+                print(f"  {label}: {constraint}", file=stream)
+        if record.files:
+            count = len(record.files)
+            print(
+                f"  files: {count} declared — run `clv plugin verify {name}` "
+                f"to re-check {'them' if count != 1 else 'it'}",
+                file=stream,
+            )
+        # Resolved now rather than read off the record, which froze at install.
+        # One plugin, one `ssh-keygen` call, and the operator asked about this
+        # one specifically — the dialog cannot afford the same and says so.
+        live = stored_signature(name)
+        print(f"  signature now: {_signature_line(live)}", file=stream)
+
+    _report_plugin_section(stream, config, name)
+    return EXIT_OK
+
+
+def _report_plugin_section(stream: TextIO, config: "LogConfig", name: str) -> None:
+    """The plugin's own ``[plugin:<name>]`` settings, if it has any.
+
+    Printed because the commonest reason a correctly installed plugin does
+    nothing is that it is waiting for a setting -- the shipped ``watch_alerts``
+    example is deliberately inert until its section names a file -- and that
+    fact lives in a different file from everything else here.
+    """
+
+    settings = config.plugin_settings.get(name.casefold())
+    print("", file=stream)
+    if not settings:
+        print(f"no [plugin:{name}] section in your settings file.", file=stream)
+        return
+    print(f"[plugin:{name}]", file=stream)
+    for key, value in sorted(settings.items()):
+        print(f"  {key} = {value}", file=stream)
+
+
+# --- plugin install ----------------------------------------------------------
+
+
+def _plugin_install(args: argparse.Namespace, stream: TextIO) -> int:
+    """Install, and say in as many words that nothing has been enabled.
+
+    The last two lines of the output are the phase's Requirement 2 made
+    visible. An install command that quietly enabled what it installed would
+    make "a file in the plugin directory is inert until you name it" false at
+    the one moment it is most tempting to break it, so this prints the line to
+    add and leaves the adding to the operator.
+    """
+
+    from .plugins.install import InstallError, install
+    from .plugins.manifest import ManifestError
+
+    try:
+        result = install(args.source, force=args.force, expected_sha256=args.sha256)
+    except (InstallError, ManifestError) as exc:
+        # Both are already phrased for whoever ran the command. Printing the
+        # exception is the whole handler, because a traceback here would be a
+        # report about CLV to somebody holding a broken tarball.
+        print(f"clv: {exc}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    version = f" {result.version}" if result.version else ""
+    verb = "replaced" if result.replaced else "installed"
+    print(f"{verb} {result.name}{version} at {result.destination}", file=stream)
+    if result.manifested:
+        count = len(result.record.files)
+        print(
+            f"  checksums: {count} file{'s' if count != 1 else ''} verified",
+            file=stream,
+        )
+    else:
+        print(
+            "  checksums: none — installed from a path with no manifest, so "
+            "`clv plugin verify` will have nothing to compare against",
+            file=stream,
+        )
+    print(f"  signature: {_signature_line(result.signature)}", file=stream)
+    for warning in result.warnings:
+        print(f"  warning: {warning}", file=stream)
+
+    print("", file=stream)
+    print(f"{result.name} is installed and NOT enabled.", file=stream)
+    print(
+        f"Add it to `plugins` in {get_config_file() or user_config_path()}:",
+        file=stream,
+    )
+    print(f"    plugins = {result.name}", file=stream)
+    print("then restart clv. Plugins are imported once, at startup.", file=stream)
+    return EXIT_OK
+
+
+def _signature_line(signature) -> str:
+    """One line for a signature state, detail included where there is one."""
+
+    if signature.state == "verified":
+        return f"verified — signed by {signature.signer}"
+    return f"{signature.state} — {signature.detail}"
+
+
+# --- plugin remove -----------------------------------------------------------
+
+
+def _plugin_remove(args: argparse.Namespace, stream: TextIO) -> int:
+    """Delete a plugin, and report the two things that did not happen.
+
+    Both asymmetries get a line. The name comes out of ``plugins``, because
+    leaving it would report the plugin as named-but-missing on every launch
+    from here on -- accurate, and indistinguishable from a bug to whoever just
+    ran this. The ``[plugin:<name>]`` section stays, because it is what the
+    operator wrote and a reinstall should not mean setting it up again.
+    """
+
+    from .plugins.install import InstallError, remove
+
+    try:
+        result = remove(args.name, purge=args.purge)
+    except InstallError as exc:
+        print(f"clv: {exc}", file=sys.stderr)
+        return EXIT_FAILURE
+    except OSError as exc:
+        print(f"clv: {args.name} could not be removed: {exc}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    for path in result.removed:
+        print(f"removed {path}", file=stream)
+    if result.disabled:
+        print(f"removed {result.name} from `plugins` in your settings file", file=stream)
+    if result.section_purged:
+        print(f"removed the [plugin:{result.name}] section", file=stream)
+    elif result.section_kept:
+        print(
+            f"kept [{result.section_kept}] in "
+            f"{get_config_file() or user_config_path()} — its settings are "
+            f"yours, and reinstalling will pick them up again. `--purge` "
+            f"removes it.",
+            file=stream,
+        )
+    return EXIT_OK
+
+
+# --- plugin verify -----------------------------------------------------------
+
+
+def _plugin_verify(args: argparse.Namespace, stream: TextIO) -> int:
+    """Re-check installed plugins, and exit 1 if anything did not match.
+
+    Both halves are re-run, and the signature half is the one worth knowing
+    about: it is checked against the keys trusted *now*, not the keys trusted
+    at install. Adding a signer turns an ``untrusted`` plugin into a verified
+    one without reinstalling it, which is the entire reason to trust keys
+    rather than files.
+    """
+
+    from .plugins.install import verify
+
+    results = verify(args.name)
+    if not results:
+        print(
+            "nothing to verify: no plugin here was installed with a manifest. "
+            "`clv plugin list` shows what is installed.",
+            file=stream,
+        )
+        return EXIT_OK
+
+    failed = 0
+    for result in results:
+        if result.ok:
+            checked = (
+                f"{result.checked} file{'s' if result.checked != 1 else ''} "
+                f"{'match' if result.checked != 1 else 'matches'}"
+                if result.checked
+                else "no files declared"
+            )
+            print(f"{result.name}: ok — {checked}", file=stream)
+        else:
+            failed += 1
+            print(f"{result.name}: FAILED", file=stream)
+            for problem in result.problems:
+                print(f"    {problem}", file=stream)
+        print(f"    signature: {_signature_line(result.signature)}", file=stream)
+
+    if failed:
+        print("", file=stream)
+        print(
+            f"{failed} of {len(results)} did not match what was installed. A "
+            f"plugin you edited yourself will say this too — if you did not "
+            f"edit it, reinstall it from a source you trust.",
+            file=stream,
+        )
+        return EXIT_FAILURE
+    return EXIT_OK
+
+
+# --- plugin trust ------------------------------------------------------------
+
+
+def _plugin_trust(args: argparse.Namespace, stream: TextIO) -> int:
+    """Add, list or remove a signer the operator trusts.
+
+    CLV ships no trust root and never will: a bundled key would make CLV the
+    arbiter of which plugins are legitimate, which is the hosted-index
+    commitment arriving through a side door. Everything this file contains, the
+    operator put there.
+    """
+
+    from .plugins.manifest import (
+        ManifestError,
+        add_trusted_signer,
+        parse_signer_line,
+        read_trusted_signers,
+        remove_trusted_signer,
+        trust_store_path,
+    )
+
+    store = trust_store_path()
+
+    if args.remove:
+        dropped = remove_trusted_signer(args.remove)
+        if not dropped:
+            print(f"clv: no trusted key belongs to {args.remove}.", file=sys.stderr)
+            return EXIT_FAILURE
+        print(f"stopped trusting {args.remove} ({dropped} key(s))", file=stream)
+        print(
+            "Plugins already installed keep working; they will report as "
+            "untrusted next time you verify them.",
+            file=stream,
+        )
+        return EXIT_OK
+
+    if args.list_signers or args.signer is None:
+        signers = read_trusted_signers()
+        if not signers:
+            print(f"no plugin signers trusted ({store} is empty or absent).", file=stream)
+            print(
+                'Add one with: clv plugin trust "alice@example.com '
+                '$(cat alice.pub)"',
+                file=stream,
+            )
+            return EXIT_OK
+        print(f"{store}", file=stream)
+        for signer in signers:
+            print(f"  {signer.principal} — {signer.key_type}", file=stream)
+        return EXIT_OK
+
+    try:
+        signer = parse_signer_line(args.signer)
+    except ManifestError as exc:
+        print(f"clv: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    try:
+        added = add_trusted_signer(signer)
+    except OSError as exc:
+        print(f"clv: {store} could not be written: {exc}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    if not added:
+        print(f"{signer.principal} was already trusted; nothing changed.", file=stream)
+        return EXIT_OK
+    print(f"trusting {signer.principal} ({signer.key_type})", file=stream)
+    print(f"  written to {store}", file=stream)
+    print(
+        "Plugins signed by this key will now verify. Run `clv plugin verify` to "
+        "re-check what is already installed.",
         file=stream,
     )
     return EXIT_OK

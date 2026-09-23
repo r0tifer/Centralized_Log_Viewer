@@ -1391,6 +1391,135 @@ be reported as news.
 
 Nothing is written until the dialog closes, so `Esc` cancels for real and one
 confirm is one write to a file full of the operator's comments.
+
+A row for a plugin installed with `clv plugin install` also carries a line
+saying where it came from and who vouched for it. A plugin copied in by hand has
+no such line — CLV never saw it arrive and will not invent a verdict on it.
+
+### From the command line
+
+Five subcommands, and **none of them imports a plugin**:
+
+| Command | Does |
+| --- | --- |
+| `clv plugin list` | What is installed, enabled or not, with versions |
+| `clv plugin info <name>` | Manifest, origin, signature, and its `[plugin:<name>]` section |
+| `clv plugin install <src>` | From a path, a `.tar.gz` or an https URL. Never enables |
+| `clv plugin verify [name…]` | Re-hash the files, re-check the signatures |
+| `clv plugin remove <name>` | Delete it; `--purge` also drops its config section |
+| `clv plugin trust <signer>` | Trust a key; `--list` and `--remove` manage them |
+
+That property is structural rather than careful: the enumeration is
+`discover_user_plugins`, which uses `pkgutil.iter_modules` and touches no import
+machinery, and `manifest.py` reads bytes and shells out to `ssh-keygen`. A test
+parametrised over every subcommand asserts it with a plugin that writes a
+sentinel file at import.
+
+### Publishing
+
+A plugin is distributed as a tar archive carrying a `clv-plugin.toml` at its top
+level. There is no index to submit to: anyone can host, and CLV downloads from
+the host the operator names.
+
+```toml
+name = "nginx_format"
+version = "1.2.0"
+requires_api = ">=1.0,<2.0"
+requires_clv = ">=3.0"
+kinds = ["LogFormat"]
+author = "Alice <alice@example.com>"
+homepage = "https://example.org/nginx-format"
+files = [{ path = "nginx_format.py", sha256 = "e3b0c442…" }]
+```
+
+`name`, `version` and `files` are required; everything else is optional, and a
+key this version does not know is **kept, not refused** — otherwise every future
+addition to the format would be a breaking change. `name` must be a legal Python
+module name: it is what the operator writes in `plugins` and what CLV imports.
+
+**`files` has two legal shapes and no others.** Either exactly one entry,
+`<name>.py`, or every entry under `<name>/` for a package with an
+`__init__.py`. A manifest that scattered files across the plugin directory would
+be installing several plugins under one name, and `remove` would have nothing
+coherent to undo.
+
+Packaging it:
+
+```bash
+sha256sum nginx_format.py                    # paste into files = [...]
+ssh-keygen -Y sign -n clv-plugin -f ~/.ssh/id_ed25519 clv-plugin.toml
+tar czf nginx_format-1.2.0.tar.gz \
+    --transform 's,^,nginx_format-1.2.0/,' \
+    nginx_format.py clv-plugin.toml clv-plugin.toml.sig
+```
+
+A single wrapping directory is stripped on install, so the `--transform` above
+is optional and harmless either way.
+
+**Publish the tarball's own `sha256sum` beside the download.** It is the only
+number an operator can check that did not come out of the archive: your
+manifest's checksums prove the files match your manifest, which anyone who
+replaced both can also arrange. `clv plugin install --sha256 <digest> <url>`
+checks it before a single member is read.
+
+**Signing is optional, and the namespace is not.** `-n clv-plugin` is what stops
+a signature you made over some other file for some other purpose counting as
+your word that this is your plugin. A signature made without it will not verify.
+
+Only the manifest is signed, and that is enough: it carries the SHA-256 of every
+file, so one signature covers the whole plugin transitively.
+
+**What an operator sees when your plugin is unsigned:**
+
+```
+  signature: unsigned — nothing was signed, so CLV cannot tell you who
+             packaged this. Trust it the way you would trust any other
+             program you install.
+```
+
+It installs. Unsigned is the ordinary case and refusing it would make signing
+compulsory, which needs an ecosystem that does not exist yet. If you do sign,
+publish your public key beside the download and tell people to run
+`clv plugin trust "you@example.com <your-key>"` — CLV ships no trust root, so
+that step is theirs and cannot be done for them.
+
+The five states an operator can see are `verified`, `unsigned`, `untrusted`,
+`unverifiable` (they have no `ssh-keygen`) and `bad`. Only `bad` refuses the
+install: an absent signature is a choice you made, a broken one is evidence.
+
+**`bad` does not depend on trust.** Whether the bytes are the bytes that were
+signed is a question about the file, not about whose key it is, so it is settled
+with `ssh-keygen -Y check-novalidate` *before* the trust store is consulted at
+all. A manifest altered after signing is refused even from a signer nobody
+trusts — which is the ordinary state of every installation, since CLV ships no
+keys. Checking trust first would send that file down the `untrusted` path,
+whose sentence says the signature is valid and only the signer is unknown.
+
+Signatures are re-resolved against the trust store **as it is at the time**,
+not as it was at install — which is why CLV keeps your manifest and signature
+byte-for-byte under `~/.config/clv/plugins/.installed/`. Someone who installs
+your plugin before trusting your key sees `untrusted`, and `clv plugin verify`
+says `verified` the moment they add it.
+
+#### No index, no search, no auto-update
+
+Stated here so the absence reads as a decision rather than an omission.
+
+CLV will not host a plugin index. That is a server, a namespace to defend and a
+moderation queue — an operational commitment rather than a feature — and every
+listing in it would be a trust signal CLV was issuing about someone else's code.
+There is therefore nothing to search: you tell people where your plugin is, the
+way you would for any other program.
+
+Nor does CLV update a plugin behind the operator. An install is an act they
+took; a silent replacement of running code they already reviewed is not, and it
+would make the enable-list a one-time gate rather than a standing decision. A
+new version is a new `clv plugin install --force`, run by someone who chose to.
+
+What replaces an index is that anyone can host, and that the operator can check
+what they got: a manifest to declare it, a published `sha256sum` they can pin
+against, and a signature they can root in a key they chose to trust.
+
 ### Shadowing
 
 A user plugin may take a name a bundled drop-in uses, which is how a plugin

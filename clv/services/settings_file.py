@@ -211,6 +211,26 @@ class SettingsDocument:
                 return self._lines[index].partition("=")[2].strip()
         return None
 
+    def values(self, section: str, option: str) -> list[str]:
+        """Every raw value assigned to *option* within *section*, in file order.
+
+        :meth:`get` answers with the first, which is this module's rule
+        everywhere. This exists for the caller that needs the *effective* one:
+        a file may legally assign a key twice, and ``configparser`` — which
+        :mod:`clv.services.config` reads the same file through — takes the
+        last. A caller deciding what a setting currently means has to agree
+        with the reader that loads it, not with the reader that edits it.
+        """
+
+        span = self._span(section)
+        if span is None:
+            return []
+        found: list[str] = []
+        for index in range(span.start, span.end):
+            if _option_name(self._lines[index]) == option:
+                found.append(self._lines[index].partition("=")[2].strip())
+        return found
+
     def options(self, section: str) -> list[str]:
         """Every option name assigned within *section*, in file order.
 
@@ -251,13 +271,28 @@ class SettingsDocument:
 
     # --- writing -------------------------------------------------------------
 
-    def set(self, section: str, option: str, value: str) -> None:
+    def set(self, section: str, option: str, value: str, *, every: bool = False) -> None:
         """Set ``option = value`` inside *section*, creating either if absent.
 
         An existing option is rewritten where it stands, keeping its indentation
         and its position among the operator's comments. A new one is inserted
         after the section's last real content line rather than at end of file,
         which is the whole reason this module exists.
+
+        *every* rewrites **all** assignments of *option* rather than the first.
+        It exists because a settings file can legally carry the same key twice
+        — the shipped template ships ``plugins =`` and an operator following the
+        README may append a second ``plugins = …`` rather than editing it — and
+        the two readers of that file disagree about which one counts:
+        ``configparser``, which :mod:`clv.services.config` reads through, takes
+        the **last**, while everything here takes the first. Editing the first
+        of a duplicated key therefore looks like it worked and changes nothing.
+        Rewriting all of them is correct whichever reader wins, which is why
+        the caller that removes a plugin from the enable list asks for it.
+
+        The default is unchanged, because an unconditional switch to "every"
+        would quietly rewrite a second assignment an operator may have put
+        there deliberately to override the first.
         """
 
         span = self._span(section)
@@ -265,26 +300,41 @@ class SettingsDocument:
             self.add_section(section, [(option, value)])
             return
 
+        found = False
         for index in range(span.start, span.end):
             if _option_name(self._lines[index]) == option:
                 self._lines[index] = _assignment(
                     option, value, _leading(self._lines[index])
                 )
-                return
+                found = True
+                if not every:
+                    return
+        if found:
+            return
 
         self._lines.insert(span.end, _assignment(option, value))
 
-    def remove_option(self, section: str, option: str) -> bool:
-        """Delete *option* from *section*. Returns whether there was one."""
+    def remove_option(self, section: str, option: str, *, every: bool = False) -> bool:
+        """Delete *option* from *section*. Returns whether there was one.
+
+        *every* deletes all of them; see :meth:`set` for why a file can carry
+        the same key twice and why leaving the others behind is worse than it
+        looks. Bottom up, so an earlier index stays valid while later ones go.
+        """
 
         span = self._span(section)
         if span is None:
             return False
-        for index in range(span.start, span.end):
-            if _option_name(self._lines[index]) == option:
-                del self._lines[index]
-                return True
-        return False
+        matches = [
+            index
+            for index in range(span.start, span.end)
+            if _option_name(self._lines[index]) == option
+        ]
+        if not matches:
+            return False
+        for index in reversed(matches if every else matches[:1]):
+            del self._lines[index]
+        return True
 
     def append_lines(self, lines: Sequence[str]) -> None:
         """Append *lines* verbatim at end of file, after one blank separator.

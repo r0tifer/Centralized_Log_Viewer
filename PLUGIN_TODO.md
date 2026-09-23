@@ -47,7 +47,7 @@ that argument; Phase 7b is the exception, and it is here because designing the
 | **Stage E — Trust and distribution** | | |
 | 13 — Isolation | An opt-in subprocess host, and honesty about what it buys | ✅ Done |
 | 14 — The CLI layer | `clv` grows an argv, without changing what bare `clv` does | ✅ Done |
-| 15 — Registry | Manifests, `clv plugin install`, signatures, no hosted index | ⬜ Not started |
+| 15 — Registry | Manifests, `clv plugin install`, signatures, no hosted index | ✅ Done |
 | **Stage F — Release** | | |
 | 16 — Documentation & release | The plugin chapter, worked examples, 3.0.0 | ⬜ Not started |
 
@@ -3076,6 +3076,136 @@ because it is the one that works with no network at all.
 machine with only the binary, verified, enabled, and used. A crafted archive
 cannot write outside the plugin directory. Suite green on 3.11 and 3.14.
 
+Checked by hand end to end: a plugin packaged with `sha256sum` and
+`ssh-keygen -Y sign`, `tar czf`'d under a `name-version/` wrapper, installed
+from a `file://` URL, reported **untrusted**, then trusted and re-verified
+without reinstalling, tampered with and caught by both `verify` and `doctor`,
+and removed with its enable-list entry dropped and its `[plugin:<name>]` section
+kept. The malicious archives and the URL guards are covered by
+`tests/test_plugin_registry.py` rather than by hand — said plainly, because the
+rest of this paragraph is a by-hand claim and the two should not be read as one.
+
+**As shipped.** Six decisions worth recording.
+
+*Signatures are `ssh-keygen -Y`, and the operator's own key material.* The
+stdlib has no asymmetric crypto and Requirement 7 forbids adding a dependency,
+which left hand-rolling Ed25519 or reusing something already on the machine.
+OpenSSH's signature mode is the second, and it is the same posture the SSH
+transport already takes — *CLV uses the setup the operator already has*. A key
+they keep in `~/.ssh/allowed_signers` for git works unchanged, and there is no
+crypto in this tree to maintain or get wrong. Three consequences were chosen
+deliberately: `-n clv-plugin` is mandatory, so a signature made over some other
+file for some other purpose cannot replay as a plugin signature; the signer is
+resolved by `ssh-keygen -Y find-principals` against the operator's store rather
+than declared in the manifest, so a plugin cannot assert who signed it and have
+CLV repeat the claim; and `unverifiable` — no `ssh-keygen` installed — is its
+own state rather than being folded into `unsigned`, because "we could not check"
+and "there was nothing to check" are different facts and an operator acts
+differently on each.
+
+*A manifest is compulsory for an archive or a URL, optional for a local path.*
+The asymmetry is the whole distinction between the two doors. A local `foo.py`
+is the documented `cp` under another name, with the operator looking straight at
+it; a tarball arrived from somewhere else and has to say what it is before CLV
+unpacks it into an import path. An unmanifested install is recorded as such and
+`verify` later says there is nothing to check rather than presenting a hash CLV
+computed from the file itself as evidence about it — a digest is worth something
+only if it came from somewhere the file did not.
+
+*The record is JSON, in a dot-prefixed directory, and the manifest is kept
+beside it.* `.installed/<name>.json` rather than `.toml`, because `tomllib`
+parses and does not write: honouring the suffix would mean hand-rolling a
+serializer for a file CLV then re-parses, and an apostrophe in an author's name
+is enough to make that a correctness bug in the file the integrity check depends
+on. The authored manifest is TOML and is read exactly as specified. It is also
+kept **byte-for-byte** next to the record, which was not in the plan and turned
+out to be the point: a signature covers exact bytes, so paraphrasing them into
+JSON would make re-verification impossible, and re-verification is what lets an
+install that read `untrusted` in March read `verified` in April because a key was
+trusted in between. Trusting keys rather than files is the entire idea, and
+without the kept manifest it would not have worked.
+
+*Extraction is manual, and streamed.* `extractfile()` with a chunked copy rather
+than `extractall()`, because `tarfile`'s filtering default differs between the
+3.11 floor and the 3.14 this was written on, and `data_filter` does not exist
+before 3.11.4 at all — doing it by hand is what makes the rules identical on
+both, which Requirement 8 needs. And `r|*` rather than `r:*`, which is the less
+obvious half: `getmembers()` on a seekable archive decompresses the whole thing
+to build its index, so a bomb would already have cost exactly what the cap exists
+to prevent before the first member was judged. Streaming means a member is judged
+from its header and an over-budget one stops the read. The decompressed-byte cap
+is then checked **per chunk** rather than against the header's `size`, because
+the header is the archive's own claim about itself.
+
+*`remove` drops the enable-list entry and keeps the config section.* Two
+asymmetries, each with a line of output. The name comes out of `plugins`,
+because leaving it would report the plugin as named-but-absent on every launch
+from then on — accurate, and indistinguishable from a bug to whoever just ran
+the command. The `[plugin:<name>]` section stays, because it is what the operator
+wrote and a reinstall should not mean setting it up again; `--purge` removes it
+for the operator who wants it gone.
+
+*Tamper detection is in `doctor` as well as `verify`.* The phase text framed
+`verify` as "the check nobody runs until they need it", which is true and is an
+argument for putting it somewhere people already go. `clv doctor` re-hashes and
+reports beside the plugin's own row; the `P` dialog does **not**, and gets only
+the provenance line, because opening a dialog should not cost work proportional
+to what is installed. `manifest.annotate()` is one function with two callers —
+the dialog and the report — for the same reason `PluginRegistry.status()` lives
+where it does.
+
+**Found rather than chosen.** Four, and the first two are the phase text's own
+claims turning out to need more than they said.
+
+*`--sha256` exists because everything else the install checks comes from inside
+the archive.* The phase text asks for the payload to be "checksum-verified
+before anything is unpacked", and writing it exposed that there was nothing to
+verify it *against*: a manifest's checksums prove the files match the manifest,
+which anyone who replaced both can arrange, and they live inside the thing being
+checked. So `install` takes a digest the operator got out of band — from the
+download page, or from whoever sent them the file — and hashes the archive as a
+file before a single member is read. It is optional, and it is the only number
+in the whole flow that an attacker holding the archive cannot rewrite. The
+publishing instructions say to publish one.
+
+*A broken signature is `bad` whether or not its signer is trusted.* Written
+first as "find out who signed it, then check it", which put the trust-store
+lookup ahead of the signature check — and since CLV ships no keys, the ordinary
+state of every installation is trusting nobody, so a tampered manifest fell
+straight through to `untrusted`, whose sentence says the signature is valid and
+only the signer is unknown. `ssh-keygen -Y check-novalidate` answers "are these
+the bytes that were signed" without consulting the store at all, and now runs
+first. The distinction is pinned by a test that trusts nobody deliberately.
+
+*`clv/plugins/` is a plugin drop-in directory, and the two new modules were
+promptly loaded as plugins.* `_LOADER_MODULES` existed for exactly this and held
+one name, `host`. `manifest.py` and `install.py` went in beside it and the flat
+walk imported both, found their dataclasses, failed to instantiate them, and
+reported two broken bundled plugins to the operator — caught by running
+`clv doctor` by hand, which no test would have covered. The tuple now has three
+names and a test asserts it covers **every** non-drop-in module in the package,
+so the next one cannot repeat it.
+
+*A settings file can carry the same key twice, and the two readers of it
+disagree about which one wins.* `configparser`, which `config.py` loads through,
+takes the **last**; `SettingsDocument`, which every edit goes through, takes the
+first. So `clv plugin remove` edited the first `plugins =` — the empty one the
+template ships — reported success, and changed nothing, with the plugin still
+enabled. This is not new and is not confined to this phase: `persist_setting` has
+the same blind spot wherever an operator appended a key rather than editing the
+one they had, which is what the README's own instructions invite. Fixed narrowly
+rather than globally: `SettingsDocument.values()` returns every assignment so a
+caller can agree with the reader that *loads* the file, and `set`/`remove_option`
+take `every=` to rewrite all of them. Both default to the old behaviour, because
+an unconditional switch would quietly rewrite a second assignment someone may
+have put there deliberately.
+
+**Also swept here.** `clv/app.py`'s `import sys` became unused when Phase 14
+moved the config flags to `clv/cli.py` and was removed. The `README.md` plugin
+chapter gained the packaged-install, signature, verification and removal
+sections beside the manual `cp`, which stays documented and stays supported as
+the path that works with no network at all.
+
 **Commit.** `feat(cli): plugin manifests, install, verify and trust`
 
 ---
@@ -3174,8 +3304,10 @@ reason that survives the decision to include everything else.
 | `clv/plugins/__init__.py` | 1,3,5,6,7a,13 | Loader, search roots, ordering, timing, registries, host |
 | `clv/api.py` | 2, all seams | **New** — the published surface, extended per phase |
 | `clv/plugins/host.py` | 13 | **New** — the subprocess host and the wire protocol |
-| `clv/cli.py` | 14,15 | **New** — argv, `doctor`, `plugin` subcommands. Absorbed the parser that was in `app.py`, which keeps `main`/`run` as shims |
-| `clv/plugins/manifest.py` | 15 | **New** — manifest parsing, checksums, signatures |
+| `clv/cli.py` | 14,15 | **New** — argv, `doctor`, the six `plugin` subcommands. Absorbed the parser that was in `app.py`, which keeps `main`/`run` as shims |
+| `clv/plugins/manifest.py` | 15 | **New** — manifest parsing, checksums, signatures, the install record |
+| `clv/plugins/install.py` | 15 | **New** — the URL fetcher and the hostile-archive extractor. Split from the row above on landing: one of them handles input from the internet and the other does not, and the malicious-archive tests should target a module that does nothing else |
+| `clv/services/settings_file.py` | 15 | `values()`, and `every=` on `set`/`remove_option` — a duplicated key edited in the wrong place |
 | `clv/services/config.py` | 3,5,6,13 | `plugins`, `[plugin:<name>]`, `plugin_time_budget_ms`, `plugin_host_timeout_ms` |
 | `clv/services/parsing.py` | 7a,7b | `LogParser(formats=...)`, injected dispatch, `FORMAT_NAMES`, the logfmt matcher and the ISO deferral |
 | `clv/services/query.py` | 8 | Operator registry, computed fields, generated `_TERM_RE` |

@@ -280,6 +280,12 @@ class PluginsDialog(ModalScreen[Optional[tuple[PluginStatus, ...]]]):
                 "⚑ Reads your log lines and delivers them wherever it is "
                 "configured to send them."
             )
+        if row.provenance:
+            # Under the origin, which says *where the file is*; this says where
+            # it came from and who vouched for it. Empty for a bundled plugin
+            # and for one copied in by hand, so no row grows a line saying CLV
+            # has nothing to tell you.
+            parts.append(row.provenance)
         if row.state == "isolated":
             # Ahead of `detail`, which for an isolated row is CLV's own summary
             # of the same fact. This is the sentence that has to survive being
