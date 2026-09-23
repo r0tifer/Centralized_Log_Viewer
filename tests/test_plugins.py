@@ -1714,6 +1714,41 @@ def test_every_ordered_registry_is_sorted_not_only_the_filters() -> None:
     assert [p.name for p in registry.exporters] == ["early-exporter", "late-exporter"]
 
 
+def test_every_kind_the_registry_keeps_is_in_the_sort() -> None:
+    """Driven off ``_KINDS``, because two lists were missed once already.
+
+    ``matchers`` and ``sinks`` were left out of ``order()`` when the watch seam
+    landed, while both docstrings said they ran in ``plugin_sort_key`` order —
+    invisible for a matcher, which is looked up by kind, and a sink delivered
+    to in filesystem order for a release. A seam phase adds a list here every
+    time, so the assertion is over the table rather than over a list someone
+    remembered to name.
+    """
+
+    from clv.plugins import _KINDS
+
+    registry = PluginRegistry()
+    for _label, interface in _KINDS:
+        kept = registry._list_for(_label)
+        kept.append(_Named(f"late-{_label}", 900, interface))
+        kept.append(_Named(f"early-{_label}", 1, interface))
+
+    registry.order()
+
+    for label, _interface in _KINDS:
+        assert [p.name for p in registry._list_for(label)] == [
+            f"early-{label}",
+            f"late-{label}",
+        ], label
+
+
+class _Named:
+    """A stand-in for a plugin of any kind: ``order()`` reads nothing else."""
+
+    def __init__(self, name: str, priority: int, interface: type) -> None:
+        self.name, self.priority, self.interface = name, priority, interface
+
+
 def test_load_plugins_orders_what_it_loaded(user_root) -> None:
     root = user_root()
     (root / "zzz_first.py").write_text(

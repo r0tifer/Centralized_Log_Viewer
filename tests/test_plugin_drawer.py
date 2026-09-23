@@ -29,7 +29,7 @@ from clv.plugins import (
 )
 from clv.services.config import load_config
 from clv.widgets.advanced_drawer import AdvancedFiltersDrawer
-from clv.widgets.plugins_dialog import PluginsDialog
+from clv.widgets.plugins_dialog import STATE_MARKS, PluginsDialog
 
 
 def _run(scenario) -> None:
@@ -135,6 +135,47 @@ async def _highlight(app, pilot, index: int):
     return app.screen
 
 
+def test_the_detail_says_where_a_plugin_came_from_and_who_signed_it() -> None:
+    """``PLUGIN_TODO.md`` Phase 15: unsigned is reported "in the output **and in
+    the drawer**".
+
+    One more line under the origin, not a column — the origin says where the
+    file *is*, this says where it came from. A bundled plugin and one copied in
+    by hand have no such line at all, because CLV never saw them arrive and will
+    not invent a verdict on a file it did not install.
+    """
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.push_screen(
+                PluginsDialog(
+                    [
+                        replace(
+                            ROWS[0],
+                            provenance=(
+                                "installed 1.2.0 from https://example.org/x.tar.gz "
+                                "— unsigned"
+                            ),
+                        ),
+                        replace(ROWS[1], provenance=""),
+                    ]
+                )
+            )
+            await pilot.pause()
+
+            first = _detail(await _highlight(app, pilot, 0))
+            assert "https://example.org/x.tar.gz" in first
+            assert "unsigned" in first
+
+            second = _detail(await _highlight(app, pilot, 1))
+            assert "installed" not in second
+            assert "unsigned" not in second
+
+    _run(scenario)
+
+
 def test_a_multi_kind_plugin_lists_every_interface_it_supplies() -> None:
     async def scenario() -> None:
         app = LogViewerApp()
@@ -148,6 +189,53 @@ def test_a_multi_kind_plugin_lists_every_interface_it_supplies() -> None:
             await pilot.pause()
 
             assert "source, filter, exporter" in _rows(app.screen)[0]
+
+    _run(scenario)
+
+
+def test_a_clustering_plugin_says_which_half_of_the_seam_it_supplies() -> None:
+    """Two kinds, two labels, and both short enough to survive a narrow pane.
+
+    A module supplying both halves is the ordinary case — a rule and the
+    contributor that keeps its clusters apart usually ship together — so the
+    row has to say which it has rather than "clustering".
+    """
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.push_screen(
+                PluginsDialog(
+                    [replace(ROWS[0], kinds=("cluster rule", "shape"))]
+                )
+            )
+            await pilot.pause()
+
+            assert "cluster rule, shape" in _rows(app.screen)[0]
+
+    _run(scenario)
+
+
+def test_a_timeline_plugin_says_which_half_of_the_seam_it_supplies() -> None:
+    """`timeline` and `metric`, not "timeline" for both.
+
+    They are different promises: one puts marks on an axis, the other changes
+    what every bucket on that axis measures. An operator deciding whether to
+    enable a module needs to know which it is getting, and `metric` is also the
+    kind that can lose a tie-break to another plugin.
+    """
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.push_screen(
+                PluginsDialog([replace(ROWS[0], kinds=("timeline", "metric"))])
+            )
+            await pilot.pause()
+
+            assert "timeline, metric" in _rows(app.screen)[0]
 
     _run(scenario)
 
@@ -843,5 +931,51 @@ def test_a_plugin_reads_its_section_through_the_app(tmp_path: Path) -> None:
             )
 
             assert seen == {"replacement": "***"}
+
+    _run(scenario)
+
+
+# --- the isolated row -------------------------------------------------------
+
+
+def test_an_isolated_row_says_what_containment_does_and_does_not_buy() -> None:
+    """The fifth state, and the one sentence an operator meets it with.
+
+    `isolated` was reserved by Phase 4 and produced by nothing until the host
+    landed. It is a *quiet* state — a plugin in a child process is healthy, and
+    painting it the colour a broken one gets would make containment look like
+    something to fix — so the row is dim and the honest sentence is in the
+    detail pane rather than in a toast nobody would see again.
+    """
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.push_screen(
+                PluginsDialog(
+                    (
+                        PluginStatus(
+                            name="shipper",
+                            origin="/home/x/.config/clv/plugins/shipper",
+                            source="user",
+                            kinds=("exporter",),
+                            state="isolated",
+                            detail="runs in a subprocess CLV can stop",
+                        ),
+                    )
+                )
+            )
+            await pilot.pause()
+
+            row = _rows(app.screen)[0]
+            assert "shipper" in row and "isolated" in row
+            assert row.startswith(STATE_MARKS["isolated"])
+
+            detail = _detail(await _highlight(app, pilot, 0))
+            assert "separate process" in detail
+            assert "stop" in detail
+            # The half that cannot be dropped: containment is not safety.
+            assert "still runs as you" in detail
 
     _run(scenario)

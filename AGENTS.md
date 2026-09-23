@@ -124,9 +124,10 @@ distros.
 | Layer | Location | Owns | Must not |
 | --- | --- | --- | --- |
 | **App shell** | `clv/app.py` | Layout, routing, lifecycle, breakpoints | Parse, filter, read files, or define widget visuals |
+| **CLI** | `clv/cli.py` | argv: the config flags, `clv doctor`, the `clv plugin` group | Import Textual outside the branch that launches the viewer, change what bare `clv` does, or let anything a plugin supplies reach `SUBCOMMANDS` |
 | **Services** | `clv/services/` | Source identity (`refs.py`), source IO (`backend.py`), parsing, filtering, discovery, reading, buffering, config, settings-file editing (`settings_file.py`), source management | Touch the UI or import Textual, or reach past `backend.py` to `os` |
 | **Widgets** | `clv/widgets/` | Self-contained UI + own `DEFAULT_CSS`; also the shared, Textual-free renderable vocabulary the pane is built from — `severity.py` (the palette), `columns.py` (the structured row), `payloads.py` (the JSON/XML/HTML/CSS/CSV preview) | Depend on other widgets' internals or import `clv.app` |
-| **Plugins** | `clv/plugins/` | Extension interfaces + loader; also the two things that spawn a subprocess and so need consent — `sources/journald.py` and `sources/ssh.py` (the SSH transport and `RemoteBackend`) | Break interface contracts, or spawn anything before the operator opts in |
+| **Plugins** | `clv/plugins/` | Extension interfaces + loader; distribution (`manifest.py`, `install.py`); the four things that spawn a subprocess and so need consent — `sources/journald.py`, `sources/ssh.py` (the SSH transport and `RemoteBackend`), `host.py` (the isolation host, spawned only for a plugin that asked to be contained) and `manifest.py` (`ssh-keygen -Y`, and only ever from an explicit `clv plugin` command — never from a render, a load or `clv doctor`) | Break interface contracts, or spawn anything before the operator opts in |
 | **State** | `clv/storage.py` | JSON session persistence (atomic), including `SavedView` records | Depend on the UI |
 
 ### Services
@@ -308,7 +309,11 @@ distros.
   than ranges recomputed from the data, which is what lets a tailed line find
   its bucket by arithmetic; when an arrival falls outside the grid `extend`
   says so and the caller rebuilds, rather than guessing. An entry with no
-  timestamp is counted in `undated` and reported, never placed.
+  timestamp is counted in `undated` and reported, never placed. Two plugin
+  seams: a `TimelineAnnotation` marks the axis, and a `TimelineMetric` says
+  what a bucket measures — declared as a per-entry value CLV sums, because the
+  fixed grid above is what makes a non-foldable metric unexpressible rather
+  than broken.
 - `clustering.py` — what `c` collapses. A line's *shape* is its message with the
   volatile tokens normalised away, plus its level and its source — so a WARN and
   an ERROR that read alike stay apart, and a merged view never folds two logs
@@ -325,6 +330,39 @@ distros.
   `App.copy_to_clipboard`. OSC 52 has no continuation form, so an oversized
   payload is truncated at a line boundary and reported, never chunked and never
   silently dropped.
+
+### Distribution
+
+Two modules under `clv/plugins/`, kept apart because one of them is the
+security surface and the other is not.
+
+- `manifest.py` — what a packaged plugin *claims*: `clv-plugin.toml` parsed
+  with `tomllib`, the SHA-256 of every file it declares, the detached signature,
+  and the record CLV keeps of an install under `plugins/.installed/`. Not to be
+  confused with `manifest_for()` in `plugins/__init__.py`, which describes a
+  live plugin object across the isolation host's pipe — same word, unrelated
+  jobs, and both docstrings say so. Three things are deliberately not CLV's to
+  decide: **who is legitimate** (no bundled trust root, ever — a shipped key
+  would make CLV the arbiter of which plugins are real, which is a hosted index
+  through a side door), **who signed it** (`ssh-keygen -Y find-principals`
+  answers from the operator's own allowed-signers file, so a manifest cannot
+  assert its own signer), and **what a signature is for** (`-n clv-plugin` is
+  mandatory, or a signature made over some other file for some other purpose
+  replays as a plugin signature). The manifest is kept byte-for-byte because a
+  signature covers exact bytes: that is what lets an install that read
+  `untrusted` read `verified` once a key is trusted, with no reinstall.
+- `install.py` — what *acts* on the claim, and the one module here that handles
+  hostile input. Extraction is manual (`extractfile()` and a chunked copy) so
+  the rules are identical on the 3.11 floor and on 3.14, where `tarfile`'s
+  filtering default differs and `data_filter` does not exist before 3.11.4. The
+  archive is read as a **stream** (`r|*`), because `getmembers()` decompresses
+  the whole thing to build an index and a bomb would already have cost what the
+  cap exists to prevent. Members are judged by name and by kind before a byte is
+  read; the decompressed-byte cap is checked per chunk rather than against the
+  header's own claim about itself. Nothing reaches the plugin directory until
+  everything has passed, so a refusal leaves it byte-for-byte as it was — which
+  is what the malicious-archive tests assert, and the half of "refused" that is
+  easy to lose.
 
 ### Data flow
 ```
@@ -386,6 +424,8 @@ config.load_config ─→ SourceManager ─→ discovery.discover (thread)
 | `SaveViewDialog` | dismiss value | The name to save the current filters under, or `None` |
 | `ViewPickerDialog` | dismiss value | `ViewRequest(action, name, new_name)`, or `None` when closed. The dialog never edits state; the app acts and reopens it |
 | `WatchRulesDialog` | dismiss value | The edited rule set, or `None` when nothing changed — so a dialog that was only looked at costs no re-indexing |
+| `CommandsDialog` | dismiss value | The chosen `command_name`, or `None`. Runs nothing itself — the app invokes, so third-party code never runs in a widget's event handler |
+| `PluginPanelScreen` | injected callback | Each control change is handed to the callback the app supplied, which returns a replacement `Panel`, a dismissing one, or `None`. The widget imports nothing from `clv.plugins`; the guard, the budget and the disable all live in the app |
 | `RemoteHostsDialog` | dismiss value | The full host list, or `None` when nothing was edited. The dialog holds a working copy and hands back the whole thing, so Escape genuinely discards; the app diffs *records* against the file, which is what leaves a section the parser skipped in place |
 | `SSHConfigImportDialog` | dismiss value | The `~/.ssh/config` aliases the operator ticked, or `None` when none were — never an empty tuple, so "cancelled" and "picked nothing" stay one fact |
 | `AdvancedFiltersDrawer` | `ScanSSHConfigRequested` | Look in `~/.ssh/config` for machines to import. Carries nothing: the drawer does not read that file, know what a host is, or write `settings.conf` |
@@ -417,7 +457,7 @@ shared globals or reaching into another widget's tree.
 
 ## Plugins
 
-Six interfaces in `clv/plugins/__init__.py`:
+Thirteen interfaces in `clv/plugins/__init__.py`:
 
 | Interface | Method | Purpose |
 | --- | --- | --- |
@@ -426,7 +466,14 @@ Six interfaces in `clv/plugins/__init__.py`:
 | `QueryOperator` | `test(stored, value) -> bool` | A comparison token the query grammar does not have |
 | `ComputedField` | `value(entry) -> str \| None` | A queryable field derived rather than parsed |
 | `FilterStage` | `apply(entry, context) -> LogEntry \| None` | Transform or drop entries |
+| `ClusterRule` | `pattern`, `placeholder` — CLV substitutes | One more volatile token for the repeat clusterer to normalise out |
+| `ShapeContributor` | `contribute(entry) -> str` | An extra component of the key two entries must share to cluster |
+| `TimelineAnnotation` | `annotations(window) -> (moment, label, level)…` | Marks on the timeline's axis — deploys, incidents, maintenance |
+| `TimelineMetric` | `metric_name`, `value(entry) -> float \| None` — CLV sums | What a bucket measures, if not entries. Per-entry only, so it stays foldable |
+| `WatchMatcher` | `matches(entry, rule) -> bool` | A watch rule kind that is not "this pattern matched" |
+| `WatchSink` | `deliver(name, count, context, entries)` | Where a watch hit goes, besides the toast |
 | `Exporter` | `export(entries, context) -> ExportResult` | Send the current view somewhere |
+| `Command` | `run(context) -> Panel \| None`, optional `on_control(id, value, context)` | A named action, invoked by key or from `C`. The one seam a plugin is *asked* through; it draws only by describing a `Panel` CLV builds |
 
 Published as a versioned surface in `clv/api.py` — that, not this module, is
 what a plugin imports. See `clv/plugins/AGENTS.md`.
@@ -499,9 +546,15 @@ installed" — the trade Item 12 asked for.
   and `workspace` fixtures, and every assertion runs against another backend —
   which is how `RemoteBackend` is held to the same behaviour as `LocalBackend`.
 
-Run: `python -m pytest` (2042 passed, 1 skipped, 11 deselected) on **both** 3.11
+Run: `python -m pytest` (2528 passed, 1 skipped, 11 deselected) on **both** 3.11
 and 3.14 — the local default is 3.14 and a green suite there is not evidence
 that the supported floor still works.
+
+Six of those need `ssh-keygen` and skip without it: the plugin-signature
+round-trips in `tests/test_plugin_registry.py` generate a throwaway key, sign
+and verify locally, and touch no network. A machine with no OpenSSH reports
+seven skipped rather than one, which is the suite being honest about what it
+could not check rather than a failure.
 
 ---
 
@@ -509,15 +562,27 @@ that the supported floor still works.
 
 - Read only what the operator configured or explicitly selected.
 - **No telemetry and no exfiltration**, absolutely. Network access is limited to
-  hosts the operator names, over SSH, using their own credentials, initiated
-  only by an explicit action, and never with elevated privilege. CLV reports
-  nothing anywhere, to anyone, ever — that part is not narrowed and will not be.
+  hosts the operator names, initiated only by an explicit action, and never with
+  elevated privilege. CLV reports nothing anywhere, to anyone, ever — that part
+  is not narrowed and will not be.
+
+  Two shapes of it, and both are outbound-only and operator-initiated. Reading a
+  remote source is SSH with the operator's own credentials. `clv plugin install
+  <url>` is an https `GET` of exactly the URL they typed — no redirect to another
+  host, no `http`, nothing sent but the request, and the payload written to disk
+  and checksum-verified before anything is unpacked. Neither carries anything
+  about the operator, their logs or their machine.
 - **No privilege escalation, anywhere.** No `sudo`, `doas` or `pkexec`, local or
   remote, not behind a setting. An unreadable file is reported, with the group
   or ACL that would fix it; it is never read by becoming someone else.
 - **No credentials.** No password field in the config schema, in any dialog, in
   `SessionState`, or in memory. A connection that needs interactive input fails
   as unreachable. Host key verification is never disabled, not even for testing.
+- **No trust root.** CLV ships no signing key and will not. A plugin signature
+  is checked against `~/.config/clv/plugin-signers`, which is empty until the
+  operator puts something in it — a bundled key would make CLV the arbiter of
+  which plugins are legitimate, which is the hosted-index commitment under
+  Non-Goals arriving through a side door.
 - Treat log contents as sensitive; never copy them into caches or temp files.
   Session state stores paths and filter settings, never log content — which
   is why marks (`services/marks.py`) live for the session only.
@@ -537,10 +602,12 @@ that the supported floor still works.
   management. CLV uses the SSH setup the operator already has.
 - Heavy parsing DSLs or schema-aware pipelines.
 - Background daemons or privileged operations. The opt-in plugin isolation host
-  planned in [PLUGIN_TODO.md](PLUGIN_TODO.md) Phase 13 is neither: it lives and
-  dies with the viewer, runs at the operator's own privilege and never above it,
-  and exists so a plugin that hangs can be *killed*. It is not a sandbox, and
-  `clv/plugins/AGENTS.md`'s trust model says so in those words.
+  ([clv/plugins/host.py](clv/plugins/host.py), `PLUGIN_TODO.md` Phase 13) is
+  neither: it lives and dies with the viewer, runs at the operator's own
+  privilege and never above it, is started only for a plugin whose author or
+  operator asked for it, and exists so a plugin that hangs can be *killed*. It
+  is not a sandbox, and `clv/plugins/AGENTS.md`'s trust model says so in those
+  words — containment, not safety.
 
 ### Reversed
 

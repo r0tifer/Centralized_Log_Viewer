@@ -45,3 +45,39 @@ def test_plugin_constraints_evaluate_against_the_real_version() -> None:
     major = clv.__version__.split(".")[0]
     assert satisfies(clv.__version__, f">={major}.0")
     assert not satisfies(clv.__version__, f">={int(major) + 1}.0")
+
+
+def test_the_plugin_api_version_is_not_the_application_version() -> None:
+    """Two numbers, moving independently, asserted apart on purpose.
+
+    CLV is 3.0.0 and the plugin API is 1.0, and that gap **is** the Phase 2
+    separation doing its job on its first outing: the doctrine reversals and the
+    new argv layer are major-version news for the application, while every
+    addition to the published surface since Phase 2 was additive and nothing
+    published was removed.
+
+    Asserted here rather than only in `tests/test_api_surface.py` so that a
+    future edit bumping the two together has to come through this file and
+    justify itself. A plugin declaring `requires_api = ">=1.0,<2.0"` is making a
+    promise about the surface, not about the release, and silently moving the
+    API version to match the app would break every such plugin for no reason.
+    """
+
+    from clv.plugins import PLUGIN_API_VERSION
+
+    assert PLUGIN_API_VERSION == "1.0"
+    assert PLUGIN_API_VERSION != clv.__version__
+
+
+def test_a_plugin_pinned_to_the_published_api_still_loads() -> None:
+    """The constraint every example declares, evaluated against this build.
+
+    `requires_api = ">=1.0,<2.0"` is what the author checklist tells people to
+    write. A release that made it unsatisfiable would disable every correctly
+    written plugin in existence, and would do it quietly -- each one reported in
+    the `P` dialog as `incompatible`, which reads like the plugin's fault.
+    """
+
+    from clv.plugins import PLUGIN_API_VERSION, satisfies
+
+    assert satisfies(PLUGIN_API_VERSION, ">=1.0,<2.0")

@@ -47,7 +47,7 @@ CONFIG_VERSION_OPTION = "config_version"
 #: template's option set changes. Deliberately not ``__version__``: most
 #: releases do not touch the settings schema, and stamping the app version
 #: would re-migrate every operator's file for nothing.
-CURRENT_CONFIG_VERSION = 4
+CURRENT_CONFIG_VERSION = 5
 
 #: One remote host per section: ``[ssh:web01]``. The suffix is the host's name
 #: within CLV — what the tree shows, what ``node:`` matches, and the fallback
@@ -125,6 +125,20 @@ _LIMITS: dict[str, tuple[int, int, int]] = {
     # already the slowest thing between opening a log and seeing it. Floor is
     # zero and means no guard, exactly as above.
     "plugin_read_budget_ms": (50, 0, 60_000),
+    # Milliseconds a watch sink may spend inside one delivery before CLV stops
+    # waiting for it. Not a budget in the sense the two above are -- a sink runs
+    # on a thread of its own and being slow costs the pane nothing -- but a
+    # deadline: a sink that never returns would otherwise be fed forever and
+    # silently deliver nothing. Generous, because the thing on the other end is
+    # usually a network. Zero means no deadline.
+    "plugin_sink_timeout_ms": (5_000, 0, 60_000),
+    # Milliseconds an *isolated* plugin may take to answer one call -- including
+    # the handshake that starts its host -- before CLV kills the child and takes
+    # the plugin out of service. A deadline rather than a budget, like the sink
+    # timeout above, and the first one in CLV that can actually be enforced: a
+    # thread cannot be stopped from outside and a process can. Zero waits
+    # forever, which is what a plugin running in-process does anyway.
+    "plugin_host_timeout_ms": (5_000, 0, 60_000),
 }
 
 DEFAULT_SETTINGS_TEMPLATE = f"""[{CONFIG_SECTION}]
@@ -232,6 +246,31 @@ plugin_time_budget_ms = 250
 #
 # Set to 0 to turn this guard off too.
 plugin_read_budget_ms = 50
+
+# milliseconds. How long a watch sink - a plugin that delivers a watch hit
+# somewhere, typically over the network - may spend in one delivery before CLV
+# gives up on it, takes it out of service and says so in the plugins dialog (P).
+# A sink runs on its own thread and never blocks the viewer, so this is not
+# about speed: it is the only thing standing between a webhook whose endpoint
+# stopped answering and a sink that is fed for the rest of the session and
+# quietly delivers nothing.
+#
+# Set to 0 for no deadline.
+plugin_sink_timeout_ms = 5000
+
+# milliseconds. How long a plugin that runs in its own process - one that
+# declared `isolated = True`, or one you isolated with `isolated = true` in its
+# own [plugin:<name>] section below - may take to answer one call before CLV
+# kills it and says so in the plugins dialog (P).
+#
+# This is the only ceiling in CLV that can actually be enforced. The render
+# budgets work by measuring a pass and declining to start the next one, so a
+# plugin that hangs inside a call hangs the viewer; a child process can simply
+# be killed. Isolation contains crashes, hangs and leaks - it does not make an
+# untrusted plugin safe, because the child runs as you, with your files.
+#
+# Set to 0 to wait forever, which is what an in-process plugin does anyway.
+plugin_host_timeout_ms = 5000
 
 # Read log folders on other machines over SSH. Off by default, and for a
 # stronger version of the reason above: a remote source spawns ssh, and a
@@ -421,6 +460,8 @@ class LogConfig:
     cluster_lookback: int = _LIMITS["cluster_lookback"][0]
     plugin_time_budget_ms: int = _LIMITS["plugin_time_budget_ms"][0]
     plugin_read_budget_ms: int = _LIMITS["plugin_read_budget_ms"][0]
+    plugin_sink_timeout_ms: int = _LIMITS["plugin_sink_timeout_ms"][0]
+    plugin_host_timeout_ms: int = _LIMITS["plugin_host_timeout_ms"][0]
     #: Ring the terminal bell when a watch rule notifies. Off by default: a
     #: bell is a thing an operator opts into, never a thing a log does to them.
     watch_bell: bool = False
@@ -522,6 +563,32 @@ def bundled_config_path() -> Path:
         return Path(meipass) / "settings.conf"
     # Development checkout: settings.conf sits beside the clv package.
     return Path(__file__).resolve().parents[2] / "settings.conf"
+
+
+def bundled_examples_dir() -> Path:
+    """Locate the worked example *sources*, wherever this build keeps them.
+
+    **The frozen build is the whole reason this exists**, and the failure it
+    fixes was silent in both directions. :data:`SEEDED_EXAMPLES` names its
+    modules as strings, so nothing in CLV statically imports ``clv.examples``
+    and PyInstaller's analysis never saw them — the modules were not in the
+    bundle at all, ``importlib.import_module`` raised, and
+    :func:`_seed_plugin_examples` swallowed it because seeding an example is the
+    least important thing that happens at startup. Every binary install
+    therefore got a ``README.txt`` listing nine files and a directory containing
+    none of them, and ``README.md`` told the operator they were "already on your
+    machine".
+
+    Even bundled, ``inspect.getsource`` would not have worked: PyInstaller ships
+    byte-compiled modules and no source. So they are shipped as **data**
+    (``--add-data clv/examples:clv/examples``) and read as files here, with the
+    import kept as the source-checkout path.
+    """
+
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return Path(meipass) / "clv" / "examples"
+    return Path(__file__).resolve().parents[1] / "examples"
 
 
 #: Backwards-compatible alias; the template is only a "repo" path when running
@@ -696,14 +763,42 @@ CLV's `clv/plugins/AGENTS.md`.
 Worked examples
 ---------------
 
-Two complete, commented plugins, each walking through what its kind of plugin
-has to declare and why:
+Nine complete, commented plugins -- one for every interface CLV publishes --
+each walking through what its kind of plugin has to declare and why:
 
     examples/nginx_error.py   teaches CLV to read nginx's error log, a format
                               the built-in matchers do not recognise
     examples/field_regex.py   adds `svc~^web[0-9]+` - a regex against one
                               field - and `age<60`, seconds since the line
                               was written
+    examples/watch_alerts.py  adds a `burst` watch rule kind - "five of these
+                              within a minute" - and a sink that appends every
+                              watch hit to a file you name. The sink ships
+                              inert: it delivers nothing until its
+                              [plugin:watch_alerts] section gives it a path
+    examples/cluster_rules.py teaches `c` to fold repeats it could not: a
+                              Kubernetes pod suffix and an ANSI colour run are
+                              normalised away, and one field of your choosing
+                              keeps two streams in separate clusters
+    examples/timeline_marks.py marks deploys on the timeline (`b`) and scales
+                              its bars by bytes rather than by lines. Ships
+                              inert: it marks nothing until its
+                              [plugin:timeline_marks] section lists moments
+    examples/commands.py      adds two commands to `C`: one sets the query to
+                              errors-only, one opens a panel that writes the
+                              filtered lines to a file you name. Its key is
+                              yours to pick, in [plugin:commands]
+    examples/redact_secrets.py hides the value beside `password=`, `token=`
+                              and friends wherever the line is shown - the
+                              pane, the detail pane, an export, the clipboard.
+                              Edit the list in [plugin:redact_secrets]
+    examples/html_report.py   adds an HTML report to `Ctrl+E`: one
+                              self-contained file carrying the query that
+                              produced it, ready to attach to a ticket
+    examples/container_logs.py offers every running container as a source,
+                              tailing live through podman or docker. Ships
+                              inert: it runs nothing until its
+                              [plugin:container_logs] section says enabled
 
 Nothing in `examples/` is listed or run: it is one directory down, and CLV
 only looks here. To use one, copy it up and name it:
@@ -733,6 +828,13 @@ PLUGIN_EXAMPLES_DIR = "examples"
 SEEDED_EXAMPLES: dict[str, str] = {
     "nginx_error.py": "clv.examples.nginx_error",
     "field_regex.py": "clv.examples.field_regex",
+    "watch_alerts.py": "clv.examples.watch_alerts",
+    "cluster_rules.py": "clv.examples.cluster_rules",
+    "timeline_marks.py": "clv.examples.timeline_marks",
+    "commands.py": "clv.examples.commands",
+    "redact_secrets.py": "clv.examples.redact_secrets",
+    "html_report.py": "clv.examples.html_report",
+    "container_logs.py": "clv.examples.container_logs",
 }
 
 
@@ -755,18 +857,42 @@ def _seed_plugin_examples(target: Path) -> None:
     except OSError:
         return
 
+    bundled = bundled_examples_dir()
     for filename, module in SEEDED_EXAMPLES.items():
         destination = target / filename
         if destination.exists():
             continue
-        try:
-            source = inspect.getsource(importlib.import_module(module))
-        except Exception:  # noqa: BLE001 - a stripped build has no source
+        source = _example_source(bundled / filename, module)
+        if source is None:
             continue
         try:
             destination.write_text(source, encoding="utf-8")
         except OSError:
             continue
+
+
+def _example_source(bundled: Path, module: str) -> Optional[str]:
+    """The text of one worked example, from the bundle or from the import.
+
+    The file first, because that is the only one of the two that works in a
+    frozen build -- see :func:`bundled_examples_dir`. The import second, because
+    a source checkout that has not been packaged has the module and may not have
+    thought about the data path, and because it is what this did before.
+
+    ``None`` rather than a raise: a missing example is a missing example, and a
+    startup that failed over one would be a far worse bug than the one this is
+    fixing.
+    """
+
+    try:
+        if bundled.is_file():
+            return bundled.read_text(encoding="utf-8")
+    except OSError:
+        pass
+    try:
+        return inspect.getsource(importlib.import_module(module))
+    except Exception:  # noqa: BLE001 - a stripped build has no source
+        return None
 
 
 def ensure_user_plugin_dir() -> Optional[Path]:
@@ -1479,6 +1605,8 @@ def load_config(path: Optional[Path] = None) -> LogConfig:
         cluster_lookback=_read_int(section, "cluster_lookback"),
         plugin_time_budget_ms=_read_int(section, "plugin_time_budget_ms"),
         plugin_read_budget_ms=_read_int(section, "plugin_read_budget_ms"),
+        plugin_sink_timeout_ms=_read_int(section, "plugin_sink_timeout_ms"),
+        plugin_host_timeout_ms=_read_int(section, "plugin_host_timeout_ms"),
         watch_bell=_read_bool(section, "watch_bell", False),
         enable_journald=_read_bool(section, "enable_journald", False),
         plugins=_read_plugin_list(section, issues),

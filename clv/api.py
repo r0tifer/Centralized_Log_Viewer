@@ -51,17 +51,29 @@ use it without a running screen. That is asserted, not intended.
 from __future__ import annotations
 
 from .plugins import (
+    CONTROL_KINDS,
+    MAX_PANEL_CONTROLS,
     PLUGIN_API_VERSION,
+    ClusterRule,
+    Command,
+    CommandContext,
     ComputedField,
+    Control,
     Exporter,
     ExportResult,
     FilterContext,
     FilterStage,
     LogFormat,
     LogSourceProvider,
+    Panel,
     Plugin,
     ProviderSource,
     QueryOperator,
+    ShapeContributor,
+    TimelineAnnotation,
+    TimelineMetric,
+    WatchMatcher,
+    WatchSink,
     setting_bool,
     setting_list,
 )
@@ -88,7 +100,9 @@ from .services.parsing import (
     normalize_level,
 )
 from .services.query import BUILTIN_OPERATORS, NORMALISED_FIELD_KEYS
+from .services.reader import TailRead
 from .services.refs import SourceRef
+from .services.watch import KIND_PATTERN, SINK_SAMPLE_LIMIT, WatchRule
 
 __all__ = [
     # The promise's own version. Constrain this, not clv.__version__.
@@ -100,7 +114,14 @@ __all__ = [
     "QueryOperator",
     "ComputedField",
     "FilterStage",
+    "ClusterRule",
+    "ShapeContributor",
+    "TimelineAnnotation",
+    "TimelineMetric",
+    "WatchMatcher",
+    "WatchSink",
     "Exporter",
+    "Command",
     # --- data handed to a plugin --------------------------------------------
     "LogEntry",
     "FilterContext",
@@ -111,6 +132,17 @@ __all__ = [
     # `LogSourceProvider.discover` may return one, so a provider author needs
     # the type even though CLV accepts a bare `Path` as shorthand.
     "SourceRef",
+    # What one bounded read produced, and the return type of a provider's
+    # `prime()` and `poll()`. Published in Phase 16 because writing the worked
+    # `LogSourceProvider` example found that it could not be written: the
+    # `open_reader` seam exists so a provider can *tail* rather than hand back a
+    # finite iterator, and the only way to satisfy it was to import
+    # `clv.services.reader` -- out of the package `clv/plugins/AGENTS.md` tells
+    # authors is internal and may move. Core duck-types the result, so a plugin
+    # returning some other object with the right attributes worked by accident
+    # and would have broken on the next field added here.
+    # Additive, so the API is still 1.0.
+    "TailRead",
     # --- declaring a format --------------------------------------------------
     # A `format_name` is four registrations and only one of them is the parser.
     # `FormatProfile` says which of a format's fields earn the source cell and
@@ -122,6 +154,50 @@ __all__ = [
     # may not claim. Published so an author can check rather than discover it
     # from a load error.
     "FORMAT_NAMES",
+    # --- extending the clustering --------------------------------------------
+    # No constant joins these two, and the absence is the point. `FORMAT_NAMES`,
+    # `BUILTIN_OPERATORS` and `KIND_PATTERN` are published because each names a
+    # namespace a plugin can collide in and would otherwise discover from a load
+    # error. Clustering has no such namespace: two rules may write the same
+    # placeholder harmlessly, and a contributor claims nothing at all.
+    # --- extending the timeline ----------------------------------------------
+    # `TimeWindow` is already published above, and it is the whole of what a
+    # `TimelineAnnotation` is handed -- no constant joins these two either. A
+    # metric claims no namespace (there is one metric and it is settled by
+    # priority, not by a name nobody else may take), and a mark claims nothing
+    # at all.
+    # --- extending the watch rules -------------------------------------------
+    # A matcher is handed the whole rule, because its `pattern` is the matcher's
+    # own parameter string and its `name` is the key to hold per-rule state
+    # under.
+    "WatchRule",
+    # The rule kind CLV owns, and therefore the one a `WatchMatcher` may not
+    # claim. Published on the same argument as `FORMAT_NAMES` and
+    # `BUILTIN_OPERATORS`: an author should be able to check rather than
+    # discover it from a load error.
+    "KIND_PATTERN",
+    # How many lines a `wants_entries` sink can actually be handed, so a sink
+    # sizes its payload against the real ceiling rather than against the count.
+    "SINK_SAMPLE_LIMIT",
+    # --- being invoked, and drawing --------------------------------------------
+    # What a command is handed, and -- through the four methods on it -- the
+    # only way it can answer back. Published together because neither is usable
+    # without the other: a `Command` that cannot name its context's type cannot
+    # be written against, and a context with nothing to hand it is not a seam.
+    "CommandContext",
+    # The vocabulary a plugin describes a modal with. CLV builds and styles the
+    # widgets; a plugin never ships one, and never ships CSS. Requirement 11 in
+    # two dataclasses: the breakpoints and the 80-column floor are CLV's, and a
+    # plugin widget in the tree would make every breakpoint test conditional on
+    # what happens to be installed.
+    "Panel",
+    "Control",
+    # The kinds a `Control` may declare and the ceiling on how many one panel
+    # may hold. Published on the same argument as `FORMAT_NAMES` and
+    # `BUILTIN_OPERATORS`: an author should be able to check rather than
+    # discover it from a refused panel.
+    "CONTROL_KINDS",
+    "MAX_PANEL_CONTROLS",
     # --- data a plugin hands back -------------------------------------------
     "ExportResult",
     # --- the severity vocabulary --------------------------------------------

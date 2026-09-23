@@ -76,9 +76,11 @@ desktop terminal and on a headless 80-column SSH session.
   do on a single file. A set may span machines: with SSH configured, local and
   remote logs interleave in one pane, and `node:` says which machine each line
   came from.
-- 🧩 **Plugins.** Seven interfaces — sources, log formats, query operators,
-  computed fields, filter stages and exporters — published as a versioned API
-  in `clv.api`. Install one by copying a file into
+- 🧩 **Plugins.** Thirteen interfaces — sources, log formats, query operators,
+  computed fields, filter stages, cluster rules, shape contributors, timeline
+  annotations, timeline metrics, watch rule kinds, watch destinations, exporters
+  and commands — published as a versioned API in `clv.api`, with a worked,
+  copyable example for every one of them. Install one by copying a file into
   `~/.config/clv/plugins/` — no root, no Python toolchain, and it survives a
   package upgrade. A file there is listed but **not run** until you name it in
   the `plugins` setting, so installing a plugin and running one stay two
@@ -113,7 +115,7 @@ Without root it installs under `~/.local`.
 
 ```bash
 # Pin a version, choose locations, or require a specific signing key
-install.sh --version v2.1.0
+install.sh --version v3.0.0
 install.sh --prefix ~/bin --libdir ~/opt/clv
 install.sh --gpg-fpr <fingerprint>     # fail unless SHA256SUMS is signed by this key
 ```
@@ -185,6 +187,7 @@ use.
 | `plugins` | Plugins to load from `~/.config/clv/plugins/`, comma separated, named without the `.py`. A file in that directory is listed but **not imported** until it is named here — installing a plugin and running one are two decisions. Plugins bundled with CLV are not listed here. | *(empty)* |
 | `plugin_time_budget_ms` | Wall time one plugin may spend on a single pass of the render path. A plugin over it on three consecutive passes is disabled and named in the `P` dialog. `0` turns the guard off. | `250` |
 | `plugin_read_budget_ms` | The same, for a plugin-supplied log format, measured over one batch of lines read from a file rather than over a render. `0` turns the guard off. | `50` |
+| `plugin_host_timeout_ms` | How long a plugin running in its own process may take to answer one call before CLV kills it. The only ceiling here that can actually be enforced — see [Running a plugin where it can be stopped](#running-a-plugin-where-it-can-be-stopped). `0` waits forever. | `5000` |
 | `enable_ssh` | Read log folders on machines named in `[ssh:<name>]` sections. Off by default, and for a stronger version of the same reason: a remote source spawns a *network* subprocess. With it false nothing connects, however many hosts are configured. | `false` |
 
 Invalid values fall back to safe defaults; the app never fails to start because
@@ -289,6 +292,49 @@ and a `log_dirs` line, leaving `ssh` to apply your own `Host` block.
 clv              # launch the TUI
 python -m clv    # module entry point
 ```
+
+### Command line
+
+`clv` with no arguments launches the viewer, and always will. Everything else is
+a subcommand that prints something and exits without starting a screen:
+
+```bash
+clv doctor                  # what this build is, what it read, what every plugin did
+clv plugin list             # what is installed, without importing any of it
+clv plugin info <name>      # one plugin's manifest, origin and signature
+clv plugin install <src>    # from a path, a .tar.gz or an https URL
+clv plugin verify [name]    # re-check installed plugins against their manifests
+clv plugin remove <name>    # delete it and stop it being enabled
+clv plugin trust <signer>   # trust a key that signs plugins
+clv --version               # which build you are actually running
+clv --print-default-config  # the newer settings template, to read
+clv --upgrade-config        # fold your settings into it (see Upgrading)
+```
+
+**`clv doctor` is the first thing to run when something is missing.** It reports
+the version and interpreter, which settings file was read and anything in it CLV
+could not honour, your plugin directories and what is in them, and one block per
+plugin: the interfaces it supplies, where it came from, whether it loaded, and
+the reason if it did not. It needs no terminal, so it works over a pipe and in a
+CI step, and it exits 0 even when a plugin is broken — a broken plugin is what it
+is for reporting.
+
+**No `clv plugin` command imports a plugin.** That is the point of them rather
+than an implementation detail: looking at what is installed is exactly what you
+do *before* deciding to trust it, and a listing that ran the code would be a poor
+way to inspect something you are unsure about. `clv plugin info` will tell you
+what a plugin declares, who signed it and what settings it is waiting for,
+without ever executing a line of it. Use `clv doctor` to see what a plugin
+actually did once enabled.
+
+Exit codes are `0` success, `1` failure, and `2` a usage error.
+
+Two things `clv` deliberately does not do. It does not take a log to open —
+`clv /var/log/syslog` says so and points at `a` and at `log_dirs`, because a
+source named on the command line would be forgotten the moment you closed the
+viewer. And **a plugin cannot add a subcommand**: an installed file must not be
+able to change what a shell command does. A plugin that wants to be invoked
+supplies a command instead, reachable from `C` and from its own key.
 
 ### Getting help
 
@@ -858,6 +904,22 @@ says so in the caption instead of drawing an empty rectangle.
 Whether the bar is open is remembered between runs, along with a **Timeline**
 switch in the Advanced drawer. Which bucket you had selected is not.
 
+**A plugin can mark the axis and change what a bucket measures.** A
+`TimelineAnnotation` puts deploys, incidents or maintenance windows on the bar —
+the marked column is underlined in the mark's own severity colour, its label
+shows in the caption, and `shift+←` / `shift+→` step between marks. A
+`TimelineMetric` scales the bar by something other than the line count: bytes,
+durations, retries. The caption then leads with the measurement and names the
+plugin supplying it, because a bar of bytes and a bar of lines are the same
+glyphs.
+
+A metric is declared as a value *per entry* and CLV does the summing, which is
+not a simplification — it is what keeps the histogram foldable, so a tailed line
+still finds its bucket by arithmetic instead of forcing a rebuild. A median
+cannot be expressed here, and that is the interface working rather than a
+limitation of it. `examples/timeline_marks.py` in your plugin directory works
+both halves through.
+
 ### Marking lines
 
 `m` marks the line under the cursor and `M` steps between the marks, wrapping
@@ -918,6 +980,15 @@ Clusters only form within `cluster_lookback` entries (200 by default, see
 [Configuration](#configuration)), so one cluster cannot quietly span a whole
 session and swallow an event from an hour ago. Whether clustering is on is
 remembered between runs; which clusters you had open is not.
+
+**The rules are extensible by plugin, and deliberately not from
+`settings.conf`.** A plugin can add a token to normalise away — an address, a
+pod name, a colour escape your logs are full of — and can widen the key so two
+streams stay in separate clusters. What it cannot be is a list of regexes in a
+config file: a typo there is a silently mis-clustered pane, with no review, no
+test and no way to tell a bad rule from a bad log. A plugin is Python someone
+can read and test, and CLV checks what it declares before running any of it.
+`clv/examples/cluster_rules.py`, in your plugin directory, is a worked one.
 
 ### Saved views
 
@@ -998,6 +1069,19 @@ something you typed, not something a log contained. Everything runs in-process
 for the life of the session — no daemon, no desktop notification service, no
 subprocess.
 
+**Both halves are extensible.** A plugin can add a *rule kind* — "five of these
+within a minute" rather than "this pattern matched" — and the `Kind` button
+appears in the rules dialog as soon as one is installed. A plugin can also add a
+*destination*, so a hit can go to a file, a webhook or anywhere else instead of
+only to a toast. Two guarantees hold whatever is installed: a destination is fed
+what the rate limiter already coalesced, so it cannot be used for a storm; and
+it runs on its own thread, so one that blocks cannot stall the viewer. A
+destination receives a rule name and a count, and receives your log lines only
+if it declares that it wants them — a plugin that does is flagged in the plugins
+dialog (`P`). A rule records the kind it needs, so one whose plugin is gone is
+kept exactly as written, marked unusable and named, rather than quietly matching
+something else. See `clv/plugins/AGENTS.md`.
+
 ### Exporting
 
 `Ctrl+E` writes the entries the filters kept to a file. Three formats ship:
@@ -1076,7 +1160,7 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `v` / `V` | Saved views (then `r` renames, `d` deletes) / save the current filters as a view |
 | `W` | Watch rules (then `a` adds, `d` deletes) |
 | `d` | Show / hide the event detail pane |
-| `b` | Show / hide the severity timeline (then `←` `→` `Enter` to filter to a bucket) |
+| `b` | Show / hide the severity timeline (then `←` `→` `Enter` to filter to a bucket, `shift+←` `shift+→` to step between plugin annotations) |
 | `c` | Collapse / expand repeated lines (then `Enter` on a cluster row) |
 | `w` | Follow new lines (auto-scroll) on/off |
 | `o` | Structured columns (time · level · source · message) on/off |
@@ -1088,11 +1172,20 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 | `Ctrl+L` | Copy mode (hides all chrome) |
 | `R` | Add, edit, test and remove remote hosts (SSH); also reachable from `a` |
 | `P` | Manage plugins (then `space` toggles, `r` re-enables) |
+| `C` | Run a plugin command (then `Enter` runs the highlighted one) |
 | `Ctrl+S` | Save added sources to `settings.conf` |
 | `Ctrl+R` | Reload configuration and rescan |
 | `q` | Quit |
 
 Every action has a keyboard path; mouse is fully supported but never required.
+
+**A plugin may add keys to this list, and they are always hidden.** A plugin
+command can ask for a key, and it never appears in the footer: the footer's
+ordering is tuned against an 80-column floor and a plugin cannot know what its
+entry would push off. Press `?` to see every binding an installed plugin added,
+listed under **Plugins** beside CLV's own. A key a plugin asks for that CLV
+already uses is refused rather than taken — the built-in keeps working, and the
+command stays runnable by name from `C`.
 
 ---
 
@@ -1201,7 +1294,14 @@ user-adjustable tree width. Responsive behavior comes from breakpoint classes
 
 ---
 
-## Installing a plugin
+## Plugins
+
+CLV is extended by plugins: thirteen interfaces, published as a versioned API in
+`clv.api`, covering everything from where lines come from to what a bucket on
+the timeline measures. This chapter is installing and managing them. Writing one
+starts at [`clv/plugins/README.md`](clv/plugins/README.md).
+
+### Installing a plugin
 
 Copy the file in, name it, restart:
 
@@ -1229,11 +1329,104 @@ Advanced drawer says how many are installed but not enabled; a name you list
 that isn't there is reported by name, so a typo says so rather than doing
 nothing.
 
+### Installing a packaged plugin
+
+A plugin published as a tarball carries a `clv-plugin.toml` declaring its name,
+its version and the SHA-256 of every file it ships. `clv plugin install` checks
+all of that before anything is copied:
+
+```bash
+clv plugin install ./nginx_format-1.2.0.tar.gz
+clv plugin install https://example.org/plugins/nginx_format-1.2.0.tar.gz
+clv plugin install --sha256 e3b0c442... https://example.org/nginx_format.tar.gz
+```
+
+**Installing still does not enable.** The command prints the exact line to add
+to `plugins` and leaves the adding to you — the same rule as copying a file in,
+at the command line, where it would be most convenient to break it.
+
+The manual `cp` above stays supported and stays documented. It is the path that
+works with no network, no manifest and no packaging, and `clv plugin install
+./my_plugin.py` is the same act with a record kept of it.
+
+What CLV checks, in this order, before a byte reaches your plugin directory:
+
+| Check | What happens if it fails |
+| --- | --- |
+| `--sha256`, if you gave one | The archive is hashed as a file and the install stops before anything is unpacked |
+| Its size | A download over 16 MB, or an archive expanding past 64 MB, is stopped mid-read |
+| The archive's shape | A member with `..`, an absolute path, a symlink, a hard link or a device node is refused and nothing is extracted |
+| The manifest's checksums | A file that does not match aborts the install, naming the file, before anything is copied |
+| The signature | A *broken* signature refuses; an absent or untrusted one installs and is reported |
+
+**`--sha256` is the only one of those that does not come from inside the
+archive.** Everything else reads something the archive says about itself, and an
+archive swapped in transit says whatever its replacer wanted — it can rewrite
+the files and the manifest's checksums together. A digest you got from the
+download page cannot be rewritten that way, so publish one if you distribute a
+plugin, and use one if you are given one.
+
+Downloads are `https` only and never follow a redirect to another host or to
+`http`. Nothing is ever imported to inspect it, at any point.
+
+#### Signatures, and who decides
+
+A plugin may ship a detached signature beside its manifest. CLV checks it
+against the keys **you** have trusted, and ships none of its own:
+
+```bash
+clv plugin trust "alice@example.com $(cat alice.pub)"
+clv plugin trust --list
+clv plugin verify                 # re-check everything installed
+```
+
+A signature is reported in one of five states — `verified`, `unsigned`,
+`untrusted` (signed by a key you have not trusted), `unverifiable` (no
+`ssh-keygen` installed) and `bad`. Only `bad` refuses an install: an absent
+signature is a choice the author made, a broken one is evidence. The format is
+OpenSSH's own, so a key you already keep in `~/.ssh/allowed_signers` works
+unchanged, and CLV never needs a key of yours.
+
+**CLV ships no trusted keys and will not.** A bundled key would make CLV the
+arbiter of which plugins are legitimate, which is a hosted plugin index arriving
+through a side door — see *Non-Goals* in
+[`clv/plugins/AGENTS.md`](clv/plugins/AGENTS.md). There is no index, no search
+and no auto-update, deliberately.
+
+#### Checking it is still what you installed
+
+```bash
+clv plugin verify              # re-hash everything, re-check every signature
+clv plugin info nginx_format   # manifest, origin, signature, its settings section
+```
+
+`clv doctor` reports a mismatch too, beside the plugin's own row, because that
+is the command you are asked for when something is wrong. A plugin you edited
+yourself reports as changed as well — that is the check working, not a warning
+about you.
+
+Signatures are re-checked against the keys you trust *now*, not the keys you
+trusted at install. Trusting a signer later turns an `untrusted` plugin into a
+verified one with no reinstall, which is the whole reason to trust keys rather
+than files.
+
+#### Removing one
+
+```bash
+clv plugin remove nginx_format            # files gone, name out of `plugins`
+clv plugin remove --purge nginx_format    # also delete its [plugin:…] section
+```
+
+Removing takes the name out of `plugins` — leaving it would report the plugin as
+missing on every launch from then on — but **keeps** its `[plugin:<name>]`
+section, so reinstalling does not mean setting it up again. `--purge` removes
+that too.
+
 ### A worked example, already on your machine
 
-`~/.config/clv/plugins/examples/nginx_error.py` is a complete, commented plugin
-that teaches CLV to read nginx's error log — a format the built-in matchers do
-not recognise, so every line of one is a raw line today. Copy it up a level to
+`~/.config/clv/plugins/examples/` holds **nine** complete, commented plugins —
+one for every interface CLV publishes. Each is copyable as it stands and each
+argues for what it declares rather than describing it. Copy one up a level to
 use it, or as the starting point for your own:
 
 ```bash
@@ -1243,6 +1436,24 @@ cd ~/.config/clv/plugins && cp examples/nginx_error.py .
 then add `nginx_error` to `plugins`. Nothing in `examples/` is listed or run:
 it is one directory down and CLV only looks in the directory itself, so the
 plugin count keeps meaning *plugins you installed*.
+
+| Example | Interface | What it does |
+| --- | --- | --- |
+| `nginx_error.py` | `LogFormat` | Reads nginx's error log — a format the built-in matchers do not recognise, so every line of one is a raw line without it |
+| `field_regex.py` | `QueryOperator`, `ComputedField` | Adds the `~` operator and the `age` field described under *Field queries* |
+| `redact_secrets.py` | `FilterStage` | Hides the value beside `password=`, `token=` and friends wherever the line is shown — the pane, the detail pane, an export, the clipboard |
+| `cluster_rules.py` | `ClusterRule`, `ShapeContributor` | Folds repeats `c` could not: a Kubernetes pod suffix and an ANSI colour run, and one field that keeps two streams apart |
+| `timeline_marks.py` | `TimelineAnnotation`, `TimelineMetric` | Marks deploys on the timeline and scales its bars by bytes rather than by lines |
+| `watch_alerts.py` | `WatchMatcher`, `WatchSink` | Adds a `burst` rule kind — "five of these within a minute" — and a destination that appends every hit to a file you name |
+| `html_report.py` | `Exporter` | Adds an HTML report to `Ctrl+E`: one self-contained file carrying the query that produced it |
+| `container_logs.py` | `LogSourceProvider` | Offers every running container as a source, tailing live through podman or docker |
+| `commands.py` | `Command` | Adds two commands to `C`, one of which opens a panel |
+
+Three of those ship **inert** — `watch_alerts`, `timeline_marks` and
+`container_logs` do nothing at all until their `[plugin:…]` section says so.
+That is the pattern any plugin that sends your logs somewhere, or runs
+something, is expected to follow: `redact_secrets` and `html_report` ship
+working because neither acts on the world.
 
 **Teaching CLV a format is a plugin's job like any other.** A `LogFormat` gets
 offered every line the built-ins declined; what it returns is an entry on equal
@@ -1267,7 +1478,7 @@ supplies, where it came from, and one of five states:
 | `not enabled` | Installed and waiting to be named in `plugins`, or switched off. |
 | `failed` | It raised, or CLV could not read it. The row shows the message. |
 | `incompatible` | It asked for a CLV or plugin API this build is not. Both versions are named. |
-| `isolated` | Reserved; nothing produces it yet. |
+| `isolated` | Running in a separate process CLV can stop — see [Running a plugin where it can be stopped](#running-a-plugin-where-it-can-be-stopped). |
 
 **Space** enables or disables the highlighted row, and **r** puts back a plugin
 a failure took out of service. Nothing is written until the dialog is closed, so
@@ -1306,14 +1517,51 @@ install any other program. The trust model and a checklist for reviewing
 someone else's plugin are in
 [`clv/plugins/AGENTS.md`](clv/plugins/AGENTS.md).
 
+### Running a plugin where it can be stopped
+
+Everything above is about a plugin that *fails*. A plugin that **hangs** is a
+different problem, and until now CLV had no answer to it: a budget works by
+measuring a pass that finished and declining to start the next one, so a plugin
+that never returns takes the viewer with it.
+
+A plugin can run in a process of its own instead:
+
+```ini
+[plugin:shipper]
+isolated = true
+```
+
+or its author can ask for the same thing with `isolated = True` on the class.
+Either way CLV starts a child the first time that plugin is needed, and a call
+that takes longer than `plugin_host_timeout_ms` (5 s by default) ends with the
+child killed, the plugin disabled, and the reason in `P` — where **r** puts it
+back and starts a fresh one.
+
+Writing it in `settings.conf` buys one thing the class attribute cannot: CLV
+never imports that module into its own process at all, so code the plugin runs
+*at import* is contained too.
+
+**This contains crashes, hangs and leaks. It does not make an untrusted plugin
+safe** — the child runs as you, with your files and your credentials, and
+everything in the paragraph above stays true of it.
+
+Four kinds can ask: exporters, watch sinks, commands and timeline annotations.
+The rest are called once per line or once per entry, where a round trip between
+processes is not a slower version of the same program but a different one; they
+are refused at load, by name, with the reason. Source providers are refused too,
+for their own reason: CLV polls a source's reader from the event loop on every
+tick.
+
+An isolated plugin's `print()` goes nowhere — its output would otherwise land on
+the terminal CLV is drawing on — so it talks to you through the same toasts
+every other plugin uses.
+
 For development, `CLV_PLUGIN_PATH` names extra directories (`:`-separated)
 searched ahead of the user directory, so a plugin can be run from where it is
 being edited. It is a development mechanism, not an install path, and the
 `plugins` enable-list still applies.
 
----
-
-## Writing a plugin
+### Writing a plugin
 
 Drop a module into `~/.config/clv/plugins/` and name it in `plugins` (above),
 or — for a plugin shipped as part of CLV itself — into `clv/plugins/filters/`
@@ -1321,21 +1569,29 @@ or — for a plugin shipped as part of CLV itself — into `clv/plugins/filters/
 the `clv.plugins` entry point group.
 
 ```python
-from dataclasses import replace
-from clv.api import FilterStage
+from clv.api import FilterContext, FilterStage, LogEntry, setting_list
+
 
 class Redact(FilterStage):
-    name = "redact-secrets"
-    requires_api = ">=1.0,<2.0"     # optional
+    name = "redact_secrets"
+    requires_api = ">=1.0,<2.0"
 
-    def apply(self, entry, context):
-        if "password" not in entry.raw:
-            return entry                # keep unchanged
-        return replace(entry, raw=entry.raw.replace("password", "******"))
+    def apply(self, entry: LogEntry, context: FilterContext) -> Optional[LogEntry]:
+        matcher = self._matcher
+        if matcher is None or not self._suspect(entry.raw):
+            return entry
+        ...
 
-def register():
-    return Redact()
+
+def register() -> list[FilterStage]:
+    return [Redact()]
 ```
+
+That is the shape of every plugin: import from `clv.api`, subclass one
+interface, say which API you were written against, and hand the instances back.
+It is also a genuine excerpt — the whole file is
+`~/.config/clv/plugins/examples/redact_secrets.py` on your machine, and its
+docstring argues for each of those lines rather than describing them.
 
 Return `None` from `apply` to drop a line. A plugin that fails to import, fails
 its version check, or raises at runtime is disabled and reported in the
@@ -1382,6 +1638,6 @@ worth starring and comparing across a fleet.
 ```bash
 python -m pip install -e .
 python -m pip install pytest
-python -m pytest            # 2042 passed, 1 skipped, 11 deselected
+python -m pytest            # 2528 passed, 1 skipped, 11 deselected
 python -m textual run clv/app.py --dev
 ```

@@ -17,6 +17,7 @@ done by a second rather than by stacking another modal.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Iterable, Sequence
 
 from rich.text import Text
@@ -31,9 +32,10 @@ from textual.widgets.option_list import Option
 from ..services.watch import (
     ACTION_BOTH,
     ACTIONS,
+    KIND_PATTERN,
     UNUSABLE_MARK,
     WatchRule,
-    describe_missing,
+    matcher_kinds,
     rule_requirements,
     validate_pattern,
 )
@@ -46,19 +48,27 @@ ACTION_LABELS = {
 }
 
 
+def _kind_label(kind: str) -> str:
+    return f"Kind: {kind}"
+
+
 def _rule_line(rule: WatchRule) -> str:
     """One list row: state, name, pattern, action, and whether it can run."""
 
+    # The kind only when it is not the built-in one. Printing "(pattern)" on
+    # every row of a viewer with no watch plugins installed would be a column of
+    # noise saying nothing.
+    kind = "" if rule.kind.casefold() == KIND_PATTERN else f"[{rule.kind}] "
     line = (
         f"{'[on] ' if rule.enabled else '[off]'} {rule.name} — "
-        f"{rule.pattern}  ({ACTION_LABELS[rule.action]})"
+        f"{kind}{rule.pattern}  ({ACTION_LABELS[rule.action]})"
     )
-    absent = rule.missing_plugins
-    if absent:
+    reason = rule.unusable_reason
+    if reason:
         # An unusable rule keeps its `[on]`: it *is* enabled, and showing it as
         # off would tell the operator to flip a switch that would change
         # nothing. What is wrong with it is named instead.
-        return f"{line}  {UNUSABLE_MARK} {describe_missing(absent)}"
+        return f"{line}  {UNUSABLE_MARK} {reason}"
     return line
 
 
@@ -132,11 +142,22 @@ class WatchRulesDialog(ModalScreen[tuple[WatchRule, ...] | None]):
         height: 1;
     }
 
-    #watch-action {
+    /* The action and (when a matcher is installed) the kind share one row.
+       Stacked they would cost three more rows than a 24-row terminal has left
+       once the list, the fields and the buttons are counted. */
+    #watch-toggles {
+        layout: horizontal;
+        height: auto;
+        width: 1fr;
+    }
+
+    #watch-action, #watch-kind {
         height: 3;
         width: auto;
         margin-top: 1;
     }
+
+    #watch-kind { margin-left: 2; }
 
     #watch-hint {
         color: $text-muted;
@@ -166,6 +187,10 @@ class WatchRulesDialog(ModalScreen[tuple[WatchRule, ...] | None]):
 
     HINT = "a adds · Enter edits · space enables/disables · d deletes · Esc closes"
     EDIT_HINT = "Pattern uses the query syntax. Enter saves · Esc goes back."
+    PLUGIN_EDIT_HINT = (
+        "Pattern is the '{kind}' matcher's own parameter, not a query. "
+        "Enter saves · Esc goes back."
+    )
 
     def __init__(
         self, rules: Sequence[WatchRule] = (), known_fields: Iterable[str] = ()
@@ -175,6 +200,7 @@ class WatchRulesDialog(ModalScreen[tuple[WatchRule, ...] | None]):
         self._known_fields = frozenset(known_fields)
         self._editing: str | None = None
         self._action = ACTION_BOTH
+        self._kind = KIND_PATTERN
         self._armed_delete = ""
         self._dirty = False
 
@@ -194,9 +220,18 @@ class WatchRulesDialog(ModalScreen[tuple[WatchRule, ...] | None]):
                         yield Input(
                             placeholder="oom-killer | tag:kernel", id="watch-pattern"
                         )
-                yield Button(
-                    ACTION_LABELS[ACTION_BOTH], id="watch-action", variant="primary"
-                )
+                with Horizontal(id="watch-toggles"):
+                    yield Button(
+                        ACTION_LABELS[ACTION_BOTH],
+                        id="watch-action",
+                        variant="primary",
+                    )
+                    # Composed only when something other than CLV's own kind is
+                    # installed. A viewer with no watch plugins renders exactly
+                    # the dialog it rendered before they existed -- no control
+                    # for a choice with one option, and no row spent on it.
+                    if len(matcher_kinds()) > 1:
+                        yield Button(_kind_label(KIND_PATTERN), id="watch-kind")
             yield Static(self.HINT, id="watch-hint")
             with Container(id="dialog-actions"):
                 yield Button("Close", id="close-watch")
@@ -259,17 +294,43 @@ class WatchRulesDialog(ModalScreen[tuple[WatchRule, ...] | None]):
         except NoMatches:  # pragma: no cover - not composed yet
             return False
 
+    def _kind_button(self) -> Button | None:
+        """The kind control, or None when it was never composed.
+
+        Every caller has to cope with it being absent, because a viewer with no
+        matcher installed does not have one — which is the ordinary case and the
+        one that must keep working exactly as it did.
+        """
+
+        found = self.query("#watch-kind")
+        return found.first(Button) if found else None
+
+    def _sync_kind_button(self) -> None:
+        button = self._kind_button()
+        if button is not None:
+            button.label = _kind_label(self._kind)
+
+    def _hint_for_kind(self) -> str:
+        if self._kind.casefold() == KIND_PATTERN:
+            return self.EDIT_HINT
+        return self.PLUGIN_EDIT_HINT.format(kind=self._kind)
+
     def _open_editor(self, rule: WatchRule | None) -> None:
         self._disarm()
         self._editing = rule.name if rule else None
         self._action = rule.action if rule else ACTION_BOTH
+        # Taken from the rule even when nothing provides it any more. The kind
+        # is what the operator saved and this dialog does not quietly rewrite
+        # it: `_save_editor` refuses instead, naming what is missing.
+        self._kind = rule.kind if rule else KIND_PATTERN
         self.query_one("#watch-editor", Container).add_class("-active")
         self.query_one("#watch-action", Button).label = ACTION_LABELS[self._action]
+        self._sync_kind_button()
         name = self.query_one("#watch-name", Input)
         pattern = self.query_one("#watch-pattern", Input)
         name.value = rule.name if rule else ""
         pattern.value = rule.pattern if rule else ""
-        self._hint(self.EDIT_HINT)
+        self._hint(self._hint_for_kind())
         name.focus()
 
     def _close_editor(self) -> None:
@@ -284,7 +345,7 @@ class WatchRulesDialog(ModalScreen[tuple[WatchRule, ...] | None]):
         if not name:
             self._hint("Give the rule a name.", warning=True)
             return
-        problem = validate_pattern(pattern, self._known_fields)
+        problem = validate_pattern(pattern, self._known_fields, kind=self._kind)
         if problem is not None:
             # Reported where it was typed. A rule that silently never matches
             # is indistinguishable from one that is simply not firing yet.
@@ -293,7 +354,14 @@ class WatchRulesDialog(ModalScreen[tuple[WatchRule, ...] | None]):
         # Recorded on the rule the operator just typed, and only on that one.
         # Re-stamping the whole list would recompute a rule's requirements while
         # its plugin was missing and erase the record that marks it unusable.
-        requires = rule_requirements(pattern, self._known_fields)
+        # Only for a query rule. A plugin kind's pattern is the matcher's own
+        # parameter string and was never parsed, so asking the grammar what it
+        # depends on would be asking about a string the grammar never saw.
+        requires = (
+            rule_requirements(pattern, self._known_fields)
+            if self._kind.casefold() == KIND_PATTERN
+            else ()
+        )
 
         enabled = True
         replacing = self._editing
@@ -307,6 +375,7 @@ class WatchRulesDialog(ModalScreen[tuple[WatchRule, ...] | None]):
             action=self._action,
             enabled=enabled,
             requires=requires,
+            kind=self._kind,
         )
         self._rules = [
             other for other in self._rules if other.name not in {replacing, name}
@@ -368,22 +437,38 @@ class WatchRulesDialog(ModalScreen[tuple[WatchRule, ...] | None]):
                 self._finish()
         elif event.button.id == "watch-action":
             self._cycle_action()
+        elif event.button.id == "watch-kind":
+            self._cycle_kind()
 
     def _cycle_action(self) -> None:
         self._action = ACTIONS[(ACTIONS.index(self._action) + 1) % len(ACTIONS)]
         self.query_one("#watch-action", Button).label = ACTION_LABELS[self._action]
+
+    def _cycle_kind(self) -> None:
+        kinds = matcher_kinds()
+        try:
+            index = kinds.index(self._kind)
+        except ValueError:
+            # The rule's kind is not installed. Cycling starts from the
+            # beginning rather than refusing: the operator is being offered the
+            # kinds they *have*, and leaving the editor without touching this
+            # still preserves the original.
+            index = -1
+        self._kind = kinds[(index + 1) % len(kinds)]
+        self._sync_kind_button()
+        self._hint(self._hint_for_kind())
 
     def _toggle_current(self) -> None:
         rule = self._current()
         if rule is None:
             return
         index = self._rules.index(rule)
-        self._rules[index] = WatchRule(
-            name=rule.name,
-            pattern=rule.pattern,
-            action=rule.action,
-            enabled=not rule.enabled,
-        )
+        # `replace`, not a rebuild. Hand-listing the fields dropped `requires`
+        # -- so pressing space on a rule whose plugin was missing cleared the
+        # record that marked it unusable, and the pattern went straight back to
+        # being matched as a regex. `kind` would have been the second field to
+        # go the same way.
+        self._rules[index] = replace(rule, enabled=not rule.enabled)
         self._dirty = True
         self._refresh_list(index)
 

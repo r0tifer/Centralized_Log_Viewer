@@ -242,7 +242,20 @@ def test_the_readme_points_authors_at_the_published_module() -> None:
     if not readme.exists():  # pragma: no cover - installed package
         pytest.skip("running from an installed package")
     text = _read(readme)
-    assert "from clv.api import FilterStage" in text
+    # Matched on the import *statement* rather than on one exact spelling of it.
+    # Phase 16 replaced the chapter's hand-written snippet with a genuine
+    # excerpt of `clv/examples/redact_secrets.py`, which imports four names on
+    # one line -- so the old literal stopped matching while the claim it was
+    # protecting was more true than before.
+    imports = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip().startswith("from clv.api import")
+    ]
+    assert any("FilterStage" in line for line in imports), (
+        "README.md no longer shows an author importing an interface from "
+        f"clv.api; found: {imports}"
+    )
     assert "from clv.plugins import FilterStage" not in text
 
 
@@ -268,6 +281,159 @@ def test_the_log_format_seam_is_documented_like_the_others() -> None:
 
 
 # --- Phase 8: the query seam and its degradation rule -----------------------
+
+
+def test_the_clustering_interfaces_are_documented_where_the_others_are() -> None:
+    """Both halves of the seam, in the numbered list, like every other kind."""
+
+    text = _read(PLUGIN_AGENTS)
+
+    assert "### 8. ClusterRule" in text
+    assert "### 9. ShapeContributor" in text
+
+
+def test_the_placeholder_invariant_is_documented_as_a_rule_not_a_habit() -> None:
+    """The constraint that is obvious in CLV's source and invisible to an author.
+
+    A digit in a placeholder is eaten by a later rule, a backslash is a group
+    reference, and a pattern matching the empty string rewrites every position
+    of every line. All three are refused at load, and an author who cannot find
+    that here meets it as a plugin that silently did not load.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+
+    assert "digit-free" in text
+    assert "backslash" in text
+    assert "empty string" in text
+
+
+def test_the_normalised_line_trap_is_written_down() -> None:
+    """A plugin rule sees what CLV's own rules left, and the docs must say so.
+
+    It is the one thing about this seam an author cannot discover by reading
+    the interface: their pattern is handed a line that has already been through
+    nine substitutions, so the obvious rule for a pod name matches nothing and
+    reports nothing.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+
+    assert "already normalised" in text
+    assert "api-<hex>-x2n9q" in text
+
+
+def test_the_clustering_reversal_is_on_the_record_in_the_contract_too() -> None:
+    """The module docstring carries it; so does the Non-Goals list.
+
+    The query DSL reversal is recorded in both places, and clustering's was in
+    only one — which left a reader of the contract's own Non-Goals with a rule
+    the code no longer follows.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    reversed_section = text.split("### Reversed", 1)[1]
+
+    assert "No rules DSL for clustering" in reversed_section
+    assert "settings.conf" in reversed_section
+
+
+# --- Phase 11: the timeline seam and the fold rule --------------------------
+
+
+def test_the_timeline_interfaces_are_documented_where_the_others_are() -> None:
+    """Both halves, in the numbered list, like every other kind."""
+
+    text = _read(PLUGIN_AGENTS)
+
+    assert "### 10. TimelineAnnotation" in text
+    assert "### 11. TimelineMetric" in text
+    # Exporter was 10 and is now 12. Asserted because the renumbering is the
+    # easy thing to get half-right, and a list with two number 10s reads as a
+    # document nobody checked.
+    assert "### 12. Exporter" in text
+
+
+def test_the_fold_rule_is_documented_as_the_reason_for_the_interface() -> None:
+    """The one thing about this seam an author cannot infer from the type.
+
+    `value() -> float` looks like an oversight — where is the aggregate hook? —
+    until you know that `extend` folds an arrival by arithmetic. An author who
+    is not told will go looking for the missing method, and an author who is
+    will understand why a median is not a feature request.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    section = text.split("### 11. TimelineMetric", 1)[1].split("\n### ", 1)[0]
+
+    assert "foldable" in section
+    assert "median" in section
+    assert "CLV does the summing" in section
+    # And the honest statement of what that costs, in the same breath.
+    assert "unexpressible" in section
+
+
+def test_the_one_metric_rule_is_written_down_with_what_it_is_not() -> None:
+    """A conflict resolved by priority is not a fault, and the docs must say so.
+
+    An operator reading "conflict" in the `P` dialog will assume something is
+    broken unless the contract says otherwise — and the loser is a healthy
+    plugin one switch away from being the one that runs.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    section = text.split("#### One metric at a time", 1)[1].split("\n#### ", 1)[0]
+
+    assert "priority" in section
+    assert "not a fault" in section
+
+
+def test_an_annotation_provider_is_told_it_runs_on_the_event_loop() -> None:
+    """The constraint that decides how the plugin is written.
+
+    A provider is the obvious place to put an HTTP call — deploys come from an
+    API — and the seam cannot stop one. What it can do is say, where the author
+    is looking, that the call is on the render path and that the budget will
+    take a plugin that blocks out of service.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    section = text.split("### 10. TimelineAnnotation", 1)[1].split("\n### ", 1)[0]
+
+    assert "may not do I/O" in section
+    assert "setup()" in section
+    assert "once per window" in section
+
+
+def test_the_timeline_budget_is_documented_as_the_sixth() -> None:
+    """That the timeline budget is counted, not what the running total is.
+
+    This asserted "Six budgets, one policy" until Phase 12 added a seventh, and
+    the total moved out to `test_the_panel_budget_is_documented_as_the_seventh`
+    — one test owns the count and changes when a budget arrives, rather than
+    every budget's test changing for every other budget.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    budget = text.split("### The budget", 1)[1].split("\n### ", 1)[0]
+
+    assert "get a sixth" in budget
+    assert "TimelineMetric" in budget
+
+
+def test_the_readme_says_what_a_metric_bar_is_showing() -> None:
+    """The caption rule is a user-facing promise, not an implementation note."""
+
+    readme = REPO_ROOT / "README.md"
+    if not readme.exists():  # pragma: no cover - installed package
+        pytest.skip("running from an installed package")
+    text = _read(readme)
+    section = text.split("### The severity timeline", 1)[1].split("\n### ", 1)[0]
+
+    assert "TimelineMetric" in section
+    # Wrapped in the source, so matched on the half that cannot move.
+    assert "plugin supplying it" in section
+    assert "foldable" in section
 
 
 def test_the_query_interfaces_are_documented_where_the_others_are() -> None:
@@ -321,3 +487,397 @@ def test_the_query_dsl_reversal_is_on_the_record() -> None:
     for word in ("OR", "parentheses", "precedence"):
         assert word in reversal, f"the reversal must still decline {word}"
     assert "vocabulary" in reversal and "structure" in reversal
+
+
+# --- commands and controls (Phase 12) ----------------------------------------
+
+
+def test_the_command_seam_is_documented_where_the_others_are() -> None:
+    """The thirteenth interface, in the numbered list with the twelve before it.
+
+    Not an appendix. An author reading down the interfaces reaches `Command`
+    where they reach everything else, which is the only arrangement in which
+    "a plugin extends a core feature on equal terms" is true of the document as
+    well as of the code.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    assert "### 13. Command" in text
+    section = text.split("### 13. Command", 1)[1].split("\n## ", 1)[0]
+    for word in ("command_name", "title", "CommandContext", "Panel", "Control"):
+        assert word in section, f"the Command section never mentions {word}"
+
+
+def test_the_published_table_lists_exactly_what_is_published() -> None:
+    """Checked against `clv.api`, not against a second list written by hand.
+
+    Four interfaces — `ClusterRule`, `ShapeContributor`, `TimelineAnnotation`
+    and `TimelineMetric` — were published by Phases 10 and 11 and never added to
+    this table, and nothing noticed for two phases. A table that restates
+    `__all__` in prose will go stale; one that is *compared* to it cannot.
+    """
+
+    from clv import api
+
+    text = _read(PLUGIN_AGENTS)
+    table = text.split("### What is published", 1)[1].split("###", 1)[0]
+    missing = [name for name in api.__all__ if f"`{name}`" not in table]
+    # The severity constants are listed as a range (`LEVEL_TRACE` … `LEVEL_CRITICAL`)
+    # rather than one by one, which is the right call for a table a human reads.
+    missing = [
+        name
+        for name in missing
+        if not (name.startswith("LEVEL_") and name not in ("LEVEL_ORDER",))
+    ]
+    assert missing == [], f"published but undocumented: {missing}"
+
+
+def test_a_command_author_is_told_it_runs_on_the_event_loop() -> None:
+    """The one failure mode this seam has and the others do not.
+
+    A `FilterStage` that is slow is disabled by a budget. A `Command` that hangs
+    hangs CLV, because a stopwatch cannot interrupt a call the process is inside
+    — so the only honest answer is to say so, and to name what will fix it.
+
+    What fixes it is now a section rather than a phase number: the pointer moved
+    from "Phase 13 will" to the isolation this file documents, and the test
+    moved with it rather than being deleted for having gone stale.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    section = text.split("### 13. Command", 1)[1].split("\n## ", 1)[0]
+    assert "#### You run on the event loop, synchronously" in section
+    assert "freezes the pane" in section
+    assert "no budget that can save you" in section
+    assert "isolated = True" in section
+    assert "(#isolation)" in section, "and the reader is sent somewhere it is explained"
+
+
+def test_the_refusal_of_show_true_is_documented_with_its_reason() -> None:
+    """Requirement 11, in the document as well as in the loader.
+
+    A refusal an author cannot find the reason for reads as a bug in CLV.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    section = text.split("### 13. Command", 1)[1].split("\n## ", 1)[0]
+    assert "refused with a reason" in section
+    assert "80-column floor" in section
+    assert "invocable by name from `C`" in section
+
+
+def test_the_no_css_rule_is_stated_as_a_rule_with_its_reason() -> None:
+    """The concession that keeps every breakpoint test unconditional."""
+
+    text = _read(PLUGIN_AGENTS)
+    section = text.split("### 13. Command", 1)[1].split("\n## ", 1)[0]
+    assert "**Plugins ship no CSS.**" in section
+    assert "breakpoint test" in section
+
+
+def test_the_queued_context_is_explained_rather_than_just_described() -> None:
+    """Why `notify` queues is the whole argument for the shape of the type.
+
+    Handing over a bound method is the obvious implementation and it defeats the
+    rule it appears to honour. A document that only listed the four methods
+    would leave the next author to re-derive that, or not.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    section = text.split("### 13. Command", 1)[1].split("\n## ", 1)[0]
+    assert "__self__" in section and "__closure__" in section
+    assert "queues" in section or "queue" in section
+
+
+def test_the_panel_budget_is_documented_as_the_seventh() -> None:
+    """Six became seven, and the sentence that counted them has to keep up."""
+
+    text = _read(PLUGIN_AGENTS)
+    assert "**Seven budgets, one policy.**" in text
+    budget = text.split("### The budget", 1)[1].split("###", 1)[0]
+    assert "seventh" in budget
+    assert "identical in all seven" in budget
+
+
+def test_the_control_vocabulary_is_listed_for_an_author_to_check() -> None:
+    """`CONTROL_KINDS` published, and the kinds written out where they are used."""
+
+    text = _read(PLUGIN_AGENTS)
+    section = text.split("### 13. Command", 1)[1].split("\n## ", 1)[0]
+    for kind in ("label", "static", "switch", "input", "select", "button"):
+        assert f"`{kind}`" in section, f"the vocabulary never documents {kind}"
+    assert "MAX_PANEL_CONTROLS" in section
+
+
+# --- isolation ----------------------------------------------------------------
+
+
+def test_the_isolation_section_says_what_it_does_and_does_not_do() -> None:
+    """The sentence, in the file that documents the mechanism.
+
+    ``test_the_sandbox_claim_cannot_come_back`` enforces the mechanical half:
+    the word may not appear. This is the other half — the honest statement has
+    to be *present*, in the section an author reads while deciding whether to
+    set the attribute, not only in the trust model three thousand lines earlier.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    assert "## Isolation" in text
+    # Unwrapped before matching: these are sentences, and which word a line
+    # happens to break on is not something a test should have an opinion about.
+    section = " ".join(
+        text.split("\n## Isolation", 1)[1].split("\n## ", 1)[0].split()
+    )
+
+    assert "does not make an untrusted plugin safe" in section
+    assert "runs as the operator" in section
+    # What it does buy, said as plainly as what it does not.
+    assert "stopped" in section
+
+
+def test_the_isolation_section_names_the_kinds_on_both_sides() -> None:
+    """An author reads a reason, never discovers an omission."""
+
+    from clv.plugins import ISOLABLE_KINDS, _ISOLATION_REFUSALS
+
+    text = _read(PLUGIN_AGENTS)
+    section = text.split("\n## Isolation", 1)[1].split("\n## ", 1)[0]
+
+    for interface in ("Exporter", "WatchSink", "Command", "TimelineAnnotation"):
+        assert f"`{interface}`" in section, f"{interface} is isolable and unlisted"
+    for interface in ("LogFormat", "FilterStage", "QueryOperator", "TimelineMetric"):
+        assert f"`{interface}`" in section, f"{interface} is refused and unlisted"
+
+    # The two lists in the document are the two lists in the loader.
+    assert len(ISOLABLE_KINDS) == 4
+    assert set(ISOLABLE_KINDS).isdisjoint(_ISOLATION_REFUSALS)
+    assert "per entry or per line" in section
+    # A provider is refused for a different reason, and the difference is the
+    # thing worth documenting: it is about *when* CLV calls it.
+    assert "live reader" in section
+
+
+def test_both_doors_into_isolation_are_documented() -> None:
+    """Including the half the class attribute cannot buy."""
+
+    text = _read(PLUGIN_AGENTS)
+    section = text.split("\n## Isolation", 1)[1].split("\n## ", 1)[0]
+
+    assert "isolated = True" in section, "the author's door"
+    assert "isolated = true" in section, "the operator's door"
+    assert "never imported" in section
+    assert "enable-list still applies" in section, "isolation is not a way around consent"
+
+
+def test_an_isolated_author_is_told_what_changes_for_them() -> None:
+    """The four costs that are not guessable from "it runs elsewhere"."""
+
+    text = _read(PLUGIN_AGENTS)
+    section = text.split("\n## Isolation", 1)[1].split("\n## ", 1)[0]
+
+    assert "snapshot" in section, "configure() no longer hands out a live view"
+    assert "print()" in section, "the child's output goes nowhere"
+    assert "plugin_host_timeout_ms" in section
+    assert "freeze_support()" in section, "the frozen build requirement"
+
+
+# --- the author-facing quick start (Phase 16) --------------------------------
+
+PLUGIN_README = REPO_ROOT / "clv" / "plugins" / "README.md"
+
+
+def test_the_author_quick_start_exists() -> None:
+    """`clv/plugins/AGENTS.md` sent authors to a file that did not exist.
+
+    Its *Developer Workflow* step 4 said to document a plugin in "this folder's
+    README.md" for five phases, and `SSH_TODO.md` deferred two of its own
+    references to it on the grounds that creating a stub would give a planned
+    document two owners. Phase 16 is where it is owed.
+    """
+
+    assert PLUGIN_README.is_file(), "clv/plugins/README.md was not written"
+
+
+def test_the_quick_start_covers_every_published_interface() -> None:
+    """One row per interface, checked against `clv.api` rather than a list.
+
+    The same argument as the published-API table above: a fourteenth interface
+    added later and left out of the author's map would be invisible to everyone
+    except the author who went looking for it.
+    """
+
+    import clv.api as api
+    from clv.plugins import Plugin
+
+    text = _read(PLUGIN_README)
+    published = [
+        name
+        for name in api.__all__
+        if isinstance(getattr(api, name), type)
+        and issubclass(getattr(api, name), Plugin)
+        and name != "Plugin"
+    ]
+    missing = [name for name in published if f"`{name}`" not in text]
+    assert missing == [], f"the quick start documents no seam for: {missing}"
+
+
+def test_the_quick_start_names_every_worked_example() -> None:
+    """An interface row that points at no file is a map with no destination."""
+
+    from clv.services.config import SEEDED_EXAMPLES
+
+    text = _read(PLUGIN_README)
+    missing = [name for name in SEEDED_EXAMPLES if f"`{name}`" not in text]
+    assert missing == [], f"the quick start never mentions: {missing}"
+
+
+def test_the_quick_start_states_the_remote_journal_dual_opt_in() -> None:
+    """`SSH_TODO.md` deferred this sentence to whichever file arrived second.
+
+    A unit on another machine is `journalctl` reached over `ssh`, so it needs
+    both switches. An author told about one of them writes a plugin that works
+    on their laptop and reports nothing on a fleet.
+    """
+
+    text = _read(PLUGIN_README)
+    assert "enable_journald" in text
+    assert "enable_ssh" in text
+
+
+def test_the_quick_start_does_not_promise_safety() -> None:
+    """The same rule the rest of this file enforces, in the newest document.
+
+    A quick start is where the temptation is strongest: it is read by someone
+    deciding whether to trust the mechanism, and "sandboxed" is the word that
+    would close the sale.
+    """
+
+    offenders = [
+        f"{number}: {line.strip()}"
+        for number, line in enumerate(_read(PLUGIN_README).splitlines(), start=1)
+        if "sandbox" in line.lower()
+    ]
+    assert not offenders, "clv/plugins/README.md must not use the word 'sandbox':\n  " + "\n  ".join(offenders)
+
+    # Whitespace-normalised, because the sentence is long enough to wrap and a
+    # line break is not a change of meaning. The isolation tests above do the
+    # same for the same reason.
+    flowed = " ".join(_read(PLUGIN_README).split())
+    assert "does not make an untrusted plugin safe" in flowed
+
+
+def test_every_link_out_of_the_quick_start_resolves() -> None:
+    """It is a new file full of cross-references, and nothing else checks them.
+
+    `tests/test_readme_docs.py` does this for `README.md` and stops at that
+    file. A dead anchor here points an author at a contract they then cannot
+    find, which is the one failure this document exists to prevent.
+    """
+
+    import re
+
+    def _slugs(path: Path) -> set[str]:
+        found: set[str] = set()
+        fenced = False
+        for line in _read(path).splitlines():
+            if line.startswith("```"):
+                fenced = not fenced
+                continue
+            if fenced or not line.startswith("#"):
+                continue
+            heading = line.lstrip("#").strip()
+            found.add(re.sub(r"[^\w\- ]", "", heading.lower()).replace(" ", "-"))
+        return found
+
+    broken: list[str] = []
+    for link in re.findall(r"\]\(([^)]+)\)", _read(PLUGIN_README)):
+        if link.startswith(("http://", "https://")):
+            continue
+        target, _, anchor = link.partition("#")
+        path = (PLUGIN_README.parent / (target or PLUGIN_README.name)).resolve()
+        if not path.is_file():
+            broken.append(f"missing file: {link}")
+        elif anchor and anchor not in _slugs(path):
+            broken.append(f"dead anchor: {link}")
+    assert broken == [], "clv/plugins/README.md: " + "; ".join(broken)
+
+
+def test_the_author_checklist_replaced_the_review_criteria() -> None:
+    """The old list promised a check CLV does not perform.
+
+    "Passes linting and security checks" sat nine lines below a section stating
+    that what CLV enforces is, in all three cases, nothing. A checklist in a
+    document about trust may not contain a tick box nobody ticks.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    assert "## A plugin author's checklist" in text
+    assert "## Plugin Review Criteria" not in text
+    assert "Passes linting and security checks" not in text
+
+
+def test_the_checklist_covers_the_eight_things_the_phase_asked_for() -> None:
+    """Each item is a failure someone has actually had.
+
+    Pinned by the load-bearing phrase of each rather than by counting list
+    items, so reordering or rewording is free and dropping one is not.
+    """
+
+    checklist = _read(PLUGIN_AGENTS).split("## A plugin author's checklist", 1)[1]
+    checklist = checklist.split("\n## ", 1)[0]
+    for phrase in (
+        "requires_api",
+        "clv.api",
+        "cheap rejection",
+        "budget",
+        "consent",
+        "isolated",
+        "manifest",
+        "trust requirements",
+    ):
+        assert phrase in checklist, f"the author checklist lost {phrase!r}"
+
+
+def test_the_developer_workflow_no_longer_names_three_interfaces_of_thirteen() -> None:
+    """It told authors to implement "one of the ABCs" and listed the 2023 three.
+
+    It also sent them to `clv/plugins/`, the bundled drop-in directory that
+    loads *without* the enable-list, which is the one place a third-party plugin
+    must not be written.
+    """
+
+    text = _read(PLUGIN_AGENTS)
+    assert "## Developer Workflow" not in text
+    assert (
+        "Implement one of the ABCs (`LogSourceProvider`, `FilterStage`, or `Exporter`)"
+        not in text
+    )
+
+
+def test_every_internal_anchor_in_the_plugin_contract_resolves() -> None:
+    """It is 2300 lines of cross-references and nothing checked them.
+
+    The author checklist added six more, each pointing at a section whose
+    heading a later edit is free to reword.
+    """
+
+    import re
+
+    text = _read(PLUGIN_AGENTS)
+    headings: set[str] = set()
+    fenced = False
+    for line in text.splitlines():
+        if line.startswith("```"):
+            fenced = not fenced
+            continue
+        if fenced or not line.startswith("#"):
+            continue
+        heading = line.lstrip("#").strip()
+        headings.add(re.sub(r"[^\w\- ]", "", heading.lower()).replace(" ", "-"))
+
+    dead = [
+        link
+        for link in re.findall(r"\]\((#[^)]+)\)", text)
+        if link[1:] not in headings
+    ]
+    assert dead == [], f"clv/plugins/AGENTS.md has dead anchors: {dead}"

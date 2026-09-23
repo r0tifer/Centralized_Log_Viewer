@@ -9,7 +9,7 @@ asks for "a plugin section in the Advanced drawer". The drawer is capped at
 ``max-height: 16`` and ``clv/widgets/AGENTS.md`` records what that costs: a new
 *row* pushes what follows below the fold, where it lays out and paints nothing.
 Four installed plugins is four rows before any of them has said anything, and
-Stage C makes twelve interfaces available. The fleet of SSH hosts hit this exact
+Stage C makes thirteen interfaces available. The fleet of SSH hosts hit this exact
 wall and settled it the same way — one summary line in the drawer, the detail in
 a modal — so plugins follow the precedent rather than inventing a second answer.
 
@@ -49,7 +49,19 @@ STATE_MARKS = {
 
 #: States that are the operator's own doing rather than a fault. Rendered dim
 #: rather than amber, and not counted as problems anywhere.
-QUIET_STATES = ("loaded", "not enabled")
+#:
+#: ``isolated`` is one of them: a plugin running in a child process is healthy,
+#: and rendering it in the colour a broken one gets would make containment look
+#: like a problem an operator has to fix.
+QUIET_STATES = ("loaded", "not enabled", "isolated")
+
+#: What an isolated row says, under the origin. Short enough for the detail pane
+#: at 80 columns and honest in both halves: a killable plugin is not a safe one,
+#: and this is the only place an operator meets that fact while deciding.
+ISOLATED_NOTE = (
+    "Runs in a separate process CLV can stop if it hangs or crashes. "
+    "It still runs as you, with your files."
+)
 
 
 class PluginsDialog(ModalScreen[Optional[tuple[PluginStatus, ...]]]):
@@ -180,6 +192,14 @@ class PluginsDialog(ModalScreen[Optional[tuple[PluginStatus, ...]]]):
         )
         if row.kinds:
             line.append(f"  {', '.join(row.kinds)}", style="#7aa3d1")
+        if row.reads_content:
+            # Between the kinds and the state, and in the warning colour rather
+            # than the kinds' own: "sink" says where this plugin sends things,
+            # and this says *what* it sends. It survives to 80 columns because
+            # it is two characters, which is the point -- the fact an operator
+            # most needs before enabling something should not be the first
+            # thing a narrow terminal drops.
+            line.append("  ⚑", style="#facc15")
         line.append(
             f"  — {state}",
             style="dim" if row.state in QUIET_STATES else "#facc15",
@@ -253,6 +273,24 @@ class PluginsDialog(ModalScreen[Optional[tuple[PluginStatus, ...]]]):
 
     def _detail(self, row: PluginStatus) -> str:
         parts = [f"{row.source}: {row.origin}"]
+        if row.reads_content:
+            # Stated in full here, because the row only has room for a glyph
+            # and this is not a fact to leave an operator guessing at.
+            parts.append(
+                "⚑ Reads your log lines and delivers them wherever it is "
+                "configured to send them."
+            )
+        if row.provenance:
+            # Under the origin, which says *where the file is*; this says where
+            # it came from and who vouched for it. Empty for a bundled plugin
+            # and for one copied in by hand, so no row grows a line saying CLV
+            # has nothing to tell you.
+            parts.append(row.provenance)
+        if row.state == "isolated":
+            # Ahead of `detail`, which for an isolated row is CLV's own summary
+            # of the same fact. This is the sentence that has to survive being
+            # read quickly, so it goes where the eye lands first.
+            parts.append(ISOLATED_NOTE)
         if row.detail:
             parts.append(row.detail)
         consequence = self._consequence(row)

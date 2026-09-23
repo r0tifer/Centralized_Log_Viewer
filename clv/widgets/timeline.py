@@ -16,12 +16,33 @@ the other candidate, is already full at 80 columns. The caption doubles as the
 place a source with no timestamps explains itself, in the same voice
 ``describe_empty_result`` uses.
 
+What a plugin can change here
+-----------------------------
+
+Two things, and neither of them is the layout (``PLUGIN_TODO.md`` Phase 11).
+
+A :class:`~clv.plugins.TimelineMetric` changes what the heights *mean* — bytes
+rather than lines — so the bar scales against
+:attr:`~clv.services.timeline.Timeline.peak_value` instead of the count, and the
+caption leads with the metric and names the plugin. It has to: the glyphs are
+identical either way, and the caption is the only thing that says which question
+the bar is answering.
+
+A :class:`~clv.plugins.TimelineAnnotation` marks a bucket. The mark is drawn by
+**styling the glyph that is already there** — underlined, in the mark's own
+severity colour — rather than by replacing it or by adding a row: replacing it
+would lose the volume exactly where something interesting happened, and a third
+row would change this widget's height for every build that has a plugin
+installed. Underline rather than colour alone, for the reason the block glyphs
+carry the volume: it has to read on a monochrome terminal.
+
 The widget renders what it is handed and decides nothing. Bucketing lives in
 :mod:`clv.services.timeline`, which is UI-free and testable without a screen.
 """
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 from rich.console import RenderableType
@@ -35,7 +56,13 @@ from textual.strip import Strip
 from textual.widget import Widget
 
 from ..services.filtering import TimeWindow
-from ..services.timeline import Timeline, describe_bucket, describe_undated
+from ..services.timeline import (
+    Timeline,
+    annotation_levels,
+    describe_bucket,
+    describe_metric,
+    describe_undated,
+)
 from ..services.timeline import EMPTY as EMPTY_TIMELINE
 from .severity import SEVERITY_COLORS, UNKNOWN_COLOR
 
@@ -78,6 +105,14 @@ class TimelineBar(Widget, can_focus=True):
         Binding("right", "bucket_right", "Next bucket", show=False),
         Binding("home", "bucket_home", "First bucket", show=False),
         Binding("end", "bucket_end", "Last bucket", show=False),
+        # Shift, rather than teaching the arrows to skip: a bar with annotations
+        # installed must still walk bucket by bucket, which is what the bar was
+        # built to do, and a key that means something different depending on
+        # what is installed is the one thing a plugin seam may not do to a
+        # binding that already exists. No-ops with nothing marked, exactly as
+        # Enter does with no buckets.
+        Binding("shift+left", "annotation_left", "Previous annotation", show=False),
+        Binding("shift+right", "annotation_right", "Next annotation", show=False),
         Binding("enter", "apply_bucket", "Filter to the selected bucket", show=False),
     ]
 
@@ -181,17 +216,41 @@ class TimelineBar(Widget, can_focus=True):
             # like a quiet source.
             return Strip.blank(width, self.rich_style)
 
-        peak = max(1, self._timeline.peak)
+        metric = self._timeline.metric
+        # What the heights are drawn from. `peak` and `peak_value` answer
+        # different questions and the installed metric is what decides which one
+        # the bar is asking.
+        peak = (
+            max(1.0, self._timeline.peak_value)
+            if metric
+            else float(max(1, self._timeline.peak))
+        )
+        marks = annotation_levels(self._timeline)
         segments: list[Segment] = []
         for index, bucket in enumerate(buckets[:width]):
             if bucket.count == 0:
+                # Keyed on the count even under a metric: `·` means nothing
+                # happened here, and a bucket holding a hundred lines that
+                # measured zero bytes is not that.
                 glyph = EMPTY_GLYPH
             else:
-                # ceil, so a bucket with a single event is never invisible.
-                height = max(1, -(-bucket.count * len(BLOCKS) // peak))
+                measure = float(bucket.value if metric else bucket.count)
+                # ceil, so a bucket with a single event is never invisible --
+                # including one whose metric summed to zero, which is still a
+                # bucket with lines in it. Float arithmetic throughout now that
+                # a metric can be fractional; the `min` below already absorbs
+                # the rounding that puts a full bucket one step over the top.
+                height = max(1, math.ceil(measure * len(BLOCKS) / peak))
                 glyph = BLOCKS[min(height, len(BLOCKS)) - 1]
-            color = SEVERITY_COLORS.get(bucket.level or "", UNKNOWN_COLOR)
-            style = Style(color=color, reverse=index == self._selected)
+            marked = index in marks
+            color = SEVERITY_COLORS.get(
+                (marks[index] if marked else bucket.level) or "", UNKNOWN_COLOR
+            )
+            style = Style(
+                color=color,
+                reverse=index == self._selected,
+                underline=marked or None,
+            )
             segments.append(Segment(glyph, style))
         strip = Strip(segments)
         return strip.adjust_cell_length(width, self.rich_style)
@@ -214,7 +273,15 @@ class TimelineBar(Widget, can_focus=True):
         skipped = f"  ({undated} with no timestamp)" if undated else ""
         if self._selected < 0:
             span = self._span_label()
-            return f"{span} · ←/→ to select a bucket, Enter to filter to it{skipped}"
+            # The metric is named before the hint, and on the unselected caption
+            # as well as the selected one: an operator who never presses an
+            # arrow key still has to be told the heights are not lines.
+            metric = describe_metric(self._timeline)
+            measuring = f" · {metric}" if metric else ""
+            return (
+                f"{span}{measuring} · ←/→ to select a bucket, "
+                f"Enter to filter to it{skipped}"
+            )
         return f"{describe_bucket(self._timeline, self._selected)}{skipped}"
 
     def _span_label(self) -> str:
@@ -254,6 +321,38 @@ class TimelineBar(Widget, can_focus=True):
 
     def action_bucket_end(self) -> None:
         self.select(len(self._timeline.buckets) - 1)
+
+    def action_annotation_left(self) -> None:
+        self._step_annotation(-1)
+
+    def action_annotation_right(self) -> None:
+        self._step_annotation(1)
+
+    def _step_annotation(self, direction: int) -> None:
+        """Move to the nearest marked bucket in *direction*, if there is one.
+
+        No wrapping, like the bucket keys beside it: `select` clamps, and an
+        operator who has walked to the last deploy of the window should not find
+        the next press back at the first one.
+        """
+
+        marked = sorted({mark.index for mark in self._timeline.annotations})
+        if not marked:
+            return
+        if self._selected < 0:
+            # From nowhere, the ends: the same rule `bucket_left` follows, so
+            # shift+← from an unselected bar lands on the last mark rather than
+            # on nothing.
+            self.select(marked[-1] if direction < 0 else marked[0])
+            return
+        candidates = [
+            index
+            for index in marked
+            if (index < self._selected if direction < 0 else index > self._selected)
+        ]
+        if not candidates:
+            return
+        self.select(candidates[-1] if direction < 0 else candidates[0])
 
     def action_apply_bucket(self) -> None:
         self._emit(self._selected)

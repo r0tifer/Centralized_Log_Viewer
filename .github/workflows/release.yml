@@ -169,11 +169,28 @@ jobs:
               dnf -y -q install python3.11 python3.11-pip
               python3.11 -m pip install --quiet --upgrade pip
               python3.11 -m pip install --quiet pyinstaller .
+              # --hidden-import: the isolation host is imported lazily, from
+              # inside a function, so that a build with no isolated plugins
+              # never touches multiprocessing. A spawned child then imports it
+              # by name rather than through any import PyInstaller can see, and
+              # a bundle that left it out would fail only for the one operator
+              # who enabled an isolated plugin.
+              #
+              # --add-data clv/examples: the worked examples are named in
+              # SEEDED_EXAMPLES as *strings*, so nothing imports them
+              # statically and PyInstaller's analysis never saw them. Every
+              # binary release before this shipped a plugin README listing nine
+              # examples beside an empty directory, silently, because the
+              # seeding code catches every exception on purpose. They ship as
+              # data rather than as hidden imports because even a bundled
+              # module has no source for inspect.getsource to read.
               python3.11 -m PyInstaller -y \
                 --name "${BIN_NAME}" \
                 --onedir \
                 --console \
                 --add-data "settings.conf:." \
+                --add-data "clv/examples:clv/examples" \
+                --hidden-import clv.plugins.host \
                 clv/__main__.py
             '
           # The container writes as root; the rest of the job is the runner user.
@@ -232,6 +249,21 @@ jobs:
           wait "$PID" 2>/dev/null || true
           test -f "${XDG_CONFIG_HOME}/clv/settings.conf" \
             || { echo "::error::binary did not provision its user settings file" >&2; exit 1; }
+          # The worked examples, which only a real bundle can check: a source
+          # checkout seeds them through inspect.getsource and would pass while
+          # the binary shipped none. Driven off the same list the app uses, so
+          # an example added without being bundled fails here.
+          EXAMPLES="${XDG_CONFIG_HOME}/clv/plugins/examples"
+          for name in nginx_error field_regex watch_alerts cluster_rules \
+                      timeline_marks commands redact_secrets html_report \
+                      container_logs; do
+            test -s "${EXAMPLES}/${name}.py" || {
+              echo "::error::worked example ${name}.py was not seeded from the bundle" >&2
+              ls -la "${EXAMPLES}" >&2 || true
+              exit 1
+            }
+          done
+          echo "All worked examples seeded into ${EXAMPLES}"
           # The file was just written from the bundled template, so the upgrade
           # pass the installer runs must see it as current. Anything else means
           # the template's config_version and CURRENT_CONFIG_VERSION have drifted,
@@ -243,6 +275,211 @@ jobs:
             echo "::error::the no-op upgrade took a backup" >&2; exit 1
           fi
           echo "Smoke test passed for ${{ matrix.arch }}"
+
+      - name: Smoke test the CLI in the frozen build
+        run: |
+          set -euo pipefail
+          # `clv doctor` is the support tool an operator will be asked to run,
+          # and the binary is the build almost all of them have. The suite can
+          # only ever check it against an interpreter, where a missing hidden
+          # import or a frozen-only path resolution cannot show up -- the same
+          # blind spot that let `Path.is_dir()` silently drop the journal
+          # provider from a bundle once already.
+          #
+          # A deliberately broken plugin, because the interesting assertion is
+          # not that the command runs: it is that a plugin CLV could not import
+          # is *named*, and that saying so is still an exit 0.
+          export HOME="${RUNNER_TEMP}/cli-home"
+          export XDG_CONFIG_HOME="${RUNNER_TEMP}/cli-config"
+          CONF="${XDG_CONFIG_HOME}/clv/settings.conf"
+          PLUGINS="${XDG_CONFIG_HOME}/clv/plugins"
+          mkdir -p "$HOME" "${PLUGINS}"
+          printf 'import definitely_not_a_module\n' > "${PLUGINS}/broken.py"
+          "dist/${BIN_NAME}/${BIN_NAME}" --print-default-config > "${CONF}"
+          sed -i 's/^plugins =$/plugins = broken/' "${CONF}"
+          grep -q '^plugins = broken$' "${CONF}" \
+            || { echo "::error::could not enable the broken plugin in ${CONF}" >&2; exit 1; }
+
+          # No terminal: stdin closed and stdout a pipe, which is how it will be
+          # run when someone is asked to paste the output.
+          "dist/${BIN_NAME}/${BIN_NAME}" doctor < /dev/null > "${RUNNER_TEMP}/doctor.txt"
+          # Both anchors ASCII on purpose: the row itself is separated by an em
+          # dash, and a grep pattern in this file should not depend on the
+          # runner's locale to match it.
+          grep -q "plugins: .*1 failed" "${RUNNER_TEMP}/doctor.txt" \
+            || { echo "::error::clv doctor did not report a failed plugin" >&2;
+                 cat "${RUNNER_TEMP}/doctor.txt" >&2; exit 1; }
+          grep -q "No module named 'definitely_not_a_module'" "${RUNNER_TEMP}/doctor.txt" \
+            || { echo "::error::clv doctor named no reason for the failure" >&2;
+                 cat "${RUNNER_TEMP}/doctor.txt" >&2; exit 1; }
+
+          "dist/${BIN_NAME}/${BIN_NAME}" plugin list < /dev/null > "${RUNNER_TEMP}/list.txt"
+          grep -q "broken" "${RUNNER_TEMP}/list.txt" \
+            || { echo "::error::clv plugin list did not list the installed plugin" >&2;
+                 cat "${RUNNER_TEMP}/list.txt" >&2; exit 1; }
+
+          # Bare `clv` must still be the viewer, so a recognised subcommand is
+          # the only thing that may divert. An unknown one is a usage error, and
+          # a bundle that answered 0 here would mean argv was being swallowed.
+          if "dist/${BIN_NAME}/${BIN_NAME}" frobnicate < /dev/null > /dev/null 2>&1; then
+            echo "::error::an unknown subcommand did not fail" >&2; exit 1
+          fi
+          echo "CLI smoke test passed for ${{ matrix.arch }}"
+
+      - name: Smoke test plugin install in the frozen build
+        run: |
+          set -euo pipefail
+          # PLUGIN_TODO.md Phase 15's gate is a claim about *this* build: "a
+          # plugin packaged, published as a tarball, installed by URL on a
+          # machine with only the binary, verified, enabled and used". The suite
+          # can only check it against an interpreter, and the interesting
+          # failure modes here are frozen-only -- tomllib present in the bundle,
+          # urllib's file handler reachable, and the plugin directory resolving
+          # from $XDG_CONFIG_HOME rather than from __file__ inside a read-only
+          # tree. This is the only place that can be checked.
+          export HOME="${RUNNER_TEMP}/install-home"
+          export XDG_CONFIG_HOME="${RUNNER_TEMP}/install-config"
+          CLV="dist/${BIN_NAME}/${BIN_NAME}"
+          BUILD="${RUNNER_TEMP}/plugin-build"
+          mkdir -p "$HOME" "${BUILD}/demo_format-1.0.0"
+          cd "${BUILD}/demo_format-1.0.0"
+
+          cat > demo_format.py <<'PLUGIN'
+          from clv.api import FilterStage
+
+
+          class Demo(FilterStage):
+              name = "demo_format"
+              requires_api = ">=1.0,<2.0"
+
+              def apply(self, entry, context):
+                  return entry
+          PLUGIN
+
+          SUM="$(sha256sum demo_format.py | cut -d' ' -f1)"
+          cat > clv-plugin.toml <<MANIFEST
+          name = "demo_format"
+          version = "1.0.0"
+          requires_api = ">=1.0,<2.0"
+          kinds = ["FilterStage"]
+          files = [{ path = "demo_format.py", sha256 = "${SUM}" }]
+          MANIFEST
+
+          cd "${BUILD}"
+          tar czf demo.tar.gz demo_format-1.0.0
+          cd "${GITHUB_WORKSPACE}"
+
+          # By URL, which is the half of the gate a local path would not cover.
+          "${CLV}" plugin install "file://${BUILD}/demo.tar.gz" < /dev/null \
+            > "${RUNNER_TEMP}/install.txt"
+          grep -q "checksums: 1 file verified" "${RUNNER_TEMP}/install.txt" \
+            || { echo "::error::install did not verify the checksum" >&2;
+                 cat "${RUNNER_TEMP}/install.txt" >&2; exit 1; }
+          # Requirement 2: installing is not consent to run it.
+          grep -q "NOT enabled" "${RUNNER_TEMP}/install.txt" \
+            || { echo "::error::install did not say the plugin is not enabled" >&2;
+                 cat "${RUNNER_TEMP}/install.txt" >&2; exit 1; }
+
+          "${CLV}" plugin verify < /dev/null > "${RUNNER_TEMP}/verify.txt"
+          grep -q "demo_format: ok" "${RUNNER_TEMP}/verify.txt" \
+            || { echo "::error::verify failed on a clean install" >&2;
+                 cat "${RUNNER_TEMP}/verify.txt" >&2; exit 1; }
+
+          # Tamper, and assert both commands notice. `verify` must also exit 1.
+          echo "# altered" >> "${XDG_CONFIG_HOME}/clv/plugins/demo_format.py"
+          if "${CLV}" plugin verify < /dev/null > "${RUNNER_TEMP}/tampered.txt"; then
+            echo "::error::verify exited 0 after the file was changed" >&2
+            cat "${RUNNER_TEMP}/tampered.txt" >&2; exit 1
+          fi
+          grep -q "demo_format.py" "${RUNNER_TEMP}/tampered.txt" \
+            || { echo "::error::verify did not name the changed file" >&2;
+                 cat "${RUNNER_TEMP}/tampered.txt" >&2; exit 1; }
+
+          # A crafted archive must not write outside the plugin directory. The
+          # member name is what a traversal looks like; the assertion is that
+          # the canary is still absent afterwards.
+          python3 - "${BUILD}/evil.tar" "${RUNNER_TEMP}/pwned" <<'EVIL'
+          import io, sys, tarfile
+          archive, canary = sys.argv[1], sys.argv[2]
+          with tarfile.open(archive, "w") as bundle:
+              payload = b"owned"
+              info = tarfile.TarInfo("../../../../../../" + canary.lstrip("/"))
+              info.size = len(payload)
+              bundle.addfile(info, io.BytesIO(payload))
+          EVIL
+          if "${CLV}" plugin install "${BUILD}/evil.tar" < /dev/null > /dev/null 2>&1; then
+            echo "::error::a traversing archive was accepted" >&2; exit 1
+          fi
+          if [ -e "${RUNNER_TEMP}/pwned" ]; then
+            echo "::error::a refused archive still wrote outside the staging dir" >&2
+            exit 1
+          fi
+
+          "${CLV}" plugin remove demo_format < /dev/null > /dev/null
+          if [ -e "${XDG_CONFIG_HOME}/clv/plugins/demo_format.py" ]; then
+            echo "::error::remove left the plugin behind" >&2; exit 1
+          fi
+          echo "Plugin install smoke test passed for ${{ matrix.arch }}"
+
+      - name: Smoke test plugin isolation in the frozen build
+        run: |
+          set -euo pipefail
+          # The one thing the test suite cannot catch. `multiprocessing`'s spawn
+          # starts a child by re-running sys.executable, which in a frozen build
+          # is this binary -- so without freeze_support() as the first statement
+          # in clv/__main__.py, the first isolated plugin re-launches the whole
+          # viewer, repeatedly. Against an interpreter, which is all the suite
+          # ever has, spawn needs no help and the bug is invisible.
+          #
+          # The probe records the pid of whatever imported it. Isolated from
+          # settings.conf, CLV never imports it in its own process, so a correct
+          # build writes exactly one line and it is not the viewer's pid.
+          export HOME="${RUNNER_TEMP}/iso-home"
+          export XDG_CONFIG_HOME="${RUNNER_TEMP}/iso-config"
+          export CLV_ISO_PROBE="${RUNNER_TEMP}/iso-probe.txt"
+          CONF="${XDG_CONFIG_HOME}/clv/settings.conf"
+          PLUGINS="${XDG_CONFIG_HOME}/clv/plugins"
+          mkdir -p "$HOME" "${PLUGINS}"
+          cat > "${PLUGINS}/isoprobe.py" <<'PROBE'
+          import os
+
+          with open(os.environ["CLV_ISO_PROBE"], "a", encoding="utf-8") as handle:
+              handle.write("imported by %d\n" % os.getpid())
+
+          from clv.api import Command
+
+
+          class Probe(Command):
+              name = "iso-probe"
+              command_name = "iso-probe"
+              title = "Isolation probe"
+
+              def run(self, context):
+                  context.notify("here")
+          PROBE
+          "dist/${BIN_NAME}/${BIN_NAME}" --print-default-config > "${CONF}"
+          sed -i 's/^plugins =$/plugins = isoprobe/' "${CONF}"
+          printf '\n[plugin:isoprobe]\nisolated = true\n' >> "${CONF}"
+          grep -q '^plugins = isoprobe$' "${CONF}" \
+            || { echo "::error::could not enable the probe plugin in ${CONF}" >&2; exit 1; }
+          TERM=xterm-256color timeout 20 "dist/${BIN_NAME}/${BIN_NAME}" < /dev/null > /dev/null 2>&1 &
+          PID=$!
+          sleep 10
+          kill -TERM "$PID" 2>/dev/null || true
+          wait "$PID" 2>/dev/null || true
+          test -f "${CLV_ISO_PROBE}" \
+            || { echo "::error::the isolated plugin was never imported — no host started" >&2; exit 1; }
+          LINES="$(wc -l < "${CLV_ISO_PROBE}")"
+          if [[ "${LINES}" -ne 1 ]]; then
+            echo "::error::the isolated plugin was imported ${LINES} times — the binary is re-launching itself; is freeze_support() still first in clv/__main__.py?" >&2
+            cat "${CLV_ISO_PROBE}" >&2
+            exit 1
+          fi
+          if grep -q "imported by ${PID}$" "${CLV_ISO_PROBE}"; then
+            echo "::error::the viewer imported the plugin itself; settings-forced isolation did not take" >&2
+            exit 1
+          fi
+          echo "Isolation smoke test passed for ${{ matrix.arch }}"
 
       - name: Stage install tree
         run: |

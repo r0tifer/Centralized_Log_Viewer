@@ -1,14 +1,21 @@
 """CLV plugin interfaces and loader.
 
-Six extension points, each matching a thing operators keep asking CLV to do that
-core should not hard-code:
+Thirteen extension points, each matching a thing operators keep asking CLV to do
+that core should not hard-code:
 
 * :class:`LogSourceProvider` — where log lines come from.
 * :class:`LogFormat` — how a line CLV does not recognise is parsed.
 * :class:`QueryOperator` — a comparison token the query box does not have.
 * :class:`ComputedField` — a queryable field derived rather than parsed.
 * :class:`FilterStage` — what happens to a line on its way to the pane.
+* :class:`ClusterRule` — one more volatile token the repeat clusterer folds out.
+* :class:`ShapeContributor` — an extra component of the key two entries share.
+* :class:`TimelineAnnotation` — marks on the timeline's axis.
+* :class:`TimelineMetric` — what a timeline bucket measures, if not entries.
+* :class:`WatchMatcher` — a watch rule kind that is not "this pattern matched".
+* :class:`WatchSink` — where a watch hit is delivered.
 * :class:`Exporter` — where the current view can be sent.
+* :class:`Command` — a named action an operator invokes, and the modal it draws.
 
 Plugins are loaded from two places: modules dropped into ``clv/plugins/``
 (``sources/``, ``filters/``, ``exporters/`` or flat), and installed
@@ -34,6 +41,7 @@ import configparser
 import importlib
 import importlib.metadata
 import inspect
+import math
 import os
 import pkgutil
 import re
@@ -42,12 +50,14 @@ import time
 import types
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
 
-from ..services.filtering import FilterSpec
+from ..services.clustering import ClusterRuleSpec, ShapeSpec
+from ..services.filtering import FilterSpec, TimeWindow
 from ..services.formats import DEFAULT_PROFILE, FormatProfile
-from ..services.parsing import FORMAT_NAMES, LogEntry
+from ..services.parsing import FORMAT_NAMES, LogEntry, normalize_level
 from ..services.query import (
     BUILTIN_OPERATORS,
     KEY_CHARS,
@@ -56,6 +66,13 @@ from ..services.query import (
     is_query_key,
 )
 from ..services.refs import SourceRef
+from ..services.timeline import AnnotationSpec, MetricSpec
+from ..services.watch import (
+    KIND_PATTERN,
+    MatcherSpec,
+    SinkSpec,
+    WatchRule,
+)
 
 #: The version of the published plugin API — the surface re-exported by
 #: :mod:`clv.api` — and **not** CLV's own version.
@@ -77,6 +94,23 @@ ENTRY_POINT_GROUP = "clv.plugins"
 
 #: Subdirectories of clv/plugins scanned for drop-in modules.
 _LOCAL_SUBPACKAGES = ("sources", "filters", "exporters")
+
+#: Modules of CLV's own that sit in ``clv/plugins/`` and are not drop-ins.
+#:
+#: The flat walk imports every module beside the subpackages, which is how a
+#: single-file plugin can be dropped straight into ``clv/plugins/``. CLV's
+#: machinery lives there too, and without this it is walked like a plugin:
+#: imported, found to export nothing, and reported to the operator as "defines
+#: no plugin" against an origin they have no way to act on.
+#:
+#: Every addition here is a module CLV put in this package, and the list has to
+#: grow with them: ``manifest`` and ``install`` arrived in Phase 15 and were
+#: promptly reported to the operator as two broken bundled plugins, because
+#: their dataclasses are classes defined in a module beside the drop-ins and
+#: the walk cannot tell the difference. That is what this tuple is for, and a
+#: test asserts it covers every non-drop-in module here so the next one cannot
+#: repeat it.
+_LOADER_MODULES = ("host", "install", "manifest")
 
 #: Extra plugin directories, ``os.pathsep``-separated, searched *before* the
 #: user plugin directory.
@@ -136,6 +170,24 @@ class Plugin(ABC):
     #: plugins that do not care both take the default and compose by name, which
     #: is at least a rule their authors can predict.
     priority: int = 100
+
+    #: Ask to be run in a subprocess CLV can stop. Default False.
+    #:
+    #: **Failure containment, not safety.** A host can be killed when it
+    #: crashes, hangs or leaks, which is the first time in CLV's history a
+    #: plugin can be *stopped* -- and it does not make an untrusted plugin safe:
+    #: the child runs as the operator, with the operator's filesystem. Setting
+    #: this is a robustness decision, never a security boundary.
+    #:
+    #: Only the coarse-grained kinds may ask. :data:`ISOLABLE_KINDS` lists them
+    #: and every other kind is refused at load with the reason named, because a
+    #: round trip per entry or per line is not a slower version of the same
+    #: program.
+    #:
+    #: An operator can ask on a plugin's behalf, with ``isolated = true`` in its
+    #: ``[plugin:<name>]`` section -- and that door contains strictly more,
+    #: because CLV then never imports the module in its own process at all.
+    isolated: bool = False
 
     def describe(self) -> str:
         return self.name
@@ -472,6 +524,351 @@ class ComputedField(Plugin):
         """
 
 
+class ClusterRule(Plugin):
+    r"""One more volatile token for the repeat clusterer to normalise out.
+
+    Clustering folds lines that read the same once their volatile tokens are
+    replaced by placeholders. The built-in list — quoted strings, timestamps,
+    UUIDs, addresses, hex, paths, numbers — is fixed and ordered, and a log
+    whose noisy token is none of those gets one cluster per line, which is the
+    feature not working on exactly the log that needed it::
+
+        class EmailAddress(ClusterRule):
+            name = "email-address"
+            pattern = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+            placeholder = "<email>"
+
+    **Declarative on purpose: you supply the pattern, CLV runs it.** There is no
+    method to implement and therefore no third-party call on a path that runs
+    per line. Everything that could go wrong is checked when the plugin loads,
+    which is the one time an author is there to read the message.
+
+    What is checked, and why each one is invisible at runtime:
+
+    * :attr:`pattern` must be a compiled pattern or a string this accepts and
+      compiles. An unreadable regex is reported with its own error.
+    * It may not match the **empty string**. ``\d*`` matches at every position,
+      so a rule written that way would splice its placeholder between every
+      character of every line.
+    * :attr:`placeholder` may contain **no digit**. Plugin rules run after the
+      built-ins, so a later plugin rule matching numbers would chew up an
+      earlier one's placeholder — the reason CLV's own nine are digit-free.
+    * It may contain **no backslash**: it is a :func:`re.sub` replacement
+      template, so a group reference in it would splice in whatever the pattern
+      captured, or raise on a group that does not exist.
+
+    An **empty** placeholder is legal and means "delete this token" — stripping
+    an ANSI colour run is a real rule, and it is the reason this is not refused
+    as an oversight.
+
+    **Ordering is append-only, and you are handed the line CLV has already
+    normalised.** Plugin rules run after every built-in, in
+    :func:`plugin_sort_key` order — the only position that cannot break the
+    built-in order, in which each rule runs on what the previous left. It is
+    also the trap: the obvious Kubernetes rule,
+    ``re.compile(r"-[a-z0-9]{8,10}-[a-z0-9]{5}\b")``, never fires, because by
+    the time it runs ``api-7d9f8b6c4-x2n9q`` is already ``api-<hex>-x2n9q``.
+    Press ``c`` and look at what a line collapses to before writing a rule for
+    it; ``clv/examples/cluster_rules.py`` works the case through.
+
+    **Cost: one substitution per *distinct* line.** ``normalise`` is memoised,
+    so a repeated line is shaped once however often it is rendered. The cluster
+    budget (``plugin_time_budget_ms``) measures what that costs, and because
+    the cache absorbs the repeats what it sees is the work that is actually new.
+    """
+
+    #: The regular expression this rule replaces. A compiled pattern, or a
+    #: string CLV compiles at load. Rejected when absent, unreadable, or able to
+    #: match the empty string.
+    pattern: Any = ""
+
+    #: What to write in its place. No digit, no backslash; empty means delete.
+    placeholder: str = ""
+
+
+class ShapeContributor(Plugin):
+    """An extra component of the key two entries must share to cluster.
+
+    A cluster's shape is the source, the level and the normalised message.
+    Field *values* are deliberately not in it — a request ID differing between
+    two lines is exactly what must not split a cluster — but sometimes a value
+    is precisely what should::
+
+        class ByUnit(ShapeContributor):
+            name = "cluster-by-unit"
+
+            def contribute(self, entry):
+                return entry.fields.get("unit", "")
+
+    Two units logging the same sentence then stay two clusters, and nothing
+    about what a shape already means has changed.
+
+    **A contributor that returns the same string for everything is a no-op.**
+    That is what makes adding one safe: it can only ever split clusters further,
+    never merge two that were apart.
+
+    **Your answer must be a pure function of the entry.** CLV clusters the whole
+    filtered set on a render and folds tailed lines into that same stream one at
+    a time; a contribution that changes between those two calls makes the
+    incremental path and a full recompute disagree about what belongs with what.
+    Returning anything but a string takes the plugin out of service, because the
+    value is composed into the key and a repr would give every entry a shape of
+    its own.
+
+    **Cost: per entry, per render, and memoised by nothing.** The shape cache is
+    keyed on the line's text, which is not enough to remember an answer that
+    depends on the whole entry — so this is the expensive half of the clustering
+    seam and the half the budget is really there for. Read a field; do not
+    compute one.
+    """
+
+    @abstractmethod
+    def contribute(self, entry: LogEntry) -> str:
+        """This entry's extra shape component, or ``""`` to add nothing.
+
+        ``""`` adds nothing *at all* rather than an empty component, which is
+        what lets a contributor answer for the entries it knows about and stay
+        out of the way for the rest — and what makes a contributor taken out of
+        service leave the shape byte-identical to a build without it.
+
+        Raising takes the contributor out of service for the session and is
+        recorded once; clustering then continues on the shape it had before the
+        plugin was installed.
+        """
+
+
+class TimelineAnnotation(Plugin):
+    """Marks on the timeline's axis: not how much happened, but what else did.
+
+    The histogram (``b``) answers *when did this start*. An annotation answers
+    *what was happening then* — a deploy, an incident, a maintenance window —
+    which is the difference between a spike and a spike with a cause::
+
+        class Deploys(TimelineAnnotation):
+            name = "deploy-marks"
+
+            def annotations(self, window):
+                for moment, version in self._deploys:      # read at setup()
+                    yield (moment, f"deploy {version}", "notice")
+
+    The bucket a mark lands in is drawn underlined and in the mark's own
+    severity colour, its label goes in the caption when that bucket is selected,
+    and ``shift+←`` / ``shift+→`` step between marked buckets.
+
+    **You are called on the event loop, and you may not do I/O.** This runs
+    inside the render that draws the bar, so a provider that opens a socket
+    blocks the pane — and it is charged against ``plugin_time_budget_ms`` like
+    every other render-path plugin, so one that does it anyway strikes out and
+    is switched off. Fetch in :meth:`~Plugin.setup`, or on a thread of your own,
+    and answer this call from memory.
+
+    **You are asked once per window, not once per render.** The answer is cached
+    against the window the bar is showing and reused until the grid moves, so
+    typing in the query box does not re-ask you. The cache is cleared whenever
+    the plugin registry changes, which is how switching a provider off takes its
+    marks off the bar.
+
+    **Return what you have; CLV drops what does not fit.** A moment outside the
+    window is not drawn — filtering by ``window`` yourself is an optimisation,
+    not a requirement. At most
+    :data:`~clv.services.timeline.MAX_ANNOTATIONS` marks are kept for one grid.
+
+    The third element is a severity, normalised the way a parsed line's is, and
+    ``None`` is the ordinary answer for something that is not a severity at all.
+    """
+
+    @abstractmethod
+    def annotations(
+        self, window: TimeWindow
+    ) -> Iterable[tuple[datetime, str, Optional[str]]]:
+        """``(moment, label, level)`` for the visible *window*.
+
+        Anything that is not a three-element tuple of a :class:`~datetime.datetime`,
+        a string and a severity-or-``None`` takes the plugin out of service with
+        a message naming what it returned — the marks are drawn and captioned,
+        and a provider that half-answers would put a mark of unknown meaning on
+        the axis.
+
+        Raising does the same and is recorded once; the bar then renders exactly
+        as it did before the plugin was installed.
+        """
+
+
+class TimelineMetric(Plugin):
+    """What a timeline bucket measures, when counting entries is the wrong unit.
+
+    A hundred lines is not a hundred kilobytes, and a log where the interesting
+    quantity is bytes, duration or retries gets a histogram that answers a
+    question nobody asked::
+
+        class BytesRead(TimelineMetric):
+            name = "bytes-metric"
+            metric_name = "bytes read"
+            unit = "B"
+
+            def value(self, entry):
+                return float(entry.fields.get("bytes", 0) or 0)
+
+    The bar is then scaled by the metric, and the caption leads with it and
+    names this plugin — because a bar whose heights mean bytes looks exactly
+    like a bar whose heights mean lines.
+
+    **Your metric must be foldable, and that is why this interface is so thin.**
+    :meth:`~clv.services.timeline.Timeline.extend` folds a newly tailed line
+    into its bucket by arithmetic, which is what makes tailing cost what arrived
+    rather than what is buffered. A sum survives that; a median, a percentile or
+    a distinct count does not. So you declare a per-entry number and **CLV does
+    the summing** — there is no ``aggregate()`` to implement, which makes a
+    non-foldable metric unexpressible rather than quietly wrong on every line
+    after the first render.
+
+    ``None`` means "not measured by me" and contributes nothing, so a metric can
+    answer for the entries it understands and stay out of the way for the rest.
+    An entry with **no timestamp** is never passed here at all: it has no bucket,
+    it is reported in ``undated``, and a metric does not get to change that.
+
+    **One metric runs at a time.** Two enabled metrics is a conflict CLV
+    resolves by :attr:`~Plugin.priority` and reports in the ``P`` dialog, naming
+    the winner; the loser stays loaded and contributes nothing, and takes over
+    if the winner is switched off. Losing a tie-break is not a fault and does
+    not mark anything failed.
+
+    **Cost: per entry, per rebuild, memoised by nothing.** The same budget and
+    the same shape as a :class:`ShapeContributor` — read a field, do not compute
+    one.
+    """
+
+    #: What this measures, in the words the caption will use — ``"bytes read"``,
+    #: not ``"bytes_read_total"``. Required: a plugin that cannot name its
+    #: metric is refused at load, because the caption would have no way to say
+    #: what the bar is showing.
+    metric_name: str = ""
+
+    #: Printed after the scaled figure: ``unit = "B"`` reads as ``1.4 MB``.
+    #: Optional, and empty prints a bare number. Prefixes are thousands-based,
+    #: so a metric wanting binary ones does its own division and says so here.
+    unit: str = ""
+
+    @abstractmethod
+    def value(self, entry: LogEntry) -> Optional[float]:
+        """This entry's contribution, or ``None`` to measure nothing.
+
+        Must be a finite real number. A bool is refused with a message rather
+        than summed as 1 — ``1.0 if condition else 0.0`` is how you count a
+        subset, and it says so where a ``True`` would not. A non-number, an
+        infinity or a NaN takes the plugin out of service, because each one
+        makes the bar's scale meaningless rather than merely wrong.
+
+        Raising does the same and is recorded once; the bar then goes back to
+        counting entries.
+        """
+
+
+class WatchMatcher(Plugin):
+    """Teaches CLV a kind of watch rule that is not "this pattern matched".
+
+    A rule declares a :attr:`~clv.services.watch.WatchRule.kind`; a matcher
+    claims one. When they meet, CLV stops treating the rule's ``pattern`` as a
+    query and hands it to this plugin untouched — it is **your** parameter
+    string, in whatever spelling you document, and CLV neither parses nor
+    validates it beyond asking :meth:`validate`.
+
+    ``kind`` is matched casefolded, must not contain whitespace, and may not be
+    ``"pattern"``: that one is CLV's and every rule ever saved already means
+    something under it.
+
+    **A matcher is offered lines.** :meth:`matches` is called once per newly
+    arrived entry per enabled rule of this kind, so a rule kind that must fire
+    because *nothing* arrived — a silence or absence rule — cannot be written
+    against this interface. There is no tick and no clock here; holding state
+    between calls is how a threshold or a burst kind is written, and that state
+    is yours to bound.
+
+    **Per entry, and charged for it.** The calls are measured against the read
+    budget and three consecutive passes over it take the plugin out of service,
+    exactly as a slow :class:`LogFormat` is. Make the cheap rejection first.
+    """
+
+    #: The rule kind this matcher claims, e.g. ``"burst"``. A matcher declaring
+    #: nothing here is rejected at load, because no rule could ever reach it.
+    kind: str = ""
+
+    @abstractmethod
+    def matches(self, entry: LogEntry, rule: WatchRule) -> bool:
+        """Whether *entry* should fire *rule*.
+
+        *rule* is the whole record, so ``rule.pattern`` is this matcher's
+        parameter string and ``rule.name`` is what the operator called it —
+        which is the key to use if this matcher keeps per-rule state.
+
+        Never raise for something the operator typed. A malformed parameter is
+        :meth:`validate`'s business; raising here disables the plugin for the
+        session over a rule that can be fixed in the dialog.
+        """
+
+    def validate(self, pattern: str) -> Optional[str]:
+        """Why *pattern* is not a usable parameter for this kind, or ``None``.
+
+        Optional, and worth implementing: it is what puts the complaint where
+        the operator typed it rather than leaving them a rule that silently
+        never fires. Returning ``None`` — the default — means "anything goes".
+        """
+
+        return None
+
+
+class WatchSink(Plugin):
+    """Somewhere a watch hit is delivered, besides the toast.
+
+    **You are fed the result of rate limiting, never the raw hits.** A rule
+    matching five hundred lines inside one window reaches you once, with
+    ``count=500``. That is not a convenience: a rule matching every line is the
+    behaviour that makes people switch a feature like this off, and a sink that
+    could bypass the coalescing would be able to do it to somebody else's
+    inbox.
+
+    **You do not run on the event loop.** Every sink gets a thread of its own,
+    so blocking on a socket is allowed here in a way it is allowed nowhere else
+    in CLV. There is a deadline: a sink that has not returned from one
+    :meth:`deliver` within ``plugin_sink_timeout_ms`` is taken out of service
+    and stops being fed. Its thread keeps running — CLV cannot kill a thread —
+    which is why a sink that talks to the network should set its own timeouts
+    rather than relying on this one.
+
+    **You get a name and a count, and nothing else, unless you say otherwise.**
+    Set :attr:`wants_entries` to receive a bounded sample of the matching lines.
+    That declaration is shown to the operator in the ``P`` dialog, because a
+    sink that reads log content and sends it somewhere is a thing they are
+    entitled to know about before they enable it.
+
+    **Egress is the operator's decision, not yours.** The convention for a sink
+    that leaves the machine is the one the journal provider follows for reading
+    it: ship inert, read your destination from your own ``[plugin:<name>]``
+    section, and deliver nothing until it is set.
+    """
+
+    #: Whether :meth:`deliver` should receive the matching lines. Default False,
+    #: and the default is the one to keep unless the sink genuinely cannot do
+    #: its job without them.
+    wants_entries: bool = False
+
+    @abstractmethod
+    def deliver(
+        self,
+        name: str,
+        count: int,
+        context: FilterContext,
+        entries: Sequence[LogEntry] = (),
+    ) -> None:
+        """Deliver one rule's window.
+
+        *name* is the rule's name and *count* is how many lines matched inside
+        the window — the true count, whatever ``entries`` holds. *entries* is
+        empty unless :attr:`wants_entries` is set, and is capped at
+        ``SINK_SAMPLE_LIMIT`` when it is.
+        """
+
+
 @dataclass(frozen=True, slots=True)
 class ExportResult:
     """What an exporter did, so the UI can report it."""
@@ -523,6 +920,268 @@ class Exporter(Plugin):
         when the exporter set :attr:`wants_path`. Keyword-only so that adding it
         could not change what an existing positional call means.
         """
+
+
+#: The empty panel form, shared. A `CommandContext` built outside a panel hands
+#: out this one rather than a fresh dict per invocation -- the same argument
+#: `LogEntry.fields` makes for its own shared empty mapping, and the same
+#: guarantee: it is read-only, so nothing can write into what everyone sees.
+_EMPTY_VALUES: Mapping[str, Any] = types.MappingProxyType({})
+
+
+#: The controls a plugin may ask CLV to draw. Six, and the list is short on
+#: purpose: every one of them is something CLV already styles, lays out and
+#: tests at 80 columns, so a panel built from them inherits the breakpoint
+#: behaviour rather than having to be measured on its own.
+CONTROL_KINDS = ("label", "static", "switch", "input", "select", "button")
+
+
+@dataclass(frozen=True, slots=True)
+class Control:
+    """One control in a :class:`Panel`, as a description rather than a widget.
+
+    A plugin says *what* it wants and CLV decides what that looks like. That
+    division is Requirement 11 of ``PLUGIN_TODO.md`` in one dataclass: the
+    responsive breakpoints and the 80-column floor are CLV's, and a plugin that
+    could hand over a widget would make every breakpoint test conditional on
+    what happens to be installed.
+
+    ``kind`` is one of :data:`CONTROL_KINDS`:
+
+    ``label``
+        A caption for the control below it.
+    ``static``
+        A line of text. The only way a panel says something without asking for
+        anything.
+    ``switch``
+        On or off. ``value`` is a ``bool``.
+    ``input``
+        A line of text. ``value`` is the initial contents, ``placeholder`` the
+        prompt shown while it is empty.
+    ``select``
+        One of ``options``, each a ``(value, label)`` pair. ``value`` is the
+        initially selected *value*, not its label.
+    ``button``
+        Pressing it calls :meth:`Command.on_control` with ``value=True``.
+
+    ``id`` is how the control is named back to you and is the key it appears
+    under in :attr:`CommandContext.values`. It must be non-empty and unique
+    within a panel; CLV refuses a panel that breaks either rule rather than
+    drawing one whose controls cannot be told apart.
+    """
+
+    kind: str
+    id: str
+    label: str = ""
+    value: Any = ""
+    #: ``select`` only: ``(value, label)`` pairs, in the order to show them.
+    options: tuple[tuple[str, str], ...] = ()
+    #: ``input`` only: what to show while the field is empty.
+    placeholder: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class Panel:
+    """A modal screen's worth of controls, described rather than built.
+
+    Returned from :meth:`Command.run` to open a modal, and from
+    :meth:`Command.on_control` to redraw one. A modal is the one place a plugin
+    gets real room, precisely because full-screen means it cannot interact with
+    the main layout at all -- so nothing it does can move a breakpoint.
+
+    ``Panel(dismiss=True)`` closes the modal. Return ``None`` from
+    ``on_control`` to leave what is on screen exactly as it is, which is the
+    ordinary answer for a callback that only recorded something.
+    """
+
+    title: str = ""
+    controls: tuple[Control, ...] = ()
+    #: Close the modal instead of drawing this panel. The rest of the panel is
+    #: ignored when this is set.
+    dismiss: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CommandContext:
+    """What a command is handed, and the only way it can answer back.
+
+    **Pure data, in both directions, and the second half is the load-bearing
+    one.** The obvious way to let a command raise a toast is to hand it a
+    callable -- but a bound method carries ``__self__`` and a closure carries
+    ``__closure__``, so a context built that way has a live route to the ``App``
+    object for anyone who looks, and the rule that a command cannot reach the
+    app would be a convention rather than a fact.
+
+    So every outward call here *appends to* :attr:`requests` and CLV drains the
+    queue after :meth:`Command.run` returns, performing each one itself. A
+    command cannot touch the screen, the registry, the session or the store. It
+    describes what it would like to have happen, and CLV decides.
+
+    That has a cost worth knowing: a long-running command cannot report progress
+    part-way through. Its messages arrive together, the moment it returns. A
+    command is on demand and synchronous, and if it is slow enough for that to
+    matter it is slow enough to be the operator's problem -- see
+    ``clv/plugins/AGENTS.md`` on why a command runs on the event loop.
+
+    It has a benefit too, and it was not free anywhere else: every member of
+    this class is already encodable, so the isolation host ``PLUGIN_TODO.md``
+    Phase 13 plans has nothing here it cannot send across a pipe.
+    """
+
+    #: The selected line, or ``None`` when the cursor is not on one.
+    entry: Optional[LogEntry] = None
+    #: Everything the current filters match, in display order. The *filtered*
+    #: set, not the buffer and not the window the pane happens to be showing.
+    entries: Sequence[LogEntry] = ()
+    #: The filters that produced :attr:`entries`.
+    spec: Optional[FilterSpec] = None
+    #: The open source, or ``None`` when nothing is selected.
+    source: Optional[SourceRef] = None
+    #: Every control's current value, keyed by :attr:`Control.id`. Empty outside
+    #: a panel. Live: a panel's callback reads the whole form from here rather
+    #: than tracking what it has been told about so far.
+    #:
+    #: A ``default_factory`` rather than a plain default, and the shared mapping
+    #: is what it returns -- exactly as ``LogEntry.fields`` does it, and for
+    #: exactly the same reason. Python 3.11, the floor the release binaries are
+    #: built against, rejects any dataclass default whose class is unhashable
+    #: and ``mappingproxy`` is one; 3.12 narrowed that check to list/dict/set,
+    #: which is why a plain default imports cleanly on a newer interpreter and
+    #: fails on the oldest supported one. Requirement 8 exists because this has
+    #: already happened here once.
+    values: Mapping[str, Any] = field(default_factory=lambda: _EMPTY_VALUES)
+    #: What this command has asked CLV to do, in the order it asked. Appended to
+    #: by the four methods below and drained by CLV afterwards; a command has no
+    #: reason to read it and every reason not to write it directly.
+    requests: list[tuple[str, Any]] = field(
+        default_factory=list, repr=False, compare=False
+    )
+
+    def notify(self, text: str, severity: str = "info") -> None:
+        """Raise a toast. *severity* is ``info``, ``warning`` or ``error``."""
+
+        self.requests.append(("notify", (str(text), str(severity))))
+
+    def request_query(self, text: str) -> None:
+        """Ask CLV to put *text* in the query box and re-filter.
+
+        Refused, named and reported if it does not parse -- with the query
+        parser's own message, so a plugin's bad query reads exactly as an
+        operator's would.
+        """
+
+        self.requests.append(("query", str(text)))
+
+    def request_source(self, ref: SourceRef) -> None:
+        """Ask CLV to select *ref*, which must be a source it already offers.
+
+        A command can move to a source; it cannot conjure one. A ref that the
+        last discovery did not list, and that no enabled provider offers, is
+        refused and reported rather than quietly doing nothing.
+        """
+
+        self.requests.append(("source", ref))
+
+    def request_view(self, name: str) -> None:
+        """Ask CLV to apply the saved view called *name*.
+
+        A view whose plugin is missing still degrades by preserve-disable-explain
+        (Requirement 12): it is refused with what it needs named, not applied
+        with some of its filters silently meaning something else.
+        """
+
+        self.requests.append(("view", str(name)))
+
+
+class Command(Plugin):
+    """A named action an operator can invoke, optionally bound to a key.
+
+    The seam that lets a plugin be *run* rather than merely consulted. Every
+    other interface in this module is called by CLV when CLV needs an answer;
+    this one is called because somebody asked for it::
+
+        class CopyAsNdjson(Command):
+            name = "ndjson-copy"
+            command_name = "copy-ndjson"
+            title = "Copy this view as NDJSON"
+            key = "j"
+
+            def run(self, context):
+                path = Path.home() / "clv-view.ndjson"
+                path.write_text(
+                    "\\n".join(json.dumps(e.fields) for e in context.entries)
+                )
+                context.notify(f"Wrote {len(context.entries)} lines to {path}")
+
+    **You run on the event loop, synchronously.** The same terms a plugin
+    :class:`Exporter` has always run on. Nothing else in CLV happens while
+    :meth:`run` is executing, so a command that blocks on a socket freezes the
+    pane -- there is no budget here that can save you, because CLV cannot
+    interrupt a call it is inside. Do the slow part on a thread of your own, or
+    declare ``isolated = True`` once ``PLUGIN_TODO.md`` Phase 13 lands and let
+    CLV run you somewhere it can kill you.
+
+    **Your key is hidden, and it may be refused.** A binding is installed with
+    ``show=False`` whatever you ask for: the footer's ordering is hand-tuned
+    against an 80-column floor and you cannot know what yours would push off.
+    ``?`` is how hidden bindings are found, which is already how CLV handles its
+    own overflow. A key that collides with a built-in, or with a command that
+    sorted ahead of you, is refused and reported -- and you stay invocable by
+    name from the ``C`` dialog, which is the whole reason that dialog exists.
+    """
+
+    #: Stable identifier. What the binding dispatches on and what the ``C``
+    #: dialog matches -- not operator-facing prose, so keep it short and do not
+    #: rename it once it has shipped. A command declaring nothing here is
+    #: refused at load, because nothing could ever address it.
+    command_name: str = ""
+
+    #: What the help overlay and the ``C`` dialog print. Operator-facing, and
+    #: required for the same reason a :class:`TimelineMetric` must name itself:
+    #: a row with nothing to say is a row nobody can act on.
+    title: str = ""
+
+    #: An optional key, in Textual's naming (``"j"``, ``"ctrl+j"``). Empty --
+    #: the default -- means the command is invocable by name only, which is a
+    #: perfectly ordinary thing for a command to be.
+    key: str = ""
+
+    #: Asking to appear in the footer. **Refused**, always, and reported when
+    #: set -- it is here so that an author who wants it reads a reason rather
+    #: than wondering why nothing happened. Requirement 11: a plugin cannot
+    #: know what its entry would push off the footer at 80 columns, and every
+    #: breakpoint test in CLV stays unconditional on what is installed.
+    show: bool = False
+
+    @abstractmethod
+    def run(self, context: CommandContext) -> Optional[Panel]:
+        """Do the thing. Return a :class:`Panel` to open a modal, or ``None``.
+
+        Raising takes the command out of service for the session and is recorded
+        once, exactly as a raising :class:`FilterStage` is; the key stops
+        working and the row in ``P`` says why, with **Re-enable** as the way
+        back.
+        """
+
+    def on_control(
+        self, control_id: str, value: Any, context: CommandContext
+    ) -> Optional[Panel]:
+        """A control in your panel changed, or a button was pressed.
+
+        *control_id* is the :attr:`Control.id`; *value* is its new value, and
+        ``True`` for a button. ``context.values`` holds the whole form, so there
+        is no need to track what you have been told so far.
+
+        Return a :class:`Panel` to redraw, ``Panel(dismiss=True)`` to close, and
+        ``None`` -- the default -- to leave the screen alone.
+
+        **You are on a modal's keystroke path.** This runs inside the event that
+        typed a character, so it is charged against ``plugin_time_budget_ms``
+        like every other plugin CLV calls from a render, and three consecutive
+        passes over the line take you out of service and close the panel.
+        """
+
+        return None
 
 
 # --- adapting the simple contract -------------------------------------------
@@ -841,7 +1500,20 @@ MAX_PLUGIN_ERRORS = 50
 #: wants a CLV you are not running" call for different actions from the
 #: operator, and the management UI must not have to *parse the message* to tell
 #: them apart. ``"load"`` is the unremarkable case and stays the default.
-ERROR_CATEGORIES = ("load", "incompatible", "shadowed", "missing", "runtime")
+#: ``conflict`` is the odd one and is deliberately not a fault: it is two
+#: plugins competing for something only one of them can have — today, the one
+#: metric a timeline bucket measures. CLV picks by ``priority`` and says so, the
+#: loser stays loaded and healthy, and :meth:`PluginRegistry.status` leaves the
+#: row's state alone and shows the note as its detail.
+ERROR_CATEGORIES = (
+    "load",
+    "incompatible",
+    "shadowed",
+    "missing",
+    "runtime",
+    "conflict",
+    "tampered",
+)
 
 
 @dataclass
@@ -1071,6 +1743,26 @@ class PluginStatus:
     #: The category of the error driving :attr:`state`, so the dialog knows
     #: whether Re-enable applies without reading :attr:`detail`.
     category: str = ""
+    #: Whether this origin supplies a :class:`WatchSink` that asked to be handed
+    #: log lines. Shown in the row, because "this plugin reads your log content
+    #: and sends it where it is configured to" is the single fact an operator
+    #: most needs before enabling something, and it is knowable from the
+    #: declaration without running anything.
+    reads_content: bool = False
+    #: Where this plugin came from and who vouched for it, as one sentence —
+    #: ``"installed 1.2.0 from https://… — signed by alice@example.com"``.
+    #:
+    #: Empty for a bundled plugin, an entry point, and a user plugin copied in
+    #: by hand: CLV has no record of those arriving and will not invent a
+    #: verdict on a file it never saw installed. Filled by
+    #: :func:`clv.plugins.manifest.annotate` rather than by :meth:`status`,
+    #: which does no filesystem IO and is not going to start.
+    provenance: str = ""
+    #: What re-hashing this plugin's recorded files found, if anything was
+    #: asked to. Empty means clean **or** never checked — ``clv doctor`` and
+    #: ``clv plugin verify`` are the two callers that ask, and each says which
+    #: of the two it got.
+    integrity: str = ""
     #: Working copy. True when this plugin should be running.
     enabled: bool = True
     #: Working copy. Set when the operator asks for a fault-disabled plugin to
@@ -1087,8 +1779,377 @@ _KINDS: tuple[tuple[str, type], ...] = (
     ("operator", QueryOperator),
     ("computed field", ComputedField),
     ("filter", FilterStage),
+    ("cluster rule", ClusterRule),
+    ("shape", ShapeContributor),
+    ("timeline", TimelineAnnotation),
+    ("metric", TimelineMetric),
+    ("matcher", WatchMatcher),
+    ("sink", WatchSink),
     ("exporter", Exporter),
+    ("command", Command),
 )
+
+
+#: The kinds an isolation host may hold. Coarse-grained, every one of them:
+#: called on demand, or once per rebuild, never per entry and never per line.
+#:
+#: In :data:`_KINDS` order, so a message listing them reads the way a row does.
+ISOLABLE_KINDS = ("timeline", "sink", "exporter", "command")
+
+#: Why each of the others may not be isolated, in that plugin's own terms.
+#:
+#: A refusal is a sentence an author reads, not an omission they discover. The
+#: shape of the answer is the same for eight of the nine -- a round trip per
+#: entry or per line is not a slower version of the same program, it is a
+#: different one -- and ``source`` is refused for its own reason, which is
+#: worth keeping distinct because it is about *when* CLV calls it rather than
+#: how often.
+_ISOLATION_REFUSALS: dict[str, str] = {
+    "source": (
+        "a source provider hands back a live reader that CLV polls from the "
+        "event loop on every tick, which needs a streaming host rather than "
+        "this one"
+    ),
+    "format": "parse() is called once per line read",
+    "operator": "test() is called once per entry, per render",
+    "computed field": "value() is called once per entry, per render",
+    "filter": "apply() is called once per entry, per render",
+    "cluster rule": "a cluster rule is applied once per line shaped",
+    "shape": "contribute() is called once per entry shaped",
+    "metric": "value() is called once per entry, per rebuild",
+    "matcher": "matches() is called once per entry, per poll",
+}
+
+#: The declarative half of a plugin: what CLV *reads* rather than calls.
+#:
+#: These are the attributes a proxy has to be able to answer for, because the
+#: loader, the export dialog, the binding installer and the ``P`` dialog all
+#: read them off the object without invoking anything. They travel once, at the
+#: handshake, and a proxy answers from them locally -- an export dialog that had
+#: to ask another process what extension to suggest would be a round trip per
+#: keystroke.
+_MANIFEST_ATTRIBUTES = (
+    "wants_path",
+    "suggested_extension",
+    "wants_entries",
+    "command_name",
+    "title",
+    "key",
+    "show",
+)
+
+#: Attribute names an author might reach for to add a ``clv`` subcommand.
+#:
+#: There is no hook here to refuse. ``clv/cli.py``'s ``SUBCOMMANDS`` is a closed
+#: literal and nothing plugin-supplied reaches it, because an installed file must
+#: not change what a shell command does (``PLUGIN_TODO.md`` Requirement 13). What
+#: this catches is the author who assumed otherwise: without it, a plugin
+#: declaring ``subcommand = "ship"`` loads, works, and simply never gets a
+#: subcommand -- a silence the author cannot diagnose from outside CLV's source.
+#:
+#: The *attribute* is refused; the plugin is not. It keeps every kind it
+#: implements, because a declaration CLV cannot honour is not a reason to
+#: withdraw the ones it can.
+_CLI_ATTRIBUTES = ("subcommand", "subcommands", "cli_command")
+
+
+def isolation_fault(kinds: Sequence[str]) -> Optional[str]:
+    """Why a plugin of these *kinds* may not be isolated, or None if it may.
+
+    Enforced at load, never at the first call, on the argument every other
+    fault check in this module makes: it is knowable from the declaration, and
+    discovering it at the first call means discovering it in front of an
+    operator who has already installed the thing.
+
+    **A plugin that is refused is not loaded**, rather than loaded in-process.
+    Running a plugin somewhere other than where it asked to run would turn a
+    stated preference into a suggestion, and the one thing worse than no
+    isolation is isolation an operator believes they have.
+    """
+
+    refused = [kind for kind in kinds if kind not in ISOLABLE_KINDS]
+    if not refused:
+        return None
+    reasons = "; ".join(
+        f"{kind} — {_ISOLATION_REFUSALS.get(kind, 'it is called per entry')}"
+        for kind in refused
+    )
+    return (
+        f"asks for isolation, which is refused for {reasons}. Isolation is "
+        f"available to: {', '.join(ISOLABLE_KINDS)}"
+    )
+
+
+def manifest_for(plugin: Any) -> dict[str, Any]:
+    """Describe *plugin* the way the other process would describe it.
+
+    One function, two callers, and that is the point: the class-declared door
+    builds this here from a live class, and the settings-forced door builds it
+    in the child from a class this process never imported. Two implementations
+    would be two answers to "what is this plugin", differing exactly when it
+    mattered.
+
+    Everything here is a JSON scalar by construction -- an attribute of any
+    other type is carried as its ``str``, because a plugin can put anything on
+    its class and a manifest that cannot cross a pipe is no manifest at all.
+    """
+
+    attributes: dict[str, Any] = {}
+    for key in _MANIFEST_ATTRIBUTES:
+        try:
+            value = getattr(plugin, key)
+        except Exception:  # noqa: BLE001 - a property on third-party code
+            continue
+        if value is None or isinstance(value, (str, bool, int, float)):
+            attributes[key] = value
+        else:
+            attributes[key] = str(value)
+    priority = getattr(plugin, "priority", 100)
+    if not isinstance(priority, int) or isinstance(priority, bool):
+        priority = 100
+    return {
+        "index": 0,
+        "qualname": f"{type(plugin).__module__}.{type(plugin).__qualname__}",
+        "name": _plugin_name(plugin),
+        "kinds": [label for label, interface in _KINDS if isinstance(plugin, interface)],
+        "attributes": attributes,
+        "priority": priority,
+        "requires_clv": getattr(plugin, "requires_clv", None),
+        "requires_api": getattr(plugin, "requires_api", None),
+    }
+
+
+# --- standing in for a plugin in another process ----------------------------
+
+
+class _IsolatedPlugin:
+    """A plugin that lives in a child process, in the shape CLV expects here.
+
+    Every call site in CLV resolves a plugin by ``isinstance`` and calls it by
+    name -- the registry files by interface, the stacks guard by interface, the
+    dialogs read attributes. So the thing standing in for an isolated plugin has
+    to *be* one of those interfaces rather than merely quack like one, which is
+    what the per-kind subclasses below are for, and why not one call site in
+    ``app.py`` knows this class exists.
+
+    It answers the declarative half from the manifest and forwards the rest.
+    """
+
+    def __init__(
+        self,
+        *,
+        registry: "PluginRegistry",
+        host: Any,
+        entry: Any,
+        resolve_by_qualname: bool,
+    ) -> None:
+        self._registry = registry
+        self._host = host
+        self._entry = entry
+        self._resolve_by_qualname = resolve_by_qualname
+        self._index: Optional[int] = None if resolve_by_qualname else entry.index
+        self.name = entry.name
+        self.priority = entry.priority
+        self.requires_clv = entry.requires_clv
+        self.requires_api = entry.requires_api
+        self.isolated = True
+        for key, value in entry.attributes.items():
+            setattr(self, key, value)
+
+    @property
+    def origin(self) -> str:
+        return self._host.origin
+
+    def configure(self, settings: Mapping[str, str]) -> None:
+        """Take a snapshot for the child.
+
+        An in-process plugin is handed a **live view** of its section and sees a
+        reload without being called again. That cannot cross a process boundary,
+        so an isolated plugin holds a snapshot which CLV replaces before its
+        next call. Said out loud in ``clv/plugins/AGENTS.md``, because a plugin
+        author who relied on the live view would otherwise find out by having
+        stale settings.
+        """
+
+        self._host.settings_changed(dict(settings))
+
+    def setup(self) -> None:
+        """Nothing here. ``setup()`` runs in the child, once its host is up.
+
+        Deliberately a no-op rather than a forwarding call: ``start()`` skips
+        isolated plugins and drives their hosts instead, so that a plugin whose
+        command is never pressed never costs a subprocess.
+        """
+
+    def teardown(self) -> None:
+        """Nothing here either -- ``shutdown()`` drives the hosts. See above."""
+
+    # --- the forwarding half ------------------------------------------------
+
+    def _call(self, method: str, payload: Optional[Mapping[str, Any]] = None) -> Any:
+        """Run *method* in the child, or take this plugin out of service.
+
+        A plugin that raises comes back as an ordinary exception and reaches the
+        guard that call site already has. A host that timed out or died is
+        different in kind -- there is nothing left to call -- so the plugin is
+        disabled here, by the same :meth:`PluginRegistry.disable` a raising
+        filter stage goes through, and the exception is re-raised so the call
+        site reports it the way it reports every other plugin failure.
+        """
+
+        from .host import HostDead, HostError
+
+        # Read off the registry rather than held by the host, so that a reload
+        # that raised the ceiling applies to the next call rather than to the
+        # next host -- an operator who raises it after a kill means it now.
+        self._host.timeout_ms = self._registry.host_timeout_ms
+        try:
+            self._host.ensure_started(setup=self._registry.started)
+            index = self._resolve_index()
+            if index is None:
+                raise HostDead(
+                    f"the isolation host did not produce {self.name!r}"
+                )
+            return self._host.call(index, method, payload)
+        except HostError as exc:
+            self._registry.disable(self, str(exc), origin=_plugin_name(self))
+            raise
+
+    def _resolve_index(self) -> Optional[int]:
+        """Which plugin in the child this one is.
+
+        Known already for a plugin the child enumerated. For one declared on its
+        class here, the parent built the manifest from its own import and the
+        child built its own from a second one, so the two are matched by
+        qualified name -- the one thing that is the same object in both.
+        """
+
+        if self._index is not None:
+            return self._index
+        self._index = self._host.index_of(self._entry.qualname)
+        return self._index
+
+
+class _IsolatedExporter(_IsolatedPlugin, Exporter):
+    def export(
+        self,
+        entries: Sequence[LogEntry],
+        context: FilterContext,
+        *,
+        destination: Optional[Path] = None,
+    ) -> ExportResult:
+        from .host import entries_to_wire, export_result_from_wire, filter_context_to_wire
+
+        return export_result_from_wire(
+            self._call(
+                "export",
+                {
+                    "entries": entries_to_wire(entries),
+                    "context": filter_context_to_wire(context),
+                    "destination": None if destination is None else str(destination),
+                    "wants_path": bool(getattr(self, "wants_path", False)),
+                },
+            )
+        )
+
+
+class _IsolatedSink(_IsolatedPlugin, WatchSink):
+    def deliver(
+        self,
+        name: str,
+        count: int,
+        context: FilterContext,
+        entries: Sequence[LogEntry] = (),
+    ) -> None:
+        from .host import entries_to_wire, filter_context_to_wire
+
+        self._call(
+            "deliver",
+            {
+                "name": str(name),
+                "count": int(count),
+                "context": filter_context_to_wire(context),
+                "entries": entries_to_wire(entries),
+            },
+        )
+
+
+class _IsolatedAnnotation(_IsolatedPlugin, TimelineAnnotation):
+    def annotations(
+        self, window: TimeWindow
+    ) -> Iterable[tuple[datetime, str, Optional[str]]]:
+        from .host import annotations_from_wire, window_to_wire
+
+        return annotations_from_wire(
+            self._call("annotations", {"window": window_to_wire(window)}) or ()
+        )
+
+
+class _IsolatedCommand(_IsolatedPlugin, Command):
+    def run(self, context: "CommandContext") -> Optional["Panel"]:
+        from .host import command_context_to_wire
+
+        return self._answer(
+            self._call("run", {"context": command_context_to_wire(context)}), context
+        )
+
+    def on_control(
+        self, control_id: str, value: Any, context: "CommandContext"
+    ) -> Optional["Panel"]:
+        from .host import _scalar, command_context_to_wire
+
+        return self._answer(
+            self._call(
+                "on_control",
+                {
+                    "control_id": str(control_id),
+                    # CLV's own widgets produce a bool or a string here and
+                    # nothing else, so this is a guard rather than a conversion
+                    # -- and the failure it guards against is an unencodable
+                    # value taking down a call instead of a control looking odd.
+                    "value": _scalar(value),
+                    "context": command_context_to_wire(context),
+                },
+            ),
+            context,
+        )
+
+    def _answer(self, produced: Any, context: "CommandContext") -> Optional["Panel"]:
+        """Unpack what the child returned, including what it asked for.
+
+        The child filled *its* copy of the context's outbox; this fills the
+        parent's, so ``_apply_command_requests`` drains exactly what it drains
+        for an in-process command and every refusal is decided by the path that
+        already owns it.
+        """
+
+        from .host import panel_from_wire, requests_from_wire
+
+        if not isinstance(produced, Mapping):  # pragma: no cover - defensive
+            return None
+        context.requests.extend(requests_from_wire(produced.get("requests") or ()))
+        return panel_from_wire(produced.get("panel"))
+
+
+#: One proxy class per set of kinds, composed once and reused. The set is the
+#: cache key rather than the plugin, because two exporters need the same class.
+_PROXY_MIXINS: dict[str, type] = {
+    "timeline": _IsolatedAnnotation,
+    "sink": _IsolatedSink,
+    "exporter": _IsolatedExporter,
+    "command": _IsolatedCommand,
+}
+_PROXY_CLASSES: dict[tuple[str, ...], type] = {}
+
+
+def _proxy_class(kinds: Sequence[str]) -> type:
+    key = tuple(kind for kind in ISOLABLE_KINDS if kind in set(kinds))
+    cached = _PROXY_CLASSES.get(key)
+    if cached is None:
+        bases = tuple(_PROXY_MIXINS[kind] for kind in key)
+        cached = type(f"Isolated({', '.join(key)})", bases, {})
+        _PROXY_CLASSES[key] = cached
+    return cached
 
 
 def _origin_source(origin: str) -> str:
@@ -1140,10 +2201,11 @@ class PluginBudget:
     One instance per *path*, not per plugin. The render path — every
     :class:`FilterStage` over every buffered entry, once per keystroke in the
     query box — gets one, built by the app from ``plugin_time_budget_ms``.
-    ``PLUGIN_TODO.md``'s Stage C adds a second for the read path, where
-    ``LogFormat`` and ``ClusterRule`` are called per *line*; it is this class
-    with a different label and a different key, so neither path restates the
-    policy and they cannot drift apart.
+    There are five: the render path, the read path (``LogFormat.parse`` over one
+    batch of lines), the query plugins, the watch matchers, and the clustering
+    plugins. Two ceilings and one policy between them — the same class with a
+    different label and a different key, so no path restates the rule and they
+    cannot drift apart.
 
     A pass is ``start()``, some number of ``charge()`` calls, ``settle()``.
     Time is attributed to the plugin rather than to the call, because "which
@@ -1263,7 +2325,31 @@ class PluginRegistry:
     operators: list[QueryOperator] = field(default_factory=list)
     computed: list[ComputedField] = field(default_factory=list)
     filters: list[FilterStage] = field(default_factory=list)
+    #: Plugin-supplied normalisation rules and shape components, in
+    #: :func:`plugin_sort_key` order. A rule is consulted per *distinct* line
+    #: behind the shape cache; a contributor per entry, behind nothing. Both are
+    #: reached only through the specs :meth:`cluster_stack` hands to
+    #: ``clv.services.clustering``.
+    rules: list[ClusterRule] = field(default_factory=list)
+    contributors: list[ShapeContributor] = field(default_factory=list)
+    #: Plugin-supplied marks on the time axis and the one metric a bucket
+    #: measures, in :func:`plugin_sort_key` order. A provider is asked once per
+    #: window; a metric is consulted per entry per rebuild. Both are reached
+    #: only through the specs :meth:`timeline_stack` hands to
+    #: ``clv.services.timeline``.
+    annotators: list[TimelineAnnotation] = field(default_factory=list)
+    metrics: list[TimelineMetric] = field(default_factory=list)
+    #: Plugin-supplied rule kinds and delivery destinations, in
+    #: :func:`plugin_sort_key` order. Reached only through the specs
+    #: :meth:`watch_stack` hands to ``clv.services.watch``.
+    matchers: list[WatchMatcher] = field(default_factory=list)
+    sinks: list[WatchSink] = field(default_factory=list)
     exporters: list[Exporter] = field(default_factory=list)
+    #: Plugin-supplied named actions, in :func:`plugin_sort_key` order. Ordered
+    #: because the order settles who gets a contested key: the first claim wins
+    #: and "first" has to mean something an author can predict, not whichever
+    #: module `pkgutil` happened to list first.
+    commands: list[Command] = field(default_factory=list)
     errors: PluginErrors = field(default_factory=PluginErrors)
     #: Every plugin found in a user root, loaded or not, in search order.
     #: Empty on a build with no user plugin directory, which is the common case
@@ -1310,6 +2396,16 @@ class PluginRegistry:
     #: Bumped whenever what this registry would *do* to an entry changes.
     #: See :attr:`generation`.
     _generation: int = field(default=0, repr=False)
+    #: One :class:`~clv.plugins.host.PluginHost` per origin that asked to be
+    #: isolated, created on the first plugin that needs it and started later --
+    #: or, for a plugin the operator isolated from ``settings.conf``, started at
+    #: load, because asking the child is the only way to learn what is in a
+    #: module this process deliberately never imported.
+    _hosts: dict[str, Any] = field(default_factory=dict, repr=False)
+    #: How long an isolated plugin has to answer before its host is killed.
+    #: ``plugin_host_timeout_ms``; 0 waits forever, which is what a build with
+    #: no host does anyway.
+    host_timeout_ms: float = field(default=5_000.0, repr=False)
 
     @property
     def total(self) -> int:
@@ -1319,7 +2415,14 @@ class PluginRegistry:
             + len(self.operators)
             + len(self.computed)
             + len(self.filters)
+            + len(self.rules)
+            + len(self.contributors)
+            + len(self.annotators)
+            + len(self.metrics)
+            + len(self.matchers)
+            + len(self.sinks)
             + len(self.exporters)
+            + len(self.commands)
         )
 
     @property
@@ -1366,7 +2469,25 @@ class PluginRegistry:
         self.operators.sort(key=plugin_sort_key)
         self.computed.sort(key=plugin_sort_key)
         self.filters.sort(key=plugin_sort_key)
+        self.rules.sort(key=plugin_sort_key)
+        self.contributors.sort(key=plugin_sort_key)
+        # Priority order is load-bearing here rather than merely tidy: it is how
+        # two metrics competing for one bucket are settled, so `metrics[0]`
+        # being the winner is a property of this sort having run.
+        self.annotators.sort(key=plugin_sort_key)
+        self.metrics.sort(key=plugin_sort_key)
+        # Both were missed when the watch seam landed, and each docstring said
+        # otherwise. It cost nothing for a matcher, which is looked up by kind —
+        # but a sink was delivered to in `pkgutil.iter_modules` order while
+        # claiming to run in priority order, which is the accident `priority`
+        # exists to remove.
+        self.matchers.sort(key=plugin_sort_key)
+        self.sinks.sort(key=plugin_sort_key)
         self.exporters.sort(key=plugin_sort_key)
+        # Load-bearing rather than tidy, the way the metrics' sort is: the key
+        # a command gets is decided by walking this list and taking the first
+        # claim, so "first" is priority-then-name only because this ran.
+        self.commands.sort(key=plugin_sort_key)
         # The end of a load: whatever a downstream cache holds was computed
         # before these plugins existed.
         self._generation += 1
@@ -1403,6 +2524,16 @@ class PluginRegistry:
                 current.clear()
         # A plugin reads through the view it was handed, so a changed section
         # changes what it returns without any call reaching this module.
+        #
+        # Except one in another process, which cannot read through anything.
+        # Each host is *told* its section changed and carries the new one to the
+        # child before its next call -- rather than being sent it now, which
+        # would put a round trip per isolated plugin on the reload path for
+        # plugins that may never be called again.
+        for origin, host in self._hosts.items():
+            host.settings_changed(
+                dict(self.settings_for(_origin_label(origin, _origin_source(origin))))
+            )
         self._generation += 1
 
     # --- lifecycle -----------------------------------------------------------
@@ -1441,9 +2572,17 @@ class PluginRegistry:
             return
         self._started = True
         for record in self.loaded:
-            if self.is_disabled(record.plugin):
+            if self.is_disabled(record.plugin) or isinstance(
+                record.plugin, _IsolatedPlugin
+            ):
+                # An isolated plugin is set up in the child, by its host, and
+                # only once that host exists -- which for a plugin whose command
+                # is never pressed is never. Forwarding `setup()` from here would
+                # start every host at mount and hand back the subprocess cost
+                # this design spends laziness to avoid.
                 continue
             self._run_hook(record.plugin, "setup")
+        self._start_hosts()
 
     def shutdown(self) -> None:
         """Run ``teardown()`` on every plugin that was set up. Once per session.
@@ -1463,9 +2602,187 @@ class PluginRegistry:
             return
         self._stopped = True
         for record in self.loaded:
-            if self.is_disabled(record.plugin):
+            if self.is_disabled(record.plugin) or isinstance(
+                record.plugin, _IsolatedPlugin
+            ):
                 continue
             self._run_hook(record.plugin, "teardown")
+        self._stop_hosts()
+
+    # --- isolation ----------------------------------------------------------
+
+    @property
+    def started(self) -> bool:
+        """Whether :meth:`start` has run.
+
+        Read by a proxy starting its host late: a host that comes up after the
+        session started has missed ``start()`` and has to run ``setup()`` on its
+        way in, or an isolated plugin would be called before it was set up.
+        """
+
+        return self._started
+
+    def _isolation_requested(self, origin: str) -> bool:
+        """Whether the operator asked for *origin* to be isolated.
+
+        ``isolated = true`` in the plugin's own ``[plugin:<name>]`` section. Read
+        from the section rather than from the class on purpose: this is the
+        answer the loader needs **before** it imports anything, which is what
+        makes this door contain an import that crashes or hangs.
+        """
+
+        return setting_bool(
+            self.settings_for(_origin_label(origin, _origin_source(origin))), "isolated"
+        )
+
+    def _host_for(self, origin: str) -> Any:
+        """The host for *origin*, created but not started.
+
+        One per origin rather than per plugin: a module's plugins share the
+        module's imported state, and giving them a child each would import it
+        once per plugin and hand two halves of one plugin two sets of globals.
+        """
+
+        host = self._hosts.get(origin)
+        if host is None:
+            # Local, so that a build with no isolated plugins never imports the
+            # host module and never touches multiprocessing. Requirement 10.
+            from .host import PluginHost
+
+            host = PluginHost(
+                origin,
+                timeout_ms=self.host_timeout_ms,
+                settings=dict(
+                    self.settings_for(_origin_label(origin, _origin_source(origin)))
+                ),
+            )
+            self._hosts[origin] = host
+        return host
+
+    def _isolate(self, plugin: Any, origin: str) -> Optional[Any]:
+        """Swap *plugin* for something that runs it in a child, or refuse it.
+
+        Returns the stand-in, or None having recorded why not. A refusal is a
+        refusal to **load**: the alternative is running a plugin in-process
+        after it asked not to be, which is worse than not isolating at all
+        because the operator would believe otherwise.
+        """
+
+        entry = manifest_for(plugin)
+        problem = isolation_fault(entry["kinds"])
+        if problem is not None:
+            self.errors.append(PluginError(origin, problem))
+            return None
+        try:
+            from .host import HostPlugin
+
+            return _proxy_class(entry["kinds"])(
+                registry=self,
+                host=self._host_for(origin),
+                entry=HostPlugin.from_wire(entry),
+                resolve_by_qualname=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - a build without the host module
+            # `load_plugins` never raises, and this is the one place in the
+            # isolation path that could have: the host module is imported
+            # lazily, so a build that failed to bundle it would surface here,
+            # at load, as an exception escaping the loader rather than as a
+            # plugin CLV could not contain.
+            self.errors.append(
+                PluginError(origin, f"could not be isolated: {exc}")
+            )
+            return None
+
+    def _proxies_for(self, host: Any) -> list[Any]:
+        return [
+            record.plugin
+            for record in self.loaded
+            if isinstance(record.plugin, _IsolatedPlugin) and record.plugin._host is host
+        ]
+
+    def _start_hosts(self) -> None:
+        """Run ``setup()`` in every host that is already up.
+
+        Only the ones already running: a lazily started host runs its setup on
+        the way in, which is the same call in a different order rather than a
+        second implementation of it.
+        """
+
+        from .host import HostError
+
+        for host in list(self._hosts.values()):
+            if not host.alive:
+                continue
+            host.timeout_ms = self.host_timeout_ms
+            try:
+                failed = host.setup([plugin.index for plugin in host.plugins])
+            except HostError as exc:
+                for proxy in self._proxies_for(host):
+                    self.disable(proxy, str(exc), origin=_plugin_name(proxy))
+                continue
+            self._report_hook_failures(host, failed)
+
+    def stop_hosts(self) -> None:
+        """Stop every isolation host, without running a lifecycle hook.
+
+        For a caller that loaded plugins to *look* at them and never called
+        :meth:`start`. :meth:`shutdown` is the wrong tool there: its premise is
+        that ``setup()`` ran, and a one-shot report has nothing to tear down.
+        What it does have is a child process and a temp directory, because a
+        plugin the operator isolated in ``settings.conf`` pays its handshake
+        during the load -- see :class:`~clv.plugins.host.PluginHost`.
+
+        ``clv doctor`` is the caller this exists for. Separate from
+        :meth:`shutdown` rather than a flag on it, so the viewer's exit path
+        cannot accidentally take the branch that skips every ``teardown()``.
+        """
+
+        self._stop_hosts()
+
+    def _stop_hosts(self) -> None:
+        """Tear down and stop every host, exactly once, whatever they do.
+
+        A host mid-call is the case the escalation in ``PluginHost.stop`` exists
+        for: it will not answer the polite request, and waiting for it is the
+        hang this whole mechanism was built to end.
+        """
+
+        from .host import HostError
+
+        for host in list(self._hosts.values()):
+            if host.alive:
+                # The ceiling as it stands now, not as it stood when this host
+                # was built: a reload can have changed it, and `teardown()` is
+                # the call most likely to be the one that hangs.
+                host.timeout_ms = self.host_timeout_ms
+                try:
+                    self._report_hook_failures(
+                        host, host.teardown([plugin.index for plugin in host.plugins])
+                    )
+                except HostError as exc:
+                    self.errors.append(
+                        PluginError(host.origin, str(exc), category="runtime")
+                    )
+            try:
+                host.stop()
+            except Exception:  # noqa: BLE001 - shutdown must not raise
+                pass
+        self._hosts.clear()
+
+    def _report_hook_failures(
+        self, host: Any, failed: Sequence[tuple[int, str]]
+    ) -> None:
+        by_index = {
+            proxy._resolve_index(): proxy for proxy in self._proxies_for(host)
+        }
+        for index, message in failed:
+            proxy = by_index.get(index)
+            if proxy is None:  # pragma: no cover - a plugin the parent refused
+                self.errors.append(
+                    PluginError(host.origin, message, category="runtime")
+                )
+                continue
+            self.disable(proxy, message, origin=_plugin_name(proxy))
 
     def available(self) -> list[DiscoveredPlugin]:
         """Plugins installed in a user root but not enabled.
@@ -1539,8 +2856,21 @@ class PluginRegistry:
                 for label, _ in _KINDS
                 if any(label in record.kinds for record in records)
             )
+            reads_content = any(
+                getattr(record.plugin, "wants_entries", False)
+                for record in records
+                if isinstance(record.plugin, WatchSink)
+            )
             errors = errors_for(origin, [record.name for record in records])
             categories = {error.category for error in errors}
+            # Not a fault and not a reason to call anything "not enabled": a
+            # plugin that lost a tie-break is loaded, healthy and one switch away
+            # from being the one that runs. It contributes its note to `detail`
+            # below and nothing to the state, which is why it is taken out of
+            # the set the state is decided from -- a module shipping a losing
+            # metric *and* a working annotation must not be reported as broken.
+            conflicts = [error for error in errors if error.category == "conflict"]
+            categories.discard("conflict")
             detail = "; ".join(
                 error.message + (f" (x{error.count})" if error.count > 1 else "")
                 for error in errors
@@ -1562,7 +2892,9 @@ class PluginRegistry:
             elif categories - {"shadowed"}:
                 state = "failed"
                 category = next(
-                    error.category for error in errors if error.category != "shadowed"
+                    error.category
+                    for error in errors
+                    if error.category not in ("shadowed", "conflict")
                 )
             elif categories:
                 # Shadowed, and nothing else. Losing a name to something found
@@ -1578,10 +2910,44 @@ class PluginRegistry:
                     if source != "user"
                     else "off"
                 )
+                # Kept beside it rather than replaced by it: "off" and "it would
+                # not have been the metric anyway" are two different things for
+                # an operator deciding whether switching it on would change
+                # anything.
+                if conflicts:
+                    detail = "; ".join(
+                        [detail] + [error.message for error in conflicts]
+                    )
             elif discovered is not None and not discovered.enabled:
                 state, category = "not enabled", ""
             else:
-                state, category = "loaded", ""
+                # The one state Phase 4 reserved and never produced. A row says
+                # "isolated" only when *everything* it loaded is: a module
+                # running a filter here and an exporter in a child is not
+                # contained, and a row claiming otherwise would be the one lie
+                # this surface cannot afford. Mixed says how many, in the
+                # detail, rather than rounding either way.
+                contained = [
+                    record
+                    for record in records
+                    if isinstance(record.plugin, _IsolatedPlugin)
+                ]
+                if contained and len(contained) == len(records):
+                    state, category = "isolated", ""
+                    detail = detail or (
+                        "runs in a subprocess CLV can stop; it still runs as you"
+                    )
+                else:
+                    state, category = "loaded", ""
+                    if contained:
+                        detail = "; ".join(
+                            part
+                            for part in (
+                                detail,
+                                f"{len(contained)} of {len(records)} isolated",
+                            )
+                            if part
+                        )
 
             named = True if discovered is None else discovered.enabled
             rows.append(
@@ -1597,6 +2963,7 @@ class PluginRegistry:
                     state=state,
                     detail=detail,
                     category=category,
+                    reads_content=reads_content,
                     enabled=named and not operator_off,
                 )
             )
@@ -1658,6 +3025,19 @@ class PluginRegistry:
             return
         self._disabled[key] = reason
         self._generation += 1
+        if isinstance(plugin, _IsolatedPlugin):
+            # Nothing will call into that child again, so it should not still be
+            # running. This is what makes the `P` dialog's "stops now" true for
+            # an isolated plugin: an operator who switches one off means the
+            # process too, and a host holding a socket open for a plugin nobody
+            # can reach is the state this whole phase is about being able to end.
+            # A host killed for hanging is already gone and stopping it again is
+            # a no-op; `enable()` revives it either way.
+            host = plugin._host
+            if all(
+                self.is_disabled(other) for other in self._proxies_for(host)
+            ):
+                host.stop()
         if record:
             self.errors.append(
                 PluginError(
@@ -1670,6 +3050,12 @@ class PluginRegistry:
 
         if self._disabled.pop(id(plugin), None) is None:
             return False
+        if isinstance(plugin, _IsolatedPlugin):
+            # A host that was killed for hanging is not evidence that the next
+            # call will hang, and an operator who has deliberately put a plugin
+            # back into service must not be answered with the corpse of its last
+            # attempt. The next call starts a fresh child.
+            plugin._host.revive()
         self._generation += 1
         return True
 
@@ -1710,13 +3096,55 @@ class PluginRegistry:
                 QueryOperator,
                 ComputedField,
                 FilterStage,
+                ClusterRule,
+                ShapeContributor,
+                TimelineAnnotation,
+                TimelineMetric,
+                WatchMatcher,
+                WatchSink,
                 Exporter,
+                Command,
             ),
         ):
             self.errors.append(
                 PluginError(origin, "does not implement a CLV plugin interface")
             )
             return False
+
+        # Reported before anything else is decided, and never fatal: see
+        # `_CLI_ATTRIBUTES`. Checked here rather than beside the per-kind faults
+        # because it is a property of the declaration rather than of any one
+        # interface, and it must be answered for a plugin of every kind.
+        for attribute in _CLI_ATTRIBUTES:
+            if hasattr(plugin, attribute):
+                self.errors.append(
+                    PluginError(
+                        origin,
+                        f"declares {attribute}: a plugin cannot add a clv "
+                        "subcommand -- implement Command instead, which is "
+                        "reachable from C and from its own key",
+                    )
+                )
+                break
+
+        # Isolation, before anything is filed and after it is known to be a
+        # plugin at all. What is filed from here on is the stand-in, so every
+        # check below -- the version constraints, the per-kind faults, the
+        # ordering, the fault-disabling -- applies to the thing CLV will
+        # actually call, rather than to an object it has decided not to use.
+        #
+        # The settings door is checked here as well as before the import,
+        # because `add()` is the one place every loader and every test funnels
+        # through: a plugin handed straight to it must honour the operator's
+        # `isolated = true` the same way one walked in from a root does.
+        if not isinstance(plugin, _IsolatedPlugin) and (
+            bool(getattr(plugin, "isolated", False))
+            or self._isolation_requested(origin)
+        ):
+            isolated = self._isolate(plugin, origin)
+            if isolated is None:
+                return False
+            plugin = isolated
 
         # Both constraints, in the same grammar, with the same two failure
         # shapes: an unreadable constraint is an error naming it, and an
@@ -1755,6 +3183,30 @@ class PluginRegistry:
 
         if isinstance(plugin, (QueryOperator, ComputedField)):
             problem = self._query_fault(plugin)
+            if problem is not None:
+                self.errors.append(PluginError(origin, problem))
+                return False
+
+        if isinstance(plugin, ClusterRule):
+            problem = self._cluster_fault(plugin)
+            if problem is not None:
+                self.errors.append(PluginError(origin, problem))
+                return False
+
+        if isinstance(plugin, TimelineMetric):
+            problem = self._metric_fault(plugin)
+            if problem is not None:
+                self.errors.append(PluginError(origin, problem))
+                return False
+
+        if isinstance(plugin, WatchMatcher):
+            problem = self._watch_fault(plugin)
+            if problem is not None:
+                self.errors.append(PluginError(origin, problem))
+                return False
+
+        if isinstance(plugin, Command):
+            problem = self._command_fault(plugin)
             if problem is not None:
                 self.errors.append(PluginError(origin, problem))
                 return False
@@ -1912,6 +3364,192 @@ class PluginRegistry:
         # parsed field, so it cannot shadow one. See `ComputedField`.
         return None
 
+    def _cluster_fault(self, plugin: ClusterRule) -> Optional[str]:
+        """Why *plugin* may not join the normalisation rules, or None if it may.
+
+        **At load, never at the first line**, and here that is not merely the
+        cheaper place — it is the only place. A :class:`ClusterRule` declares a
+        pattern and a placeholder and CLV performs the substitution, so there is
+        no call that could fail later and nothing to disable when it does. Every
+        one of these is silent at runtime: a placeholder with a digit in it gets
+        chewed up by the next plugin rule that matches numbers, a backslash
+        splices in a capture group, and a pattern matching the empty string
+        rewrites every position of every line. All three read, from the outside,
+        as clustering behaving oddly on this log.
+        """
+
+        try:
+            pattern = _compiled_rule(plugin)
+        except re.error as exc:
+            return f"pattern is not a usable regular expression: {exc}"
+        except TypeError:
+            declared = getattr(plugin, "pattern", None)
+            if declared is None or declared == "":
+                return "declares no pattern, so it would normalise nothing"
+            return (
+                f"pattern must be a compiled regular expression or a string, "
+                f"not {type(declared).__name__}"
+            )
+        if pattern.search("") is not None:
+            return (
+                f"pattern {pattern.pattern!r} matches the empty string, so it "
+                "would write its placeholder at every position of every line"
+            )
+
+        placeholder = getattr(plugin, "placeholder", "")
+        if not isinstance(placeholder, str):
+            return (
+                "placeholder must be a string, not "
+                f"{type(placeholder).__name__}"
+            )
+        if "\\" in placeholder:
+            return (
+                f"placeholder {placeholder!r} contains a backslash. It is a "
+                "substitution template, so a group reference in it would be "
+                "replaced by whatever the pattern captured rather than written "
+                "out"
+            )
+        if any(char.isdigit() for char in placeholder):
+            return (
+                f"placeholder {placeholder!r} contains a digit. Plugin rules "
+                "run after CLV's own, so a later rule matching numbers would "
+                "rewrite what this one produced — which is why every built-in "
+                "placeholder is digit-free"
+            )
+        return None
+
+    def _watch_fault(self, plugin: "WatchMatcher") -> Optional[str]:
+        """Why *plugin* may not claim its rule kind, or None if it may.
+
+        **At load, never at the first rule**, on the same argument as
+        :meth:`_query_fault`: everything here is knowable without evaluating
+        anything, and the consequence of missing it is a matcher that loaded
+        cleanly and then never runs, because another one has the kind.
+        """
+
+        kind = getattr(plugin, "kind", "")
+        if not isinstance(kind, str) or not kind.strip():
+            return "declares no kind, so no watch rule could ever reach it"
+        if kind != kind.strip() or any(char.isspace() for char in kind):
+            return f"kind {kind!r} contains whitespace"
+        if kind.casefold() == KIND_PATTERN:
+            return (
+                f"kind {kind!r} is CLV\'s own. A plugin adds a rule kind, it "
+                "does not redefine one — every watch rule ever saved already "
+                "means something under this kind"
+            )
+        # Casefolded, because a stored `kind` is operator-facing text and
+        # `matcher_for` folds when it looks one up: compared exactly, the second
+        # plugin to claim `Burst` against `burst` would load and then never be
+        # reached, which from the outside is a plugin that is simply not working.
+        folded = kind.casefold()
+        for other in self.matchers:
+            if getattr(other, "kind", "").casefold() == folded:
+                return (
+                    f"kind {kind!r} is already registered by "
+                    f"{_plugin_name(other)}"
+                )
+        return None
+
+    def _command_fault(self, plugin: "Command") -> Optional[str]:
+        """Why *plugin* may not be a command, or None if it may.
+
+        **At load, never at the first invocation**, on the argument the other
+        four faults make. Every one of these is knowable without running
+        anything, and every one of them is silent at runtime: a command with no
+        `command_name` has no binding to dispatch and no row to select, a
+        command with no `title` is a blank line in the help overlay, and a
+        duplicate name means the second one loads cleanly and is then never
+        reached because the first answers to the name.
+        """
+
+        name = getattr(plugin, "command_name", "")
+        if not isinstance(name, str) or not name.strip():
+            return "declares no command_name, so nothing could ever invoke it"
+        if name != name.strip() or any(char.isspace() for char in name):
+            return f"command_name {name!r} contains whitespace"
+        # Casefolded for the reason `_watch_fault` folds a rule kind: the name
+        # is matched case-insensitively when a binding dispatches, so `Redact`
+        # against `redact` would load and then never be reached -- which from
+        # the outside is a command that simply does not work.
+        folded = name.casefold()
+        for other in self.commands:
+            if getattr(other, "command_name", "").casefold() == folded:
+                return (
+                    f"command_name {name!r} is already registered by "
+                    f"{_plugin_name(other)}"
+                )
+
+        title = getattr(plugin, "title", "")
+        if not isinstance(title, str) or not title.strip():
+            return (
+                "declares no title; the help overlay and the C dialog have "
+                "nothing to print for a command that cannot name itself"
+            )
+
+        key = getattr(plugin, "key", "")
+        if not isinstance(key, str):
+            return "key must be a string, in Textual's naming (\"j\", \"ctrl+j\")"
+        if key != key.strip() or any(char.isspace() for char in key):
+            return f"key {key!r} contains whitespace"
+        return None
+
+    def _metric_fault(self, plugin: "TimelineMetric") -> Optional[str]:
+        """Why *plugin* may not be a metric, or None if it may.
+
+        One check, and it is about the caption rather than about the number. A
+        bar drawn from a metric and a bar drawn from counts are the same glyphs;
+        the caption is the only thing that distinguishes them, and a metric with
+        no name leaves it saying nothing. At load, like the other three faults —
+        an unnamed metric would otherwise be discovered as a caption that reads
+        oddly, which nobody reports as a bug.
+        """
+
+        name = getattr(plugin, "metric_name", "")
+        if not isinstance(name, str) or not name.strip():
+            return (
+                "declares no metric_name; a bar scaled by a metric has to be "
+                "able to say what it is showing"
+            )
+        return None
+
+    def timeline_stack(
+        self, *, budget: Optional[PluginBudget] = None
+    ) -> "TimelineStack":
+        """The enabled timeline plugins as ``clv.services.timeline`` takes them.
+
+        The fifth of the same shape, for the fifth time for the same reason:
+        ``timeline.py`` may not import this module, so the guard travels with
+        the plugin rather than being fetched alongside it. Unlike the four
+        before it this one also *decides* something — which metric runs — because
+        picking by ``priority`` needs the registry, and the service must not be
+        handed a choice it has no way to make.
+        """
+
+        return TimelineStack(self, budget=budget)
+
+    def cluster_stack(
+        self, *, budget: Optional[PluginBudget] = None
+    ) -> "ClusterStack":
+        """The enabled clustering plugins as ``clv.services.clustering`` takes them.
+
+        The fourth of the same shape, for the fourth time for the same reason:
+        ``clustering.py`` may not import this module, so the guard travels with
+        the plugin rather than being fetched alongside it.
+        """
+
+        return ClusterStack(self, budget=budget)
+
+    def watch_stack(self, *, budget: Optional[PluginBudget] = None) -> "WatchStack":
+        """The loaded watch plugins as specs ``clv.services.watch`` can install.
+
+        The third of the same shape, for the third time for the same reason:
+        ``watch.py`` may not import this module, so the guard travels with the
+        plugin rather than being fetched alongside it.
+        """
+
+        return WatchStack(self, budget=budget)
+
     def query_stack(self, *, budget: Optional[PluginBudget] = None) -> "QueryStack":
         """The loaded query plugins as specs ``clv.services.query`` can install.
 
@@ -1941,7 +3579,14 @@ class PluginRegistry:
             "operator": self.operators,
             "computed field": self.computed,
             "filter": self.filters,
+            "cluster rule": self.rules,
+            "shape": self.contributors,
+            "timeline": self.annotators,
+            "metric": self.metrics,
+            "matcher": self.matchers,
+            "sink": self.sinks,
             "exporter": self.exporters,
+            "command": self.commands,
         }[kind]
 
     def discover_sources(self) -> list[ProviderSource]:
@@ -2320,6 +3965,526 @@ class QueryStack:
         return value
 
 
+class ClusterStack:
+    """The enabled clustering plugins, wrapped in everything CLV owes them.
+
+    Produces the :class:`~clv.services.clustering.ClusterRuleSpec` and
+    :class:`~clv.services.clustering.ShapeSpec` records
+    ``clustering.install_cluster_plugins`` stores, with the substitution and
+    the contribution already carrying their guard and their budget.
+
+    **Enabled only, and that is the one place this seam departs from the two
+    before it.** A ``QueryOperator``'s token and a ``WatchMatcher``'s kind stay
+    registered while their plugin is switched off, because a saved query or rule
+    means something under them and dropping one would silently reinterpret it. A
+    cluster rule reserves nothing: no saved view, watch rule or session names
+    one, and there is no text whose meaning could change. So an out-of-service
+    rule is simply not installed, and the shapes go back to being what they were
+    — which is also the only behaviour an operator switching a rule off in the
+    ``P`` dialog could reasonably expect.
+
+    The wrappers re-check :meth:`PluginRegistry.is_disabled` per call anyway,
+    because a plugin disabled mid-render is disabled immediately and the specs
+    are only rebuilt on the next generation change.
+    """
+
+    __slots__ = ("_registry", "rules", "contributors", "_budget")
+
+    def __init__(
+        self, registry: "PluginRegistry", *, budget: Optional[PluginBudget] = None
+    ) -> None:
+        self._registry = registry
+        self._budget = budget
+        self.rules: tuple[ClusterRuleSpec, ...] = tuple(
+            ClusterRuleSpec(
+                plugin=_plugin_name(plugin),
+                apply=self._guard_apply(plugin),
+            )
+            for plugin in registry.rules
+            if not registry.is_disabled(plugin)
+        )
+        self.contributors: tuple[ShapeSpec, ...] = tuple(
+            ShapeSpec(
+                plugin=_plugin_name(plugin),
+                contribute=self._guard_contribute(plugin),
+            )
+            for plugin in registry.contributors
+            if not registry.is_disabled(plugin)
+        )
+
+    def start(self) -> None:
+        """Open a budget pass. One clustering of the filtered set is one pass."""
+
+        budget = self._budget
+        if budget is not None and budget.active:
+            budget.start()
+
+    def settle(self) -> None:
+        """Close the pass, disabling anything that has struck out."""
+
+        budget = self._budget
+        if budget is not None and budget.active:
+            budget.settle()
+
+    def _guard_apply(self, plugin: ClusterRule):
+        """One rule's substitution, timed and contained.
+
+        The pattern and the placeholder are read **once**, here, rather than per
+        line: a plugin that recomputed either between calls would otherwise make
+        the memoised shape of a line depend on when it was first seen.
+
+        The ``except`` is belt and braces and is expected never to fire.
+        :meth:`PluginRegistry._cluster_fault` has already proved the pattern
+        compiles, does not match the empty string, and has a placeholder that is
+        a literal — after which ``sub`` has nothing left to raise about short of
+        the interpreter running out of something. It is here because the cost of
+        an ``except`` that does not fire is zero and the cost of one missing is
+        a render that dies on a line.
+        """
+
+        registry = self._registry
+        budget = self._budget
+        clock = time.perf_counter
+        pattern = _compiled_rule(plugin)
+        placeholder = plugin.placeholder
+
+        def apply(text: str) -> str:
+            if registry.is_disabled(plugin):
+                return text
+            timing = budget is not None and budget.active
+            mark = clock() if timing else 0.0
+            try:
+                return pattern.sub(placeholder, text)
+            except Exception as exc:  # noqa: BLE001 - third-party pattern
+                registry.disable(
+                    plugin, f"raised: {exc}", origin=_plugin_name(plugin)
+                )
+                return text
+            finally:
+                if timing:
+                    budget.charge(plugin, clock() - mark)
+
+        return apply
+
+    def _guard_contribute(self, plugin: ShapeContributor):
+        registry = self._registry
+        budget = self._budget
+        clock = time.perf_counter
+
+        def contribute(entry: LogEntry) -> str:
+            if registry.is_disabled(plugin):
+                # The no-op contribution, not a marker: a disabled contributor
+                # has to leave the shape it would have widened exactly as it
+                # was before the plugin was installed.
+                return ""
+            timing = budget is not None and budget.active
+            mark = clock() if timing else 0.0
+            try:
+                result = plugin.contribute(entry)
+            except Exception as exc:  # noqa: BLE001 - third-party code
+                registry.disable(
+                    plugin, f"raised: {exc}", origin=_plugin_name(plugin)
+                )
+                return ""
+            finally:
+                if timing:
+                    budget.charge(plugin, clock() - mark)
+            if isinstance(result, str):
+                return result
+            # The contribution is composed into the shape. A non-string would be
+            # formatted by its repr, and an object whose repr carries its
+            # address gives every entry a shape of its own -- clustering
+            # switched off, with nothing on screen to say so.
+            registry.disable(
+                plugin,
+                f"contribute() returned {type(result).__name__}; a shape "
+                "contributor must return a string",
+                origin=_plugin_name(plugin),
+            )
+            return ""
+
+        return contribute
+
+
+class TimelineStack:
+    """The enabled timeline plugins, wrapped in everything CLV owes them.
+
+    Produces the :class:`~clv.services.timeline.AnnotationSpec` records and the
+    single :class:`~clv.services.timeline.MetricSpec` that
+    ``timeline.install_timeline_plugins`` stores, with every third-party
+    callable already carrying its guard and its budget.
+
+    **Enabled only**, like :class:`ClusterStack` and for the same reason: a mark
+    on an axis and a bucket's unit are named by nothing that is saved, so a
+    plugin switched off is simply not installed and the bar goes back to being
+    what it was. Nothing could be silently reinterpreted in the meantime, which
+    is what makes Phase 8's reservation rule unnecessary here.
+
+    **This one also decides something.** The other four stacks install whatever
+    they are given; a bucket can only measure one thing, so this picks the
+    highest-priority enabled metric, records a note against every loser naming
+    the winner, and hands the service a single spec. The service is not given a
+    choice it would have no basis to make, and the decision is re-run on every
+    rebuild of the stack — so switching the winner off promotes the runner-up
+    rather than leaving the bar counting entries.
+    """
+
+    __slots__ = ("_registry", "annotators", "metric", "_budget")
+
+    def __init__(
+        self, registry: "PluginRegistry", *, budget: Optional[PluginBudget] = None
+    ) -> None:
+        self._registry = registry
+        self._budget = budget
+        self.annotators: tuple[AnnotationSpec, ...] = tuple(
+            AnnotationSpec(
+                plugin=_plugin_name(plugin),
+                fetch=self._guard_fetch(plugin),
+            )
+            for plugin in registry.annotators
+            if not registry.is_disabled(plugin)
+        )
+        self.metric: Optional[MetricSpec] = self._elect_metric()
+
+    def start(self) -> None:
+        """Open a budget pass. One rebuild of the bar is one pass."""
+
+        budget = self._budget
+        if budget is not None and budget.active:
+            budget.start()
+
+    def settle(self) -> None:
+        """Close the pass, disabling anything that has struck out."""
+
+        budget = self._budget
+        if budget is not None and budget.active:
+            budget.settle()
+
+    def _elect_metric(self) -> Optional[MetricSpec]:
+        """The metric that runs, and a note for each one that does not.
+
+        ``registry.metrics`` is in :func:`plugin_sort_key` order, so the first
+        enabled plugin in it is the highest-priority one and the election is a
+        walk rather than a sort.
+
+        Every metric's previous note is discarded first, because this contest is
+        re-run whenever the stack is rebuilt and last time's loser may be this
+        time's winner. Leaving the old note behind would leave the ``P`` dialog
+        saying a plugin is not in use while the bar is drawn from its numbers.
+        """
+
+        registry = self._registry
+        winner: Optional[TimelineMetric] = None
+        for plugin in registry.metrics:
+            registry.errors.discard(_plugin_name(plugin), category="conflict")
+            if registry.is_disabled(plugin):
+                continue
+            if winner is None:
+                winner = plugin
+                continue
+            registry.errors.append(
+                PluginError(
+                    _plugin_name(plugin),
+                    f"metric not in use: {_plugin_name(winner)} has priority. "
+                    "A bucket measures one thing; switch that plugin off to "
+                    "use this one",
+                    category="conflict",
+                )
+            )
+        if winner is None:
+            return None
+        return MetricSpec(
+            plugin=_plugin_name(winner),
+            metric_name=winner.metric_name,
+            # Read once, here, rather than per caption: a plugin that changed
+            # its unit between renders would relabel numbers that had already
+            # been summed under the old one.
+            unit=str(getattr(winner, "unit", "") or ""),
+            value=self._guard_value(winner),
+        )
+
+    def _guard_fetch(self, plugin: TimelineAnnotation):
+        registry = self._registry
+        budget = self._budget
+        clock = time.perf_counter
+
+        def fetch(window: TimeWindow) -> tuple[tuple[datetime, str, Optional[str]], ...]:
+            if registry.is_disabled(plugin):
+                return ()
+            timing = budget is not None and budget.active
+            mark = clock() if timing else 0.0
+            try:
+                # `list` inside the `try`, not outside: the documented shape is
+                # a generator, and a generator that raises does so while it is
+                # being walked rather than when it is created.
+                produced = list(plugin.annotations(window))
+            except Exception as exc:  # noqa: BLE001 - third-party code
+                registry.disable(
+                    plugin, f"raised: {exc}", origin=_plugin_name(plugin)
+                )
+                return ()
+            finally:
+                if timing:
+                    budget.charge(plugin, clock() - mark)
+            return self._marks(plugin, produced)
+
+        return fetch
+
+    def _marks(
+        self, plugin: TimelineAnnotation, produced: Sequence[Any]
+    ) -> tuple[tuple[datetime, str, Optional[str]], ...]:
+        """Check what a provider answered, or take it out of service.
+
+        All or nothing per call, rather than dropping the bad item: a provider
+        that cannot say what shape its marks are is a provider whose *good* marks
+        cannot be trusted to mean what their labels say, and a mark of uncertain
+        meaning on a time axis is worse than no mark at all.
+        """
+
+        marks: list[tuple[datetime, str, Optional[str]]] = []
+        for item in produced:
+            if not isinstance(item, tuple) or len(item) != 3:
+                self._registry.disable(
+                    plugin,
+                    f"annotations() yielded {type(item).__name__}; each mark "
+                    "must be a (moment, label, level) tuple",
+                    origin=_plugin_name(plugin),
+                )
+                return ()
+            moment, label, level = item
+            if not isinstance(moment, datetime) or not isinstance(label, str):
+                self._registry.disable(
+                    plugin,
+                    "annotations() yielded a mark that is not "
+                    "(datetime, str, level); got "
+                    f"({type(moment).__name__}, {type(label).__name__})",
+                    origin=_plugin_name(plugin),
+                )
+                return ()
+            # Normalised exactly as a parsed line's level is, so a mark saying
+            # `"warning"` is coloured the same as a line saying `"WARN"` and an
+            # unrecognised word becomes None rather than an invented severity.
+            marks.append((moment, label, normalize_level(level)))
+        return tuple(marks)
+
+    def _guard_value(self, plugin: TimelineMetric):
+        registry = self._registry
+        budget = self._budget
+        clock = time.perf_counter
+
+        def value(entry: LogEntry) -> Optional[float]:
+            if registry.is_disabled(plugin):
+                return None
+            timing = budget is not None and budget.active
+            mark = clock() if timing else 0.0
+            try:
+                result = plugin.value(entry)
+            except Exception as exc:  # noqa: BLE001 - third-party code
+                registry.disable(
+                    plugin, f"raised: {exc}", origin=_plugin_name(plugin)
+                )
+                return None
+            finally:
+                if timing:
+                    budget.charge(plugin, clock() - mark)
+            if result is None:
+                return None
+            if isinstance(result, bool) or not isinstance(result, (int, float)):
+                # A bool is refused rather than summed as 1: counting a subset
+                # of entries is a legitimate metric and `1.0 if ... else 0.0`
+                # says so, where a `True` reads as an answer to a different
+                # question.
+                registry.disable(
+                    plugin,
+                    f"value() returned {type(result).__name__}; a timeline "
+                    "metric must return a number or None",
+                    origin=_plugin_name(plugin),
+                )
+                return None
+            number = float(result)
+            if not math.isfinite(number):
+                # An infinity or a NaN does not make one bucket wrong, it makes
+                # the whole bar meaningless: `peak_value` is what every height
+                # is scaled against, and neither has a scale.
+                registry.disable(
+                    plugin,
+                    f"value() returned {result!r}; a timeline metric must "
+                    "return a finite number",
+                    origin=_plugin_name(plugin),
+                )
+                return None
+            return number
+
+        return value
+
+
+class WatchStack:
+    """The loaded watch plugins, wrapped in everything CLV owes them.
+
+    Produces the :class:`~clv.services.watch.MatcherSpec` and
+    :class:`~clv.services.watch.SinkSpec` records
+    ``watch.install_watch_plugins`` stores, with every third-party callable
+    already carrying its guard.
+
+    **Matchers: loaded, not enabled.** Every loaded matcher gets a spec; one out
+    of service gets ``matches=None``. That is what keeps its *kind* claimed
+    while it is switched off, so a rule declaring that kind reports the plugin
+    by name instead of falling back to the pattern path and matching its
+    parameter string as a query — the same reservation, and the same reason,
+    as :class:`~clv.services.query.OperatorSpec`.
+
+    **Sinks: only the enabled ones.** The asymmetry is deliberate. A kind has to
+    stay reserved because a saved rule *means* something under it; a
+    destination reserves nothing and means nothing, so a sink that is out of
+    service is simply not in the list and nothing is delivered to it.
+    """
+
+    __slots__ = ("_registry", "matchers", "sinks", "_budget")
+
+    def __init__(
+        self, registry: "PluginRegistry", *, budget: Optional[PluginBudget] = None
+    ) -> None:
+        self._registry = registry
+        self._budget = budget
+        self.matchers: tuple[MatcherSpec, ...] = tuple(
+            MatcherSpec(
+                kind=plugin.kind,
+                plugin=_plugin_name(plugin),
+                matches=(
+                    None
+                    if registry.is_disabled(plugin)
+                    else self._guard_matches(plugin)
+                ),
+                validate=(
+                    None
+                    if registry.is_disabled(plugin)
+                    else self._guard_validate(plugin)
+                ),
+            )
+            for plugin in registry.matchers
+        )
+        self.sinks: tuple[SinkSpec, ...] = tuple(
+            SinkSpec(
+                plugin=_plugin_name(plugin),
+                deliver=self._guard_deliver(plugin),
+                wants_entries=bool(getattr(plugin, "wants_entries", False)),
+                disable=self._disabler(plugin),
+            )
+            for plugin in registry.sinks
+            if not registry.is_disabled(plugin)
+        )
+
+    def start(self) -> None:
+        """Open a budget pass. One poll's batch of new lines is one pass."""
+
+        budget = self._budget
+        if budget is not None and budget.active:
+            budget.start()
+
+    def settle(self) -> None:
+        """Close the pass, disabling anything that has struck out."""
+
+        budget = self._budget
+        if budget is not None and budget.active:
+            budget.settle()
+
+    def _disabler(self, plugin: Any):
+        """A one-argument kill switch for *plugin*, closed over the registry.
+
+        Handed to a :class:`~clv.services.watch.SinkSpec` so the dispatcher can
+        retire a sink that *hangs* — which no wrapper around ``deliver`` can
+        detect, because a call that never returns never reaches its ``except``.
+        """
+
+        registry = self._registry
+
+        def disable(reason: str) -> None:
+            registry.disable(plugin, reason, origin=_plugin_name(plugin))
+
+        return disable
+
+    def _guard_matches(self, plugin: "WatchMatcher"):
+        registry = self._registry
+        budget = self._budget
+        clock = time.perf_counter
+
+        def matches(entry: LogEntry, rule: Any) -> bool:
+            if registry.is_disabled(plugin):
+                return False
+            timing = budget is not None and budget.active
+            mark = clock() if timing else 0.0
+            try:
+                result = plugin.matches(entry, rule)
+            except Exception as exc:  # noqa: BLE001 - third-party code
+                registry.disable(
+                    plugin, f"raised: {exc}", origin=_plugin_name(plugin)
+                )
+                return False
+            finally:
+                if timing:
+                    budget.charge(plugin, clock() - mark)
+            # Python's truth protocol rather than a type check, unlike
+            # `ComputedField.value`. A wrong *type* there is a silent
+            # never-matches, because the value is compared against a string; a
+            # truthy object here is what an author writing
+            # `return self._pattern.search(entry.raw)` plainly meant, and
+            # refusing it would be pedantry with a plugin taken out of service
+            # at the end of it.
+            return bool(result)
+
+        return matches
+
+    def _guard_validate(self, plugin: "WatchMatcher"):
+        registry = self._registry
+
+        def validate(pattern: str) -> Optional[str]:
+            if registry.is_disabled(plugin):
+                return None
+            try:
+                result = plugin.validate(pattern)
+            except Exception as exc:  # noqa: BLE001 - third-party code
+                registry.disable(
+                    plugin, f"validate() raised: {exc}", origin=_plugin_name(plugin)
+                )
+                return None
+            # Off the render path entirely -- this runs when the operator
+            # presses Save in the rules dialog -- so it is unbudgeted, and a
+            # non-string is read as "no complaint" rather than shown as one.
+            return result if isinstance(result, str) and result else None
+
+        return validate
+
+    def _guard_deliver(self, plugin: "WatchSink"):
+        """Wrap ``deliver`` so a raise disables the sink instead of the thread.
+
+        Deliberately **not** budgeted. A sink is one call per rule per window on
+        a thread of its own, so "slow" is not a symptom here and a
+        :class:`PluginBudget`'s three-strikes-per-pass policy has no pass to
+        count. What can actually go wrong is a call that never comes back, and
+        that is the dispatcher's deadline, not a stopwatch around a call that
+        has already returned.
+        """
+
+        registry = self._registry
+
+        def deliver(
+            name: str,
+            count: int,
+            context: Any,
+            entries: Sequence[LogEntry] = (),
+        ) -> None:
+            if registry.is_disabled(plugin):
+                return
+            try:
+                plugin.deliver(name, count, context, entries)
+            except Exception as exc:  # noqa: BLE001 - third-party code
+                registry.disable(
+                    plugin, f"raised: {exc}", origin=_plugin_name(plugin)
+                )
+
+        return deliver
+
+
 class FormatStack(Sequence):
     """The enabled :class:`LogFormat` plugins, wrapped in everything CLV owes them.
 
@@ -2450,6 +4615,102 @@ def _entry_fault(entry: Any, format_name: str) -> Optional[str]:
                 "downstream coerces"
             )
     return None
+
+
+#: How many controls one panel may hold. A modal is full-screen and scrolls, so
+#: this is not a layout limit -- it is a bound on how much third-party code runs
+#: per keystroke, since every control is a widget CLV mounts and `on_control`
+#: is called against the whole live form.
+MAX_PANEL_CONTROLS = 32
+
+
+def panel_fault(panel: Any) -> Optional[str]:
+    """Why *panel* cannot be drawn, or None if it can.
+
+    Checked every time a command hands one over rather than once at load,
+    because a panel is *returned* rather than declared: `run()` builds it from
+    whatever the plugin knows at the moment it is invoked, so there is no
+    earlier point at which it exists to be checked.
+
+    The duplicate-id rule is the one that earns its place. `values` is keyed on
+    the id, so two controls sharing one means a panel whose form silently loses
+    a field -- and the plugin reading it back gets an answer that looks right.
+    """
+
+    if not isinstance(panel, Panel):
+        return f"returned {type(panel).__name__}, not a Panel"
+    if panel.dismiss:
+        # Nothing else about a dismissing panel is read, so nothing else about
+        # it is worth refusing over.
+        return None
+    if not isinstance(panel.title, str) or not panel.title.strip():
+        return "returned a Panel with no title"
+    controls = panel.controls
+    if isinstance(controls, (str, bytes)) or not isinstance(controls, Iterable):
+        return "returned a Panel whose controls are not a sequence"
+    controls = tuple(controls)
+    if not controls:
+        return "returned a Panel with no controls"
+    if len(controls) > MAX_PANEL_CONTROLS:
+        return (
+            f"returned a Panel with {len(controls)} controls; "
+            f"the limit is {MAX_PANEL_CONTROLS}"
+        )
+    seen: set[str] = set()
+    for control in controls:
+        if not isinstance(control, Control):
+            return f"returned a {type(control).__name__} where a Control was expected"
+        if control.kind not in CONTROL_KINDS:
+            return (
+                f"returned a control of kind {control.kind!r}; "
+                f"the kinds are {', '.join(CONTROL_KINDS)}"
+            )
+        if not isinstance(control.id, str) or not control.id.strip():
+            return f"returned a {control.kind} control with no id"
+        if control.id in seen:
+            return (
+                f"returned two controls with id {control.id!r}; "
+                "values are keyed on the id and one would be lost"
+            )
+        seen.add(control.id)
+        if control.kind == "select":
+            options = control.options
+            if isinstance(options, (str, bytes)) or not isinstance(options, Iterable):
+                return f"select {control.id!r} has no options"
+            pairs = tuple(options)
+            if not pairs:
+                return f"select {control.id!r} has no options"
+            for pair in pairs:
+                if (
+                    isinstance(pair, (str, bytes))
+                    or not isinstance(pair, Sequence)
+                    or len(pair) != 2
+                    or not all(isinstance(part, str) for part in pair)
+                ):
+                    return (
+                        f"select {control.id!r} has an option that is not a "
+                        "(value, label) pair of strings"
+                    )
+    return None
+
+
+def _compiled_rule(plugin: ClusterRule) -> re.Pattern[str]:
+    """*plugin*'s pattern, compiled. Raises what ``re.compile`` raises.
+
+    A :class:`ClusterRule` may declare either a compiled pattern or the string
+    for one, because writing ``re.compile`` around a literal is the kind of
+    ceremony an author forgets and then cannot diagnose. Called from
+    :meth:`PluginRegistry._cluster_fault`, which is where the failure is
+    reported, and again from :class:`ClusterStack`, where it cannot fail — the
+    ``re`` module memoises compilation, so the second call is a dict lookup.
+    """
+
+    pattern = getattr(plugin, "pattern", "")
+    if isinstance(pattern, re.Pattern):
+        return pattern
+    if isinstance(pattern, str) and pattern:
+        return re.compile(pattern)
+    raise TypeError(f"pattern must be a pattern or a string, not {type(pattern)!r}")
 
 
 def _plugin_name(plugin: Any) -> str:
@@ -2605,6 +4866,15 @@ def _load_module(
     installed in a different directory.
     """
 
+    # Before the import, which is the whole of what this door buys. A plugin the
+    # operator isolated in `settings.conf` is never imported into this process,
+    # so an import that raises, hangs or spawns something is contained the same
+    # way a call is -- which a class attribute cannot do for itself, since
+    # reading it means importing the module that declares it.
+    if registry._isolation_requested(origin):
+        _load_isolated(registry, origin, clv_version)
+        return
+
     try:
         module = importlib.import_module(module_name)
     except Exception as exc:  # noqa: BLE001 - third-party code
@@ -2619,6 +4889,69 @@ def _load_module(
         registry.errors.append(PluginError(origin, diagnosis))
     for candidate in candidates:
         registry.add(candidate, origin=origin, clv_version=clv_version)
+
+
+def _load_isolated(
+    registry: PluginRegistry, origin: str, clv_version: str
+) -> None:
+    """Load *origin* in a child process, having imported nothing here.
+
+    The mirror image of :func:`_load_module`: there, CLV imports a module and
+    asks the objects what they are; here it asks a child what it found, and
+    builds a stand-in per answer. Everything after that is the same path -- the
+    version constraints, the per-kind faults, the ordering and the dialog row
+    are all decided by ``add()`` on the stand-in, so an isolated plugin is
+    refused for a missing ``command_name`` in exactly the words an in-process
+    one is.
+    """
+
+    try:
+        from .host import HostError
+
+        host = registry._host_for(origin)
+    except Exception as exc:  # noqa: BLE001 - a build without the host module
+        registry.errors.append(PluginError(origin, f"could not be isolated: {exc}"))
+        return
+
+    try:
+        host.ensure_started(setup=registry.started)
+    except HostError as exc:
+        registry.errors.append(PluginError(origin, str(exc)))
+        registry._hosts.pop(origin, None)
+        return
+
+    for message in host.errors:
+        # Raised in the child, filed here: a module CLV never imported still has
+        # to be able to report a plugin of its that could not be built, and to
+        # do it against the origin the operator installed.
+        registry.errors.append(PluginError(origin, message))
+
+    if not host.plugins:
+        registry.errors.append(
+            PluginError(origin, "defines no plugin — add register() or __all__")
+        )
+
+    added = 0
+    for entry in host.plugins:
+        problem = isolation_fault(entry.kinds)
+        if problem is not None:
+            registry.errors.append(PluginError(origin, problem))
+            continue
+        proxy = _proxy_class(entry.kinds)(
+            registry=registry,
+            host=host,
+            entry=entry,
+            resolve_by_qualname=False,
+        )
+        if registry.add(proxy, origin=origin, clv_version=clv_version):
+            added += 1
+
+    if not added:
+        # Nothing survived, so nothing will ever call into this child. Leaving
+        # it running would be a subprocess per refused plugin, for the life of
+        # the session, doing nothing.
+        host.stop()
+        registry._hosts.pop(origin, None)
 
 
 def plugin_search_roots() -> list[Path]:
@@ -2678,28 +5011,60 @@ def _install_user_package(roots: Sequence[Path]) -> None:
     sys.modules[USER_PLUGIN_PACKAGE] = package
 
 
-def _load_user_roots(
-    registry: PluginRegistry,
-    clv_version: str,
-    roots: Sequence[Path],
-    enabled: Sequence[str],
-    claimed: dict[str, str],
-) -> None:
-    """Walk the user roots, importing only what the enable-list names.
+@dataclass(frozen=True, slots=True)
+class UserPluginScan:
+    """What is in the user plugin roots, learned without importing anything.
 
-    The order of the two checks in the loop is the phase's whole point:
-    ``pkgutil.iter_modules`` yields a name **without importing it**, and
-    ``importlib`` is reached only for a name the operator wrote in
-    ``settings.conf``. An unlisted module is recorded and left alone, so
-    dropping a file into the plugin directory cannot execute anything.
+    The import-free half of :func:`_load_user_roots`, lifted out so that
+    ``clv plugin list`` can report what is installed without running it. There is
+    one walk rather than two on purpose: the listing an operator reads and the
+    listing CLV imports from have to be the same listing, or a plugin can be in
+    one and not the other and nothing says which is lying.
+
+    ``pkgutil.iter_modules`` yields a name without importing it, which is what
+    makes this whole type possible -- see :data:`PLUGIN_STATES` and the enable
+    list in ``clv/plugins/AGENTS.md``.
     """
+
+    #: The roots that were readable directories, in search order. Not the roots
+    #: asked for: an absent or unreadable one is a non-event and is absent here.
+    #: This is what decides whether the synthetic package is installed at all.
+    roots: tuple[Path, ...]
+    #: Every module found, in search order, loaded or not.
+    plugins: tuple[DiscoveredPlugin, ...]
+    #: Shadowed names and enable-list names that matched nothing on disk.
+    errors: tuple[PluginError, ...]
+    #: Casefolded name to origin, for the **enabled** entries only -- the names
+    #: a user root has actually claimed, which is what lets a bundled plugin of
+    #: the same name know it was overridden deliberately.
+    claimed: Mapping[str, str]
+
+
+def discover_user_plugins(
+    roots: Optional[Sequence[Path]] = None,
+    enabled: Iterable[str] = (),
+) -> UserPluginScan:
+    """Walk the user plugin *roots* and import nothing at all.
+
+    *roots* defaults to :func:`plugin_search_roots`; *enabled* is the operator's
+    enable list, and decides only which entries come back marked
+    :attr:`DiscoveredPlugin.enabled` -- nothing here acts on it.
+
+    Never raises, and never touches ``sys.modules``: an unreadable root is
+    skipped, and installing the synthetic package is the *loader's* business,
+    because a listing that mutated the import system would be a side effect from
+    a command whose whole promise is that it has none.
+    """
+
+    search = list(plugin_search_roots() if roots is None else roots)
+    wanted = {name.casefold() for name in enabled}
 
     # Each root paired with what is in it, resolved before anything is
     # installed: on the overwhelmingly common machine with no user plugins at
     # all there is nothing to search, and nothing should be put into
     # `sys.modules` on its behalf.
     listings: list[tuple[Path, list]] = []
-    for root in roots:
+    for root in search:
         try:
             if not root.is_dir():
                 continue
@@ -2709,14 +5074,10 @@ def _load_user_roots(
             # who chmod'd their own plugin directory does not need CLV to stop.
             continue
 
-    wanted = set(enabled)
     found: set[str] = set()
-
-    # Not an early return even when there is nothing to search: a plugin named
-    # in settings.conf that is nowhere on disk still has to be reported, and
-    # "the directory does not exist" is the most likely reason for it.
-    if listings:
-        _install_user_package([root for root, _ in listings])
+    claimed: dict[str, str] = {}
+    plugins: list[DiscoveredPlugin] = []
+    errors: list[PluginError] = []
 
     for root, entries in listings:
         for info in entries:
@@ -2727,7 +5088,7 @@ def _load_user_roots(
             origin = f"{root / info.name}"
 
             if key in claimed:
-                registry.discovered.append(
+                plugins.append(
                     DiscoveredPlugin(
                         name=info.name,
                         root=root,
@@ -2736,7 +5097,7 @@ def _load_user_roots(
                         shadowed_by=claimed[key],
                     )
                 )
-                registry.errors.append(
+                errors.append(
                     PluginError(
                         origin,
                         f"shadowed by {claimed[key]}, which was found first",
@@ -2746,7 +5107,7 @@ def _load_user_roots(
                 continue
 
             if key not in wanted:
-                registry.discovered.append(
+                plugins.append(
                     DiscoveredPlugin(
                         name=info.name,
                         root=root,
@@ -2757,7 +5118,7 @@ def _load_user_roots(
                 continue
 
             claimed[key] = origin
-            registry.discovered.append(
+            plugins.append(
                 DiscoveredPlugin(
                     name=info.name,
                     root=root,
@@ -2765,23 +5126,17 @@ def _load_user_roots(
                     is_package=info.ispkg,
                 )
             )
-            _load_module(
-                registry,
-                f"{USER_PLUGIN_PACKAGE}.{info.name}",
-                origin=origin,
-                clv_version=clv_version,
-            )
 
     # A typo in settings.conf says so. Naming a plugin that is not there used
     # to be indistinguishable from naming nothing at all.
-    where = ", ".join(str(root) for root in roots)
+    where = ", ".join(str(root) for root in search)
     for name in enabled:
-        if name not in found:
+        if name.casefold() not in found:
             # Reported against the *name*, not against a generic "plugins"
             # origin: this is a row in the management UI as much as it is a line
             # in the log panel, and a row has to be able to say which plugin it
             # is about.
-            registry.errors.append(
+            errors.append(
                 PluginError(
                     name,
                     "named in settings.conf but was not found"
@@ -2790,7 +5145,70 @@ def _load_user_roots(
                 )
             )
 
+    return UserPluginScan(
+        roots=tuple(root for root, _ in listings),
+        plugins=tuple(plugins),
+        errors=tuple(errors),
+        claimed=types.MappingProxyType(claimed),
+    )
 
+
+def _load_user_roots(
+    registry: PluginRegistry,
+    clv_version: str,
+    roots: Sequence[Path],
+    enabled: Sequence[str],
+    claimed: dict[str, str],
+) -> None:
+    """Walk the user roots, importing only what the enable-list names.
+
+    The split between this and :func:`discover_user_plugins` is the phase's
+    whole point: the scan names every module **without importing it**, and
+    ``importlib`` is reached here only for an entry the scan marked enabled,
+    which it does only for a name the operator wrote in ``settings.conf``. An
+    unlisted module is recorded and left alone, so dropping a file into the
+    plugin directory cannot execute anything.
+
+    *claimed* is shared with the bundled and entry-point loaders and is updated
+    in place, so a name a user root took is known to be taken by the time they
+    run.
+
+    *enabled* arrives in whatever case the operator wrote; the scan casefolds for
+    matching and keeps the original for its messages.
+    """
+
+    scan = discover_user_plugins(roots, enabled)
+    registry.discovered.extend(scan.plugins)
+
+    # Before a single import, and that ordering is deliberate: a shadowed name
+    # and an enable-list typo are facts about the filesystem, settled by the
+    # scan, and worth having recorded even if the import that follows hangs.
+    for error in scan.errors:
+        registry.errors.append(error)
+
+    # Not gated on there being anything to import: a plugin named in
+    # settings.conf that is nowhere on disk still has to be reported, and "the
+    # directory does not exist" is the most likely reason for it.
+    if scan.roots:
+        _install_user_package(list(scan.roots))
+
+    # `claimed` is written, never read. The user roots are walked first, so
+    # there is nothing here for a name to lose to -- the scan has already
+    # settled user-versus-user shadowing, which is the only kind knowable
+    # without importing. What the writes are for is the two walks that come
+    # after: a bundled plugin of the same name needs to know an enabled user
+    # module took it, and only an enabled one takes anything.
+    for entry in scan.plugins:
+        if not entry.enabled:
+            continue
+        origin = f"{entry.root / entry.name}"
+        claimed[entry.name.casefold()] = origin
+        _load_module(
+            registry,
+            f"{USER_PLUGIN_PACKAGE}.{entry.name}",
+            origin=origin,
+            clv_version=clv_version,
+        )
 def _load_local(
     registry: PluginRegistry,
     clv_version: str,
@@ -2829,6 +5247,13 @@ def _load_local(
     for directory, package_name in search:
         for info in pkgutil.iter_modules([directory]):
             if info.name.startswith("_") or info.name in _LOCAL_SUBPACKAGES:
+                continue
+            if package_name == __name__ and info.name in _LOADER_MODULES:
+                # CLV's own machinery, which lives beside the drop-in folders
+                # and is not one. Scanned as a drop-in it loads cleanly, exports
+                # nothing and is reported as "defines no plugin" -- an error
+                # about CLV, in the operator's plugin list, that no operator can
+                # act on.
                 continue
             module_name = f"{package_name}.{info.name}"
             key = info.name.casefold()
@@ -2931,6 +5356,11 @@ def _load_entry_points(
             )
             continue
         claimed.setdefault(key, origin)
+        if registry._isolation_requested(origin):
+            # Before `load()`, for the reason `_load_module` checks before
+            # `import_module`: loading an entry point imports its module.
+            _load_isolated(registry, origin, clv_version)
+            continue
         try:
             loaded = entry_point.load()
         except Exception as exc:  # noqa: BLE001 - third-party code
@@ -2959,6 +5389,7 @@ def load_plugins(
     roots: Optional[Sequence[Path]] = None,
     enabled: Iterable[str] = (),
     settings: Optional[Mapping[str, Mapping[str, str]]] = None,
+    host_timeout_ms: Optional[float] = None,
 ) -> PluginRegistry:
     """Discover and load all available plugins.
 
@@ -2978,7 +5409,12 @@ def load_plugins(
     *settings* is the parsed ``[plugin:<name>]`` sections. Seeded **before**
     anything is imported, so a plugin is configured on the same pass it is
     constructed rather than being handed its settings some time after it has
-    started deciding things without them.
+    started deciding things without them -- and so that a section saying
+    ``isolated = true`` is known before the module it names would have been
+    imported, which is what lets that plugin be loaded in a child instead.
+
+    *host_timeout_ms* bounds every call into an isolation host, including the
+    handshake that starts one. ``None`` leaves the registry's default.
 
     Never raises: any failure is captured in :attr:`PluginRegistry.errors`.
     """
@@ -2987,6 +5423,11 @@ def load_plugins(
         from .. import __version__ as clv_version  # local import avoids a cycle
 
     registry = PluginRegistry()
+    if host_timeout_ms is not None:
+        # Before anything is loaded, because a plugin the operator isolated in
+        # `settings.conf` starts its host during the load and has to be bounded
+        # by the operator's ceiling on the pass that starts it.
+        registry.host_timeout_ms = float(host_timeout_ms)
     if settings:
         registry.refresh_settings(settings)
     #: Names taken by an enabled *user* module. Only these may displace a
@@ -2998,13 +5439,14 @@ def load_plugins(
 
     if include_user:
         search_roots = list(roots) if roots is not None else plugin_search_roots()
-        _load_user_roots(
-            registry,
-            clv_version,
-            search_roots,
-            [name.casefold() for name in enabled],
-            claimed,
-        )
+        # Passed through rather than casefolded here: `discover_user_plugins`
+        # casefolds for matching, so doing it twice only decided which spelling
+        # its messages quote. Through `config.py` the list is already casefolded
+        # (`_read_plugin_list` treats case as a typo class), so this changes no
+        # output -- what it changes is that the scan is the only place the rule
+        # lives, and `clv plugin list` calling it directly cannot now disagree
+        # with the loader about a name.
+        _load_user_roots(registry, clv_version, search_roots, list(enabled), claimed)
         claimed_by_user.update(claimed)
     if include_local:
         _load_local(registry, clv_version, claimed, claimed_by_user)
@@ -3069,6 +5511,15 @@ __all__ = [
     "QueryOperator",
     "ComputedField",
     "QueryStack",
+    "ClusterRule",
+    "ShapeContributor",
+    "ClusterStack",
+    "TimelineAnnotation",
+    "TimelineMetric",
+    "TimelineStack",
+    "WatchMatcher",
+    "WatchSink",
+    "WatchStack",
     "LogSourceProvider",
     "ProviderSource",
     "Plugin",
@@ -3076,7 +5527,10 @@ __all__ = [
     "PluginErrors",
     "PluginRegistry",
     "PluginStatus",
+    "ISOLABLE_KINDS",
+    "isolation_fault",
     "load_plugins",
+    "manifest_for",
     "plugin_search_roots",
     "plugin_sort_key",
     "satisfies",

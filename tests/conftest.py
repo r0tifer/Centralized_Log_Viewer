@@ -95,3 +95,59 @@ def query_plugins_are_not_shared_between_tests():
     from clv.services.query import install_query_plugins
 
     install_query_plugins()
+
+
+@pytest.fixture(autouse=True)
+def cluster_plugins_are_not_shared_between_tests():
+    """Reset the installed cluster rules and shape contributors between tests.
+
+    The third of the same argument, and the one with the longest reach. A
+    leaked rule does not merely stay registered: ``install_cluster_plugins``
+    clears the memoised shape cache, so every later test that clusters anything
+    would be shaping its lines through a rule from a test that has already
+    finished — and clustering that is subtly wrong reads exactly like
+    clustering that works.
+    """
+
+    yield
+    from clv.services.clustering import install_cluster_plugins
+
+    install_cluster_plugins()
+
+
+@pytest.fixture(autouse=True)
+def timeline_plugins_are_not_shared_between_tests():
+    """Reset the installed annotation providers and metric between tests.
+
+    The fourth of the same argument, and it leaks in two directions at once. A
+    leftover metric changes what every later bar is *scaled by* and what its
+    caption claims to be showing; a leftover provider leaves marks — and the
+    triples behind them — in the module's one-entry annotation cache, which is
+    keyed on the window and would happily serve a later test whose grid covers
+    the same seconds. ``install_timeline_plugins`` clears that cache, which is
+    exactly why putting the module back is enough.
+    """
+
+    yield
+    from clv.services.timeline import install_timeline_plugins
+
+    install_timeline_plugins()
+
+
+@pytest.fixture(autouse=True)
+def watch_plugins_are_not_shared_between_tests():
+    """Reset the installed watch matchers and sinks between tests.
+
+    The same argument as the query fixture above, one seam along.
+    ``clv.services.watch`` holds its matchers and sinks in module state for the
+    same reason ``query`` does — a ``WatchRule`` is frozen and persisted, so a
+    registry of live callables cannot ride on it — and a leak here fails just as
+    quietly: a leftover ``burst`` matcher makes ``matcher_kinds()`` report two
+    kinds, so the rules dialog composes a control that the test asserting a
+    build with no watch plugins renders nothing new was written to catch.
+    """
+
+    yield
+    from clv.services.watch import install_watch_plugins
+
+    install_watch_plugins()

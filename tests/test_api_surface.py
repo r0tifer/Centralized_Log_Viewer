@@ -44,7 +44,20 @@ EXPECTED_API = frozenset(
         "QueryOperator",
         "ComputedField",
         "FilterStage",
+        "ClusterRule",
+        "ShapeContributor",
+        "TimelineAnnotation",
+        "TimelineMetric",
+        "WatchMatcher",
+        "WatchSink",
         "Exporter",
+        "Command",
+        # being invoked, and drawing
+        "CommandContext",
+        "Panel",
+        "Control",
+        "CONTROL_KINDS",
+        "MAX_PANEL_CONTROLS",
         # data handed to a plugin
         "LogEntry",
         "FilterContext",
@@ -52,10 +65,15 @@ EXPECTED_API = frozenset(
         "TimeWindow",
         "ProviderSource",
         "SourceRef",
+        "TailRead",
         # declaring a format
         "FormatProfile",
         "DEFAULT_PROFILE",
         "FORMAT_NAMES",
+        # extending the watch rules
+        "WatchRule",
+        "KIND_PATTERN",
+        "SINK_SAMPLE_LIMIT",
         # data a plugin hands back
         "ExportResult",
         # the severity vocabulary
@@ -103,6 +121,20 @@ EXPECTED_SIGNATURES: dict[str, str] = {
     "LogFormat.parse": "(self, line: 'str') -> 'Optional[LogEntry]'",
     "QueryOperator.test": "(self, stored: 'str', value: 'str') -> 'bool'",
     "ComputedField.value": "(self, entry: 'LogEntry') -> 'Optional[str]'",
+    "ShapeContributor.contribute": "(self, entry: 'LogEntry') -> 'str'",
+    "TimelineAnnotation.annotations": (
+        "(self, window: 'TimeWindow') -> "
+        "'Iterable[tuple[datetime, str, Optional[str]]]'"
+    ),
+    "TimelineMetric.value": "(self, entry: 'LogEntry') -> 'Optional[float]'",
+    "WatchMatcher.matches": (
+        "(self, entry: 'LogEntry', rule: 'WatchRule') -> 'bool'"
+    ),
+    "WatchMatcher.validate": "(self, pattern: 'str') -> 'Optional[str]'",
+    "WatchSink.deliver": (
+        "(self, name: 'str', count: 'int', context: 'FilterContext', "
+        "entries: 'Sequence[LogEntry]' = ()) -> 'None'"
+    ),
     "FormatProfile.keys": "(self) -> 'frozenset[str]'",
     "FilterStage.apply": (
         "(self, entry: 'LogEntry', context: 'FilterContext') -> 'Optional[LogEntry]'"
@@ -111,6 +143,19 @@ EXPECTED_SIGNATURES: dict[str, str] = {
         "(self, entries: 'Sequence[LogEntry]', context: 'FilterContext', *, "
         "destination: 'Optional[Path]' = None) -> 'ExportResult'"
     ),
+    "Command.run": (
+        "(self, context: 'CommandContext') -> 'Optional[Panel]'"
+    ),
+    "Command.on_control": (
+        "(self, control_id: 'str', value: 'Any', context: 'CommandContext') "
+        "-> 'Optional[Panel]'"
+    ),
+    "CommandContext.notify": (
+        "(self, text: 'str', severity: 'str' = 'info') -> 'None'"
+    ),
+    "CommandContext.request_query": "(self, text: 'str') -> 'None'",
+    "CommandContext.request_source": "(self, ref: 'SourceRef') -> 'None'",
+    "CommandContext.request_view": "(self, name: 'str') -> 'None'",
     "TimeWindow.contains": "(self, moment: 'datetime') -> 'bool'",
     "normalize_level": "(raw: 'object') -> 'Optional[str]'",
     "level_rank": "(level: 'Optional[str]') -> 'int'",
@@ -170,6 +215,32 @@ def test_plugin_metadata_keeps_its_defaults(attribute: str, default: object) -> 
     assert getattr(api.Plugin, attribute) == default
 
 
+def test_a_cluster_rule_declares_a_pattern_and_a_placeholder() -> None:
+    """The one published interface whose contract is data rather than a method.
+
+    ``ClusterRule`` has nothing in ``EXPECTED_SIGNATURES`` because it has no
+    method to implement — CLV performs the substitution — so these two names
+    and their defaults *are* the frozen surface, and this is where a rename
+    would have to be seen in the diff.
+    """
+
+    assert api.ClusterRule.pattern == ""
+    assert api.ClusterRule.placeholder == ""
+
+
+def test_a_timeline_metric_declares_a_name_and_a_unit() -> None:
+    """Two class attributes, and the caption is what they are for.
+
+    ``metric_name`` is not optional in practice — a metric that does not set it
+    is refused at load — but the *default* is part of the frozen surface: it is
+    what an author's subclass inherits before they set it, and what the load
+    check tests against.
+    """
+
+    assert api.TimelineMetric.metric_name == ""
+    assert api.TimelineMetric.unit == ""
+
+
 def test_an_exporter_declares_whether_it_wants_a_destination() -> None:
     """And the default is the behaviour every existing exporter already had."""
 
@@ -210,6 +281,7 @@ def test_the_api_version_is_not_clv_s_version() -> None:
         ("LogSourceProvider", "clv.plugins", "LogSourceProvider"),
         ("ProviderSource", "clv.plugins", "ProviderSource"),
         ("SourceRef", "clv.services.refs", "SourceRef"),
+        ("TailRead", "clv.services.reader", "TailRead"),
         ("NORMALISED_FIELD_KEYS", "clv.services.query", "NORMALISED_FIELD_KEYS"),
     ],
 )

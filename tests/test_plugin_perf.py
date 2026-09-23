@@ -238,6 +238,48 @@ def test_an_invalid_query_is_not_cached() -> None:
 # --- the generation counter and the shape cache -----------------------------
 
 
+def test_re_enabling_a_plugin_clears_its_strikes_on_every_budget() -> None:
+    """**Re-enable** promises a clean count, and it has to mean every ceiling.
+
+    The re-enable path was written when the app held two budgets and named both
+    by hand. Four seam phases have added one each since, none of them here — so
+    a query operator, a watch matcher, a shape contributor or a timeline metric
+    that had struck once or twice on its own ceiling and was then taken out of
+    service for another reason came back still carrying those strikes, and one
+    slow pass took it straight out again.
+
+    Driven off the app's own budgets rather than a list written here, so the
+    eighth cannot be missed the same way. The seventh — the panel budget Phase
+    12 added for a `Command`'s `on_control` — is what this sentence used to
+    predict, and it arrived costing one line in `_forget_budgets` and one number
+    here, which is the count doing its job rather than being in the way.
+    """
+
+    app = LogViewerApp()
+    budgets = [value for value in vars(app).values() if isinstance(value, PluginBudget)]
+    assert len(budgets) == 7, "a budget was added; `_forget_budgets` needs it too"
+    plugin = Counting()
+
+    # Two strikes each: one short of the three that disable.
+    for budget in budgets:
+        for _ in range(2):
+            budget.start()
+            budget.charge(plugin, 10.0)
+            budget.settle()
+    assert not app._plugins.is_disabled(plugin)
+
+    app._forget_budgets(plugin)
+
+    for budget in budgets:
+        budget.start()
+        budget.charge(plugin, 10.0)
+        budget.settle()
+
+    assert not app._plugins.is_disabled(plugin), (
+        "a strike survived Re-enable on at least one budget"
+    )
+
+
 def test_a_plugin_change_clears_the_clustering_shape_cache() -> None:
     """The assertion `PLUGIN_TODO.md` Phase 10 rests on.
 
