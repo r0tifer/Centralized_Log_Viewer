@@ -1149,6 +1149,13 @@ def test_the_spawn_handshake_precedes_the_app_import() -> None:
     Spawn starts its child by re-running ``sys.executable``, which in a frozen
     build is the CLV binary. Unless that argv is handled before anything else,
     an isolated plugin's first call re-launches the whole viewer.
+
+    The import moved from ``clv.app`` to ``clv.cli`` when the command line grew
+    subcommands, and the ordering matters more now than it did: ``clv.cli``
+    builds an ``argparse`` parser, and ``clv --multiprocessing-fork …`` is not a
+    command line it knows. Reaching it first would turn every isolated call in a
+    bundle into a usage error, so this test matches whatever CLV imports rather
+    than one module's name -- a rename must not be able to pass it by default.
     """
 
     source = (Path(__file__).resolve().parents[1] / "clv" / "__main__.py").read_text(
@@ -1162,10 +1169,15 @@ def test_the_spawn_handshake_precedes_the_app_import() -> None:
     ]
 
     handshake = code.index("freeze_support()")
-    imports_app = next(
-        index for index, line in enumerate(code) if "from clv.app import run" in line
+    imports_clv = [
+        index
+        for index, line in enumerate(code)
+        if line.startswith(("import clv", "from clv"))
+    ]
+    assert imports_clv, "clv/__main__.py imports nothing of CLV's — has it moved?"
+    assert handshake < min(imports_clv), (
+        "CLV is imported before the spawn handshake"
     )
-    assert handshake < imports_app, "CLV is imported before the spawn handshake"
 
 
 def test_the_handshake_is_the_one_that_works_on_the_release_floor() -> None:

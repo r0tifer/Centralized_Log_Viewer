@@ -78,15 +78,12 @@ from .services.config import (
     RemoteHost,
     get_config_file,
     ensure_user_plugin_dir,
-    default_config_text,
     host_options,
     load_config,
     plugin_settings_for,
     undocumented_settings,
     user_config_path,
 )
-from .services.config_upgrade import describe as describe_upgrade
-from .services.config_upgrade import upgrade_user_settings
 from .services.discovery import DiscoveredFile, DiscoveryReport, discover
 from .services.export import (
     BUILTIN_FORMATS,
@@ -7357,65 +7354,24 @@ def _find_node(node: TreeNode[Path], target: Path) -> Optional[TreeNode[Path]]:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """Parse the command line and either print something or run the viewer.
+    """Compatibility shim. The command line lives in :mod:`clv.cli`.
 
-    Split out from :func:`run` so it is testable: ``run`` is the console-script
-    entry point and cannot be called from a test without taking the terminal.
-
-    Both flags exist for the operator who has just upgraded.
-    ``--print-default-config`` is read-only and always has been: it prints the
-    reference so they can read what a newer build documents.
-    ``--upgrade-config`` is the one place in CLV that rewrites their settings
-    file, and it does so only because they asked -- the launch path still never
-    touches it. A plain ``diff`` between the two files is mostly noise, since
-    they are ordered and commented differently, which is why the merge is a
-    command rather than a suggestion.
+    It moved there when it grew subcommands: ``clv doctor`` has to run without a
+    terminal, and anything importable from this module brings a UI toolkit with
+    it. This name stays because it is what the tests and the documentation for
+    two config flags already call, and because a shim costs a line where a
+    rename costs a search.
     """
 
-    import argparse
+    from .cli import main as _main
 
-    parser = argparse.ArgumentParser(
-        prog="clv",
-        description="Centralized Log Viewer — a terminal log viewer.",
-    )
-    # Not decoration: an operator running a stale bundle has no way to tell, and
-    # "the feature is missing" and "the build is old" look identical from the UI.
-    parser.add_argument(
-        "--version", action="version", version=f"clv {__version__}"
-    )
-    parser.add_argument(
-        "--print-default-config",
-        action="store_true",
-        help=(
-            "print the shipped, fully commented settings file and exit. This is "
-            "the reference a newer version documents; --upgrade-config is how to "
-            "fold it into the file you already have."
-        ),
-    )
-    parser.add_argument(
-        "--upgrade-config",
-        action="store_true",
-        help=(
-            "rewrite your settings file from the shipped template, keeping your "
-            "values and hosts, after saving the previous one alongside it. Does "
-            "nothing if it is already current. The installer runs this for you."
-        ),
-    )
-    args = parser.parse_args(argv)
-
-    if args.print_default_config:
-        sys.stdout.write(default_config_text())
-        return 0
-
-    if args.upgrade_config:
-        result = upgrade_user_settings()
-        stream = sys.stdout if result.ok else sys.stderr
-        print(describe_upgrade(result), file=stream)
-        return 0 if result.ok else 1
-
-    LogViewerApp().run()
-    return 0
+    return _main(argv)
 
 
 def run() -> None:  # pragma: no cover - script entry point
-    raise SystemExit(main())
+    """Compatibility shim; see :func:`main`. The console scripts use
+    :func:`clv.cli.main`."""
+
+    from .cli import run as _run
+
+    _run()

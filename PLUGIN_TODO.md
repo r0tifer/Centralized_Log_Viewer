@@ -46,7 +46,7 @@ that argument; Phase 7b is the exception, and it is here because designing the
 | 12 — Commands and controls | Commands, bindings, modal panels | ✅ Done |
 | **Stage E — Trust and distribution** | | |
 | 13 — Isolation | An opt-in subprocess host, and honesty about what it buys | ✅ Done |
-| 14 — The CLI layer | `clv` grows an argv, without changing what bare `clv` does | ⬜ Not started |
+| 14 — The CLI layer | `clv` grows an argv, without changing what bare `clv` does | ✅ Done |
 | 15 — Registry | Manifests, `clv plugin install`, signatures, no hosted index | ⬜ Not started |
 | **Stage F — Release** | | |
 | 16 — Documentation & release | The plugin chapter, worked examples, 3.0.0 | ⬜ Not started |
@@ -2855,7 +2855,136 @@ as such.
   `tests/test_install_script.py` extended.
 
 **Gate.** `clv` launches the TUI exactly as before; `clv doctor` diagnoses a
-broken plugin without a terminal. Suite green on 3.11 and 3.14.
+broken plugin without a terminal. Suite green on 3.11 and 3.14: 2372 passed,
+1 skipped, 11 deselected on both.
+
+Checked by hand against a real `CLV_PLUGIN_PATH` root carrying four modules — a
+working format, one left unnamed, one raising on import, one requiring CLV 99 —
+plus a name in `settings.conf` matching nothing on disk. All five rows read
+correctly beside the bundled journal provider, and `clv doctor` exited 0 with two
+of them broken. `clv plugin list` over the same root reported the same set, and
+the usage errors were each run: a bare path, an unknown subcommand, `clv plugin`
+with no subcommand, and an unknown one under it. The new `release.yml`
+step was run end to end against a source checkout with the broken plugin in the
+**real** user plugin directory rather than on `CLV_PLUGIN_PATH`, which is the path
+an operator takes and the one the workflow uses; every grep in it holds.
+
+The isolated row, the sentinel that proves `clv plugin list` imports nothing, and
+the assertion that no host outlives `doctor` are covered by
+`tests/test_cli.py` rather than by hand — said plainly because the rest of this
+paragraph is a by-hand claim and the two should not be read as one.
+
+One thing the by-hand check turned up that no test would have: **an existing
+install keeps working without being reinstalled.** The console script in a
+`pip install -e .` environment has `clv.app:run` baked into it, and `clv doctor`
+through that script works — the shim is not only for the test suite's import, it
+is what an operator with CLV already installed gets the new subcommands through.
+
+**Corrected on landing: CLV already had an argv layer, and this phase's premise
+was stale.** The text above says there is "**no argv handling anywhere**" and "no `argparse` import in the codebase", citing `app.py:3678-3679`.
+That stopped being true when [SSH_TODO.md](SSH_TODO.md)'s config-upgrade work
+landed: `clv/app.py` carried an `argparse.ArgumentParser(prog="clv")` with
+`--version`, `--print-default-config` and `--upgrade-config`, and the exit codes
+this phase "defines" — 0, 1 on a failed upgrade, 2 from argparse — were already
+exactly those. `install.sh` forwarded argv and `release.yml` already ran
+`clv --upgrade-config` against the built binary.
+
+So the risky part was never adding argv. It was *extending* a parser three flags
+and two test files already depended on, and the compatibility surface was four
+entry paths rather than one: two console scripts, `python -m clv`, the frozen
+bundle, and `clv.app.main` called directly from `tests/test_config_upgrade.py`.
+Recorded rather than quietly fixed, because a phase that had been read as
+greenfield would have been implemented as a second parser beside the first.
+
+**As shipped.** Six decisions worth recording, two of them things this phase
+found rather than chose.
+
+*The layer moved to `clv/cli.py`, and `clv.app` keeps two shims.* `clv doctor`
+has to run over a pipe, in a CI step and in a bug report, and anything reachable
+from `app.py` brings Textual with it — so `clv/cli.py` imports the app inside the
+branch that launches it and nowhere else, `clv/__main__.py` and both console
+scripts point at `clv.cli:main`, and `clv.app.main` / `clv.app.run` stay as
+one-line shims. A test asserts out of process that a full `clv doctor` run leaves
+`textual`, `rich`, `clv.app` and `clv.widgets` unimported — in process it would
+pass on any session where something else had already imported a widget, which is
+every session.
+
+*`clv doctor` reports `PluginRegistry.status()` and derives nothing.* That method
+already said in its own docstring that it lives in the registry "so it can be
+asserted without a screen", and this is the caller that took it up on the offer:
+the rows, the five states, the details and the sort order are all its, so the
+report and the `P` dialog cannot reach two conclusions about one plugin. What the
+CLI adds is the frame around it — version, build kind and interpreter, the
+settings file, the `ConfigIssue`s beside the plugin errors for the reason `app.py`
+gives them one colour, and the search roots each with what was found in it. The
+one count it adds to the drawer's summary is `isolated`, which that line omits: a
+subprocess must not be invisible to the command meant to find it.
+
+*It does not call `start()`, and says so.* A diagnostic must not run `setup()` and
+begin acquiring sockets and connections on the operator's behalf — the loader
+declines to for the same reason. The cost is stated in the output's own
+documentation rather than left to be discovered: a plugin that fails in `setup()`
+is reported here as loaded, and that is the one thing this report cannot tell you.
+
+*`stop_hosts()` exists because `shutdown()`'s premise is false here.* A plugin
+the operator isolated in `settings.conf` starts its host during the **load** —
+`PluginHost`'s "that door pays for its handshake at load" — so a command that
+only reads the registry would leave a live child and a `clv-plugin-*` temp
+directory behind on every run. `shutdown()` is the wrong tool: it runs
+`teardown()` on every plugin that was *set up*, and under `doctor` none were.
+The new method stops the processes and runs no hook, and it is a separate method
+rather than a flag so the viewer's exit path cannot take the branch that skips
+every `teardown()`. Pinned by a test that counts what is left in `/tmp`.
+
+*`clv plugin list` imports nothing, and that is a property of the code rather
+than of the command.* The enumeration was inside `_load_user_roots`, tangled with
+the imports it gated. It is now `discover_user_plugins`, returning a
+`UserPluginScan`, and `_load_user_roots` consumes it — one walk, so the listing an
+operator reads and the listing CLV imports from cannot disagree, asserted by a
+test that compares them. Phase 15's rule that no `clv plugin` command may import
+plugin code therefore arrives already satisfied, with the sentinel test already
+written, rather than being retrofitted onto five new subcommands at once.
+
+*A plugin cannot add a subcommand, refused twice over.* `SUBCOMMANDS` is a closed
+literal and a test asserts the parser's choices are exactly it, so a later change
+that fed it a registry list fails there however reasonable it looked. And
+`PluginRegistry.add` reports a plugin declaring `subcommand`, `subcommands` or
+`cli_command`, naming the attribute and pointing at `Command` — because without
+it such a plugin loads, works, and simply never gets a subcommand, which is the
+failure an author cannot diagnose from outside CLV's source. The attribute is
+refused; the plugin is not, and keeps every interface it implements.
+
+**Found rather than chosen.**
+
+*The bare-path check rests on every top-level option being a flag, so that is
+pinned rather than assumed.* `clv /var/log/syslog` has to be declined by name
+rather than as an invalid choice, which means finding the first token that is not
+an option — and that is only safe while no option consumes a value. Verified that
+it is not merely theoretical: with a hypothetical `--config` added,
+`clv --config /etc/clv.conf` is reported as an attempt to open a log. A test
+asserts every top-level action takes zero arguments, so adding such an option
+fails there instead.
+
+*The frozen-build ordering test had to change, and it string-matched the import.*
+`tests/test_plugin_isolation.py` asserts against the source of `clv/__main__.py`
+that `freeze_support()` precedes CLV's import, because no test can build a
+bundle. It did so with `next(… if "from clv.app import run" in line)`, so
+repointing that import raised `StopIteration` rather than failing — a guard that
+reports a crash instead of a verdict. It now matches whatever of CLV's the file
+imports, and asserts there is one, so the next rename cannot pass it by default.
+The ordering matters more than it did: `clv.cli` builds a parser, and
+`clv --multiprocessing-fork …` is not a command line it knows, so reaching it
+before the handshake would turn every isolated call in a bundle into a usage
+error.
+
+**Also swept here.** `default_config_text`, `describe_upgrade` and
+`upgrade_user_settings` became unused in `clv/app.py` when the flags moved and
+were removed. `release.yml` gained a CLI smoke step: the existing one proves the
+binary can take a terminal, and this one proves it can answer without one —
+a deliberately broken plugin installed in the throwaway `XDG_CONFIG_HOME`, and
+`clv doctor` asserted to name it, to name the reason, and to exit 0 anyway. It is
+the only place the phase's gate can be checked on the build almost every operator
+has.
 
 **Commit.** `feat(cli): an argv layer that leaves bare clv alone`
 
@@ -3045,7 +3174,7 @@ reason that survives the decision to include everything else.
 | `clv/plugins/__init__.py` | 1,3,5,6,7a,13 | Loader, search roots, ordering, timing, registries, host |
 | `clv/api.py` | 2, all seams | **New** — the published surface, extended per phase |
 | `clv/plugins/host.py` | 13 | **New** — the subprocess host and the wire protocol |
-| `clv/cli.py` | 14,15 | **New** — argv, `doctor`, `plugin` subcommands |
+| `clv/cli.py` | 14,15 | **New** — argv, `doctor`, `plugin` subcommands. Absorbed the parser that was in `app.py`, which keeps `main`/`run` as shims |
 | `clv/plugins/manifest.py` | 15 | **New** — manifest parsing, checksums, signatures |
 | `clv/services/config.py` | 3,5,6,13 | `plugins`, `[plugin:<name>]`, `plugin_time_budget_ms`, `plugin_host_timeout_ms` |
 | `clv/services/parsing.py` | 7a,7b | `LogParser(formats=...)`, injected dispatch, `FORMAT_NAMES`, the logfmt matcher and the ISO deferral |
@@ -3063,7 +3192,7 @@ reason that survives the decision to include everything else.
 | `clv/widgets/detail_pane.py` | 7a,7b | Plugin format labels; `FORMAT_LABELS` gains logfmt |
 | `clv/widgets/help_overlay.py` | 12 | Plugin command section |
 | `clv/widgets/timeline.py` | 11 | Annotation rendering and stepping |
-| `clv/__main__.py` | 13,14 | `freeze_support()`, before anything of CLV's is imported; argv entry |
+| `clv/__main__.py` | 13,14 | `freeze_support()`, before anything of CLV's is imported; argv entry (`clv.cli`, not `clv.app`) |
 | `clv/plugins/formats/` | 7a | **New** — drop-in directory and the nginx reference |
 | `examples/plugins/` | 16 | **New** — one copyable example per interface |
 | `clv/plugins/README.md` | 16 | **New** — author-facing quick start. Covers the **shipped** sources too: journald, and the SSH transport `SSH_TODO.md` Phase 4 added (a backend rather than a provider — see `clv/plugins/AGENTS.md`, which holds that contract until this file exists). |

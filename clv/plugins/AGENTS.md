@@ -1165,6 +1165,27 @@ first mounts.
 
 ## Plugin Discovery
 
+### When a plugin does not appear, run `clv doctor`
+
+Before reading any of what follows. It loads plugins exactly the way the viewer
+does and prints, without starting a screen: which settings file was read and
+anything in it CLV could not honour, every search root below and what was found
+in each, and one block per plugin — the interfaces it supplied, its origin, its
+state, and the reason for that state. Every failure mode documented in this file
+is a line in that output, which is why it is a better first question than "open
+the drawer and read me the amber text".
+
+It exits 0 even when a plugin failed, so it is safe in a script, and it imports
+no UI, so it works over a pipe and in CI.
+
+One thing it cannot tell you, and the omission is deliberate: it does **not**
+call `setup()`. A diagnostic must not start acquiring sockets, files and
+connections on the operator's behalf, so a plugin that fails in `setup()` is
+reported here as loaded. `clv plugin list` is narrower still and imports nothing
+at all — use it to see what is installed, and `doctor` to see what it did.
+
+### The search order
+
 Four stages, searched in this order. **The first to claim a name wins, and the
 loser is reported** — never silently dropped, because two plugins quietly
 resolving by load order is the defect this ordering exists to prevent.
@@ -1370,7 +1391,6 @@ be reported as news.
 
 Nothing is written until the dialog closes, so `Esc` cancels for real and one
 confirm is one write to a file full of the operator's comments.
-
 ### Shadowing
 
 A user plugin may take a name a bundled drop-in uses, which is how a plugin
@@ -2076,6 +2096,18 @@ Still non-goals:
   daemon: it lives and dies with the viewer, it is started only for a plugin
   whose author or operator asked for it, and it exists to make a plugin
   *killable*, not to make it long-lived.
+- **Subcommands.** A plugin cannot add one, and the parser in
+  [`clv/cli.py`](../cli.py) is built from a closed literal tuple so that nothing
+  installed can reach it. An installed file must not be able to change what a
+  shell command does — that is the same argument as the enable-list one stage
+  further on: if dropping a file into a directory can redefine `clv`, then
+  asking for consent before *importing* it has bought nothing.
+
+  The supported way to be invoked is [`Command`](#13-command), which is reached
+  from `C` and from its own key, with the operator present and the viewer
+  running. Declaring `subcommand`, `subcommands` or `cli_command` on a plugin
+  gets you a reported error naming the attribute and pointing here; the plugin
+  itself still loads and keeps every interface it implements.
 
 ### Reversed
 

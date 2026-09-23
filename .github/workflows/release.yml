@@ -251,6 +251,56 @@ jobs:
           fi
           echo "Smoke test passed for ${{ matrix.arch }}"
 
+      - name: Smoke test the CLI in the frozen build
+        run: |
+          set -euo pipefail
+          # `clv doctor` is the support tool an operator will be asked to run,
+          # and the binary is the build almost all of them have. The suite can
+          # only ever check it against an interpreter, where a missing hidden
+          # import or a frozen-only path resolution cannot show up -- the same
+          # blind spot that let `Path.is_dir()` silently drop the journal
+          # provider from a bundle once already.
+          #
+          # A deliberately broken plugin, because the interesting assertion is
+          # not that the command runs: it is that a plugin CLV could not import
+          # is *named*, and that saying so is still an exit 0.
+          export HOME="${RUNNER_TEMP}/cli-home"
+          export XDG_CONFIG_HOME="${RUNNER_TEMP}/cli-config"
+          CONF="${XDG_CONFIG_HOME}/clv/settings.conf"
+          PLUGINS="${XDG_CONFIG_HOME}/clv/plugins"
+          mkdir -p "$HOME" "${PLUGINS}"
+          printf 'import definitely_not_a_module\n' > "${PLUGINS}/broken.py"
+          "dist/${BIN_NAME}/${BIN_NAME}" --print-default-config > "${CONF}"
+          sed -i 's/^plugins =$/plugins = broken/' "${CONF}"
+          grep -q '^plugins = broken$' "${CONF}" \
+            || { echo "::error::could not enable the broken plugin in ${CONF}" >&2; exit 1; }
+
+          # No terminal: stdin closed and stdout a pipe, which is how it will be
+          # run when someone is asked to paste the output.
+          "dist/${BIN_NAME}/${BIN_NAME}" doctor < /dev/null > "${RUNNER_TEMP}/doctor.txt"
+          # Both anchors ASCII on purpose: the row itself is separated by an em
+          # dash, and a grep pattern in this file should not depend on the
+          # runner's locale to match it.
+          grep -q "plugins: .*1 failed" "${RUNNER_TEMP}/doctor.txt" \
+            || { echo "::error::clv doctor did not report a failed plugin" >&2;
+                 cat "${RUNNER_TEMP}/doctor.txt" >&2; exit 1; }
+          grep -q "No module named 'definitely_not_a_module'" "${RUNNER_TEMP}/doctor.txt" \
+            || { echo "::error::clv doctor named no reason for the failure" >&2;
+                 cat "${RUNNER_TEMP}/doctor.txt" >&2; exit 1; }
+
+          "dist/${BIN_NAME}/${BIN_NAME}" plugin list < /dev/null > "${RUNNER_TEMP}/list.txt"
+          grep -q "broken" "${RUNNER_TEMP}/list.txt" \
+            || { echo "::error::clv plugin list did not list the installed plugin" >&2;
+                 cat "${RUNNER_TEMP}/list.txt" >&2; exit 1; }
+
+          # Bare `clv` must still be the viewer, so a recognised subcommand is
+          # the only thing that may divert. An unknown one is a usage error, and
+          # a bundle that answered 0 here would mean argv was being swallowed.
+          if "dist/${BIN_NAME}/${BIN_NAME}" frobnicate < /dev/null > /dev/null 2>&1; then
+            echo "::error::an unknown subcommand did not fail" >&2; exit 1
+          fi
+          echo "CLI smoke test passed for ${{ matrix.arch }}"
+
       - name: Smoke test plugin isolation in the frozen build
         run: |
           set -euo pipefail

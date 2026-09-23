@@ -1815,6 +1815,20 @@ _MANIFEST_ATTRIBUTES = (
     "show",
 )
 
+#: Attribute names an author might reach for to add a ``clv`` subcommand.
+#:
+#: There is no hook here to refuse. ``clv/cli.py``'s ``SUBCOMMANDS`` is a closed
+#: literal and nothing plugin-supplied reaches it, because an installed file must
+#: not change what a shell command does (``PLUGIN_TODO.md`` Requirement 13). What
+#: this catches is the author who assumed otherwise: without it, a plugin
+#: declaring ``subcommand = "ship"`` loads, works, and simply never gets a
+#: subcommand -- a silence the author cannot diagnose from outside CLV's source.
+#:
+#: The *attribute* is refused; the plugin is not. It keeps every kind it
+#: implements, because a declaration CLV cannot honour is not a reason to
+#: withdraw the ones it can.
+_CLI_ATTRIBUTES = ("subcommand", "subcommands", "cli_command")
+
 
 def isolation_fault(kinds: Sequence[str]) -> Optional[str]:
     """Why a plugin of these *kinds* may not be isolated, or None if it may.
@@ -2685,6 +2699,23 @@ class PluginRegistry:
                 continue
             self._report_hook_failures(host, failed)
 
+    def stop_hosts(self) -> None:
+        """Stop every isolation host, without running a lifecycle hook.
+
+        For a caller that loaded plugins to *look* at them and never called
+        :meth:`start`. :meth:`shutdown` is the wrong tool there: its premise is
+        that ``setup()`` ran, and a one-shot report has nothing to tear down.
+        What it does have is a child process and a temp directory, because a
+        plugin the operator isolated in ``settings.conf`` pays its handshake
+        during the load -- see :class:`~clv.plugins.host.PluginHost`.
+
+        ``clv doctor`` is the caller this exists for. Separate from
+        :meth:`shutdown` rather than a flag on it, so the viewer's exit path
+        cannot accidentally take the branch that skips every ``teardown()``.
+        """
+
+        self._stop_hosts()
+
     def _stop_hosts(self) -> None:
         """Tear down and stop every host, exactly once, whatever they do.
 
@@ -3056,6 +3087,22 @@ class PluginRegistry:
                 PluginError(origin, "does not implement a CLV plugin interface")
             )
             return False
+
+        # Reported before anything else is decided, and never fatal: see
+        # `_CLI_ATTRIBUTES`. Checked here rather than beside the per-kind faults
+        # because it is a property of the declaration rather than of any one
+        # interface, and it must be answered for a plugin of every kind.
+        for attribute in _CLI_ATTRIBUTES:
+            if hasattr(plugin, attribute):
+                self.errors.append(
+                    PluginError(
+                        origin,
+                        f"declares {attribute}: a plugin cannot add a clv "
+                        "subcommand -- implement Command instead, which is "
+                        "reachable from C and from its own key",
+                    )
+                )
+                break
 
         # Isolation, before anything is filed and after it is known to be a
         # plugin at all. What is filed from here on is the stand-in, so every
@@ -4941,28 +4988,60 @@ def _install_user_package(roots: Sequence[Path]) -> None:
     sys.modules[USER_PLUGIN_PACKAGE] = package
 
 
-def _load_user_roots(
-    registry: PluginRegistry,
-    clv_version: str,
-    roots: Sequence[Path],
-    enabled: Sequence[str],
-    claimed: dict[str, str],
-) -> None:
-    """Walk the user roots, importing only what the enable-list names.
+@dataclass(frozen=True, slots=True)
+class UserPluginScan:
+    """What is in the user plugin roots, learned without importing anything.
 
-    The order of the two checks in the loop is the phase's whole point:
-    ``pkgutil.iter_modules`` yields a name **without importing it**, and
-    ``importlib`` is reached only for a name the operator wrote in
-    ``settings.conf``. An unlisted module is recorded and left alone, so
-    dropping a file into the plugin directory cannot execute anything.
+    The import-free half of :func:`_load_user_roots`, lifted out so that
+    ``clv plugin list`` can report what is installed without running it. There is
+    one walk rather than two on purpose: the listing an operator reads and the
+    listing CLV imports from have to be the same listing, or a plugin can be in
+    one and not the other and nothing says which is lying.
+
+    ``pkgutil.iter_modules`` yields a name without importing it, which is what
+    makes this whole type possible -- see :data:`PLUGIN_STATES` and the enable
+    list in ``clv/plugins/AGENTS.md``.
     """
+
+    #: The roots that were readable directories, in search order. Not the roots
+    #: asked for: an absent or unreadable one is a non-event and is absent here.
+    #: This is what decides whether the synthetic package is installed at all.
+    roots: tuple[Path, ...]
+    #: Every module found, in search order, loaded or not.
+    plugins: tuple[DiscoveredPlugin, ...]
+    #: Shadowed names and enable-list names that matched nothing on disk.
+    errors: tuple[PluginError, ...]
+    #: Casefolded name to origin, for the **enabled** entries only -- the names
+    #: a user root has actually claimed, which is what lets a bundled plugin of
+    #: the same name know it was overridden deliberately.
+    claimed: Mapping[str, str]
+
+
+def discover_user_plugins(
+    roots: Optional[Sequence[Path]] = None,
+    enabled: Iterable[str] = (),
+) -> UserPluginScan:
+    """Walk the user plugin *roots* and import nothing at all.
+
+    *roots* defaults to :func:`plugin_search_roots`; *enabled* is the operator's
+    enable list, and decides only which entries come back marked
+    :attr:`DiscoveredPlugin.enabled` -- nothing here acts on it.
+
+    Never raises, and never touches ``sys.modules``: an unreadable root is
+    skipped, and installing the synthetic package is the *loader's* business,
+    because a listing that mutated the import system would be a side effect from
+    a command whose whole promise is that it has none.
+    """
+
+    search = list(plugin_search_roots() if roots is None else roots)
+    wanted = {name.casefold() for name in enabled}
 
     # Each root paired with what is in it, resolved before anything is
     # installed: on the overwhelmingly common machine with no user plugins at
     # all there is nothing to search, and nothing should be put into
     # `sys.modules` on its behalf.
     listings: list[tuple[Path, list]] = []
-    for root in roots:
+    for root in search:
         try:
             if not root.is_dir():
                 continue
@@ -4972,14 +5051,10 @@ def _load_user_roots(
             # who chmod'd their own plugin directory does not need CLV to stop.
             continue
 
-    wanted = set(enabled)
     found: set[str] = set()
-
-    # Not an early return even when there is nothing to search: a plugin named
-    # in settings.conf that is nowhere on disk still has to be reported, and
-    # "the directory does not exist" is the most likely reason for it.
-    if listings:
-        _install_user_package([root for root, _ in listings])
+    claimed: dict[str, str] = {}
+    plugins: list[DiscoveredPlugin] = []
+    errors: list[PluginError] = []
 
     for root, entries in listings:
         for info in entries:
@@ -4990,7 +5065,7 @@ def _load_user_roots(
             origin = f"{root / info.name}"
 
             if key in claimed:
-                registry.discovered.append(
+                plugins.append(
                     DiscoveredPlugin(
                         name=info.name,
                         root=root,
@@ -4999,7 +5074,7 @@ def _load_user_roots(
                         shadowed_by=claimed[key],
                     )
                 )
-                registry.errors.append(
+                errors.append(
                     PluginError(
                         origin,
                         f"shadowed by {claimed[key]}, which was found first",
@@ -5009,7 +5084,7 @@ def _load_user_roots(
                 continue
 
             if key not in wanted:
-                registry.discovered.append(
+                plugins.append(
                     DiscoveredPlugin(
                         name=info.name,
                         root=root,
@@ -5020,7 +5095,7 @@ def _load_user_roots(
                 continue
 
             claimed[key] = origin
-            registry.discovered.append(
+            plugins.append(
                 DiscoveredPlugin(
                     name=info.name,
                     root=root,
@@ -5028,23 +5103,17 @@ def _load_user_roots(
                     is_package=info.ispkg,
                 )
             )
-            _load_module(
-                registry,
-                f"{USER_PLUGIN_PACKAGE}.{info.name}",
-                origin=origin,
-                clv_version=clv_version,
-            )
 
     # A typo in settings.conf says so. Naming a plugin that is not there used
     # to be indistinguishable from naming nothing at all.
-    where = ", ".join(str(root) for root in roots)
+    where = ", ".join(str(root) for root in search)
     for name in enabled:
-        if name not in found:
+        if name.casefold() not in found:
             # Reported against the *name*, not against a generic "plugins"
             # origin: this is a row in the management UI as much as it is a line
             # in the log panel, and a row has to be able to say which plugin it
             # is about.
-            registry.errors.append(
+            errors.append(
                 PluginError(
                     name,
                     "named in settings.conf but was not found"
@@ -5053,7 +5122,70 @@ def _load_user_roots(
                 )
             )
 
+    return UserPluginScan(
+        roots=tuple(root for root, _ in listings),
+        plugins=tuple(plugins),
+        errors=tuple(errors),
+        claimed=types.MappingProxyType(claimed),
+    )
 
+
+def _load_user_roots(
+    registry: PluginRegistry,
+    clv_version: str,
+    roots: Sequence[Path],
+    enabled: Sequence[str],
+    claimed: dict[str, str],
+) -> None:
+    """Walk the user roots, importing only what the enable-list names.
+
+    The split between this and :func:`discover_user_plugins` is the phase's
+    whole point: the scan names every module **without importing it**, and
+    ``importlib`` is reached here only for an entry the scan marked enabled,
+    which it does only for a name the operator wrote in ``settings.conf``. An
+    unlisted module is recorded and left alone, so dropping a file into the
+    plugin directory cannot execute anything.
+
+    *claimed* is shared with the bundled and entry-point loaders and is updated
+    in place, so a name a user root took is known to be taken by the time they
+    run.
+
+    *enabled* arrives in whatever case the operator wrote; the scan casefolds for
+    matching and keeps the original for its messages.
+    """
+
+    scan = discover_user_plugins(roots, enabled)
+    registry.discovered.extend(scan.plugins)
+
+    # Before a single import, and that ordering is deliberate: a shadowed name
+    # and an enable-list typo are facts about the filesystem, settled by the
+    # scan, and worth having recorded even if the import that follows hangs.
+    for error in scan.errors:
+        registry.errors.append(error)
+
+    # Not gated on there being anything to import: a plugin named in
+    # settings.conf that is nowhere on disk still has to be reported, and "the
+    # directory does not exist" is the most likely reason for it.
+    if scan.roots:
+        _install_user_package(list(scan.roots))
+
+    # `claimed` is written, never read. The user roots are walked first, so
+    # there is nothing here for a name to lose to -- the scan has already
+    # settled user-versus-user shadowing, which is the only kind knowable
+    # without importing. What the writes are for is the two walks that come
+    # after: a bundled plugin of the same name needs to know an enabled user
+    # module took it, and only an enabled one takes anything.
+    for entry in scan.plugins:
+        if not entry.enabled:
+            continue
+        origin = f"{entry.root / entry.name}"
+        claimed[entry.name.casefold()] = origin
+        _load_module(
+            registry,
+            f"{USER_PLUGIN_PACKAGE}.{entry.name}",
+            origin=origin,
+            clv_version=clv_version,
+        )
 def _load_local(
     registry: PluginRegistry,
     clv_version: str,
@@ -5284,13 +5416,14 @@ def load_plugins(
 
     if include_user:
         search_roots = list(roots) if roots is not None else plugin_search_roots()
-        _load_user_roots(
-            registry,
-            clv_version,
-            search_roots,
-            [name.casefold() for name in enabled],
-            claimed,
-        )
+        # Passed through rather than casefolded here: `discover_user_plugins`
+        # casefolds for matching, so doing it twice only decided which spelling
+        # its messages quote. Through `config.py` the list is already casefolded
+        # (`_read_plugin_list` treats case as a typo class), so this changes no
+        # output -- what it changes is that the scan is the only place the rule
+        # lives, and `clv plugin list` calling it directly cannot now disagree
+        # with the loader about a name.
+        _load_user_roots(registry, clv_version, search_roots, list(enabled), claimed)
         claimed_by_user.update(claimed)
     if include_local:
         _load_local(registry, clv_version, claimed, claimed_by_user)

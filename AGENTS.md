@@ -124,6 +124,7 @@ distros.
 | Layer | Location | Owns | Must not |
 | --- | --- | --- | --- |
 | **App shell** | `clv/app.py` | Layout, routing, lifecycle, breakpoints | Parse, filter, read files, or define widget visuals |
+| **CLI** | `clv/cli.py` | argv: the config flags, `clv doctor`, the `clv plugin` group | Import Textual outside the branch that launches the viewer, change what bare `clv` does, or let anything a plugin supplies reach `SUBCOMMANDS` |
 | **Services** | `clv/services/` | Source identity (`refs.py`), source IO (`backend.py`), parsing, filtering, discovery, reading, buffering, config, settings-file editing (`settings_file.py`), source management | Touch the UI or import Textual, or reach past `backend.py` to `os` |
 | **Widgets** | `clv/widgets/` | Self-contained UI + own `DEFAULT_CSS`; also the shared, Textual-free renderable vocabulary the pane is built from — `severity.py` (the palette), `columns.py` (the structured row), `payloads.py` (the JSON/XML/HTML/CSS/CSV preview) | Depend on other widgets' internals or import `clv.app` |
 | **Plugins** | `clv/plugins/` | Extension interfaces + loader; the three things that spawn a subprocess and so need consent — `sources/journald.py`, `sources/ssh.py` (the SSH transport and `RemoteBackend`) and `host.py` (the isolation host, spawned only for a plugin that asked to be contained) | Break interface contracts, or spawn anything before the operator opts in |
@@ -512,7 +513,7 @@ installed" — the trade Item 12 asked for.
   and `workspace` fixtures, and every assertion runs against another backend —
   which is how `RemoteBackend` is held to the same behaviour as `LocalBackend`.
 
-Run: `python -m pytest` (2338 passed, 1 skipped, 11 deselected) on **both** 3.11
+Run: `python -m pytest` (2372 passed, 1 skipped, 11 deselected) on **both** 3.11
 and 3.14 — the local default is 3.14 and a green suite there is not evidence
 that the supported floor still works.
 

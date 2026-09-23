@@ -21,8 +21,8 @@ rich = ">=14.2.0"
 pytest = "^9.0.2"
 
 [tool.poetry.scripts]
-clv = "clv.app:run"
-CentralizedLogViewer = "clv.app:run"
+clv = "clv.cli:main"
+CentralizedLogViewer = "clv.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -106,6 +106,19 @@ def test_from_local_install_lays_out_the_tree_and_launcher(tmp_path: Path) -> No
     assert run.returncode == 0
     assert "fake-clv --flag" in run.stdout
 
+    # Every token, not just the first. One flag proved enough while `clv` only
+    # had flags; now that it has `doctor` and `plugin list`, a launcher that
+    # forwarded `$1` instead of `"$@"` would still have passed the line above
+    # and dropped every subcommand argument.
+    forwarded = subprocess.run(
+        [str(launcher), "plugin", "list", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert forwarded.returncode == 0
+    assert "fake-clv plugin list --help" in forwarded.stdout
+
 
 def test_install_leaves_no_temporary_directory_behind(tmp_path: Path) -> None:
     """The EXIT trap must not reference an out-of-scope local under `set -u`.

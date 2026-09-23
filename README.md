@@ -291,6 +291,42 @@ clv              # launch the TUI
 python -m clv    # module entry point
 ```
 
+### Command line
+
+`clv` with no arguments launches the viewer, and always will. Everything else is
+a subcommand that prints something and exits without starting a screen:
+
+```bash
+clv doctor                  # what this build is, what it read, what every plugin did
+clv plugin list             # what is installed, without importing any of it
+clv --version               # which build you are actually running
+clv --print-default-config  # the newer settings template, to read
+clv --upgrade-config        # fold your settings into it (see Upgrading)
+```
+
+**`clv doctor` is the first thing to run when something is missing.** It reports
+the version and interpreter, which settings file was read and anything in it CLV
+could not honour, your plugin directories and what is in them, and one block per
+plugin: the interfaces it supplies, where it came from, whether it loaded, and
+the reason if it did not. It needs no terminal, so it works over a pipe and in a
+CI step, and it exits 0 even when a plugin is broken — a broken plugin is what it
+is for reporting.
+
+`clv plugin list` imports nothing. That is the point of it rather than an
+implementation detail: looking at what is installed is exactly what you do
+*before* deciding to trust it, and a listing that ran the code would be a poor
+way to inspect something you are unsure about. Use `clv doctor` to see what a
+plugin actually did once enabled.
+
+Exit codes are `0` success, `1` failure, and `2` a usage error.
+
+Two things `clv` deliberately does not do. It does not take a log to open —
+`clv /var/log/syslog` says so and points at `a` and at `log_dirs`, because a
+source named on the command line would be forgotten the moment you closed the
+viewer. And **a plugin cannot add a subcommand**: an installed file must not be
+able to change what a shell command does. A plugin that wants to be invoked
+supplies a command instead, reachable from `C` and from its own key.
+
 ### Getting help
 
 Press `?` for an overlay listing every keybinding, grouped by what it does. The
@@ -1477,6 +1513,6 @@ worth starring and comparing across a fleet.
 ```bash
 python -m pip install -e .
 python -m pip install pytest
-python -m pytest            # 2137 passed, 1 skipped, 11 deselected
+python -m pytest            # 2372 passed, 1 skipped, 11 deselected
 python -m textual run clv/app.py --dev
 ```

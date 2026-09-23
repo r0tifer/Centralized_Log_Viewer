@@ -25,11 +25,17 @@ whatever the next version decides.
 *It is guarded by `sys.frozen`, so a source run imports nothing.* Outside a
 frozen build spawn launches its child as ``python -c …`` and never re-enters
 this file, so the import would be ~30 ms of startup bought for nothing on every
-`python -m clv`. The console scripts (``clv.app:run``) do not come through here
+`python -m clv`. The console scripts (``clv.cli:main``) do not come through here
 at all. If `sys.frozen` were ever not set in a bundle the child would break
 loudly rather than silently, and the release workflow's isolation smoke test is
 what catches it — nothing in the test suite can, because the suite only ever has
 an interpreter.
+
+**The import below is `clv.cli`, and the ordering matters twice over.** That
+module builds an ``argparse`` parser, and ``clv --multiprocessing-fork …`` is not
+a command line it knows: reaching it before the handshake would turn every
+isolated plugin call in a bundle into a usage error. ``freeze_support()`` never
+returns in a spawned child, so it never does.
 """
 
 import sys
@@ -39,7 +45,7 @@ if getattr(sys, "frozen", False):  # pragma: no cover - only in a frozen build
 
     freeze_support()
 
-from clv.app import run  # noqa: E402 - must not precede the spawn handshake
+from clv.cli import run  # noqa: E402 - must not precede the spawn handshake
 
 
 def main() -> None:
