@@ -22,6 +22,7 @@ from clv.services.config import (
     ConfigIssue,
     LogConfig,
     RemoteHost,
+    SEEDED_EXAMPLES,
     bundled_config_path,
     config_version_of,
     ensure_user_plugin_dir,
@@ -1395,3 +1396,48 @@ def test_the_worked_example_is_never_written_over() -> None:
     # the lesser wrong: it costs a file, where refusing to would need a marker
     # this directory has no other reason to carry.
     assert example.exists()
+
+
+def test_the_examples_are_seeded_from_the_bundle_when_there_is_no_source(
+    tmp_path, monkeypatch
+) -> None:
+    """A frozen build has no importable `clv.examples`, and must still seed.
+
+    This is the bug the whole mechanism had until Phase 16 and the reason it was
+    invisible: `SEEDED_EXAMPLES` names its modules as *strings*, so nothing
+    statically imports them, PyInstaller's analysis never saw them, and they
+    were not in the bundle. `importlib.import_module` raised,
+    `_seed_plugin_examples` swallowed it -- correctly, because seeding is the
+    least important thing that happens at startup -- and every binary install
+    got a README.txt naming nine files beside an empty directory.
+
+    `sys._MEIPASS` plus an import that cannot work is the proxy for that build.
+    It is not a substitute for one: the real check is the smoke step in
+    `.github/workflows/release.yml`, which runs against an actual bundle.
+    """
+
+    import importlib
+
+    from clv.services import config as config_module
+
+    bundle = tmp_path / "bundle"
+    (bundle / "clv" / "examples").mkdir(parents=True)
+    for filename in SEEDED_EXAMPLES:
+        (bundle / "clv" / "examples" / filename).write_text(
+            f"# bundled {filename}\n", encoding="utf-8"
+        )
+
+    monkeypatch.setattr(sys, "_MEIPASS", str(bundle), raising=False)
+
+    def _no_source(name):
+        raise ModuleNotFoundError(f"No module named {name!r}")
+
+    monkeypatch.setattr(importlib, "import_module", _no_source)
+    monkeypatch.setattr(config_module.importlib, "import_module", _no_source)
+
+    created = ensure_user_plugin_dir()
+    assert created is not None
+    for filename in SEEDED_EXAMPLES:
+        seeded = created / "examples" / filename
+        assert seeded.is_file(), f"{filename} was not seeded from the bundle"
+        assert seeded.read_text(encoding="utf-8") == f"# bundled {filename}\n"

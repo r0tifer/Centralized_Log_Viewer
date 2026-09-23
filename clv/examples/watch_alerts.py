@@ -99,6 +99,7 @@ class Burst(WatchMatcher):
     """
 
     name = "watch-alerts"
+    requires_api = ">=1.0,<2.0"
     kind = "burst"
 
     def __init__(self) -> None:
@@ -168,6 +169,7 @@ class AlertFile(WatchSink):
     """
 
     name = "watch-alerts"
+    requires_api = ">=1.0,<2.0"
     # Left at the default deliberately. See this module's docstring.
     wants_entries = False
 

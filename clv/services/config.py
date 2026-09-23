@@ -565,6 +565,32 @@ def bundled_config_path() -> Path:
     return Path(__file__).resolve().parents[2] / "settings.conf"
 
 
+def bundled_examples_dir() -> Path:
+    """Locate the worked example *sources*, wherever this build keeps them.
+
+    **The frozen build is the whole reason this exists**, and the failure it
+    fixes was silent in both directions. :data:`SEEDED_EXAMPLES` names its
+    modules as strings, so nothing in CLV statically imports ``clv.examples``
+    and PyInstaller's analysis never saw them — the modules were not in the
+    bundle at all, ``importlib.import_module`` raised, and
+    :func:`_seed_plugin_examples` swallowed it because seeding an example is the
+    least important thing that happens at startup. Every binary install
+    therefore got a ``README.txt`` listing nine files and a directory containing
+    none of them, and ``README.md`` told the operator they were "already on your
+    machine".
+
+    Even bundled, ``inspect.getsource`` would not have worked: PyInstaller ships
+    byte-compiled modules and no source. So they are shipped as **data**
+    (``--add-data clv/examples:clv/examples``) and read as files here, with the
+    import kept as the source-checkout path.
+    """
+
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return Path(meipass) / "clv" / "examples"
+    return Path(__file__).resolve().parents[1] / "examples"
+
+
 #: Backwards-compatible alias; the template is only a "repo" path when running
 #: from a source checkout.
 repo_config_path = bundled_config_path
@@ -737,8 +763,8 @@ CLV's `clv/plugins/AGENTS.md`.
 Worked examples
 ---------------
 
-Six complete, commented plugins, each walking through what its kind of
-plugin has to declare and why:
+Nine complete, commented plugins -- one for every interface CLV publishes --
+each walking through what its kind of plugin has to declare and why:
 
     examples/nginx_error.py   teaches CLV to read nginx's error log, a format
                               the built-in matchers do not recognise
@@ -762,6 +788,17 @@ plugin has to declare and why:
                               errors-only, one opens a panel that writes the
                               filtered lines to a file you name. Its key is
                               yours to pick, in [plugin:commands]
+    examples/redact_secrets.py hides the value beside `password=`, `token=`
+                              and friends wherever the line is shown - the
+                              pane, the detail pane, an export, the clipboard.
+                              Edit the list in [plugin:redact_secrets]
+    examples/html_report.py   adds an HTML report to `Ctrl+E`: one
+                              self-contained file carrying the query that
+                              produced it, ready to attach to a ticket
+    examples/container_logs.py offers every running container as a source,
+                              tailing live through podman or docker. Ships
+                              inert: it runs nothing until its
+                              [plugin:container_logs] section says enabled
 
 Nothing in `examples/` is listed or run: it is one directory down, and CLV
 only looks here. To use one, copy it up and name it:
@@ -795,6 +832,9 @@ SEEDED_EXAMPLES: dict[str, str] = {
     "cluster_rules.py": "clv.examples.cluster_rules",
     "timeline_marks.py": "clv.examples.timeline_marks",
     "commands.py": "clv.examples.commands",
+    "redact_secrets.py": "clv.examples.redact_secrets",
+    "html_report.py": "clv.examples.html_report",
+    "container_logs.py": "clv.examples.container_logs",
 }
 
 
@@ -817,18 +857,42 @@ def _seed_plugin_examples(target: Path) -> None:
     except OSError:
         return
 
+    bundled = bundled_examples_dir()
     for filename, module in SEEDED_EXAMPLES.items():
         destination = target / filename
         if destination.exists():
             continue
-        try:
-            source = inspect.getsource(importlib.import_module(module))
-        except Exception:  # noqa: BLE001 - a stripped build has no source
+        source = _example_source(bundled / filename, module)
+        if source is None:
             continue
         try:
             destination.write_text(source, encoding="utf-8")
         except OSError:
             continue
+
+
+def _example_source(bundled: Path, module: str) -> Optional[str]:
+    """The text of one worked example, from the bundle or from the import.
+
+    The file first, because that is the only one of the two that works in a
+    frozen build -- see :func:`bundled_examples_dir`. The import second, because
+    a source checkout that has not been packaged has the module and may not have
+    thought about the data path, and because it is what this did before.
+
+    ``None`` rather than a raise: a missing example is a missing example, and a
+    startup that failed over one would be a far worse bug than the one this is
+    fixing.
+    """
+
+    try:
+        if bundled.is_file():
+            return bundled.read_text(encoding="utf-8")
+    except OSError:
+        pass
+    try:
+        return inspect.getsource(importlib.import_module(module))
+    except Exception:  # noqa: BLE001 - a stripped build has no source
+        return None
 
 
 def ensure_user_plugin_dir() -> Optional[Path]:

@@ -98,6 +98,7 @@ class DeployMarks(TimelineAnnotation):
     """
 
     name = "deploy-marks"
+    requires_api = ">=1.0,<2.0"
 
     def __init__(self) -> None:
         self._settings: dict = {}
@@ -170,6 +171,7 @@ class BytesPerBucket(TimelineMetric):
     """
 
     name = "bytes-metric"
+    requires_api = ">=1.0,<2.0"
     metric_name = "bytes"
     #: Printed after the scaled figure, so 1 449 984 reads as `1.4 MB`.
     unit = "B"

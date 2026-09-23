@@ -175,11 +175,21 @@ jobs:
               # by name rather than through any import PyInstaller can see, and
               # a bundle that left it out would fail only for the one operator
               # who enabled an isolated plugin.
+              #
+              # --add-data clv/examples: the worked examples are named in
+              # SEEDED_EXAMPLES as *strings*, so nothing imports them
+              # statically and PyInstaller's analysis never saw them. Every
+              # binary release before this shipped a plugin README listing nine
+              # examples beside an empty directory, silently, because the
+              # seeding code catches every exception on purpose. They ship as
+              # data rather than as hidden imports because even a bundled
+              # module has no source for inspect.getsource to read.
               python3.11 -m PyInstaller -y \
                 --name "${BIN_NAME}" \
                 --onedir \
                 --console \
                 --add-data "settings.conf:." \
+                --add-data "clv/examples:clv/examples" \
                 --hidden-import clv.plugins.host \
                 clv/__main__.py
             '
@@ -239,6 +249,21 @@ jobs:
           wait "$PID" 2>/dev/null || true
           test -f "${XDG_CONFIG_HOME}/clv/settings.conf" \
             || { echo "::error::binary did not provision its user settings file" >&2; exit 1; }
+          # The worked examples, which only a real bundle can check: a source
+          # checkout seeds them through inspect.getsource and would pass while
+          # the binary shipped none. Driven off the same list the app uses, so
+          # an example added without being bundled fails here.
+          EXAMPLES="${XDG_CONFIG_HOME}/clv/plugins/examples"
+          for name in nginx_error field_regex watch_alerts cluster_rules \
+                      timeline_marks commands redact_secrets html_report \
+                      container_logs; do
+            test -s "${EXAMPLES}/${name}.py" || {
+              echo "::error::worked example ${name}.py was not seeded from the bundle" >&2
+              ls -la "${EXAMPLES}" >&2 || true
+              exit 1
+            }
+          done
+          echo "All worked examples seeded into ${EXAMPLES}"
           # The file was just written from the bundled template, so the upgrade
           # pass the installer runs must see it as current. Anything else means
           # the template's config_version and CURRENT_CONFIG_VERSION have drifted,

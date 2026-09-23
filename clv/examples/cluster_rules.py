@@ -92,6 +92,7 @@ class EmailAddress(ClusterRule):
     """
 
     name = "email-address"
+    requires_api = ">=1.0,<2.0"
     pattern = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
     placeholder = "<email>"
 
@@ -117,6 +118,7 @@ class AnsiColour(ClusterRule):
     """
 
     name = "ansi-colour"
+    requires_api = ">=1.0,<2.0"
     priority = 50
     pattern = re.compile(r"\x1b\[[^m]*m")
     placeholder = ""
@@ -138,6 +140,7 @@ class SplitByField(ShapeContributor):
     """
 
     name = "split-by-field"
+    requires_api = ">=1.0,<2.0"
 
     def __init__(self) -> None:
         self._settings = {}

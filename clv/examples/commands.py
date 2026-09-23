@@ -75,6 +75,7 @@ class ShowErrors(Command):
     """
 
     name = "show-errors"
+    requires_api = ">=1.0,<2.0"
     command_name = "show-errors"
     title = "Show errors only"
 
@@ -109,6 +110,7 @@ class SaveView(Command):
     """
 
     name = "save-view"
+    requires_api = ">=1.0,<2.0"
     command_name = "save-view"
     title = "Save this view to a file"
 

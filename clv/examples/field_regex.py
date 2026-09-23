@@ -78,6 +78,7 @@ class RegexMatch(QueryOperator):
     """``key~pattern`` — the field matches the regular expression."""
 
     name = "field-regex"
+    requires_api = ">=1.0,<2.0"
     token = "~"
 
     def test(self, stored: str, value: str) -> bool:
@@ -99,6 +100,7 @@ class NotRegexMatch(QueryOperator):
     """
 
     name = "field-regex"
+    requires_api = ">=1.0,<2.0"
     token = "!~"
 
     def test(self, stored: str, value: str) -> bool:
@@ -117,6 +119,7 @@ class EntryAge(ComputedField):
     """
 
     name = "entry-age"
+    requires_api = ">=1.0,<2.0"
     field_name = "age"
 
     def value(self, entry: LogEntry) -> Optional[str]:
