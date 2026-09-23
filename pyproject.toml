@@ -1,5 +1,14 @@
 [tool.poetry]
-name = "clv"
+# The name on PyPI, and it is the *product* name rather than the command name.
+# `clv` is the import package, the console script and the binary; this is the
+# distribution, and it matches APP_NAME in .github/workflows/release.yml, which
+# is what the .deb, the .rpm and the tarball have always been called. One
+# product, one name, in every place someone installs it from.
+#
+# PEP 503 normalises `Centralized_Log_Viewer` -- the project on PyPI -- to
+# exactly this, which is what the trusted publisher authenticates against.
+# tests/test_release_workflow.py pins the two together.
+name = "centralized-log-viewer"
 version = "3.0.0"
 description = "Centralized Log Viewer Textual TUI"
 readme = "README.md"
