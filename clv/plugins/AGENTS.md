@@ -1398,7 +1398,7 @@ no such line — CLV never saw it arrive and will not invent a verdict on it.
 
 ### From the command line
 
-Five subcommands, and **none of them imports a plugin**:
+Six subcommands, and **none of them imports a plugin**:
 
 | Command | Does |
 | --- | --- |
@@ -1983,13 +1983,23 @@ choosing what to install.
 
 ---
 
-## Plugin Testing
+## Testing a plugin
 
-| Type | What to Test | Tools |
-|------|---------------|-------|
-| **Unit** | Validate `discover()`, `apply()`, `export()` methods | pytest |
-| **Integration** | Verify plugin registration and runtime behavior | textual + pytest |
-| **Static** | Lint for unsafe imports and access | ruff, mypy |
+**Your plugin's unit tests need no terminal.** Importing `clv.api` pulls in no
+Textual widget, no Rich renderable and not `clv.app` — asserted out of process
+by `tests/test_api_surface.py`, so it is a property rather than an intention.
+Construct your plugin, hand `apply` or `parse` a `LogEntry` you built yourself,
+and assert on what comes back.
+
+**Test it through the loader at least once.** Importing your module proves it
+parses; it does not prove CLV can find what it exports, that `register()`
+returns what you think, or that your `requires_api` is satisfiable. Point
+`CLV_PLUGIN_PATH` at the directory you are editing in, call `load_plugins`, and
+assert `registry.errors` is empty — the one assertion that catches a plugin
+which loads and supplies nothing.
+
+`tests/test_examples.py` in CLV's own tree does exactly this for the nine worked
+examples and is written to be copied.
 
 ---
 
@@ -2017,7 +2027,7 @@ lesser version of the core than the core writes against itself.
 | Handed to you | `LogEntry`, `FilterContext`, `FilterSpec`, `TimeWindow`, `ProviderSource`, `SourceRef` |
 | Declaring a format | `FormatProfile`, `DEFAULT_PROFILE`, `FORMAT_NAMES` |
 | Being invoked, and drawing | `CommandContext`, `Panel`, `Control`, `CONTROL_KINDS`, `MAX_PANEL_CONTROLS` |
-| Handed back | `ExportResult` |
+| Handed back | `ExportResult`, `TailRead` |
 | Severity | `normalize_level`, `level_rank`, `level_matches`, `highest_level`, `LEVEL_TRACE` … `LEVEL_CRITICAL`, `LEVEL_ORDER`, `SEVERITY_BUCKETS` |
 | Fields | `NORMALISED_FIELD_KEYS` |
 | Extending the query | `BUILTIN_OPERATORS` |
@@ -2045,6 +2055,16 @@ for the panel vocabulary: an author should be able to read what a `Control` may
 be and how many one panel may hold, rather than discover either from a refused
 panel.
 
+`TailRead` is what a `prime()` or a `poll()` returns, and it is published
+because writing the worked `LogSourceProvider` example found that the seam could
+not be written against this document. `open_reader` exists so a provider can
+*tail* rather than hand back a finite iterator — and the only way to build its
+return value was `from clv.services.reader import TailRead`, out of the package
+this section tells authors is internal and may move. Core reads the result's
+attributes rather than checking its type, so a plugin returning some other
+object with the right names worked by accident and would have broken silently on
+the next field added to it. Published, so the accident becomes the contract.
+
 Four of these interfaces were missing from this table when Phase 12 came to add
 `Command` to it — `ClusterRule`, `ShapeContributor`, `TimelineAnnotation` and
 `TimelineMetric` were published by Phases 10 and 11 and listed everywhere except
@@ -2062,7 +2082,7 @@ declare**:
 class Redact(FilterStage):
     name = "redact-secrets"
     requires_api = ">=1.0,<2.0"   # what you actually depend on
-    requires_clv = ">=2.0,<3.0"   # optional, and rarely what you mean
+    requires_clv = ">=3.0"        # optional, and rarely what you mean
 ```
 
 Both use the grammar in [The constraint grammar](#the-constraint-grammar) and
@@ -2188,23 +2208,52 @@ was told never appears in it.
 
 ---
 
-## Developer Workflow
+## A plugin author's checklist
 
-1. Create your plugin module in `clv/plugins/` or as a separate package.  
-2. Implement one of the ABCs (`LogSourceProvider`, `FilterStage`, or `Exporter`).  
-3. Add minimal tests.  
-4. Add documentation to this folder’s `README.md` if distributing internally.  
-5. Submit PRs with a short demo (e.g., asciinema or screenshot).
+Eight things, in the order they bite. Nothing here is enforced by CLV except
+where it says so — this is a checklist, not a gate, and the *Trust model* above
+explains why there is no gate to build.
 
----
+1. **Declare `requires_api`.** `requires_api = ">=1.0,<2.0"` pins the promise;
+   `requires_clv` pins the application and is rarely what you mean. A plugin
+   that declares neither loads against every CLV there will ever be, including
+   the one that removes the name it depends on.
+2. **Import only from `clv.api`.** It re-exports the real objects, so there is
+   no conversion cost and nothing to lose. Anything out of `clv.services.*` is
+   internal, is not covered by the deprecation policy, and will move.
+3. **Make the cheap rejection first.** Every per-line and per-entry seam is
+   offered work it will decline most of the time. A substring test before a
+   regex, and a compiled pattern held rather than built per call, is the
+   difference between a plugin nobody notices and one CLV takes out of service.
+4. **Know which budget you are in.** Seven of them, one policy — see
+   [Performance](#performance). A filter stage is charged per render, a format
+   per batch of lines read, a sink per delivery, a panel per control change.
+   Find yours before you write the slow thing, not after CLV disables it.
+5. **Ask for consent before you act on the world.** A subprocess, a socket, or a
+   write anywhere but your own files needs an opt-in in your `[plugin:<name>]`
+   section, read fresh rather than cached. Ship inert. *Not enforced* — see
+   [Conventions for plugin authors](#conventions-for-plugin-authors).
+6. **Declare `isolated` if your kind allows it.** `Exporter`, `WatchSink`,
+   `Command` and `TimelineAnnotation` can run where CLV can kill them. The rest
+   are refused by name, with the reason. Isolation contains a hang; it does not
+   make your plugin safe to install, and your documentation should not imply it
+   does.
+7. **Ship a manifest.** Even unsigned. It is what lets `clv plugin verify` tell
+   an operator their copy is still the one you published, and what lets them
+   trust your key later without reinstalling. See [Publishing](#publishing).
+8. **State your trust requirements in your own README.** What you read, what you
+   run, where you send it. CLV cannot inspect any of that, and the operator
+   deciding whether to enable you has nothing else to go on.
 
-## Plugin Review Criteria
+### Contributing a plugin to CLV itself
 
-- ✅ Conforms to ABCs  
-- ✅ Does not alter core logic or CSS  
-- ✅ Has tests and docstrings  
-- ✅ Respects CLV’s minimal dependency policy  
-- ✅ Passes linting and security checks
+Different question, and a rarer one. Everything under `clv/plugins/` loads
+**without** being named in the enable-list, on the argument that trusting a
+plugin CLV shipped is the trust already placed in CLV — so a drop-in there is
+held to the same bar as core: it earns its subprocess or its dependency in
+review, it has tests in `tests/`, and it does not regress the zero-plugin path.
+A worked *example* is not that, and belongs in `clv/examples/`, which is seeded
+into the operator's own directory and loads only when they copy it up a level.
 
 ---
 

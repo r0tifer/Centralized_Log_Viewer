@@ -100,6 +100,7 @@ from .services.parsing import (
     normalize_level,
 )
 from .services.query import BUILTIN_OPERATORS, NORMALISED_FIELD_KEYS
+from .services.reader import TailRead
 from .services.refs import SourceRef
 from .services.watch import KIND_PATTERN, SINK_SAMPLE_LIMIT, WatchRule
 
@@ -131,6 +132,17 @@ __all__ = [
     # `LogSourceProvider.discover` may return one, so a provider author needs
     # the type even though CLV accepts a bare `Path` as shorthand.
     "SourceRef",
+    # What one bounded read produced, and the return type of a provider's
+    # `prime()` and `poll()`. Published in Phase 16 because writing the worked
+    # `LogSourceProvider` example found that it could not be written: the
+    # `open_reader` seam exists so a provider can *tail* rather than hand back a
+    # finite iterator, and the only way to satisfy it was to import
+    # `clv.services.reader` -- out of the package `clv/plugins/AGENTS.md` tells
+    # authors is internal and may move. Core duck-types the result, so a plugin
+    # returning some other object with the right attributes worked by accident
+    # and would have broken on the next field added here.
+    # Additive, so the API is still 1.0.
+    "TailRead",
     # --- declaring a format --------------------------------------------------
     # A `format_name` is four registrations and only one of them is the parser.
     # `FormatProfile` says which of a format's fields earn the source cell and

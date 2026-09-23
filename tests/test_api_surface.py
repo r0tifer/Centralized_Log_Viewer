@@ -65,6 +65,7 @@ EXPECTED_API = frozenset(
         "TimeWindow",
         "ProviderSource",
         "SourceRef",
+        "TailRead",
         # declaring a format
         "FormatProfile",
         "DEFAULT_PROFILE",
@@ -280,6 +281,7 @@ def test_the_api_version_is_not_clv_s_version() -> None:
         ("LogSourceProvider", "clv.plugins", "LogSourceProvider"),
         ("ProviderSource", "clv.plugins", "ProviderSource"),
         ("SourceRef", "clv.services.refs", "SourceRef"),
+        ("TailRead", "clv.services.reader", "TailRead"),
         ("NORMALISED_FIELD_KEYS", "clv.services.query", "NORMALISED_FIELD_KEYS"),
     ],
 )
