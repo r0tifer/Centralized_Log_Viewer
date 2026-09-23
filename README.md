@@ -1638,6 +1638,6 @@ worth starring and comparing across a fleet.
 ```bash
 python -m pip install -e .
 python -m pip install pytest
-python -m pytest            # 2528 passed, 1 skipped, 11 deselected
+python -m pytest            # 2532 passed, 1 skipped, 11 deselected
 python -m textual run clv/app.py --dev
 ```

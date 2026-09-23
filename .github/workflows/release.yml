@@ -178,12 +178,23 @@ jobs:
               #
               # --add-data clv/examples: the worked examples are named in
               # SEEDED_EXAMPLES as *strings*, so nothing imports them
-              # statically and PyInstaller's analysis never saw them. Every
+              # statically and the PyInstaller analysis never saw them. Every
               # binary release before this shipped a plugin README listing nine
               # examples beside an empty directory, silently, because the
               # seeding code catches every exception on purpose. They ship as
               # data rather than as hidden imports because even a bundled
               # module has no source for inspect.getsource to read.
+              #
+              # NOTE: this whole script is a single-quoted argument to
+              # `bash -c`, so an apostrophe anywhere in it -- including inside
+              # a comment like this one -- closes the quote early and hands the
+              # remainder to the shell on the runner rather than the one in the
+              # container. That is not hypothetical. It is what broke the first
+              # v3.0.0 build on both architectures, and it failed in the least
+              # obvious way available: `python3.11 -m PyInstaller` then ran
+              # against the hostedtoolcache interpreter on the runner, which
+              # has no PyInstaller, so the error named a Python that is not the
+              # one this step installs. Write no apostrophes below this line.
               python3.11 -m PyInstaller -y \
                 --name "${BIN_NAME}" \
                 --onedir \
