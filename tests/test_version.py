@@ -50,11 +50,11 @@ def test_plugin_constraints_evaluate_against_the_real_version() -> None:
 def test_the_plugin_api_version_is_not_the_application_version() -> None:
     """Two numbers, moving independently, asserted apart on purpose.
 
-    CLV is 3.0.0 and the plugin API is 1.0, and that gap **is** the Phase 2
-    separation doing its job on its first outing: the doctrine reversals and the
-    new argv layer are major-version news for the application, while every
-    addition to the published surface since Phase 2 was additive and nothing
-    published was removed.
+    CLV is 3.1.0 and the plugin API is 1.0, and that gap **is** the Phase 2
+    separation doing its job: the 3.0.0 doctrine reversals and the new argv
+    layer were major-version news for the application, and 3.1.0's help pages
+    are minor-version news for it, while every addition to the published
+    surface since Phase 2 was additive and nothing published was removed.
 
     Asserted here rather than only in `tests/test_api_surface.py` so that a
     future edit bumping the two together has to come through this file and

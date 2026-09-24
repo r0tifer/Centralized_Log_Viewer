@@ -17,6 +17,7 @@ would mean reworking every feature built on top of them.
 | 3 — Query and view power | 8, 9, 10 | ✅ **Complete** (`b882cfb`, `3fbbf75`, `bd174af`) |
 | 4 — The source layer | 11, 12, 13 | ✅ **Complete** (`24647af`, `eb25ed7`, `ec03023`) |
 | 5 — Analysis | 14, 15 | ✅ **Complete** (`c8639ba`, `5ed505e`) |
+| 6 — Help that is not only keys | 16 | ✅ **Complete** |
 
 Completed items are kept in full rather than deleted: the "production ready
 when" lists are what the tests were written against, and the reasoning behind
@@ -1250,6 +1251,83 @@ gutter, `n`/`N` and the watch highlight all keep working with no branch of their
 own, and only `Enter` differs. And a tailed line that joins an *open* cluster
 costs a redraw rather than an in-place update, because inserting a row into the
 middle of the pane is the one thing that widget deliberately cannot do.
+
+---
+
+# Phase 6 — Help that is not only keys ✅
+
+## 16. Tabbed help menu ✅
+
+**Goal.** Item 2 solved the discoverability of *keys* and stopped there, which
+was right at the time: the footer was the bottleneck and a generated list was
+the cheapest unblock. Fifteen items later the bottleneck moved. An operator who
+does not already know what a field term is, why a pane is empty, what `x` then
+`u` are for, or that there is no password option, has nowhere in the app to
+find out — that material is in `README.md`, and `README.md` **does not ship in
+the wheel** (`pyproject.toml`'s `include` carries `settings.conf` and nothing
+else; `tests/test_readme_docs.py` skips itself when it cannot find it). Help
+that exists only in a file the install does not carry is missing exactly where
+it is needed.
+
+**Production ready when:**
+- `?` opens a modal of pages selected by a tab strip, `Esc`/`q`/`?` close it.
+  **One entry point**, not a second binding: the footer is at capacity at 80
+  columns and `?` already holds the first slot.
+- The tab strip is `SegmentedButtons` rather than a new control. It already has
+  click, `←`/`→`, `Enter`/`Space`, hover and focus styling, and it is what
+  `clv/widgets/AGENTS.md` names as the control to reuse.
+- Five pages: Overview, Search, Sources, Reading, Keys. **Keys stays generated
+  from `BINDINGS`** — the Item 2 guarantee is not allowed to weaken because
+  four written pages arrived beside it.
+- The written pages live in a Textual-free `help_content.py`, for the reason
+  `severity.py` is where it is: a widget may not import `clv.app`.
+- Readable at 80×24, with the whole tab strip on screen and every page
+  scrollable.
+- `←`/`→` change page from anywhere in the modal, `1`–`5` jump. Reopening
+  returns to the page last read, so `?` still lands on Keys for whoever is
+  using it that way.
+
+**Tests required** (extending `tests/test_help_overlay.py`):
+- Every Item 2 assertion still passes unedited — that is the point of keeping
+  one `#help-body` scroller and toggling `display` rather than rebuilding it.
+- Exactly one page is in the layout at a time, over every page.
+- `←`/`→` change the page **while the body holds focus** — the test that fails
+  if the `priority=True` flag is dropped and the scroller reclaims the arrows.
+- `←`/`→` do not wrap; `1`–`5` jump; a number past the end is a no-op.
+- Clicking a tab does what the key does.
+- The tab strip is fully painted inside the dialog at 80×24 — the horizontal
+  analogue of the 58-cell description budget, and what fails on a sixth tab.
+- Every `Example` line fits without wrapping, and every `KeyRows` key fits the
+  12-cell column.
+- A bracketed config snippet paints its brackets.
+
+**As shipped.**
+- **`?`'s description stays `"Help"`.** The house rule is that a modal's
+  sub-keys ride in the opening binding's description; `?` is the one binding
+  where that rule must not apply, because its description is what the footer
+  paints, `?` is first in the footer, and `test_footer_budget_at_80_columns`
+  pins the first six visible entries at 80 columns. Lengthening it drops `t`
+  off the edge. The justification is also weaker here than elsewhere: the tab
+  strip and the hint line are on screen the moment help opens, which is what
+  that rule exists to substitute for.
+- **`_sections` became a property** derived from the Keys page rather than a
+  field set beside it, so the sections a caller reads are the ones rendered
+  rather than a second copy that can drift.
+- **The Keys page has no preamble.** Four rows of introduction is four
+  bindings pushed under the fold at 24 rows, on the one page people arrive at
+  already knowing what they want.
+- **`tests/test_plugin_timeline.py`'s overlay test moved off the compositor.**
+  It asserted against painted pixels, which now answers "is this row inside the
+  current scroll offset of the current page" — a question with nothing to do
+  with whether the binding reached help. It reads the rendered widgets, the way
+  the sibling suite always has.
+
+**GUI.** No new control in the query bar and no new footer entry; the action
+row is at capacity at 80 columns, which is the constraint that caused the
+original layout regression.
+
+**README.** "Getting help" rewritten around the five pages, and the `?` row in
+the keyboard shortcuts table names the paging keys.
 
 ---
 

@@ -9,7 +9,7 @@
 # exactly this, which is what the trusted publisher authenticates against.
 # tests/test_release_workflow.py pins the two together.
 name = "centralized-log-viewer"
-version = "3.0.0"
+version = "3.1.0"
 description = "Centralized Log Viewer Textual TUI"
 readme = "README.md"
 authors = ["Centralized Log Viewer Maintainers <maintainers@example.com>"]

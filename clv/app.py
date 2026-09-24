@@ -179,6 +179,7 @@ from .widgets.detail_pane import DetailPane
 from .widgets.export_dialog import ExportChoice, ExportDialog, ExportRequest
 from .widgets.filter_chip import FilterChip, FilterChips
 from .widgets.goto_dialog import GotoDialog
+from .widgets.help_content import DEFAULT_PAGE, help_pages
 from .widgets.help_overlay import HelpOverlay, HelpSection, format_key
 from .widgets.log_view import LogView
 from .widgets.commands_dialog import CommandRow, CommandsDialog
@@ -878,6 +879,11 @@ class LogViewerApp(App[None]):
         self._show_lines = self._config.default_show_lines
         self._sources_panel_width = self._config.tree_width
         self._copy_mode = False
+        #: The help page `?` reopens on. The first press of a session lands on
+        #: the overview; after that it returns to whatever was last read, which
+        #: is what pays back the muscle memory `?` had when it only ever showed
+        #: keybindings.
+        self._help_page = DEFAULT_PAGE
         self._breakpoint = ""
         self._merged = False
         self._plugins: PluginRegistry = PluginRegistry()
@@ -6169,7 +6175,7 @@ class LogViewerApp(App[None]):
         return f"Starred log is not available: {ref}"
 
     def action_show_help(self) -> None:
-        """Open the binding list. Tailing continues behind it."""
+        """Open the help pages. Tailing continues behind them."""
 
         # `?` reaches this action from the overlay too, where it closes rather
         # than reopening; guard anyway so it can never stack two overlays.
@@ -6187,7 +6193,23 @@ class LogViewerApp(App[None]):
         # appended as a separate section, so a plugin key can no more go missing
         # from the overlay than one added to `BINDINGS` can.
         bindings += self._command_bindings
-        self.push_screen(HelpOverlay(build_help_sections(bindings)))
+        self.push_screen(
+            HelpOverlay(
+                help_pages(build_help_sections(bindings)),
+                start=self._help_page,
+            ),
+            callback=self._remember_help_page,
+        )
+
+    def _remember_help_page(self, page: str | None) -> None:
+        """Reopen where the reader left off.
+
+        The overlay dismisses with the page it was showing rather than reaching
+        into the app for it, so the widget still imports nothing from here.
+        """
+
+        if page:
+            self._help_page = page
 
     def action_toggle_advanced(self) -> None:
         self.advanced_drawer.toggle()

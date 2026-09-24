@@ -8,11 +8,24 @@ from pathlib import Path
 import pytest
 from textual.binding import Binding
 from textual.containers import VerticalScroll
-from textual.widgets import Footer, Input, Static
+from textual.widgets import Footer, Input, Label, Static
 
+from textual.containers import Container
+
+import clv.widgets.help_content
 from clv.app import BINDING_CATEGORIES, LogViewerApp, build_help_sections
+from clv.widgets.help_content import (
+    DEFAULT_PAGE,
+    STATIC_PAGES,
+    Example,
+    Heading,
+    KeyRows,
+    Paragraph,
+    help_pages,
+)
 from clv.widgets.help_overlay import HelpOverlay, HelpSection, format_key
 from clv.widgets.log_view import LogView
+from clv.widgets.segmented import SegmentedButtons
 from clv.widgets.timeline import TimelineBar
 
 
@@ -192,7 +205,13 @@ def test_overlay_is_on_screen_and_scrollable_at_80x24() -> None:
             assert dialog.region.bottom <= 24
 
             # Every binding at 24 rows does not fit, so the body must scroll
-            # rather than clip.
+            # rather than clip. Asserted on the Keys page rather than whatever
+            # page help opened on: that one provably cannot fit, so a failure
+            # here means the scroller broke and not that a written page was
+            # trimmed.
+            await pilot.press("5")
+            await pilot.pause()
+            assert overlay.page == "keys"
             body = overlay.query_one("#help-body", VerticalScroll)
             assert body.max_scroll_y > 0
 
@@ -369,3 +388,463 @@ def test_every_description_fits_the_overlay_at_eighty_columns() -> None:
     ):
         description = binding.description or binding.action
         assert len(description) <= budget, f"{binding.key}: {description!r}"
+
+
+# --- pages ------------------------------------------------------------------
+
+
+def _visible_pages(overlay: HelpOverlay) -> list[str]:
+    return [
+        page.id or ""
+        for page in overlay.query(".help-page").results(Container)
+        if page.display
+    ]
+
+
+def test_help_opens_on_the_overview_page() -> None:
+    """`?` is help, not a cheatsheet. The cheatsheet is one page of it."""
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.set_focus(app.log_panel)
+            await pilot.press("question_mark")
+            await pilot.pause()
+
+            overlay = app.screen
+            assert isinstance(overlay, HelpOverlay)
+            assert overlay.page == DEFAULT_PAGE == "overview"
+
+    asyncio.run(scenario())
+
+
+def test_exactly_one_page_is_displayed() -> None:
+    """Every page is mounted; only one is in the layout.
+
+    `display: none` rather than a rebuild, so `query(Static)` still finds every
+    binding and `max_scroll_y` still describes the page on screen.
+    """
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.set_focus(app.log_panel)
+            await pilot.press("question_mark")
+            await pilot.pause()
+
+            overlay = app.screen
+            assert isinstance(overlay, HelpOverlay)
+            assert len(overlay.query(".help-page")) == len(STATIC_PAGES) + 1
+
+            for index, page in enumerate(overlay._pages):
+                overlay.show_page(page.key)
+                await pilot.pause()
+                assert _visible_pages(overlay) == [f"help-page-{page.key}"], index
+
+    asyncio.run(scenario())
+
+
+def test_arrows_change_page_and_do_not_wrap() -> None:
+    """The ends of the strip are where an operator expects to stop."""
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.set_focus(app.log_panel)
+            await pilot.press("question_mark")
+            await pilot.pause()
+            overlay = app.screen
+            assert isinstance(overlay, HelpOverlay)
+
+            # Left at the first page is a no-op, not a jump to the last.
+            await pilot.press("left")
+            await pilot.pause()
+            assert overlay.page == "overview"
+
+            await pilot.press("right")
+            await pilot.pause()
+            assert overlay.page == "search"
+
+            for _ in range(10):
+                await pilot.press("right")
+            await pilot.pause()
+            assert overlay.page == "keys"
+
+    asyncio.run(scenario())
+
+
+def test_arrows_reach_the_page_while_the_body_holds_focus() -> None:
+    """The reason the arrow bindings are `priority=True`.
+
+    `on_mount` focuses the scroller so Up/Down scroll, and a focused
+    `VerticalScroll` binds Left/Right to horizontal scrolling. Without the
+    priority flag it wins and the tab strip is unreachable from the keyboard.
+    """
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.set_focus(app.log_panel)
+            await pilot.press("question_mark")
+            await pilot.pause()
+
+            overlay = app.screen
+            assert isinstance(overlay, HelpOverlay)
+            body = overlay.query_one("#help-body", VerticalScroll)
+            assert app.focused is body
+
+            await pilot.press("right")
+            await pilot.pause()
+            assert overlay.page == "search"
+
+    asyncio.run(scenario())
+
+
+def test_number_keys_jump_to_a_page() -> None:
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.set_focus(app.log_panel)
+            await pilot.press("question_mark")
+            await pilot.pause()
+            overlay = app.screen
+            assert isinstance(overlay, HelpOverlay)
+
+            await pilot.press("5")
+            await pilot.pause()
+            assert overlay.page == "keys"
+
+            await pilot.press("1")
+            await pilot.pause()
+            assert overlay.page == "overview"
+
+            # Past the end does nothing rather than raising.
+            await pilot.press("9")
+            await pilot.pause()
+            assert overlay.page == "overview"
+
+    asyncio.run(scenario())
+
+
+def test_clicking_a_tab_changes_the_page() -> None:
+    """Keyboard and mouse reach the same places."""
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.set_focus(app.log_panel)
+            await pilot.press("question_mark")
+            await pilot.pause()
+
+            overlay = app.screen
+            assert isinstance(overlay, HelpOverlay)
+            tabs = overlay.query_one("#help-tabs", SegmentedButtons)
+            segment = next(
+                child
+                for child in tabs.children
+                if tabs.owns_widget(child) and child._value == "sources"
+            )
+            await pilot.click(segment)
+            await pilot.pause()
+
+            assert overlay.page == "sources"
+            assert tabs.value == "sources"
+
+    asyncio.run(scenario())
+
+
+def test_the_title_names_the_page_on_screen() -> None:
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.set_focus(app.log_panel)
+            await pilot.press("question_mark")
+            await pilot.pause()
+
+            overlay = app.screen
+            assert isinstance(overlay, HelpOverlay)
+            title = overlay.query_one("#help-title", Label)
+            assert "Getting started" in str(title.content)
+
+            await pilot.press("5")
+            await pilot.pause()
+            assert "Keyboard shortcuts" in str(title.content)
+
+    asyncio.run(scenario())
+
+
+def test_reopening_returns_to_the_last_page_read() -> None:
+    """`?` meant "keybindings" for a long time; this is what pays that back."""
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.set_focus(app.log_panel)
+
+            await pilot.press("question_mark")
+            await pilot.pause()
+            await pilot.press("5")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+
+            await pilot.press("question_mark")
+            await pilot.pause()
+            overlay = app.screen
+            assert isinstance(overlay, HelpOverlay)
+            assert overlay.page == "keys"
+
+    asyncio.run(scenario())
+
+
+# --- the content ------------------------------------------------------------
+
+
+def test_the_keys_page_is_generated_from_the_sections_it_is_handed() -> None:
+    """The "a key cannot go missing" guarantee, restated for the page."""
+
+    sections = build_help_sections(
+        [*LogViewerApp.BINDINGS, Binding("z", "invented_action", "Invented")]
+    )
+    pages = help_pages(sections)
+
+    assert [page.key for page in pages][-1] == "keys"
+    rows = [
+        row
+        for block in pages[-1].blocks
+        if isinstance(block, KeyRows)
+        for row in block.rows
+    ]
+    assert ("z", "Invented") in rows
+
+
+def test_sections_read_back_off_the_rendered_page() -> None:
+    """`_sections` is derived, so it cannot disagree with what is on screen.
+
+    Keys come back as the page shows them — `question_mark` as `?` — because
+    that is what "read back off the page" means.
+    """
+
+    sections = build_help_sections(LogViewerApp.BINDINGS)
+    overlay = HelpOverlay(help_pages(sections))
+
+    assert [section.title for section in overlay._sections] == [
+        section.title for section in sections
+    ]
+    assert overlay._sections == [
+        HelpSection(
+            section.title,
+            tuple((format_key(key), text) for key, text in section.rows),
+        )
+        for section in sections
+    ]
+
+
+def test_every_written_page_explains_and_shows() -> None:
+    """A page stubbed out and forgotten is the failure this catches."""
+
+    for page in STATIC_PAGES:
+        kinds = {type(block) for block in page.blocks}
+        assert Paragraph in kinds, page.key
+        assert Example in kinds, page.key
+        assert Heading in kinds, page.key
+
+
+def test_every_example_line_fits_at_eighty_columns() -> None:
+    """An example is never wrapped, so an overlong line is a clipped line.
+
+    `#help-dialog` is 76 wide, `padding: 1 2` takes 4 and the scrollbar takes
+    2, leaving 70; `.help-example` spends 1 on its rule and 2 on padding. 64 is
+    that budget with a little room, because a query cut in half is worse than a
+    query that looks cramped.
+    """
+
+    for page in STATIC_PAGES:
+        for block in page.blocks:
+            if isinstance(block, Example):
+                for line in block.lines:
+                    assert len(line) <= 64, f"{page.key}: {line!r}"
+
+
+def test_every_key_column_entry_fits_its_cell() -> None:
+    """`.help-key` is 12 cells, one of them padding, and clips past that.
+
+    11 rather than 12 so the cell keeps a space before its description. A
+    12-character entry rendered flush against its text is not a clipped cell,
+    which is why nothing catches it by looking for one.
+    """
+
+    for page in STATIC_PAGES:
+        for block in page.blocks:
+            if isinstance(block, KeyRows):
+                for key, description in block.rows:
+                    assert len(key) <= 11, f"{page.key}: {key!r}"
+                    assert len(description) <= 58, f"{page.key}: {description!r}"
+
+
+def test_a_written_page_key_cell_is_rendered_verbatim() -> None:
+    """`format_key` belongs to the Keys page and nowhere else.
+
+    It capitalises anything longer than one character, which is right for
+    `pageup` and wrong for `key:value` — and wrong silently, since a corrupted
+    piece of syntax still renders.
+    """
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.set_focus(app.log_panel)
+            await pilot.press("question_mark")
+            await pilot.pause()
+
+            rendered = _overlay_text(app)
+            assert "key:value" in rendered
+            assert "Key:value" not in rendered
+            # And the Keys page still translates, on the same render.
+            assert "PgUp" in rendered or "Pageup" in rendered
+
+    asyncio.run(scenario())
+
+
+def test_content_with_brackets_is_not_read_as_markup() -> None:
+    """`Static` parses console markup, and would eat `[log_viewer]` silently."""
+
+    snippets = [
+        line
+        for page in STATIC_PAGES
+        for block in page.blocks
+        if isinstance(block, Example)
+        for line in block.lines
+        if line.startswith("[")
+    ]
+    assert snippets, "no bracketed snippet left to guard"
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.set_focus(app.log_panel)
+            await pilot.press("question_mark")
+            await pilot.pause()
+
+            rendered = _overlay_text(app)
+            for snippet in snippets:
+                assert snippet in rendered, snippet
+
+    asyncio.run(scenario())
+
+
+# --- layout -----------------------------------------------------------------
+
+
+def test_the_tab_strip_fits_at_eighty_columns() -> None:
+    """A sixth tab is what this fails on.
+
+    The horizontal analogue of the description budget above:
+    `SegmentedButtons` is `overflow: hidden`, so a strip that outgrows the
+    dialog loses its last tabs without a word — and a tab nobody can see or
+    click is a page that does not exist.
+    """
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app.set_focus(app.log_panel)
+            await pilot.press("question_mark")
+            await pilot.pause()
+
+            overlay = app.screen
+            assert isinstance(overlay, HelpOverlay)
+            dialog = overlay.query_one("#help-dialog")
+            tabs = overlay.query_one("#help-tabs", SegmentedButtons)
+            segments = [
+                child for child in tabs.children if tabs.owns_widget(child)
+            ]
+            assert len(segments) == len(STATIC_PAGES) + 1
+
+            for segment in segments:
+                assert segment.region.width > 0, segment._value
+                assert segment.region.right <= dialog.region.right, segment._value
+
+    asyncio.run(scenario())
+
+
+def test_the_hint_line_survives_the_vertical_budget_at_80x24() -> None:
+    """24 rows minus border, padding, title and a 3-row strip leaves 14.
+
+    The hint is the only thing that says the arrow keys change the page, so it
+    is the one row that must not be the one squeezed out.
+    """
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            app.set_focus(app.log_panel)
+            await pilot.press("question_mark")
+            await pilot.pause()
+
+            overlay = app.screen
+            assert isinstance(overlay, HelpOverlay)
+            dialog = overlay.query_one("#help-dialog")
+            hint = overlay.query_one("#help-hint", Static)
+            assert hint.region.width > 0
+            assert hint.region.bottom <= dialog.region.bottom
+
+            body = overlay.query_one("#help-body", VerticalScroll)
+            assert body.region.height >= 10
+
+    asyncio.run(scenario())
+
+
+def test_the_content_module_imports_no_textual() -> None:
+    """`help_content` is data, and the claim in its docstring is load-bearing.
+
+    It sits in `widgets/` for the reason `severity.py` does — a widget may not
+    import `clv.app`, so the text has to live somewhere a widget can reach.
+    That only stays a sound argument while the module is renderer-agnostic;
+    the first `from textual...` makes it a widget with the wrong name.
+    """
+
+    import ast
+    from pathlib import Path
+
+    source = Path(clv.widgets.help_content.__file__).read_text(encoding="utf-8")
+    imported: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+
+    assert "textual" not in imported
+    assert "rich" not in imported
+
+
+def test_the_hint_names_the_range_the_strip_actually_has() -> None:
+    """A hint that promises `1-5` when there are four pages is a lie."""
+
+    async def scenario() -> None:
+        app = LogViewerApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            app.set_focus(app.log_panel)
+            await pilot.press("question_mark")
+            await pilot.pause()
+
+            overlay = app.screen
+            assert isinstance(overlay, HelpOverlay)
+            hint = str(overlay.query_one("#help-hint", Static).content)
+            assert f"1-{len(overlay._pages)} jump" in hint
+
+    asyncio.run(scenario())
