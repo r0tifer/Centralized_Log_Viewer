@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from textual.widgets import Static
 
 from clv import __version__
 from clv.app import LogViewerApp
@@ -1185,7 +1186,15 @@ def test_switching_a_metric_off_mid_session_puts_the_counts_back(tmp_path: Path)
 
 
 def test_the_help_overlay_lists_the_annotation_keys(tmp_path: Path) -> None:
-    """Bound on the widget, so the overlay has to be handed them explicitly."""
+    """Bound on the widget, so the overlay has to be handed them explicitly.
+
+    Read off the rendered widgets rather than off the compositor, which is what
+    this asserted before help grew pages. A paint assertion now answers "is
+    this row inside the current scroll offset of the current page", and these
+    rows sit in the middle of Navigation — so it would fail for a reason that
+    has nothing to do with whether the binding reached help. The sibling suite
+    in `tests/test_help_overlay.py` reads the same way.
+    """
 
     async def scenario() -> None:
         app = LogViewerApp()
@@ -1194,11 +1203,11 @@ def test_the_help_overlay_lists_the_annotation_keys(tmp_path: Path) -> None:
             await pilot.press("question_mark")
             await pilot.pause()
 
-            painted = "\n".join(
-                "".join(segment.text for segment in strip)
-                for strip in app.screen._compositor.render_strips()
+            overlay = app.screen
+            rendered = "\n".join(
+                str(static.content) for static in overlay.query(Static).results()
             )
 
-            assert "annotation" in painted.lower()
+            assert "annotation" in rendered.lower()
 
     asyncio.run(scenario())

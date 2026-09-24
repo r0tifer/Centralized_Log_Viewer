@@ -338,14 +338,32 @@ supplies a command instead, reachable from `C` and from its own key.
 
 ### Getting help
 
-Press `?` for an overlay listing every keybinding, grouped by what it does. The
-footer only has room for the first handful at narrow widths, so the overlay is
-the complete list — it is generated from the bindings themselves and cannot
-fall out of date. Dismiss it with `?`, `Esc` or `q`.
+Press `?`. The footer entry says `? Help` and clicking it does the same thing.
+
+Help opens as a modal over the whole view, in five pages selected by the tabs
+along the top:
+
+| Page | Covers |
+| --- | --- |
+| **Overview** | What CLV is, adding sources, the tree's groups, where settings live |
+| **Search** | The query box, field terms and their operators, time windows, severity, and what an empty pane is telling you |
+| **Sources** | Discovery and what it skips, compressed and rotated sets, starring, merging, remote hosts over SSH, the journal |
+| **Reading** | The cursor and the detail pane, structured columns, the timeline, marks, clustering, saved views, watch rules, export and the clipboard |
+| **Keys** | Every keybinding, grouped by what it does |
+
+`←` and `→` change page, `1`–`5` jump straight to one, and `↑`/`↓` scroll the
+page you are on. Dismiss it with `?`, `Esc` or `q`. It reopens on the page you
+left, so `?` still lands on **Keys** for as long as that is what you are using
+it for.
+
+The **Keys** page is the complete list. The footer only has room for the first
+handful at narrow widths, and everything it drops — along with any key an
+installed plugin added — is there. It is generated from the bindings
+themselves and cannot fall out of date.
 
 One wrinkle worth knowing: while the cursor is in the query input, `?` types a
 literal question mark, because it is a valid regex character. Press `Esc` first
-if the input has focus. Tailing continues while the overlay is open.
+if the input has focus. Tailing continues while help is open.
 
 ### Starred logs
 
@@ -1139,7 +1157,7 @@ drawer; the setting is remembered, and `Ctrl+L` remains.
 
 | Key | Action |
 | --- | --- |
-| `?` | Show every keybinding |
+| `?` | Open help (then `←` `→` change page, `1`-`5` jump) |
 | `/` | Focus the query input |
 | `Enter` | Apply filters (in the query input) · open the detail pane (in the log pane) |
 | `Esc` | Clear the query |
@@ -1638,6 +1656,6 @@ worth starring and comparing across a fleet.
 ```bash
 python -m pip install -e .
 python -m pip install pytest
-python -m pytest            # 2532 passed, 1 skipped, 11 deselected
+python -m pytest            # 2551 passed, 1 skipped, 11 deselected
 python -m textual run clv/app.py --dev
 ```
